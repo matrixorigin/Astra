@@ -46,10 +46,7 @@ pub struct LearningSyncMetadata {
 // ─── File I/O ────────────────────────────────────────────────────────────────
 
 pub fn tool_health_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("tool-health")
+    astra_runtime_env::local_state_root().join("tool-health")
 }
 
 pub fn tool_health_path(profile: &str) -> PathBuf {

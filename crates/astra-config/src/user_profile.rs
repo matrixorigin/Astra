@@ -1,10 +1,10 @@
 //! M5: User Profile System
 //!
-//! Provides per-user preferences, learned patterns, and scenario detection.
+//! Provides per-user preferences, learned patterns, and typed scenario state.
 //!
 //! Key features:
 //! - User preferences (verbosity, language style, explicit tool blocks)
-//! - Scenario detection (code review, debugging, exploration, planning)
+//! - Scenario strategy selected by the LLM-produced [`TurnIntent`]
 //! - Config overrides per user
 //! - A/B experiment enrollment
 
@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
-use astra_core::ConfidenceInterval;
 use astra_turn_types::{ObjectiveRelation, UserFeedback};
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +30,7 @@ pub struct UserProfile {
     /// User preferences.
     pub preferences: UserPreferences,
 
-    /// Detected scenario for current session.
+    /// Scenario selected from the latest accepted typed turn intent.
     pub current_scenario: Option<Scenario>,
 
     /// Active A/B experiments for this user.
@@ -67,10 +66,26 @@ impl UserProfile {
         self.updated_at = SystemTime::now();
     }
 
-    /// Set current scenario.
-    pub fn set_scenario(&mut self, scenario: Scenario) {
-        self.current_scenario = Some(scenario);
-        self.touch();
+    /// Apply scenario state from the typed LLM turn-intent contract.
+    ///
+    /// Query text and tool observations deliberately have no write path to
+    /// `current_scenario`. A prohibited active scenario may be cleared even
+    /// when the judge does not select a replacement.
+    pub fn apply_judged_turn_intent(&mut self, intent: &TurnIntent) {
+        if let Some(scenario) = intent
+            .requested_scenario
+            .filter(|scenario| intent.allows_scenario(*scenario))
+        {
+            self.current_scenario = Some(scenario);
+            self.stats.record_scenario(scenario);
+            self.touch();
+        } else if self
+            .current_scenario
+            .is_some_and(|scenario| !intent.allows_scenario(scenario))
+        {
+            self.current_scenario = None;
+            self.touch();
+        }
     }
 
     /// Enroll in an A/B experiment.
@@ -393,6 +408,71 @@ pub enum WorkspaceMutationIntent {
     MustMutate,
 }
 
+/// Domain assigned to the current turn by the semantic LLM judge.
+///
+/// This value is intentionally part of [`TurnIntent`]: downstream routing
+/// telemetry must not reconstruct a domain by matching words in the user's
+/// message. `None` means the judge did not provide a reliable domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnIntentDomain {
+    #[serde(rename = "github")]
+    GitHub,
+    Git,
+    Code,
+    Memory,
+    Web,
+    System,
+    Database,
+}
+
+impl TurnIntentDomain {
+    /// Stable label used by journal and observability projections.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Git => "git",
+            Self::Code => "code",
+            Self::Memory => "memory",
+            Self::Web => "web",
+            Self::System => "system",
+            Self::Database => "database",
+        }
+    }
+}
+
+/// LLM-judged communicative role of the current user turn.
+///
+/// Tool-surface policy consumes this typed value instead of attempting to
+/// recognize greetings, acknowledgements, or tasks from user text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCommunicativeAct {
+    /// The user asks the agent to perform work or take an action.
+    Task,
+    /// The user asks a substantive question that may require tools.
+    Question,
+    /// The user only acknowledges prior output and requests no further work.
+    Acknowledgement,
+    /// The user makes a purely social utterance and requests no further work.
+    Social,
+    /// The judge could not reliably classify the communicative act.
+    #[default]
+    Unknown,
+}
+
+impl TurnCommunicativeAct {
+    /// Whether this act may need a tool-bearing model surface.
+    ///
+    /// Unknown stays tool-capable so a judge failure cannot silently remove
+    /// agent capabilities.
+    #[must_use]
+    pub const fn uses_tool_surface(self) -> bool {
+        !matches!(self, Self::Acknowledgement | Self::Social)
+    }
+}
+
 /// Semantic turn intent produced by an upstream judge/classifier.
 ///
 /// This type is deliberately structural: the runtime policy consumes the
@@ -401,6 +481,13 @@ pub enum WorkspaceMutationIntent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct TurnIntent {
+    /// Judge-owned work domain. Consumers must preserve `None` rather than
+    /// infer a replacement from user text, memory snippets, or tool names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<TurnIntentDomain>,
+    /// Judge-owned communicative role. This field is required when decoding
+    /// judge output so obsolete schemas fail instead of silently guessing.
+    pub communicative_act: TurnCommunicativeAct,
     /// Scenario the current user turn asks to enter, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_scenario: Option<Scenario>,
@@ -427,6 +514,18 @@ pub struct TurnIntent {
 }
 
 impl TurnIntent {
+    #[must_use]
+    pub fn with_domain(mut self, domain: TurnIntentDomain) -> Self {
+        self.domain = Some(domain);
+        self
+    }
+
+    #[must_use]
+    pub fn with_communicative_act(mut self, act: TurnCommunicativeAct) -> Self {
+        self.communicative_act = act;
+        self
+    }
+
     #[must_use]
     pub fn with_requested_scenario(mut self, scenario: Scenario) -> Self {
         self.requested_scenario = Some(scenario);
@@ -606,260 +705,6 @@ pub struct ScenarioStrategy {
     pub verification_strictness: Option<f64>,
 }
 
-// ─── Scenario Detector ──────────────────────────────────────────────────────
-
-/// Detects the current work scenario based on query patterns and tool usage.
-#[derive(Debug, Default)]
-pub struct ScenarioDetector {
-    /// Recent queries for pattern matching.
-    recent_queries: Vec<String>,
-    /// Recent tool calls.
-    recent_tools: Vec<String>,
-    /// Detection confidence threshold.
-    confidence_threshold: f64,
-}
-
-impl ScenarioDetector {
-    /// Create a new scenario detector with default confidence threshold (0.6).
-    pub fn new() -> Self {
-        Self {
-            recent_queries: Vec::new(),
-            recent_tools: Vec::new(),
-            confidence_threshold: 0.6,
-        }
-    }
-
-    /// Add a query for analysis.
-    pub fn observe_query(&mut self, query: &str) {
-        self.recent_queries.push(query.to_lowercase());
-        // Keep last 5 queries
-        if self.recent_queries.len() > 5 {
-            self.recent_queries.remove(0);
-        }
-    }
-
-    /// Add a tool call for analysis.
-    pub fn observe_tool(&mut self, tool_name: &str) {
-        self.recent_tools.push(tool_name.to_string());
-        // Keep last 10 tool calls
-        if self.recent_tools.len() > 10 {
-            self.recent_tools.remove(0);
-        }
-    }
-
-    /// Detect the most likely scenario.
-    ///
-    /// Requires at least 3 total observations (queries + tool uses) to avoid
-    /// spurious matches on trivial inputs where the confidence interval is
-    /// too wide to be meaningful.
-    pub fn detect(&self) -> Option<(Scenario, ConfidenceInterval)> {
-        let total_observations = self.recent_queries.len() + self.recent_tools.len();
-        if total_observations < 3 {
-            return None;
-        }
-
-        let scores = self.score_scenarios();
-
-        // Find the highest scoring scenario above threshold
-        scores
-            .into_iter()
-            .filter(|(_, score)| score.conservatively_exceeds(self.confidence_threshold))
-            .max_by(|a, b| scenario_confidence_cmp(&a.1, &b.1))
-    }
-
-    /// Score all scenarios based on current evidence.
-    fn score_scenarios(&self) -> Vec<(Scenario, ConfidenceInterval)> {
-        let scenarios = [
-            Scenario::CodeReview,
-            Scenario::Debugging,
-            Scenario::Exploration,
-            Scenario::Planning,
-            Scenario::Implementation,
-            Scenario::Refactoring,
-            Scenario::Testing,
-            Scenario::Documentation,
-            Scenario::DevOps,
-            Scenario::Learning,
-            Scenario::QuickAnswer,
-            Scenario::BenchmarkComparison,
-        ];
-
-        scenarios
-            .into_iter()
-            .map(|s| {
-                let query_score = self.score_queries(s);
-                let tool_score = self.score_tools(s);
-                // Weight queries slightly more than tools
-                let combined = query_score * 0.6 + tool_score * 0.4;
-                (s, self.score_interval(combined))
-            })
-            .collect()
-    }
-
-    fn score_queries(&self, scenario: Scenario) -> f64 {
-        if self.recent_queries.is_empty() {
-            return 0.0;
-        }
-
-        let keywords = scenario_keywords(scenario);
-        let mut matches = 0;
-
-        for query in &self.recent_queries {
-            for keyword in &keywords {
-                if query.contains(keyword) {
-                    matches += 1;
-                    break; // One match per query
-                }
-            }
-        }
-
-        matches as f64 / self.recent_queries.len() as f64
-    }
-
-    fn score_tools(&self, scenario: Scenario) -> f64 {
-        if self.recent_tools.is_empty() {
-            return 0.0;
-        }
-
-        let suggested = scenario.suggested_tools();
-        let mut matches = 0;
-
-        for tool in &self.recent_tools {
-            if suggested.iter().any(|r| tool.contains(r)) {
-                matches += 1;
-            }
-        }
-
-        matches as f64 / self.recent_tools.len() as f64
-    }
-
-    fn score_interval(&self, point: f64) -> ConfidenceInterval {
-        let observation_count = (self.recent_queries.len() + self.recent_tools.len()).max(1) as f64;
-        let margin = (0.35 / observation_count.sqrt()).clamp(0.08, 0.25);
-        ConfidenceInterval::symmetric(point, margin)
-    }
-
-    /// Clear detection history.
-    pub fn clear(&mut self) {
-        self.recent_queries.clear();
-        self.recent_tools.clear();
-    }
-}
-
-fn scenario_confidence_cmp(
-    left: &ConfidenceInterval,
-    right: &ConfidenceInterval,
-) -> std::cmp::Ordering {
-    left.lower
-        .partial_cmp(&right.lower)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| {
-            left.point
-                .partial_cmp(&right.point)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-}
-
-fn scenario_keywords(scenario: Scenario) -> Vec<&'static str> {
-    match scenario {
-        Scenario::CodeReview => vec![
-            "review",
-            "pr",
-            "pull request",
-            "diff",
-            "change",
-            "feedback",
-            "comment",
-            "approve",
-        ],
-        Scenario::Debugging => vec![
-            "bug", "fix", "error", "crash", "debug", "issue", "problem", "wrong", "fail", "broken",
-        ],
-        Scenario::Exploration => vec![
-            "find",
-            "search",
-            "where",
-            "what",
-            "how",
-            "explore",
-            "look",
-            "understand",
-            "show",
-        ],
-        Scenario::Planning => vec![
-            "plan",
-            "design",
-            "architect",
-            "strategy",
-            "approach",
-            "think",
-            "consider",
-            "propose",
-        ],
-        Scenario::Implementation => vec![
-            "create",
-            "implement",
-            "add",
-            "build",
-            "write",
-            "new",
-            "feature",
-            "develop",
-        ],
-        Scenario::Refactoring => vec![
-            "refactor",
-            "restructure",
-            "clean",
-            "improve",
-            "optimize",
-            "reorganize",
-            "simplify",
-        ],
-        Scenario::Testing => vec![
-            "test",
-            "spec",
-            "assert",
-            "verify",
-            "coverage",
-            "unit",
-            "integration",
-        ],
-        Scenario::Documentation => vec![
-            "doc", "comment", "readme", "explain", "describe", "document",
-        ],
-        Scenario::DevOps => vec![
-            "deploy",
-            "ci",
-            "cd",
-            "pipeline",
-            "docker",
-            "kubernetes",
-            "config",
-            "env",
-        ],
-        Scenario::Learning => vec![
-            "learn", "tutorial", "example", "teach", "explain", "how does", "what is",
-        ],
-        // Keyword overlap with Exploration/Learning is intentional — QuickAnswer
-        // wins only when the fallback-routing pre-filter in agentic adaptive runtime
-        // confirms the query is short AND interrogative AND read-only. Keywords here
-        // exist so the scoring path can still identify it if those preconditions match.
-        Scenario::QuickAnswer => vec![
-            "why",
-            "what",
-            "where",
-            "which",
-            "who",
-            "为啥",
-            "为什么",
-            "怎么",
-            "哪里",
-            "哪个",
-        ],
-        Scenario::BenchmarkComparison => Vec::new(),
-    }
-}
-
 // ─── User Stats ─────────────────────────────────────────────────────────────
 
 /// User session statistics for personalization.
@@ -1021,19 +866,15 @@ impl UserProfileStore {
 
 // ─── Profile Manager ────────────────────────────────────────────────────────
 
-/// High-level manager for user profiles with scenario detection.
+/// High-level manager for user profiles and non-semantic usage statistics.
 pub struct UserProfileManager {
     store: Arc<UserProfileStore>,
-    detectors: RwLock<HashMap<String, ScenarioDetector>>,
 }
 
 impl UserProfileManager {
     /// Create a new profile manager backed by the given store.
     pub fn new(store: Arc<UserProfileStore>) -> Self {
-        Self {
-            store,
-            detectors: RwLock::new(HashMap::new()),
-        }
+        Self { store }
     }
 
     /// Get the current profile for a user.
@@ -1046,32 +887,15 @@ impl UserProfileManager {
         self.store.update(profile);
     }
 
-    /// Record a user query and update scenario detection.
-    pub fn observe_query(&self, user_id: &str, query: &str) {
-        let mut detectors = self.detectors.write_or_recover();
-        let detector = detectors.entry(user_id.to_string()).or_default();
-        detector.observe_query(query);
-
-        // Update profile with new query count
+    /// Record a query count without interpreting its natural-language text.
+    pub fn observe_query(&self, user_id: &str, _query: &str) {
         let mut profile = self.store.get_or_create(user_id);
         profile.stats.total_queries += 1;
-
-        // Check for scenario detection
-        if let Some((scenario, _confidence)) = detector.detect() {
-            profile.set_scenario(scenario);
-            profile.stats.record_scenario(scenario);
-        }
-
         self.store.update(profile);
     }
 
-    /// Record a tool call.
+    /// Record exact tool-use statistics without treating tool names as intent.
     pub fn observe_tool(&self, user_id: &str, tool_name: &str) {
-        let mut detectors = self.detectors.write_or_recover();
-        let detector = detectors.entry(user_id.to_string()).or_default();
-        detector.observe_tool(tool_name);
-
-        // Update profile stats
         let mut profile = self.store.get_or_create(user_id);
         profile.stats.record_tool_use(tool_name);
         self.store.update(profile);
@@ -1117,6 +941,14 @@ mod tests {
         assert!(intent.allows_scenario(Scenario::Implementation));
         assert!(!intent.allows_scenario(Scenario::CodeReview));
         assert_eq!(intent.prohibited_scenarios, vec![Scenario::CodeReview]);
+
+        let mut profile = UserProfile::new("typed-intent-owner");
+        profile.apply_judged_turn_intent(&intent);
+        assert_eq!(
+            profile.current_scenario,
+            Some(Scenario::Implementation),
+            "typed turn intent is the scenario state owner"
+        );
     }
 
     #[test]
@@ -1133,6 +965,7 @@ mod tests {
 
     #[test]
     fn turn_intent_workspace_mutation_defaults_fail_closed() {
+        assert_eq!(TurnIntent::default().domain, None);
         assert_eq!(
             TurnIntent::default().workspace_mutation,
             WorkspaceMutationIntent::Unknown
@@ -1145,6 +978,37 @@ mod tests {
     }
 
     #[test]
+    fn turn_intent_domain_has_stable_typed_labels() {
+        let intent = TurnIntent::default().with_domain(TurnIntentDomain::GitHub);
+        assert_eq!(intent.domain.map(TurnIntentDomain::as_str), Some("github"));
+        assert_eq!(
+            serde_json::to_value(intent).unwrap()["domain"],
+            "github",
+            "the strict judge schema and journal projection share one label"
+        );
+    }
+
+    #[test]
+    fn communicative_act_tool_surface_policy_is_structural() {
+        for act in [
+            TurnCommunicativeAct::Task,
+            TurnCommunicativeAct::Question,
+            TurnCommunicativeAct::Unknown,
+        ] {
+            assert!(act.uses_tool_surface(), "{act:?} must stay tool-capable");
+        }
+        for act in [
+            TurnCommunicativeAct::Acknowledgement,
+            TurnCommunicativeAct::Social,
+        ] {
+            assert!(
+                !act.uses_tool_surface(),
+                "{act:?} must produce a tool-free base surface"
+            );
+        }
+    }
+
+    #[test]
     fn test_blocked_tool_check() {
         let prefs = UserPreferences {
             blocked_tools: vec!["bash".to_string()],
@@ -1153,58 +1017,6 @@ mod tests {
 
         assert!(prefs.is_blocked_tool("bash"));
         assert!(!prefs.is_blocked_tool("read_file"));
-    }
-
-    #[test]
-    fn test_scenario_detection() {
-        let mut detector = ScenarioDetector::new();
-
-        // Simulate debugging scenario
-        detector.observe_query("there's a bug in the auth module");
-        detector.observe_query("why is this test failing");
-        detector.observe_tool("bash");
-        detector.observe_tool("read_file");
-
-        let result = detector.detect();
-        assert!(result.is_some());
-        let (scenario, confidence) = result.unwrap();
-        assert_eq!(scenario, Scenario::Debugging);
-        assert!(confidence.conservatively_exceeds(0.6));
-        assert!(confidence.point >= confidence.lower);
-        assert!(confidence.point <= confidence.upper);
-    }
-
-    #[test]
-    fn test_scenario_detection_rejects_thin_evidence() {
-        let mut detector = ScenarioDetector::new();
-        detector.observe_query("fix");
-        assert!(detector.detect().is_none());
-    }
-
-    #[test]
-    fn scenario_confidence_cmp_prefers_stronger_lower_bound() {
-        let wide_high_point = ConfidenceInterval::new(0.82, 0.61, 1.0);
-        let steadier_lower_bound = ConfidenceInterval::new(0.79, 0.74, 0.84);
-
-        assert_eq!(
-            scenario_confidence_cmp(&wide_high_point, &steadier_lower_bound),
-            std::cmp::Ordering::Less
-        );
-    }
-
-    #[test]
-    fn test_scenario_keywords() {
-        let keywords = scenario_keywords(Scenario::CodeReview);
-        assert!(keywords.contains(&"review"));
-        assert!(keywords.contains(&"pr"));
-
-        let keywords = scenario_keywords(Scenario::Testing);
-        assert!(keywords.contains(&"test"));
-
-        assert!(
-            scenario_keywords(Scenario::BenchmarkComparison).is_empty(),
-            "benchmark comparison must be supplied by structured turn intent, not keyword fallback"
-        );
     }
 
     #[test]
@@ -1270,42 +1082,12 @@ mod tests {
         let store = Arc::new(UserProfileStore::new());
         let manager = UserProfileManager::new(store);
 
-        manager.observe_query("user1", "find all tests");
+        manager.observe_query("user1", "opaque query");
         manager.observe_tool("user1", "grep");
 
         let profile = manager.get_profile("user1");
         assert_eq!(profile.stats.total_queries, 1);
         assert_eq!(profile.stats.total_tool_calls, 1);
-    }
-
-    #[test]
-    fn scenario_detect_returns_none_below_min_observations() {
-        let mut det = ScenarioDetector::new();
-        // A single strong keyword should NOT trigger a detection.
-        det.observe_query("review pull request code changes");
-        assert!(
-            det.detect().is_none(),
-            "1 query + 0 tools < 3 observations → should return None"
-        );
-
-        det.observe_tool("bash");
-        assert!(
-            det.detect().is_none(),
-            "1 query + 1 tool < 3 observations → should return None"
-        );
-
-        // After 3 total observations, score_scenarios actually runs.
-        // Verify by checking that the internal score_scenarios produces
-        // results when we bypass the gate (unit test of the gating logic).
-        det.observe_query("check the diff for bugs");
-        let total = det.recent_queries.len() + det.recent_tools.len();
-        assert!(total >= 3, "should have at least 3 observations now");
-        // detect() now runs the scoring engine (may or may not exceed
-        // threshold, but it is no longer short-circuited).
-        let scores = det.score_scenarios();
-        assert!(
-            !scores.is_empty(),
-            "scoring engine should run with >= 3 observations"
-        );
+        assert_eq!(profile.current_scenario, None);
     }
 }

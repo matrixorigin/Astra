@@ -11,7 +11,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 
+pub mod history_work;
+pub mod history_work_baseline;
 pub mod identity;
+pub mod local_state;
 pub mod work_unit;
 
 pub mod canonical_names;

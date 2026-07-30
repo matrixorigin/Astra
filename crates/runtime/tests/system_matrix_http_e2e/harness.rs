@@ -136,7 +136,6 @@ pub fn build_e2e_access_token(user_id: &str, username: &str, exp_unix: u64) -> S
 }
 
 async fn build_state(memoria: Arc<E2eMemoriaStub>) -> (astra_runtime::AppState, String, String) {
-    dotenvy::dotenv().ok();
     let settings = AppSettings::from_env().expect("AppSettings::from_env (see astra-server env)");
     let matrixone_database = settings.matrixone.database.clone();
     let url = settings.matrixone.database_url_with_password();

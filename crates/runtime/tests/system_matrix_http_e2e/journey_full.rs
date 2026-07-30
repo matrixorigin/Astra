@@ -1026,27 +1026,6 @@ pub async fn run_product_matrix_full_journey(
         "introspection retrieval quality: {irq_j}"
     );
 
-    let (st_route, route_j) = post_json(
-        app,
-        "/chat/route",
-        Some(auth_header),
-        json!({ "query": "run tests and fix failures" }),
-    )
-    .await;
-    assert_eq!(st_route, StatusCode::OK, "chat/route: {route_j}");
-    let mut route_keys = route_j
-        .as_object()
-        .expect("chat/route should return an object")
-        .keys()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    route_keys.sort_unstable();
-    assert_eq!(
-        route_keys,
-        ["intent", "matched_by", "query", "task_type", "tier"],
-        "chat/route shape: {route_j}"
-    );
-
     let (st_models, models_j) = get_json(app, "/models", Some(auth_header), &[]).await;
     assert_eq!(st_models, StatusCode::OK, "list models: {models_j}");
     assert!(

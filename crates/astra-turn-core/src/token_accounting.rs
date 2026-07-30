@@ -3,6 +3,7 @@
 //! Replaces the 4 bare `u64` fields in `AgenticLoopState` with a single
 //! struct that enforces the disjoint-bucket invariant.
 
+use astra_turn_types::NormalizedPromptCacheUsage;
 use serde::{Deserialize, Serialize};
 
 /// Four disjoint token buckets whose sum equals billable total.
@@ -20,21 +21,21 @@ pub struct TokenAccounting {
 }
 
 impl TokenAccounting {
+    fn normalized_input(&self) -> NormalizedPromptCacheUsage {
+        NormalizedPromptCacheUsage::new(self.prompt, self.cache_read, self.cache_creation)
+    }
+
     /// Total billable tokens across all buckets.
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.prompt
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_creation)
-            .saturating_add(self.completion)
+        self.normalized_input()
+            .total_tokens_with_output(self.completion)
     }
 
     /// Total input tokens (prompt + cache_read + cache_creation).
     #[must_use]
     pub fn total_input(&self) -> u64 {
-        self.prompt
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_creation)
+        self.normalized_input().total_input_tokens()
     }
 
     /// Total input tokens as `u32`, saturating instead of truncating.

@@ -56,22 +56,7 @@ pub enum EventKind {
         to: String,
     },
 
-    // ── Perception ──
-    IntentDetected {
-        signals: Vec<String>,
-        confidence: f64,
-    },
-    EntityExtracted {
-        entities: Vec<String>,
-        domains: Vec<String>,
-    },
-
     // ── Planning ──
-    ToolsSelected {
-        tools: Vec<String>,
-        confidence: f64,
-        boost_terms: Vec<String>,
-    },
     BudgetSet {
         max_rounds: u32,
         max_tokens: u64,
@@ -194,10 +179,7 @@ impl EventKind {
             EventKind::PhaseTransition { .. } => TraceLevel::Info,
             EventKind::ToolCallStarted { .. } => TraceLevel::Info,
             EventKind::ToolCallCompleted { .. } => TraceLevel::Info,
-            EventKind::ToolsSelected { .. } => TraceLevel::Info,
             EventKind::TurnCompleted { .. } => TraceLevel::Info,
-            EventKind::IntentDetected { .. } => TraceLevel::Info,
-            EventKind::EntityExtracted { .. } => TraceLevel::Info,
             EventKind::BudgetSet { .. } => TraceLevel::Info,
             EventKind::SkillStarted { .. } => TraceLevel::Info,
             EventKind::SkillCompleted { .. } => TraceLevel::Info,
@@ -374,10 +356,9 @@ mod tests {
 
         let id2 = log
             .emit(
-                EventKind::ToolsSelected {
-                    tools: vec!["bash".into()],
-                    confidence: 0.8,
-                    boost_terms: vec![],
+                EventKind::BudgetSet {
+                    max_rounds: 8,
+                    max_tokens: 4_000,
                 },
                 Some(id1),
             )
@@ -390,19 +371,18 @@ mod tests {
         let mut log = EventLog::with_min_level(TraceLevel::Trace);
         let e0 = log
             .emit(
-                EventKind::IntentDetected {
-                    signals: vec!["is_fetch".into()],
-                    confidence: 0.7,
+                EventKind::PhaseTransition {
+                    from: "Perceive".into(),
+                    to: "Plan".into(),
                 },
                 None,
             )
             .unwrap();
         let e1 = log
             .emit(
-                EventKind::ToolsSelected {
-                    tools: vec!["github".into()],
-                    confidence: 0.7,
-                    boost_terms: vec![],
+                EventKind::BudgetSet {
+                    max_rounds: 8,
+                    max_tokens: 4_000,
                 },
                 Some(e0),
             )

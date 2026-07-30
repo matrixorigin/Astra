@@ -44,7 +44,7 @@ use astra_turn_core::agentic_post_tool_policy::{
     map_post_tool_policy_outcome, policy_advisory_bundle_value,
 };
 use astra_turn_core::agentic_turn_flow::{
-    agentic_round_stall_preflight_with_tool_calls, append_explain_turn_batch,
+    agentic_round_stall_preflight, append_explain_turn_batch,
 };
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use astra_turn_core::tool_result_semantics::tool_dedup_signature;
@@ -1174,7 +1174,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         );
     }
 
-    let tool_calls_for_guard = agentic_round_stall_preflight_with_tool_calls(
+    agentic_round_stall_preflight(
         turn_index,
         &turn_result.accum.tool_calls,
         &turn_result.edge_tool_round,
@@ -1833,8 +1833,6 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     match map_post_tool_policy_outcome(apply_agentic_post_tool_policy(
         AgenticPostToolPolicyRequest {
             turn_index: turn_index as u32,
-            tool_calls_for_guard: &tool_calls_for_guard,
-            intent_tool_turns: &mut state.stall.intent_tool_turns,
             messages: &mut state.messages,
             turn_guard: &mut state.turn_guard,
             verdict_events: &mut state.stall.verdict_events,

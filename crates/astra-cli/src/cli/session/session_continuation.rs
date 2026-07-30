@@ -12,6 +12,20 @@ pub(crate) struct SessionContinuation {
     pub(crate) activated_deferred_tool_names: Vec<String>,
 }
 
+pub(crate) fn materialize_cli_continuation_messages(
+    site: astra_core::history_work::HistoryWorkSite,
+    messages: &[Value],
+) -> Vec<Value> {
+    crate::cli::history_work::clone_json_history(site, messages)
+}
+
+fn record_session_restore_hydration(messages: &[Value]) {
+    crate::cli::history_work::record_json_history(
+        astra_core::history_work::HistoryWorkSite::CliSessionRestoreHydration,
+        messages,
+    );
+}
+
 pub(crate) fn continuation_activation_names(
     messages: &[Value],
     persisted_names: impl IntoIterator<Item = String>,
@@ -78,6 +92,7 @@ pub(crate) fn load_session_continuation_for_recovery(
         };
 
     if let Some(messages) = journal_messages {
+        record_session_restore_hydration(&messages);
         return Some(SessionContinuation {
             completed_turn_count: None,
             activated_deferred_tool_names: continuation_activation_names(
@@ -93,6 +108,7 @@ pub(crate) fn load_session_continuation_for_recovery(
     match heavy {
         Some(cp) if !cp.messages.is_empty() => {
             let prompt_state = heavy_checkpoint_prompt_state(&cp);
+            record_session_restore_hydration(&cp.messages);
             let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
                 cp.messages,
                 &prompt_state,
@@ -171,6 +187,7 @@ pub(crate) fn load_csl_continuation(
     let Some(materialized) = materialized else {
         return Ok(None);
     };
+    record_session_restore_hydration(&materialized.messages);
     let messages =
         astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
             materialized.messages,
@@ -210,6 +227,7 @@ fn heavy_checkpoint_prompt_state(
 /// bias the model toward tool usage on the next turn even when the user's
 /// new message is purely conversational.
 pub(crate) fn sanitize_continuation_messages(msgs: Vec<Value>) -> Vec<Value> {
+    record_session_restore_hydration(&msgs);
     let (sanitized, invalid_turn_semantics_dropped) =
         astra_turn_core::prompt_facing::recover_canonical_continuation_messages_with_turn_semantics(
             msgs,
@@ -236,8 +254,12 @@ pub(crate) fn extract_text_content(msg: &Value) -> Option<String> {
 /// - ignore assistant tool-call stubs that have no visible text,
 /// - concatenate multiple visible assistant chunks in the same turn.
 pub(crate) fn history_pairs_from_messages(msgs: &[Value]) -> Vec<(String, String)> {
-    let visible_msgs =
-        astra_turn_core::prompt_facing::sanitize_user_visible_messages(msgs.to_vec());
+    let visible_msgs = astra_turn_core::prompt_facing::sanitize_user_visible_messages(
+        materialize_cli_continuation_messages(
+            astra_core::history_work::HistoryWorkSite::CliDisplayHistoryProjectionClone,
+            msgs,
+        ),
+    );
     let mut pairs = Vec::new();
     let mut current_user = String::new();
     let mut current_assistant = String::new();
@@ -286,6 +308,23 @@ mod tests {
     use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use astra_services::session_journal;
     use serde_json::json;
+
+    #[test]
+    fn continuation_materialization_preserves_nested_typed_messages() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": ["hi", {"text": "nested"}],
+        })];
+
+        assert_eq!(
+            super::materialize_cli_continuation_messages(
+                astra_core::history_work::HistoryWorkSite::CliDisplayHistoryProjectionClone,
+                &messages,
+            ),
+            messages,
+            "instrumentation must not project or reinterpret typed continuation data"
+        );
+    }
 
     #[test]
     #[serial_test::serial]

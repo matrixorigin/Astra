@@ -272,7 +272,13 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
             turn,
             messages,
             session_state,
-        } => (messages.clone(), session_state.clone(), *seq, *turn),
+        } => {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                messages,
+            );
+            (messages.clone(), session_state.clone(), *seq, *turn)
+        }
         _ => unreachable!(),
     };
 
@@ -287,6 +293,10 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
                 appended,
                 state_patch,
             } => {
+                astra_core::history_work::record_serialized_value(
+                    astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                    appended,
+                );
                 messages.extend(appended.iter().cloned());
                 if let Some(patch) = state_patch {
                     state.apply_patch(patch);
@@ -301,6 +311,10 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
                 session_state,
             } => {
                 // A later snapshot resets everything.
+                astra_core::history_work::record_serialized_value(
+                    astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                    snap_messages,
+                );
                 messages = snap_messages.clone();
                 state = session_state.clone();
                 last_seq = *seq;

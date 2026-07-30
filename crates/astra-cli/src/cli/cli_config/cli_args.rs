@@ -246,6 +246,24 @@ pub(crate) enum Command {
     Message(Vec<String>),
 }
 
+impl Command {
+    pub(crate) fn profile_identity_admission(
+        &self,
+    ) -> crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission {
+        use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
+
+        match self {
+            Self::Login(_) | Self::Register(_) => {
+                CliProfileIdentityAdmission::AuthenticationBootstrap
+            }
+            Self::Admin(args) if args.is_authentication_bootstrap() => {
+                CliProfileIdentityAdmission::AuthenticationBootstrap
+            }
+            _ => CliProfileIdentityAdmission::RequireBoundAccount,
+        }
+    }
+}
+
 /// Subcommands for the standalone `astra context` group.  Mirrors
 /// the TUI's `/context` slash command but works without a running
 /// TUI session — useful for forensic replay from a persisted session.

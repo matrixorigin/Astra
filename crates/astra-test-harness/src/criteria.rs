@@ -798,11 +798,12 @@ fn evaluate_one(
         },
 
         Criterion::TokensBetween { min, max } => {
-            let total = outcome
-                .prompt_tokens
-                .saturating_add(outcome.cached_input_tokens)
-                .saturating_add(outcome.cache_creation_tokens)
-                .saturating_add(outcome.completion_tokens);
+            let total = astra_turn_types::NormalizedPromptCacheUsage::new(
+                outcome.prompt_tokens,
+                outcome.cached_input_tokens,
+                outcome.cache_creation_tokens,
+            )
+            .total_tokens_with_output(outcome.completion_tokens);
             let passed = total >= *min && total <= *max;
             CriterionResult {
                 criterion: c.clone(),

@@ -103,9 +103,24 @@ fn duplicate_read_stub(path: &str) -> String {
 }
 
 fn serialized_value_chars(value: &Value) -> usize {
-    serde_json::to_string(value)
-        .map(|encoded| encoded.chars().count())
-        .unwrap_or(1)
+    let site = astra_core::history_work::HistoryWorkSite::CompactionHistorySerialization;
+    match serde_json::to_string(value) {
+        Ok(encoded) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    encoded.len().try_into().unwrap_or(u64::MAX),
+                    1,
+                    0,
+                );
+            }
+            encoded.chars().count()
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            1
+        }
+    }
 }
 
 fn serialized_message_chars(messages: &[Value]) -> usize {
@@ -481,6 +496,10 @@ pub(crate) fn compact_tiered_impl(
     let messages_before = messages.len();
 
     if tier == CompactionTier::Normal {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         return CompactResult {
             messages: messages.to_vec(),
             boundary: None,
@@ -500,6 +519,10 @@ pub(crate) fn compact_tiered_impl(
     let total_chars = serialized_message_chars(messages);
 
     if total_chars <= budget_chars {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         return CompactResult {
             messages: messages.to_vec(),
             boundary: None,
@@ -510,6 +533,10 @@ pub(crate) fn compact_tiered_impl(
         };
     }
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        messages,
+    );
     let mut compacted = messages.to_vec();
     let trunc_limit = match tier {
         CompactionTier::Normal => unreachable!(),

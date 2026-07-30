@@ -251,7 +251,7 @@ impl ChatComposer {
 }
 
 fn history_file_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".astra").join("history"))
+    Some(astra_runtime_env::local_state_root().join("history"))
 }
 
 fn load_history() -> (Vec<String>, Option<PathBuf>) {

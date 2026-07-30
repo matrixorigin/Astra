@@ -687,6 +687,8 @@ struct CliSseStreamHost<'a> {
     last_context_window_measured: Option<u64>,
     /// Optional direct stream sink for bounded/live paths.
     stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
+    /// Strict per-exchange protocol observer for `stream-json`.
+    stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -982,6 +984,7 @@ impl<'a> CliSseStreamHost<'a> {
             last_context_system_prompt_tokens: None,
             last_context_window_measured: None,
             stream_event_sink: ctx.stream_event_sink,
+            stream_json_exchange: None,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
@@ -2840,6 +2843,24 @@ fn sync_incremental_tool_result_state(
 
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
+    fn requires_strict_sse_json(&self) -> bool {
+        self.stream_json_exchange.is_some()
+    }
+
+    async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        match self.stream_json_exchange.as_mut() {
+            Some(exchange) => exchange.accepted_event(event),
+            None => Ok(()),
+        }
+    }
+
+    async fn on_sse_done(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
+        match self.stream_json_exchange.as_mut() {
+            Some(exchange) => exchange.finish(accum),
+            None => Ok(()),
+        }
+    }
+
     fn on_before_sse_read_loop(&mut self) {
         self.try_emit_stream_event(chat_stream::StreamEvent::WaitingForModel);
         if self.render_policy.is_silent() {
@@ -2886,10 +2907,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let measured = accum
             .has_usage
             .then(|| {
-                accum
-                    .prompt_tokens
-                    .saturating_add(accum.cache_read_tokens)
-                    .saturating_add(accum.cache_creation_tokens)
+                astra_turn_types::NormalizedPromptCacheUsage::new(
+                    accum.prompt_tokens,
+                    accum.cache_read_tokens,
+                    accum.cache_creation_tokens,
+                )
+                .total_input_tokens()
             })
             .filter(|tokens| *tokens > 0);
         if measured != self.last_context_window_measured {
@@ -6632,6 +6655,7 @@ pub(crate) async fn consume_turn_sse(
     pre_clear_lines: usize,
     auth_profile: Option<&str>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
 ) -> TurnResult {
     // Release the payload/HTTP prep line here so TTFT (`on_before_sse_read_loop`) can take over
     // on the same stderr row without a multi‑hundred‑ms blank gap.
@@ -6661,6 +6685,7 @@ pub(crate) async fn consume_turn_sse(
             render_md && !render_policy.suppress_text(),
             auth_profile,
         );
+        host.stream_json_exchange = stream_json_exchange;
         // pre_clear_lines only applies to non-md fallback path.
         if host.render.md.is_none() {
             host.render.lines_written = pre_clear_lines;
@@ -6683,6 +6708,10 @@ pub(crate) async fn consume_turn_sse(
             refreshed_token,
         )
     } else {
+        debug_assert!(
+            stream_json_exchange.is_none(),
+            "stream-json protocol observation requires the CLI edge SSE host"
+        );
         let mut render = StreamRenderState::with_term_width(
             term_width,
             render_md && !render_policy.suppress_text(),
@@ -8135,6 +8164,7 @@ mod tests {
         creds.profiles.insert(
             "test".to_string(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some("expired-token".to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
@@ -8155,6 +8185,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "fresh-token",
                 "refresh_token": "fresh-refresh-token"
             })))

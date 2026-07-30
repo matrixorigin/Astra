@@ -7,7 +7,6 @@ pub mod state;
 
 pub use execution::{
     FileConflict, ParallelGroups, analyze_parallelism, format_subtask_prompt_with_operator_notes,
-    subtask_requires_browser_verification,
 };
 pub use repository::{
     CloudPlanRepository, FinalizeStepRun, InMemoryPlanRepository, NewStepRun, PlanListFilter,

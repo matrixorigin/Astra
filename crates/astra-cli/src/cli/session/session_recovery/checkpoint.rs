@@ -6,7 +6,7 @@ use super::io::{
 };
 use super::workspace::persist_recovery_workspace_snapshot;
 use crate::cli::cli_config::cli_utils::cli_user_id;
-use crate::cli::session::session_projection::history_as_messages;
+use crate::cli::session::session_projection::history_as_messages_for;
 use crate::cli::session::session_state::SessionState;
 
 #[derive(Debug)]
@@ -133,7 +133,10 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         epoch_ms,
     };
 
-    let messages = history_as_messages(&state.history);
+    let messages = history_as_messages_for(
+        astra_core::history_work::HistoryWorkSite::CliRecoveryCheckpointHistoryMaterialization,
+        &state.history,
+    );
     let activated_deferred_tool_names =
         astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
             &messages,
@@ -367,7 +370,10 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         super::super::session_projection::CslCheckpointFields,
         &prev_state,
     );
-    let messages = super::super::session_projection::history_as_messages(&state.history);
+    let messages = super::super::session_projection::history_as_messages_for(
+        astra_core::history_work::HistoryWorkSite::CliRecoveryCslHistoryMaterialization,
+        &state.history,
+    );
     let workspace_path = workspace_path_for(&sid);
     let workspace_backup = read_optional_file_bytes(&workspace_path)?;
 

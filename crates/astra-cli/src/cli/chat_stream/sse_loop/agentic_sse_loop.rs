@@ -117,9 +117,12 @@ pub(crate) fn eprint_stream_loop_sidecars(ctx: StreamLoopSidecarEprint<'_>) {
         // All three occupy the context window and are all billed (different
         // rates). Showing only `total_prompt` (fresh) made cache-heavy turns
         // look like ↑12 when the actual traffic was 60k+.
-        let total_input = total_prompt
-            .saturating_add(total_cache_read)
-            .saturating_add(total_cache_creation);
+        let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+            total_prompt,
+            total_cache_read,
+            total_cache_creation,
+        )
+        .total_input_tokens();
         eprintln!(
             "{}",
             format!(

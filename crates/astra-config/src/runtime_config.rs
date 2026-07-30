@@ -2033,6 +2033,22 @@ fn cli_overlay_snapshot() -> Option<RuntimeConfig> {
     cli_overlay_cell().read().ok().and_then(|s| s.clone())
 }
 
+fn user_runtime_config_path_from_roots(
+    local_root: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    local_root
+        .or_else(|| home.map(|home| home.join(".astra")))
+        .map(|root| root.join("config/runtime.toml"))
+}
+
+fn user_runtime_config_path() -> Option<PathBuf> {
+    user_runtime_config_path_from_roots(
+        astra_runtime_env::local_state_root_override(),
+        dirs::home_dir(),
+    )
+}
+
 // ─── Configuration Loading ───────────────────────────────────────────────────
 
 impl RuntimeConfig {
@@ -2061,21 +2077,21 @@ impl RuntimeConfig {
     pub fn load() -> Self {
         let mut config = Self::default();
 
-        // User-level config
-        if let Some(home) = dirs::home_dir() {
-            let user_config = home.join(".astra/config/runtime.toml");
-            if let Ok(content) = std::fs::read_to_string(&user_config) {
-                match toml::from_str::<RuntimeConfig>(&content) {
-                    Ok(user) => config = config.merge(user),
-                    Err(err) => {
-                        // Malformed TOML silently falling back to defaults
-                        // was the #1 footgun in the P1 review — now logged.
-                        tracing::warn!(
-                            path = %user_config.display(),
-                            error = %err,
-                            "invalid runtime.toml at user config path; falling back to defaults"
-                        );
-                    }
+        // User-level config. External process orchestrators can redirect the
+        // complete Astra-local namespace without rewriting HOME.
+        if let Some(user_config) = user_runtime_config_path()
+            && let Ok(content) = std::fs::read_to_string(&user_config)
+        {
+            match toml::from_str::<RuntimeConfig>(&content) {
+                Ok(user) => config = config.merge(user),
+                Err(err) => {
+                    // Malformed TOML silently falling back to defaults
+                    // was the #1 footgun in the P1 review — now logged.
+                    tracing::warn!(
+                        path = %user_config.display(),
+                        error = %err,
+                        "invalid runtime.toml at user config path; falling back to defaults"
+                    );
                 }
             }
         }
@@ -2812,6 +2828,21 @@ impl RuntimeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_local_root_is_authoritative_for_user_runtime_config() {
+        let local_root = PathBuf::from("/isolated/astra");
+        let home = PathBuf::from("/developer/home");
+
+        assert_eq!(
+            user_runtime_config_path_from_roots(Some(local_root.clone()), Some(home)),
+            Some(local_root.join("config/runtime.toml"))
+        );
+        assert_eq!(
+            user_runtime_config_path_from_roots(None, Some(PathBuf::from("/developer/home"))),
+            Some(PathBuf::from("/developer/home/.astra/config/runtime.toml"))
+        );
+    }
 
     #[test]
     fn test_default_config() {

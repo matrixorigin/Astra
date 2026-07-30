@@ -8,7 +8,6 @@ use serde_json::json;
 use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
-use astra_turn_core::tool_registry_state::ConversationState;
 
 // ── Tool Surface: always-load build (hot path, every turn) ──────
 
@@ -256,24 +255,6 @@ fn bench_parse_sse_json_frame(c: &mut Criterion) {
     group.finish();
 }
 
-// ── ConversationState Extraction ───────────────────────────────────
-
-fn bench_conversation_state(c: &mut Criterion) {
-    let queries = [
-        ("en_simple", "list all PRs"),
-        ("cn_mixed", "帮我创建一个issue关于matrixone的性能问题"),
-        ("long_context", &"analyze the recent changes in the repository and provide a summary of what was modified ".repeat(5)),
-    ];
-
-    let mut group = c.benchmark_group("conversation_state");
-    for (label, query) in &queries {
-        group.bench_with_input(BenchmarkId::new(*label, query.len()), query, |b, q| {
-            b.iter(|| ConversationState::from_message(black_box(q), black_box(5)))
-        });
-    }
-    group.finish();
-}
-
 // ── Tokenizer ──────────────────────────────────────────────────────
 
 fn bench_tokenize(c: &mut Criterion) {
@@ -338,7 +319,6 @@ criterion_group!(
     bench_build_tf,
     bench_sse_frame_end,
     bench_parse_sse_json_frame,
-    bench_conversation_state,
     bench_build_always_load_surface,
     bench_default_always_load_names,
     bench_inject_required_tool_names,

@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -101,11 +102,247 @@ pub(crate) enum LlmProviderProtocol {
     BedrockConverse,
 }
 
+impl LlmProviderProtocol {
+    #[must_use]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiCompatible => "openai_compatible",
+            Self::AnthropicMessages => "anthropic_messages",
+            Self::BedrockConverse => "bedrock_converse",
+        }
+    }
+}
+
 pub(crate) fn llm_provider_protocol(provider: &str) -> LlmProviderProtocol {
     match provider {
         "anthropic" => LlmProviderProtocol::AnthropicMessages,
         "bedrock" => LlmProviderProtocol::BedrockConverse,
         _ => LlmProviderProtocol::OpenAiCompatible,
+    }
+}
+
+/// Immutable identity of the exact serialized provider payload.
+///
+/// The bytes are serialized once by [`PreparedProviderRequest`]. The HTTP
+/// request body and this hash therefore cannot drift through a second JSON
+/// serialization or a pre-transport prompt projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProviderWireRequestIdentity {
+    pub protocol: LlmProviderProtocol,
+    pub provider_wire_hash: String,
+    pub provider_wire_bytes: u64,
+    pub composition: ProviderWireComposition,
+}
+
+/// Mutually exclusive byte zones from the exact serialized provider body.
+///
+/// Child JSON values contribute their exact serialized bytes. Object keys,
+/// array delimiters, commas, and provider-specific configuration remain in
+/// `provider_envelope_bytes`, so the four zones always reconcile to the
+/// actual HTTP body length without counting any message or tool twice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProviderWireComposition {
+    pub system_bytes: u64,
+    pub conversation_bytes: u64,
+    pub tool_schema_bytes: u64,
+    pub provider_envelope_bytes: u64,
+    pub system_items: u32,
+    pub conversation_items: u32,
+    pub tool_schema_items: u32,
+}
+
+impl ProviderWireComposition {
+    fn from_body(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+        provider_wire_bytes: u64,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let mut composition = Self::default();
+        match protocol {
+            LlmProviderProtocol::OpenAiCompatible => {
+                for message in body
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if message.get("role").and_then(Value::as_str) == Some("system") {
+                        composition.system_bytes = composition
+                            .system_bytes
+                            .saturating_add(serialized_value_bytes(message)?);
+                        composition.system_items = composition.system_items.saturating_add(1);
+                    } else {
+                        composition.conversation_bytes = composition
+                            .conversation_bytes
+                            .saturating_add(serialized_value_bytes(message)?);
+                        composition.conversation_items =
+                            composition.conversation_items.saturating_add(1);
+                    }
+                }
+                accumulate_wire_items(
+                    body.get("tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
+            LlmProviderProtocol::AnthropicMessages => {
+                accumulate_wire_items(
+                    body.get("system"),
+                    &mut composition.system_bytes,
+                    &mut composition.system_items,
+                )?;
+                accumulate_wire_items(
+                    body.get("messages"),
+                    &mut composition.conversation_bytes,
+                    &mut composition.conversation_items,
+                )?;
+                accumulate_wire_items(
+                    body.get("tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
+            LlmProviderProtocol::BedrockConverse => {
+                accumulate_wire_items(
+                    body.get("system"),
+                    &mut composition.system_bytes,
+                    &mut composition.system_items,
+                )?;
+                accumulate_wire_items(
+                    body.get("messages"),
+                    &mut composition.conversation_bytes,
+                    &mut composition.conversation_items,
+                )?;
+                accumulate_wire_items(
+                    body.pointer("/toolConfig/tools"),
+                    &mut composition.tool_schema_bytes,
+                    &mut composition.tool_schema_items,
+                )?;
+            }
+        }
+        let payload_bytes = composition
+            .system_bytes
+            .saturating_add(composition.conversation_bytes)
+            .saturating_add(composition.tool_schema_bytes);
+        composition.provider_envelope_bytes = provider_wire_bytes
+            .checked_sub(payload_bytes)
+            .ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "provider wire composition exceeds the serialized request body",
+                )
+            })?;
+        Ok(composition)
+    }
+
+    #[must_use]
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.system_bytes
+            .saturating_add(self.conversation_bytes)
+            .saturating_add(self.tool_schema_bytes)
+            .saturating_add(self.provider_envelope_bytes)
+    }
+}
+
+fn serialized_value_bytes(value: &Value) -> Result<u64, astra_core::ClassifiedError> {
+    serde_json::to_vec(value)
+        .map(|encoded| {
+            let bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_bytes(
+                    astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+                    bytes,
+                );
+            }
+            bytes
+        })
+        .map_err(|error| {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+                &error,
+            );
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize provider wire composition value: {error}"),
+            )
+        })
+}
+
+fn accumulate_wire_items(
+    value: Option<&Value>,
+    bytes: &mut u64,
+    items: &mut u32,
+) -> Result<(), astra_core::ClassifiedError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if let Some(values) = value.as_array() {
+        for value in values {
+            *bytes = bytes.saturating_add(serialized_value_bytes(value)?);
+            *items = items.saturating_add(1);
+        }
+    } else {
+        *bytes = bytes.saturating_add(serialized_value_bytes(value)?);
+        *items = items.saturating_add(1);
+    }
+    Ok(())
+}
+
+/// Exact provider payload shared by durable attempt admission and HTTP send.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedProviderRequest {
+    body: Bytes,
+    identity: ProviderWireRequestIdentity,
+}
+
+impl PreparedProviderRequest {
+    pub(crate) fn from_json(
+        body: &Value,
+        protocol: LlmProviderProtocol,
+    ) -> Result<Self, astra_core::ClassifiedError> {
+        let encoded = serde_json::to_vec(body).map_err(|error| {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
+                &error,
+            );
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("serialize exact provider request body: {error}"),
+            )
+        })?;
+        let provider_wire_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::ProviderBodySerialization,
+                provider_wire_bytes,
+            );
+        }
+        let provider_wire_hash = format!("{:x}", Sha256::digest(&encoded));
+        let composition = ProviderWireComposition::from_body(body, protocol, provider_wire_bytes)?;
+        Ok(Self {
+            body: Bytes::from(encoded),
+            identity: ProviderWireRequestIdentity {
+                protocol,
+                provider_wire_hash,
+                provider_wire_bytes,
+                composition,
+            },
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn identity(&self) -> &ProviderWireRequestIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub(crate) fn body(&self) -> Bytes {
+        self.body.clone()
+    }
+
+    #[cfg(test)]
+    fn body_bytes(&self) -> &[u8] {
+        self.body.as_ref()
     }
 }
 
@@ -385,7 +622,10 @@ pub(crate) struct LlmCall<'a> {
 /// contain multiple physical attempts.
 #[async_trait]
 pub(crate) trait ProviderAttemptObserver: Send + Sync {
-    async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError>;
+    async fn begin_attempt(
+        &self,
+        wire: &ProviderWireRequestIdentity,
+    ) -> Result<u32, astra_core::ClassifiedError>;
 
     async fn finish_attempt(
         &self,
@@ -412,6 +652,13 @@ pub(crate) fn provider_attempt_terminal_from_result(
 pub(crate) fn provider_attempt_terminal_from_error(
     error: &astra_core::ClassifiedError,
 ) -> astra_services::InferenceInvocationTerminal {
+    provider_attempt_terminal_from_error_with_partial(error, None)
+}
+
+pub(crate) fn provider_attempt_terminal_from_error_with_partial(
+    error: &astra_core::ClassifiedError,
+    partial: Option<&LlmCallResult>,
+) -> astra_services::InferenceInvocationTerminal {
     let status = match error.kind {
         astra_core::ErrorKind::Cancelled => astra_services::InferenceTerminalStatus::Cancelled,
         astra_core::ErrorKind::StreamIdle | astra_core::ErrorKind::StreamTransport => {
@@ -420,10 +667,18 @@ pub(crate) fn provider_attempt_terminal_from_error(
         _ => astra_services::InferenceTerminalStatus::Failed,
     };
     let message = redact_provider_secrets(&error.message);
+    let usage = partial
+        .map(|partial| crate::turn::token_usage::TokenUsage::from_partial_json_map(&partial.usage))
+        .unwrap_or_default();
     astra_services::InferenceInvocationTerminal {
         status,
-        usage: astra_services::InferenceUsage::default(),
-        provider_response_id: None,
+        usage: astra_services::InferenceUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cached_input_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+        },
+        provider_response_id: partial.and_then(|partial| partial.response_id.clone()),
         error_kind: Some(error.kind.as_str().to_string()),
         error_message: Some(
             astra_text_utils::str_preview::truncate_str(&message, 1_000).to_string(),
@@ -475,6 +730,20 @@ pub(crate) async fn finish_observed_provider_error(
         observer,
         attempt_index,
         &provider_attempt_terminal_from_error(error),
+    )
+    .await
+}
+
+pub(crate) async fn finish_observed_provider_error_with_partial(
+    observer: Option<&dyn ProviderAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+    partial: &LlmCallResult,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_attempt(
+        observer,
+        attempt_index,
+        &provider_attempt_terminal_from_error_with_partial(error, Some(partial)),
     )
     .await
 }
@@ -912,6 +1181,10 @@ fn coerce_tool_result_content(content: Option<&Value>) -> String {
 }
 
 fn normalize_openai_tool_message_content(messages: &[Value]) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        messages,
+    );
     messages
         .iter()
         .map(|message| {
@@ -1152,6 +1425,10 @@ const SYNTHETIC_TOOL_INTERRUPTED_CONTENT: &str = "[tool execution not recorded]"
 /// This mirrors the reference agent's `ensureToolResultPairing` but operates on OpenAI
 /// wire format (role=tool messages) instead of Anthropic blocks.
 pub(crate) fn repair_openai_tool_pairing(messages: &[Value]) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        messages,
+    );
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len());
     let mut missing_counts: usize = 0;
     let mut orphan_counts: usize = 0;
@@ -1283,6 +1560,10 @@ fn synthetic_anthropic_tool_result_block(tool_use_id: &str) -> Value {
 /// inputs (after conversion) and already-native `role=user` tool_result blocks
 /// are handled consistently.
 fn repair_anthropic_tool_pairing(messages: &[Value]) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        messages,
+    );
     let mut repaired: Vec<Value> = Vec::with_capacity(messages.len() + 1);
     let mut missing_counts: usize = 0;
     let mut orphan_counts: usize = 0;
@@ -1421,6 +1702,10 @@ fn build_bedrock_messages(
     messages: &[Value],
     include_reasoning_content: bool,
 ) -> (Vec<Value>, Vec<Value>) {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        messages,
+    );
     let mut system = Vec::new();
     let mut out = Vec::new();
     // Bedrock Converse requires all toolResult blocks for a given assistant
@@ -1826,6 +2111,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
         .any(crate::turn::wire_assembly::is_required_runtime_preamble)
     {
         marker_stripped_messages = {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+                messages,
+            );
             let mut cloned = messages.to_vec();
             strip_internal_runtime_markers(&mut cloned);
             cloned
@@ -1849,6 +2138,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
     let reasoning_repaired: std::borrow::Cow<'_, [Value]> = if policy.is_no_op() {
         std::borrow::Cow::Borrowed(messages)
     } else {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+            messages,
+        );
         let mut owned = messages.to_vec();
         astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(&mut owned, &policy);
         std::borrow::Cow::Owned(owned)
@@ -1980,6 +2273,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
                 body["temperature"] = json!(temp);
             }
             if !tools.is_empty() {
+                astra_core::history_work::record_serialized_value(
+                    astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+                    tools,
+                );
                 let mut wire_tools = tools.to_vec();
                 for tool in &mut wire_tools {
                     strip_internal_schema_extensions(tool);
@@ -2602,6 +2899,10 @@ fn anthropic_content_blocks_from_openai_user(msg: &Value) -> Vec<Value> {
 }
 
 fn build_anthropic_system_and_messages(messages: &[Value]) -> (Vec<Value>, Vec<Value>) {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        messages,
+    );
     let mut system = Vec::new();
     let mut out_messages = Vec::new();
     for msg in messages {
@@ -2855,6 +3156,8 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         thinking,
         request_body_overrides,
     );
+    let prepared_request =
+        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
 
     let url = llm_request_url(
         base_url,
@@ -2919,7 +3222,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         }
 
         let observed_attempt = match attempt_observer {
-            Some(observer) => Some(observer.begin_attempt().await?),
+            Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
             None => None,
         };
         let mut req = client.post(&url).header("content-type", "application/json");
@@ -2938,7 +3241,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
             model_name,
             "LLM request sending"
         );
-        let response = match req.json(&body).send().await {
+        let response = match req.body(prepared_request.body()).send().await {
             Ok(r) => {
                 tracing::debug!(
                     target: "astra_runtime::llm_client",
@@ -3000,8 +3303,13 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                             ),
                             &partial,
                         );
-                        finish_observed_provider_error(attempt_observer, observed_attempt, &error)
-                            .await?;
+                        finish_observed_provider_error_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
                         return Err(error);
                     }
                     Err(crate::turn::bedrock::transport::BedrockStreamError::Exception {
@@ -3020,10 +3328,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                     ),
                                     &partial,
                                 );
-                                finish_observed_provider_error(
+                                finish_observed_provider_error_with_partial(
                                     attempt_observer,
                                     observed_attempt,
                                     &error,
+                                    &partial,
                                 )
                                 .await?;
                                 last_err = error.message.clone();
@@ -3057,10 +3366,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                     ),
                                     &partial,
                                 );
-                                finish_observed_provider_error(
+                                finish_observed_provider_error_with_partial(
                                     attempt_observer,
                                     observed_attempt,
                                     &error,
+                                    &partial,
                                 )
                                 .await?;
                                 last_err = error.message.clone();
@@ -3078,10 +3388,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                                     ),
                                     &partial,
                                 );
-                                finish_observed_provider_error(
+                                finish_observed_provider_error_with_partial(
                                     attempt_observer,
                                     observed_attempt,
                                     &error,
+                                    &partial,
                                 )
                                 .await?;
                                 return Err(error);
@@ -3099,8 +3410,13 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                             ),
                             &partial,
                         );
-                        finish_observed_provider_error(attempt_observer, observed_attempt, &error)
-                            .await?;
+                        finish_observed_provider_error_with_partial(
+                            attempt_observer,
+                            observed_attempt,
+                            &error,
+                            &partial,
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
@@ -3147,8 +3463,13 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         ),
                         &partial,
                     );
-                    finish_observed_provider_error(attempt_observer, observed_attempt, &error)
-                        .await?;
+                    finish_observed_provider_error_with_partial(
+                        attempt_observer,
+                        observed_attempt,
+                        &error,
+                        &partial,
+                    )
+                    .await?;
                     return Err(error);
                 }
                 Err(StreamCollectError::Transport { error, partial }) => {
@@ -3159,10 +3480,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         ),
                         &partial,
                     );
-                    finish_observed_provider_error(
+                    finish_observed_provider_error_with_partial(
                         attempt_observer,
                         observed_attempt,
                         &observed_error,
+                        &partial,
                     )
                     .await?;
                     return Err(observed_error);
@@ -3179,10 +3501,11 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
                         ),
                         &partial,
                     );
-                    finish_observed_provider_error(
+                    finish_observed_provider_error_with_partial(
                         attempt_observer,
                         observed_attempt,
                         &observed_error,
+                        &partial,
                     )
                     .await?;
                     return Err(observed_error);
@@ -3360,11 +3683,13 @@ async fn collect_llm_stream(
     let mut reasoning = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage = Map::new();
+    let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
     let mut in_think = false;
-    let partial_result = |full_text: &String,
+    let partial_result = |response_id: &Option<String>,
+                          full_text: &String,
                           reasoning: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
                           usage: &Map<String, Value>,
@@ -3376,7 +3701,7 @@ async fn collect_llm_stream(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
-            response_id: None,
+            response_id: response_id.clone(),
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
             reasoning_signature: String::new(),
@@ -3406,6 +3731,7 @@ async fn collect_llm_stream(
                 }
                 return Err(StreamCollectError::Cancelled {
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &tool_calls_map,
@@ -3424,6 +3750,7 @@ async fn collect_llm_stream(
                         elapsed_ms: idle.as_millis() as u64,
                         made_progress,
                         partial: partial_result(
+                            &response_id,
                             &full_text,
                             &reasoning,
                             &tool_calls_map,
@@ -3448,6 +3775,7 @@ async fn collect_llm_stream(
                 return Err(StreamCollectError::Transport {
                     error,
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &tool_calls_map,
@@ -3457,6 +3785,12 @@ async fn collect_llm_stream(
                 });
             }
         };
+        if response_id.is_none() {
+            response_id = chunk
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
         // Parse usage from any chunk. Streaming endpoints we call are always
         // OpenAI-compatible: Bedrock Converse streams are intercepted at a
         // higher level and decoded by the dedicated Bedrock transport.
@@ -3510,6 +3844,7 @@ async fn collect_llm_stream(
                         "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
                     ),
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &tool_calls_map,
@@ -3549,6 +3884,7 @@ async fn collect_llm_stream(
                         "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
                     ),
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &tool_calls_map,
@@ -3622,6 +3958,7 @@ async fn collect_llm_stream(
                                     "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
                                 ),
                                 partial: partial_result(
+                                    &response_id,
                                     &full_text,
                                     &reasoning,
                                     &tool_calls_map,
@@ -3656,6 +3993,7 @@ async fn collect_llm_stream(
         return Err(StreamCollectError::Transport {
             error: "provider SSE ended without a terminal marker".to_string(),
             partial: partial_result(
+                &response_id,
                 &full_text,
                 &reasoning,
                 &tool_calls_map,
@@ -3700,7 +4038,7 @@ async fn collect_llm_stream(
     }
 
     Ok(LlmCallResult {
-        response_id: None,
+        response_id,
         full_text,
         reasoning,
         reasoning_signature: String::new(),
@@ -3733,10 +4071,12 @@ async fn collect_anthropic_llm_stream(
     let mut reasoning_signature = String::new();
     let mut tool_calls_map: HashMap<usize, Map<String, Value>> = HashMap::new();
     let mut usage_tokens = crate::turn::token_usage::TokenUsage::default();
+    let mut response_id: Option<String> = None;
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
-    let partial_result = |full_text: &String,
+    let partial_result = |response_id: &Option<String>,
+                          full_text: &String,
                           reasoning: &String,
                           reasoning_signature: &String,
                           tool_calls_map: &HashMap<usize, Map<String, Value>>,
@@ -3749,7 +4089,7 @@ async fn collect_anthropic_llm_stream(
             .map(|(_, value)| Value::Object(value.clone()))
             .collect();
         LlmCallResult {
-            response_id: None,
+            response_id: response_id.clone(),
             full_text: full_text.clone(),
             reasoning: reasoning.clone(),
             reasoning_signature: reasoning_signature.clone(),
@@ -3770,6 +4110,7 @@ async fn collect_anthropic_llm_stream(
             biased;
             _ = wait_llm_cancel(cancel) => return Err(StreamCollectError::Cancelled {
                 partial: partial_result(
+                    &response_id,
                     &full_text,
                     &reasoning,
                     &reasoning_signature,
@@ -3785,6 +4126,7 @@ async fn collect_anthropic_llm_stream(
                         elapsed_ms: idle.as_millis() as u64,
                         made_progress,
                         partial: partial_result(
+                            &response_id,
                             &full_text,
                             &reasoning,
                             &reasoning_signature,
@@ -3807,6 +4149,7 @@ async fn collect_anthropic_llm_stream(
                 return Err(StreamCollectError::Transport {
                     error,
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &reasoning_signature,
@@ -3817,6 +4160,13 @@ async fn collect_anthropic_llm_stream(
                 });
             }
         };
+        if response_id.is_none() {
+            response_id = event
+                .pointer("/message/id")
+                .or_else(|| event.get("id"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+        }
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if let Some(u) = event
@@ -3891,6 +4241,7 @@ async fn collect_anthropic_llm_stream(
                                         "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
                                     ),
                                     partial: partial_result(
+                                        &response_id,
                                         &full_text,
                                         &reasoning,
                                         &reasoning_signature,
@@ -3916,6 +4267,7 @@ async fn collect_anthropic_llm_stream(
                                         "LLM stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} bytes — aborting"
                                     ),
                                     partial: partial_result(
+                                        &response_id,
                                         &full_text,
                                         &reasoning,
                                         &reasoning_signature,
@@ -3963,6 +4315,7 @@ async fn collect_anthropic_llm_stream(
                                     "stream tool-call arguments exceeded {MAX_STREAM_ACCUMULATION_BYTES} byte limit"
                                 ),
                                 partial: partial_result(
+                                    &response_id,
                                     &full_text,
                                     &reasoning,
                                     &reasoning_signature,
@@ -4030,6 +4383,7 @@ async fn collect_anthropic_llm_stream(
                 return Err(StreamCollectError::Transport {
                     error: event.to_string(),
                     partial: partial_result(
+                        &response_id,
                         &full_text,
                         &reasoning,
                         &reasoning_signature,
@@ -4047,6 +4401,7 @@ async fn collect_anthropic_llm_stream(
         return Err(StreamCollectError::Transport {
             error: "Anthropic SSE ended without message_stop".to_string(),
             partial: partial_result(
+                &response_id,
                 &full_text,
                 &reasoning,
                 &reasoning_signature,
@@ -4064,7 +4419,7 @@ async fn collect_anthropic_llm_stream(
         .map(|(_, v)| Value::Object(v))
         .collect();
     Ok(LlmCallResult {
-        response_id: None,
+        response_id,
         full_text,
         reasoning,
         reasoning_signature,
@@ -4153,6 +4508,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         thinking,
         request_body_overrides,
     );
+    let prepared_request =
+        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
 
     let url = llm_request_url(
         base_url,
@@ -4164,7 +4521,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let _registered_endpoint_permit =
         acquire_registered_endpoint_permit_for_override(&url, completions_url_override)?;
     let observed_attempt = match attempt_observer {
-        Some(observer) => Some(observer.begin_attempt().await?),
+        Some(observer) => Some(observer.begin_attempt(prepared_request.identity()).await?),
         None => None,
     };
     let mut req = client.post(&url).header("content-type", "application/json");
@@ -4183,7 +4540,12 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         model_name,
         "LLM non-stream request sending"
     );
-    let resp = match req.timeout(effective_timeout).json(&body).send().await {
+    let resp = match req
+        .timeout(effective_timeout)
+        .body(prepared_request.body())
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(e) => {
             let elapsed = started.elapsed();
@@ -4236,6 +4598,15 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
         return Err(error);
     }
+    let transport_response_id = provider_uses_bedrock_converse(provider)
+        .then(|| {
+            resp.headers()
+                .get("x-amzn-requestid")
+                .and_then(|value| value.to_str().ok())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .flatten();
     let v: Value = match resp.json().await {
         Ok(value) => value,
         Err(error) => {
@@ -4243,11 +4614,24 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
                 astra_core::ErrorKind::StreamTransport,
                 error.to_string(),
             );
-            finish_observed_provider_error(attempt_observer, observed_attempt, &error).await?;
+            let partial = LlmCallResult {
+                response_id: transport_response_id.clone(),
+                ..LlmCallResult::default()
+            };
+            finish_observed_provider_error_with_partial(
+                attempt_observer,
+                observed_attempt,
+                &error,
+                &partial,
+            )
+            .await?;
             return Err(error);
         }
     };
-    let result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    let mut result = parse_nonstream_response_for_provider(&v, provider, model_name, started);
+    if result.response_id.is_none() {
+        result.response_id = transport_response_id;
+    }
     finish_observed_provider_attempt(
         attempt_observer,
         observed_attempt,
@@ -5838,14 +6222,19 @@ mod tests {
     struct RecordingAttemptObserver {
         next: AtomicU32,
         began: Mutex<Vec<u32>>,
+        wires: Mutex<Vec<ProviderWireRequestIdentity>>,
         finished: Mutex<Vec<(u32, astra_services::InferenceTerminalStatus)>>,
     }
 
     #[async_trait]
     impl ProviderAttemptObserver for RecordingAttemptObserver {
-        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+        async fn begin_attempt(
+            &self,
+            wire: &ProviderWireRequestIdentity,
+        ) -> Result<u32, astra_core::ClassifiedError> {
             let attempt = self.next.fetch_add(1, Ordering::SeqCst);
             self.began.lock().expect("began lock").push(attempt);
+            self.wires.lock().expect("wires lock").push(wire.clone());
             Ok(attempt)
         }
 
@@ -5862,11 +6251,126 @@ mod tests {
         }
     }
 
+    #[test]
+    fn prepared_provider_request_reconciles_exact_bytes_for_every_protocol() {
+        let cases = [
+            (
+                LlmProviderProtocol::OpenAiCompatible,
+                json!({
+                    "model": "m",
+                    "messages": [
+                        {"role": "system", "content": "stable"},
+                        {"role": "user", "content": "task"}
+                    ],
+                    "tools": [{"type": "function", "function": {"name": "read"}}],
+                    "stream": true
+                }),
+                (1, 1, 1),
+            ),
+            (
+                LlmProviderProtocol::AnthropicMessages,
+                json!({
+                    "model": "m",
+                    "system": [{"type": "text", "text": "stable"}],
+                    "messages": [{"role": "user", "content": "task"}],
+                    "tools": [{"name": "read", "input_schema": {"type": "object"}}],
+                    "stream": true
+                }),
+                (1, 1, 1),
+            ),
+            (
+                LlmProviderProtocol::BedrockConverse,
+                json!({
+                    "system": [{"text": "stable"}],
+                    "messages": [{"role": "user", "content": [{"text": "task"}]}],
+                    "toolConfig": {"tools": [{"toolSpec": {"name": "read"}}]},
+                    "inferenceConfig": {"maxTokens": 128}
+                }),
+                (1, 1, 1),
+            ),
+        ];
+
+        for (protocol, body, expected_counts) in cases {
+            let expected_bytes = serde_json::to_vec(&body).expect("fixture serializes");
+            let expected_hash = format!("{:x}", Sha256::digest(&expected_bytes));
+            assert_eq!(
+                serialized_value_bytes(&body).expect("composition serialization"),
+                u64::try_from(expected_bytes.len()).unwrap_or(u64::MAX),
+                "composition accounting must use the exact compact JSON stream"
+            );
+            let prepared =
+                PreparedProviderRequest::from_json(&body, protocol).expect("prepare exact body");
+            let identity = prepared.identity();
+
+            assert_eq!(prepared.body_bytes(), expected_bytes);
+            assert_eq!(identity.provider_wire_hash, expected_hash);
+            assert_eq!(
+                identity.provider_wire_bytes,
+                u64::try_from(expected_bytes.len()).expect("fixture length")
+            );
+            assert_eq!(
+                identity.composition.total_bytes(),
+                identity.provider_wire_bytes,
+                "{protocol:?} byte zones must be exhaustive and disjoint"
+            );
+            assert_eq!(
+                (
+                    identity.composition.system_items,
+                    identity.composition.conversation_items,
+                    identity.composition.tool_schema_items,
+                ),
+                expected_counts
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_stream_terminal_preserves_observed_usage_and_response_identity() {
+        let partial = LlmCallResult {
+            response_id: Some("provider-response-7".to_string()),
+            usage: Map::from_iter([
+                ("input_tokens".to_string(), json!(200)),
+                ("cached_input_tokens".to_string(), json!(800)),
+                ("cache_creation_tokens".to_string(), json!(100)),
+                ("output_tokens".to_string(), json!(50)),
+            ]),
+            ..LlmCallResult::default()
+        };
+        let terminal = provider_attempt_terminal_from_error_with_partial(
+            &astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::StreamTransport,
+                "connection ended after partial delivery",
+            ),
+            Some(&partial),
+        );
+
+        assert_eq!(
+            terminal.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+        assert_eq!(
+            terminal.provider_response_id.as_deref(),
+            Some("provider-response-7")
+        );
+        assert_eq!(
+            terminal.usage,
+            astra_services::InferenceUsage {
+                input_tokens: 200,
+                output_tokens: 50,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+            }
+        );
+    }
+
     struct RejectingAttemptObserver;
 
     #[async_trait]
     impl ProviderAttemptObserver for RejectingAttemptObserver {
-        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+        async fn begin_attempt(
+            &self,
+            _wire: &ProviderWireRequestIdentity,
+        ) -> Result<u32, astra_core::ClassifiedError> {
             Err(astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::DatabaseError,
                 "durable attempt admission unavailable",
@@ -7275,6 +7779,16 @@ mod tests {
         assert_eq!(res.full_text, "after-429");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert_eq!(*observer.began.lock().expect("began"), vec![0, 1]);
+        let wires = observer.wires.lock().expect("wires");
+        assert_eq!(wires.len(), 2);
+        assert_eq!(
+            wires[0], wires[1],
+            "physical retries of one prepared request must send the same exact bytes"
+        );
+        assert_eq!(
+            wires[0].composition.total_bytes(),
+            wires[0].provider_wire_bytes
+        );
         assert_eq!(
             *observer.finished.lock().expect("finished"),
             vec![

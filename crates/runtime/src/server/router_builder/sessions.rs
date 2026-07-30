@@ -38,6 +38,14 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             get(session::session_handlers::list_session_devices_handler),
         )
         .route(
+            "/sessions/{session_id}/device/enroll",
+            post(session::session_handlers::enroll_session_device_handler),
+        )
+        .route(
+            "/sessions/{session_id}/device/challenge",
+            post(session::session_handlers::create_session_device_challenge_handler),
+        )
+        .route(
             "/sessions/{session_id}/device/revoke",
             post(session::session_handlers::revoke_session_device_handler),
         )

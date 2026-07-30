@@ -36,6 +36,14 @@ pub struct LlmRequestDump {
 impl LlmRequestDump {
     /// Serialize to JSON for persistence.
     pub fn to_json(&self) -> Value {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::RequestDumpClone,
+            &self.messages,
+        );
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::RequestDumpClone,
+            &self.tools,
+        );
         json!({
             "session_id": self.session_id,
             "model": self.model,
@@ -79,7 +87,22 @@ impl LlmRequestDump {
         std::fs::create_dir_all(&dir).ok()?;
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
         let path = dir.join(format!("llm_error_{ts}.json"));
-        let content = serde_json::to_string_pretty(&self.to_json()).ok()?;
+        let content = match serde_json::to_string_pretty(&self.to_json()) {
+            Ok(content) => content,
+            Err(error) => {
+                astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::RequestDumpSerialization,
+                    &error,
+                );
+                return None;
+            }
+        };
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::RequestDumpSerialization,
+                u64::try_from(content.len()).unwrap_or(u64::MAX),
+            );
+        }
         std::fs::write(&path, content).ok()?;
         Some(path.display().to_string())
     }
@@ -88,8 +111,13 @@ impl LlmRequestDump {
         user_id: &str,
         store: &dyn SessionArtifactJsonStore,
     ) -> Result<(), String> {
+        let record = self.to_remote_artifact_record(user_id);
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::RequestDumpSerialization,
+            &record.content,
+        );
         store
-            .persist_json_artifact(self.to_remote_artifact_record(user_id))
+            .persist_json_artifact(record)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())
@@ -109,6 +137,14 @@ pub fn build_llm_request_dump(
     round: i64,
     max_output_tokens: Option<usize>,
 ) -> LlmRequestDump {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RequestDumpClone,
+        messages,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RequestDumpClone,
+        tools,
+    );
     LlmRequestDump {
         session_id: session_id.to_string(),
         agent_id: agent_id.map(ToString::to_string),

@@ -495,7 +495,17 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 pub fn skill_search_paths() -> Vec<PathBuf> {
     let home = dirs::home_dir();
     if let Ok(cwd) = std::env::current_dir() {
-        return skill_search_paths_from(&cwd, home.as_deref());
+        let mut paths = if astra_runtime_env::local_state_root_override().is_some() {
+            isolated_project_skill_search_paths(&cwd)
+        } else {
+            project_skill_search_paths_from(&cwd, home.as_deref())
+        };
+        for global in process_global_skill_search_paths(home.as_deref()) {
+            if !paths.contains(&global) {
+                paths.push(global);
+            }
+        }
+        return paths;
     }
 
     let mut paths = vec![
@@ -503,11 +513,9 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
         PathBuf::from(".agent/skills"),
         PathBuf::from(".claude/skills"),
     ];
-    if let Some(home) = home {
-        for global in home_skill_search_paths_from(&home) {
-            if !paths.contains(&global) {
-                paths.push(global);
-            }
+    for global in process_global_skill_search_paths(home.as_deref()) {
+        if !paths.contains(&global) {
+            paths.push(global);
         }
     }
     paths
@@ -520,16 +528,7 @@ pub fn skill_search_paths() -> Vec<PathBuf> {
 /// helper because project-local skills have no server-side user ACL and could be
 /// exposed to unrelated web users.
 pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
-    let mut paths = Vec::with_capacity(12);
-
-    // Single walk-up collecting native .astra/skills/, Astra-agent
-    // .agent/skills/, and Claude-compatible .claude/skills/. Native contracts
-    // keep priority over compatibility roots when names collide.
-    let (astra, claude, agent) = walk_up_skill_paths_from(cwd, home);
-    paths.extend(astra);
-    paths.extend(agent);
-    paths.extend(claude);
-
+    let mut paths = project_skill_search_paths_from(cwd, home);
     if let Some(home) = home {
         for global in home_skill_search_paths_from(home) {
             if !paths.contains(&global) {
@@ -537,8 +536,57 @@ pub fn skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> 
             }
         }
     }
-
     paths
+}
+
+fn project_skill_search_paths_from(cwd: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let (astra, claude, agent) = walk_up_skill_paths_from(cwd, home);
+    grouped_skill_paths(astra, claude, agent)
+}
+
+/// Discover project skills without crossing the nearest repository boundary.
+///
+/// An explicit Astra-local root is an isolation contract. In that mode, HOME
+/// is not a trustworthy lexical boundary: either HOME or cwd may contain
+/// symlinks. Canonicalizing cwd and stopping at the nearest repository root
+/// avoids scanning unrelated user-global compatibility directories. Outside a
+/// repository, only cwd itself is searched.
+fn isolated_project_skill_search_paths(cwd: &Path) -> Vec<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let boundary = cwd
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .unwrap_or(cwd.as_path());
+    let (astra, claude, agent) = walk_up_skill_paths_impl(&cwd, Some(boundary), true);
+    grouped_skill_paths(astra, claude, agent)
+}
+
+fn grouped_skill_paths(
+    astra: Vec<PathBuf>,
+    claude: Vec<PathBuf>,
+    agent: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(12);
+    paths.extend(astra);
+    paths.extend(agent);
+    paths.extend(claude);
+    paths
+}
+
+fn process_global_skill_search_paths(home: Option<&Path>) -> Vec<PathBuf> {
+    process_global_skill_search_paths_from(
+        astra_runtime_env::local_state_root_override().as_deref(),
+        home,
+    )
+}
+
+fn process_global_skill_search_paths_from(
+    local_root: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<PathBuf> {
+    local_root
+        .map(|root| vec![root.join("skills")])
+        .unwrap_or_else(|| home.map(home_skill_search_paths_from).unwrap_or_default())
 }
 
 /// Return the user-level global skill paths for a specific HOME directory.
@@ -563,9 +611,7 @@ pub fn home_skill_search_paths_from(home: &Path) -> Vec<PathBuf> {
 /// [`skill_search_paths`], this function never inspects the current working
 /// directory.
 pub fn home_skill_search_paths() -> Vec<PathBuf> {
-    dirs::home_dir()
-        .map(|home| home_skill_search_paths_from(&home))
-        .unwrap_or_default()
+    process_global_skill_search_paths(dirs::home_dir().as_deref())
 }
 
 /// Walk from `start` upward once, collecting `.astra/skills/`,
@@ -587,12 +633,23 @@ pub fn walk_up_skill_paths_from(
     start: &Path,
     home: Option<&Path>,
 ) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
+    walk_up_skill_paths_impl(start, home, true)
+}
+
+fn walk_up_skill_paths_impl(
+    start: &Path,
+    boundary: Option<&Path>,
+    include_boundary: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
     let mut astra = Vec::new();
     let mut claude = Vec::new();
     let mut agent = Vec::new();
     let mut dir = start.to_path_buf();
 
     loop {
+        if !include_boundary && matches!(boundary, Some(stop) if dir == stop) {
+            break;
+        }
         let a = dir.join(".astra").join("skills");
         if a.is_dir() {
             astra.push(a);
@@ -609,7 +666,7 @@ pub fn walk_up_skill_paths_from(
         if dir.join(".git").exists() {
             break;
         }
-        if matches!(home, Some(h) if dir == h) {
+        if matches!(boundary, Some(stop) if dir == stop) {
             break;
         }
         if !dir.pop() {
@@ -1045,6 +1102,48 @@ Hooked body."#;
             paths.iter().all(|path| path.starts_with(&home)),
             "HOME-only catalog must not include cwd/project paths: {paths:?}"
         );
+    }
+
+    #[test]
+    fn explicit_local_root_excludes_all_home_compatibility_catalogs() {
+        let local_root = PathBuf::from("/isolated/astra");
+        let home = PathBuf::from("/developer/home");
+
+        assert_eq!(
+            process_global_skill_search_paths_from(Some(&local_root), Some(&home)),
+            vec![local_root.join("skills")]
+        );
+    }
+
+    #[test]
+    fn isolated_project_walk_stops_at_repository_root() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let home = sandbox.path().join("home");
+        let project = home.join("project");
+        let cwd = project.join("subdir");
+        std::fs::create_dir_all(home.join(".astra/skills")).unwrap();
+        std::fs::create_dir_all(project.join(".astra/skills")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+
+        let paths = isolated_project_skill_search_paths(&cwd);
+
+        assert!(paths.contains(&project.join(".astra/skills")));
+        assert!(!paths.contains(&home.join(".astra/skills")));
+    }
+
+    #[test]
+    fn isolated_project_walk_without_repository_searches_only_cwd() {
+        let sandbox = tempfile::TempDir::new().unwrap();
+        let parent = sandbox.path().join("parent");
+        let cwd = parent.join("child");
+        std::fs::create_dir_all(parent.join(".astra/skills")).unwrap();
+        std::fs::create_dir_all(cwd.join(".astra/skills")).unwrap();
+
+        let paths = isolated_project_skill_search_paths(&cwd);
+
+        assert!(paths.contains(&cwd.join(".astra/skills")));
+        assert!(!paths.contains(&parent.join(".astra/skills")));
     }
 
     #[test]

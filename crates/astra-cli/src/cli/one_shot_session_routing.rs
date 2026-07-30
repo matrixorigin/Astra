@@ -3,7 +3,8 @@ use crate::cli::cli_config::cli_utils::{
 };
 use crate::cli::session::session_continuation::{
     SessionContinuation, continuation_activation_names, load_csl_continuation,
-    load_session_continuation_for_recovery, sanitize_continuation_messages,
+    load_session_continuation_for_recovery, materialize_cli_continuation_messages,
+    sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
     fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
@@ -64,7 +65,10 @@ impl OneShotSessionRouting {
             return Some(local);
         }
         if !self.resume_metadata.continuation_messages.is_empty() {
-            let messages = self.resume_metadata.continuation_messages.clone();
+            let messages = materialize_cli_continuation_messages(
+                astra_core::history_work::HistoryWorkSite::CliOneShotContinuationClone,
+                &self.resume_metadata.continuation_messages,
+            );
             return Some(SessionContinuation {
                 completed_turn_count: Some(self.resume_metadata.completed_turn_count),
                 activated_deferred_tool_names: continuation_activation_names(

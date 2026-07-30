@@ -105,6 +105,10 @@ impl CslManager {
         mat.session_state = mat.session_state.for_csl_continuity();
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
+        record_full_history_clone(
+            astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+            &mat.messages,
+        );
         self.last_canonical_messages = mat.messages.clone();
         self.last_canonical_message_hashes = canonical_message_hashes(&mat.messages);
         self.last_session_state = mat.session_state.clone();
@@ -136,6 +140,10 @@ impl CslManager {
             self.load().await?;
         }
         let session_state = session_state.for_csl_continuity();
+        record_full_history_clone(
+            astra_core::history_work::HistoryWorkSite::CslPersistInputClone,
+            messages,
+        );
         let mut canonical_messages = messages.to_vec();
         carry_forward_user_turn_semantics(&self.last_canonical_messages, &mut canonical_messages);
         let canonical_message_count = canonical_messages.len();
@@ -146,6 +154,10 @@ impl CslManager {
 
         if self.last_seq == 0 {
             let canonical_message_hashes = canonical_message_hashes(&canonical_messages);
+            record_full_history_clone(
+                astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
+                &canonical_messages,
+            );
             let snapshot = CslEntry::Snapshot {
                 seq: 1,
                 turn,
@@ -170,6 +182,10 @@ impl CslManager {
         );
         if common_prefix_len < self.last_canonical_message_hashes.len() {
             let next_seq = self.last_seq + 1;
+            record_full_history_clone(
+                astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
+                &canonical_messages,
+            );
             let snapshot = CslEntry::Snapshot {
                 seq: next_seq,
                 turn,
@@ -200,7 +216,12 @@ impl CslManager {
         self.store.append(&self.session_id, &delta, &meta).await?;
         self.last_seq = next_seq;
         self.last_turn = turn;
+        record_full_history_clone(
+            astra_core::history_work::HistoryWorkSite::CslStateInstallClone,
+            &canonical_messages,
+        );
         self.last_canonical_messages = canonical_messages.clone();
+        record_hash_index_clone(canonical_message_hashes.len());
         self.last_canonical_message_hashes = canonical_message_hashes.clone();
         self.last_session_state = session_state.clone();
 
@@ -210,6 +231,10 @@ impl CslManager {
             && turn.is_multiple_of(self.config.snapshot_interval)
         {
             let snap_seq = self.last_seq + 1;
+            record_full_history_clone(
+                astra_core::history_work::HistoryWorkSite::CslSnapshotClone,
+                &canonical_messages,
+            );
             let snapshot = CslEntry::Snapshot {
                 seq: snap_seq,
                 turn,
@@ -290,6 +315,22 @@ impl CslManager {
 
 type CanonicalMessageHash = [u8; 32];
 
+fn record_hash_index_clone(rows: usize) {
+    if !astra_core::history_work::instrumentation_enabled() {
+        return;
+    }
+    let bytes = rows
+        .checked_mul(std::mem::size_of::<CanonicalMessageHash>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .unwrap_or(u64::MAX);
+    astra_core::history_work::record_operation(
+        astra_core::history_work::HistoryWorkSite::CslHashIndexClone,
+        bytes,
+        rows.try_into().unwrap_or(u64::MAX),
+        0,
+    );
+}
+
 fn canonical_message_hashes(messages: &[serde_json::Value]) -> Vec<CanonicalMessageHash> {
     messages.iter().map(canonical_message_hash).collect()
 }
@@ -298,12 +339,30 @@ fn canonical_message_hash(message: &serde_json::Value) -> CanonicalMessageHash {
     // serde_json::Value object order can come from insertion order when the
     // preserve_order feature is enabled, so sort recursively before hashing.
     let canonical = sort_json_object_keys(message);
-    let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|_| {
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_else(|error| {
         // Serializing a serde_json::Value should be infallible; keep a stable
-        // fallback so a representation error cannot crash CSL diffing.
+        // fallback so a representation error cannot crash CSL diffing, while
+        // invalidating any active instrumentation interval.
+        astra_core::history_work::record_serialization_failure(
+            astra_core::history_work::HistoryWorkSite::CslMessageHash,
+            &error,
+        );
         canonical.to_string().into_bytes()
     });
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::CslMessageHash,
+            bytes.len().try_into().unwrap_or(u64::MAX),
+        );
+    }
     Sha256::digest(bytes).into()
+}
+
+fn record_full_history_clone(
+    site: astra_core::history_work::HistoryWorkSite,
+    messages: &[serde_json::Value],
+) {
+    astra_core::history_work::record_serialized_value(site, messages);
 }
 
 fn canonical_message_identity_hash(message: &serde_json::Value) -> CanonicalMessageHash {

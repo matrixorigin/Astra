@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v10";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-30-v11";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1557,6 +1557,239 @@ async fn fail_if_required_columns_missing_or_nullable(
     fail_if_required_column_nullability_mismatches(pool, database, table, &requirements).await
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedColumnShape {
+    data_type: String,
+    character_maximum_length: Option<i64>,
+    nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedIndexShape {
+    columns: Vec<String>,
+    non_unique: bool,
+}
+
+fn inference_provider_attempt_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+    indexes: &BTreeMap<String, ObservedIndexShape>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (name, expected_type, expected_width) in [
+        ("admission_token", "char", Some(32_i64)),
+        ("provider_protocol", "varchar", Some(32_i64)),
+        ("provider_wire_hash", "char", Some(64_i64)),
+        ("provider_wire_bytes", "bigint", None),
+    ] {
+        let Some(column) = columns.get(name) else {
+            reasons.push(format!("missing NOT NULL column {name}"));
+            continue;
+        };
+        if column.nullable {
+            reasons.push(format!("nullable column {name}"));
+        }
+        if !column.data_type.eq_ignore_ascii_case(expected_type) {
+            reasons.push(format!(
+                "column {name} has type {}, expected {expected_type}",
+                column.data_type
+            ));
+        }
+        if let Some(expected_width) = expected_width
+            && column.character_maximum_length != Some(expected_width)
+        {
+            reasons.push(format!(
+                "column {name} has width {:?}, expected {expected_width}",
+                column.character_maximum_length
+            ));
+        }
+    }
+
+    for (name, expected_columns) in [
+        ("PRIMARY", &["user_id", "attempt_id"][..]),
+        (
+            "uq_inference_provider_attempt",
+            &["user_id", "invocation_id", "attempt_index"][..],
+        ),
+    ] {
+        let Some(index) = indexes.get(name) else {
+            reasons.push(format!("missing unique constraint {name}"));
+            continue;
+        };
+        if index.non_unique {
+            reasons.push(format!("constraint {name} is not unique"));
+        }
+        if !index
+            .columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            reasons.push(format!(
+                "constraint {name} has columns ({}), expected ({})",
+                index.columns.join(", "),
+                expected_columns.join(", ")
+            ));
+        }
+    }
+    reasons
+}
+
+fn inference_invocation_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+) -> Vec<String> {
+    let Some(column) = columns.get("admission_token") else {
+        return vec!["missing NOT NULL column admission_token".to_string()];
+    };
+    let mut reasons = Vec::new();
+    if column.nullable {
+        reasons.push("nullable column admission_token".to_string());
+    }
+    if !column.data_type.eq_ignore_ascii_case("char") {
+        reasons.push(format!(
+            "column admission_token has type {}, expected char",
+            column.data_type
+        ));
+    }
+    if column.character_maximum_length != Some(32) {
+        reasons.push(format!(
+            "column admission_token has width {:?}, expected 32",
+            column.character_maximum_length
+        ));
+    }
+    reasons
+}
+
+async fn verify_inference_invocation_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_invocations";
+    let rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'admission_token'",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+    let reasons = inference_invocation_schema_mismatches(&columns);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
+async fn verify_inference_provider_attempt_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_provider_attempts";
+    let column_rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in column_rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+
+    let index_rows = query(
+        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_provider_attempt')
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
+    for row in index_rows {
+        let name: String = row.try_get("INDEX_NAME")?;
+        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
+                )));
+            }
+        };
+        let column: String = row.try_get("COLUMN_NAME")?;
+        let index = indexes
+            .entry(name.clone())
+            .or_insert_with(|| ObservedIndexShape {
+                columns: Vec::new(),
+                non_unique,
+            });
+        if index.non_unique != non_unique {
+            return Err(sqlx::Error::Protocol(format!(
+                "schema constraint {table}.{name} reports inconsistent uniqueness"
+            )));
+        }
+        index.columns.push(column);
+    }
+
+    let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
 async fn fail_if_required_columns_missing_or_not_nullable(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -1860,7 +2093,9 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        return verify_core_schema_catalog(&pool, &settings.database).await;
+        verify_core_schema_catalog(&pool, &settings.database).await?;
+        verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
+        return verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await;
     }
 
     // Existing deployments may still have UUID-sized identity columns. Widen
@@ -1977,6 +2212,26 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at),
             INDEX idx_auth_refresh_tokens_prefix (token_prefix)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "auth_reauthentication_proofs",
+        "CREATE TABLE IF NOT EXISTS auth_reauthentication_proofs (
+            proof_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            purpose VARCHAR(32) NOT NULL,
+            proof_hash CHAR(64) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            consumed_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, proof_id),
+            UNIQUE KEY uq_auth_reauthentication_proof_hash (proof_hash),
+            INDEX idx_auth_reauthentication_user_expiry (user_id, expires_at),
+            INDEX idx_auth_reauthentication_expiry (expires_at, consumed_at)
         )",
     )
     .execute(&pool)
@@ -3293,6 +3548,7 @@ async fn ensure_core_schema_while_leased(
             session_id VARCHAR(128) NOT NULL,
             device_id VARCHAR(128) NOT NULL,
             device_fingerprint VARCHAR(128) NOT NULL,
+            device_key_hash CHAR(64) NOT NULL,
             trust_level VARCHAR(32) NOT NULL DEFAULT 'new_device',
             status VARCHAR(32) NOT NULL DEFAULT 'active',
             last_monotonic_id BIGINT NOT NULL DEFAULT 0,
@@ -3311,6 +3567,26 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "session_device_leases",
+        &[
+            "lease_id",
+            "user_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "device_key_hash",
+            "trust_level",
+            "status",
+            "last_monotonic_id",
+            "expires_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
     ensure_primary_key_shape(
         &pool,
         &settings.database,
@@ -3318,6 +3594,28 @@ async fn ensure_core_schema_while_leased(
         &["user_id", "lease_id"],
         "ALTER TABLE session_device_leases ADD PRIMARY KEY (user_id, lease_id)",
     )
+    .await?;
+    core_schema_create!(
+        pool,
+        "session_device_challenges",
+        "CREATE TABLE IF NOT EXISTS session_device_challenges (
+            challenge_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            device_id VARCHAR(128) NOT NULL,
+            device_fingerprint VARCHAR(128) NOT NULL,
+            purpose VARCHAR(32) NOT NULL,
+            challenge_digest CHAR(64) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            consumed_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, challenge_id),
+            INDEX idx_device_challenges_owner_device
+                (user_id, session_id, device_id, created_at),
+            INDEX idx_device_challenges_expiry (expires_at, consumed_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
     core_schema_create!(pool, "session_device_lease_events",
         "CREATE TABLE IF NOT EXISTS session_device_lease_events (
@@ -4559,6 +4857,7 @@ async fn ensure_core_schema_while_leased(
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
             harness_run_id VARCHAR(128) NULL,
+            admission_token CHAR(32) NOT NULL,
             turn_index BIGINT NULL,
             round_index BIGINT NULL,
             operation_id VARCHAR(64) NOT NULL,
@@ -4609,6 +4908,10 @@ async fn ensure_core_schema_while_leased(
             harness_run_id VARCHAR(128) NULL,
             attempt_index BIGINT NOT NULL,
             provider VARCHAR(64) NOT NULL,
+            admission_token CHAR(32) NOT NULL,
+            provider_protocol VARCHAR(32) NOT NULL,
+            provider_wire_hash CHAR(64) NOT NULL,
+            provider_wire_bytes BIGINT NOT NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -4627,6 +4930,9 @@ async fn ensure_core_schema_while_leased(
                         AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_provider_attempts_status
                 CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
+            CONSTRAINT chk_inference_provider_attempts_wire
+                CHECK (provider_protocol IN ('openai_compatible', 'anthropic_messages', 'bedrock_converse')
+                    AND provider_wire_bytes > 0),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
@@ -4744,6 +5050,8 @@ async fn ensure_core_schema_while_leased(
         &["scope_kind", "operation_id"],
     )
     .await?;
+    verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
+    verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
     for (table, nullable_columns) in [
         (
             "inference_routes",
@@ -6776,6 +7084,8 @@ pub async fn cleanup_expired_data(
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
+    const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
+    const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
@@ -6803,6 +7113,38 @@ pub async fn cleanup_expired_data(
     .map_err(|e| format!("cleanup auth_refresh_tokens: {e}"))?;
     results.push(CleanupResult {
         table: "auth_refresh_tokens",
+        rows_deleted: deleted,
+    });
+
+    let deleted = sqlx::query(
+        "DELETE FROM auth_reauthentication_proofs
+         WHERE expires_at < NOW(6) OR consumed_at IS NOT NULL
+         ORDER BY created_at ASC, proof_id ASC
+         LIMIT ?",
+    )
+    .bind(AUTH_PROOF_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("cleanup auth_reauthentication_proofs: {error}"))?;
+    results.push(CleanupResult {
+        table: "auth_reauthentication_proofs",
+        rows_deleted: deleted,
+    });
+
+    let deleted = sqlx::query(
+        "DELETE FROM session_device_challenges
+         WHERE expires_at < NOW(6) OR consumed_at IS NOT NULL
+         ORDER BY created_at ASC, challenge_id ASC
+         LIMIT ?",
+    )
+    .bind(DEVICE_CHALLENGE_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("cleanup session_device_challenges: {error}"))?;
+    results.push(CleanupResult {
+        table: "session_device_challenges",
         rows_deleted: deleted,
     });
 
@@ -7382,6 +7724,206 @@ mod tests {
             TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS,
             &[("identity_key", 71)]
         );
+    }
+
+    fn canonical_provider_attempt_columns() -> BTreeMap<String, ObservedColumnShape> {
+        [
+            (
+                "admission_token",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(32),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_protocol",
+                ObservedColumnShape {
+                    data_type: "varchar".to_string(),
+                    character_maximum_length: Some(32),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_wire_hash",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_wire_bytes",
+                ObservedColumnShape {
+                    data_type: "bigint".to_string(),
+                    character_maximum_length: None,
+                    nullable: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, shape)| (name.to_string(), shape))
+        .collect()
+    }
+
+    fn canonical_provider_attempt_indexes() -> BTreeMap<String, ObservedIndexShape> {
+        [
+            (
+                "PRIMARY",
+                ObservedIndexShape {
+                    columns: vec!["user_id".to_string(), "attempt_id".to_string()],
+                    non_unique: false,
+                },
+            ),
+            (
+                "uq_inference_provider_attempt",
+                ObservedIndexShape {
+                    columns: vec![
+                        "user_id".to_string(),
+                        "invocation_id".to_string(),
+                        "attempt_index".to_string(),
+                    ],
+                    non_unique: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, shape)| (name.to_string(), shape))
+        .collect()
+    }
+
+    #[test]
+    fn provider_attempt_schema_contract_accepts_the_exact_wire_shape() {
+        assert!(
+            inference_provider_attempt_schema_mismatches(
+                &canonical_provider_attempt_columns(),
+                &canonical_provider_attempt_indexes(),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn invocation_schema_contract_requires_an_exact_admission_fence() {
+        let exact = [(
+            "admission_token".to_string(),
+            ObservedColumnShape {
+                data_type: "char".to_string(),
+                character_maximum_length: Some(32),
+                nullable: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(inference_invocation_schema_mismatches(&exact).is_empty());
+
+        let mut nullable = exact.clone();
+        nullable.get_mut("admission_token").unwrap().nullable = true;
+        assert!(!inference_invocation_schema_mismatches(&nullable).is_empty());
+
+        let mut wrong_width = exact;
+        wrong_width
+            .get_mut("admission_token")
+            .unwrap()
+            .character_maximum_length = Some(36);
+        assert!(!inference_invocation_schema_mismatches(&wrong_width).is_empty());
+    }
+
+    #[test]
+    fn provider_attempt_schema_contract_rejects_independent_column_and_key_drift() {
+        let exact_columns = canonical_provider_attempt_columns();
+        let exact_indexes = canonical_provider_attempt_indexes();
+        let mut cases = Vec::new();
+
+        let mut columns = exact_columns.clone();
+        columns.remove("admission_token");
+        cases.push((
+            "missing NOT NULL column admission_token",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.remove("provider_protocol");
+        cases.push((
+            "missing NOT NULL column provider_protocol",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_protocol").unwrap().nullable = true;
+        cases.push((
+            "nullable column provider_protocol",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_wire_hash").unwrap().data_type = "varchar".to_string();
+        cases.push((
+            "provider_wire_hash has type varchar",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("provider_wire_hash")
+            .unwrap()
+            .character_maximum_length = Some(32);
+        cases.push((
+            "provider_wire_hash has width Some(32)",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_wire_bytes").unwrap().data_type = "int".to_string();
+        cases.push((
+            "provider_wire_bytes has type int",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut indexes = exact_indexes.clone();
+        indexes.remove("PRIMARY");
+        cases.push((
+            "missing unique constraint PRIMARY",
+            exact_columns.clone(),
+            indexes,
+        ));
+
+        let mut indexes = exact_indexes.clone();
+        indexes
+            .get_mut("uq_inference_provider_attempt")
+            .unwrap()
+            .non_unique = true;
+        cases.push((
+            "constraint uq_inference_provider_attempt is not unique",
+            exact_columns.clone(),
+            indexes,
+        ));
+
+        let mut indexes = exact_indexes;
+        indexes
+            .get_mut("uq_inference_provider_attempt")
+            .unwrap()
+            .columns
+            .swap(1, 2);
+        cases.push((
+            "constraint uq_inference_provider_attempt has columns",
+            exact_columns,
+            indexes,
+        ));
+
+        for (expected, columns, indexes) in cases {
+            let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
+            assert!(
+                reasons.iter().any(|reason| reason.contains(expected)),
+                "expected `{expected}` in {reasons:?}"
+            );
+        }
     }
 
     #[test]

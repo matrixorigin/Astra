@@ -2977,6 +2977,12 @@ impl AgenticRunLifecycleService {
     }
 
     fn record_run_admission(&self, outcome: &'static str, wait: Duration) {
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_admission_units(
+                astra_core::history_work::HistoryWorkSite::RunAdmission,
+                CURRENT_RUN_ADMISSION_WEIGHT_UNITS,
+            );
+        }
         let Some(registry) = self.metrics_registry.as_ref() else {
             return;
         };
@@ -2990,6 +2996,11 @@ impl AgenticRunLifecycleService {
             METRIC_RUN_ADMISSION_WAIT_MS_TOTAL,
             &[("outcome", outcome)],
             duration_millis_u64(wait),
+        );
+        registry.increment_counter(
+            METRIC_RUN_ADMISSION_WEIGHT_UNITS_TOTAL,
+            &[("outcome", outcome)],
+            CURRENT_RUN_ADMISSION_WEIGHT_UNITS,
         );
     }
 
@@ -4094,8 +4105,7 @@ impl AgenticRunLifecycleService {
         mut events: Vec<Value>,
         loop_state: &AgenticLoopState,
     ) -> (Vec<Value>, RunStatus, Option<String>) {
-        let total_input =
-            loop_state.total_prompt + loop_state.total_cache_read + loop_state.total_cache_creation;
+        let total_input = loop_state.provider_input_tokens();
         let usage = json!({
             "prompt_tokens": total_input,
             "completion_tokens": loop_state.total_completion,
@@ -6394,6 +6404,11 @@ impl AgenticRunLifecycleService {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_selection
             .resolve_for_model(request.model.as_deref());
+        let max_turn_input_tokens = effective_max_turn_input_tokens(
+            astra_core::RuntimeLimits::global(),
+            request.model.as_deref(),
+            request.admitted_model_execution.as_ref(),
+        );
         AgenticLoopState {
             messages: vec![user_message],
             run_transcript_capture: None,
@@ -6510,7 +6525,7 @@ impl AgenticRunLifecycleService {
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             budget_wrapup_ignored_rounds: 0,
@@ -7084,10 +7099,12 @@ fn build_shutdown_extraction_request(
     state: &AgenticLoopState,
 ) -> Option<crate::session_memory::ExtractionRequest> {
     state.context_manifest_user_id.as_ref()?;
-    state
-        .current_session_id
-        .as_ref()
-        .map(|session_id| crate::session_memory::ExtractionRequest {
+    state.current_session_id.as_ref().map(|session_id| {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::MemoryExtractionHistoryClone,
+            &state.messages,
+        );
+        crate::session_memory::ExtractionRequest {
             inference_scope: astra_turn_types::InferenceInvocationScope::Session {
                 session_id: session_id.clone(),
                 turn: state.current_session_turn_number(),
@@ -7102,7 +7119,8 @@ fn build_shutdown_extraction_request(
                 .turn_intent
                 .as_ref()
                 .is_some_and(|intent| intent.reanchors_current_objective()),
-        })
+        }
+    })
 }
 
 fn exact_runtime_string(
@@ -8564,7 +8582,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 );
                 // Record tokens consumed so check_token_budget sees up-to-date usage.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = loop_state.total_prompt + loop_state.total_completion;
+                    let total = loop_state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
@@ -10096,7 +10114,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 // Record tokens consumed regardless of cancel — cancelled runs still
                 // consumed tokens and must count toward the daily budget.
                 if let Some(ref gov) = bg_resource_governor {
-                    let total = state.total_prompt + state.total_completion;
+                    let total = state.provider_total_tokens();
                     if total > 0 {
                         gov.record_tokens(&bg_user_id, total).await;
                     }
@@ -12315,6 +12333,18 @@ fn resolve_subrun_agentic_turn_budget(
     )
 }
 
+fn effective_max_turn_input_tokens(
+    limits: &astra_core::RuntimeLimits,
+    fallback_model: Option<&str>,
+    admitted_execution: Option<&astra_services::AdmittedModelExecution>,
+) -> u64 {
+    let model = admitted_execution
+        .map(|execution| execution.model_name.as_str())
+        .or(fallback_model);
+    let context_window = admitted_execution.and_then(|execution| execution.context_window);
+    limits.effective_max_turn_input_tokens_with_context_window(model, context_window)
+}
+
 #[async_trait]
 impl SubRunExecutor for ServerSubRunExecutor {
     async fn execute(
@@ -12339,6 +12369,11 @@ impl SubRunExecutor for ServerSubRunExecutor {
         let child_model_name = admitted_model_execution
             .as_ref()
             .map(|execution| execution.model_name.clone());
+        let max_turn_input_tokens = effective_max_turn_input_tokens(
+            astra_core::RuntimeLimits::global(),
+            child_model_name.as_deref(),
+            admitted_model_execution.as_ref(),
+        );
         if let Some(sink) = config.live_event_sink.as_ref()
             && let Err(error) = sink.send(AgentLiveEvent {
                 run_id: config.run_id.clone(),
@@ -12666,7 +12701,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             budget_wrapup_ignored_rounds: 0,

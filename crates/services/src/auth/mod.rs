@@ -32,7 +32,7 @@ fn bcrypt_cost_from_env() -> u32 {
     })
 }
 use chrono::{Duration as ChronoDuration, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use sqlx::{MySql, Row, query};
 use tracing::warn;
@@ -84,6 +84,8 @@ type HmacSha256 = Hmac<Sha256>;
 const PROVIDER_REQUEST_TOKEN_PREFIX: &str = "moi-provider-v1";
 const PROVIDER_REQUEST_MAX_TTL_SECONDS: i64 = 300;
 const PROVIDER_REQUEST_CLOCK_SKEW_SECONDS: i64 = 60;
+const REAUTHENTICATION_PROOF_TTL_SECONDS: i64 = 300;
+const AUTH_PASSWORD_MAX_BYTES: usize = 72;
 
 #[derive(Debug, Deserialize)]
 struct ProviderRequestClaims {
@@ -335,6 +337,29 @@ pub trait AuthService: Send + Sync {
         headers: &HeaderMap,
     ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    async fn reauthenticate(
+        &self,
+        _user_id: &str,
+        _request: ReauthenticationRequestData,
+    ) -> Result<ReauthenticationProofRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Reauthentication is not configured",
+        ))
+    }
+
+    async fn consume_reauthentication_proof(
+        &self,
+        _user_id: &str,
+        _purpose: ReauthenticationPurpose,
+        _proof: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Reauthentication is not configured",
+        ))
+    }
+
     async fn current_principal(
         &self,
         headers: &HeaderMap,
@@ -455,6 +480,35 @@ pub struct AuthRefreshRequestData {
     pub refresh_token: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReauthenticationPurpose {
+    DeviceTrust,
+    DeviceReenroll,
+}
+
+impl ReauthenticationPurpose {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeviceTrust => "device_trust",
+            Self::DeviceReenroll => "device_reenroll",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReauthenticationRequestData {
+    pub password: String,
+    pub purpose: ReauthenticationPurpose,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReauthenticationProofRecord {
+    pub proof: String,
+    pub purpose: ReauthenticationPurpose,
+    pub expires_in: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthUserRecord {
     pub user_id: String,
@@ -526,6 +580,7 @@ pub struct AuthProviderAuthorizedRequestContext {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthTokenRecord {
+    pub user_id: String,
     pub access_token: String,
     pub refresh_token: String,
     pub token_type: String,
@@ -1120,6 +1175,7 @@ impl DatabaseAuthService {
             .map_err(|e| map_auth_sqlx(e, "external.commit_tx", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
+            user_id: astra_user_id,
             access_token,
             refresh_token,
             token_type: "bearer".to_string(),
@@ -1457,6 +1513,7 @@ impl AuthService for DatabaseAuthService {
             .map_err(|e| map_auth_sqlx(e, "login.commit_tx", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
+            user_id: user.user_id,
             access_token,
             refresh_token,
             token_type: "bearer".to_string(),
@@ -1546,6 +1603,7 @@ impl AuthService for DatabaseAuthService {
             .map_err(|e| map_auth_sqlx(e, "refresh.commit_tx", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
+            user_id: user.user_id,
             access_token,
             refresh_token: new_refresh_token,
             token_type: "bearer".to_string(),
@@ -1610,6 +1668,96 @@ impl AuthService for DatabaseAuthService {
             .await
             .map_err(|e| map_auth_sqlx(e, "logout.commit_tx", Some(&pool)))?;
 
+        Ok(())
+    }
+
+    async fn reauthenticate(
+        &self,
+        user_id: &str,
+        request: ReauthenticationRequestData,
+    ) -> Result<ReauthenticationProofRecord, (StatusCode, Json<ErrorResponse>)> {
+        if request.password.is_empty() || request.password.len() > AUTH_PASSWORD_MAX_BYTES {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Reauthentication failed",
+            ));
+        }
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let user = self
+            .fetch_user_by_id_or_username(&pool, user_id, None)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "reauthenticate.fetch_user", Some(&pool)))?
+            .ok_or_else(|| error_response(StatusCode::UNAUTHORIZED, "Reauthentication failed"))?;
+        if !user.is_active
+            || !bcrypt_verify(request.password.as_str(), &user.password_hash).unwrap_or(false)
+        {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Reauthentication failed",
+            ));
+        }
+
+        let proof = format!("rp_{}_{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let proof_hash = sha256_hex(&proof);
+        let expires_at = Utc::now() + ChronoDuration::seconds(REAUTHENTICATION_PROOF_TTL_SECONDS);
+        query(
+            "INSERT INTO auth_reauthentication_proofs
+             (proof_id, user_id, purpose, proof_hash, expires_at, created_at)
+             VALUES (?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(request.purpose.as_str())
+        .bind(proof_hash)
+        .bind(expires_at.naive_utc())
+        .execute(&pool)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "reauthenticate.insert_proof", Some(&pool)))?;
+
+        Ok(ReauthenticationProofRecord {
+            proof,
+            purpose: request.purpose,
+            expires_in: REAUTHENTICATION_PROOF_TTL_SECONDS as u32,
+        })
+    }
+
+    async fn consume_reauthentication_proof(
+        &self,
+        user_id: &str,
+        purpose: ReauthenticationPurpose,
+        proof: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if proof.is_empty() || proof.trim() != proof || proof.len() > 160 {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Reauthentication proof is invalid or expired",
+            ));
+        }
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "auth.get_pool", None))?;
+        let result = query(
+            "UPDATE auth_reauthentication_proofs
+             SET consumed_at = NOW(6)
+             WHERE user_id = ? AND purpose = ? AND proof_hash = ?
+               AND consumed_at IS NULL AND expires_at > NOW(6)",
+        )
+        .bind(user_id)
+        .bind(purpose.as_str())
+        .bind(sha256_hex(proof))
+        .execute(&pool)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "reauthenticate.consume_proof", Some(&pool)))?;
+        if result.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Reauthentication proof is invalid or expired",
+            ));
+        }
         Ok(())
     }
 

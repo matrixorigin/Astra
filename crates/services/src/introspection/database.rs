@@ -10,10 +10,13 @@ use crate::storage::agent_session_exists_for_user;
 
 use super::scoring::{
     DEGRADATION_DELTA, QUALITY_DEGRADED, QUALITY_GOOD, TOKEN_CHAR_RATIO, analyze_context_health,
-    billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_drift,
-    compute_trend, pollution_ratio, relevance_quality, zone_balance,
+    billable_input_from_canonical, compaction_effectiveness, compaction_forecast, compute_trend,
+    pollution_ratio, relevance_quality, zone_balance,
 };
-use super::{IntrospectionService, ServiceResult, SkillInfo, SkillsIntrospectionResponse};
+use super::{
+    INTENT_DRIFT_ASSESSMENT_EVENT_TYPE, IntentDriftAssessmentV1, IntentDriftCheckResponseV2,
+    IntrospectionService, ServiceResult, SkillInfo, SkillsIntrospectionResponse,
+};
 
 const MAX_INTROSPECTION_USAGE_ROWS: i32 = 128;
 const ASK_USER_HISTORY_EVENT_LIMIT: i32 = 50;
@@ -69,6 +72,13 @@ struct AskUserHistoryRow {
     created_at: String,
     metadata: Value,
     content_preview: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IntentDriftAssessmentRow {
+    event_id: String,
+    created_at: String,
+    assessment: IntentDriftAssessmentV1,
 }
 
 trait IntrospectionRow {
@@ -532,14 +542,43 @@ async fn context_snapshot_cursor_after_skipping(
     Ok(cursor)
 }
 
-fn optional_drift_preview_from_row(
-    row: Option<&impl IntrospectionRow>,
-    context: &str,
-) -> ServiceResult<String> {
-    let Some(row) = row else {
-        return Ok(String::new());
-    };
-    introspection_row_string(row, context, "preview")
+fn intent_drift_assessment_from_row(
+    row: &impl IntrospectionRow,
+) -> ServiceResult<IntentDriftAssessmentRow> {
+    let context = "intent_drift_assessment_row";
+    let metadata_json = introspection_row_string(row, context, "metadata_json")?;
+    let assessment: IntentDriftAssessmentV1 = serde_json::from_str(&metadata_json)
+        .map_err(|error| introspection_decode_error(context, "metadata_json", error))?;
+    assessment
+        .validate()
+        .map_err(|error| introspection_decode_error(context, "metadata_json", error))?;
+    Ok(IntentDriftAssessmentRow {
+        event_id: introspection_required_non_empty_string(row, context, "event_id")?,
+        created_at: introspection_required_non_empty_string(row, context, "created_at")?,
+        assessment,
+    })
+}
+
+fn unavailable_intent_drift_response(
+    user_id: &str,
+    session_id: &str,
+) -> ServiceResult<IntentDriftCheckResponseV2> {
+    IntentDriftCheckResponseV2::unavailable(user_id, session_id).map_err(internal_error)
+}
+
+fn assessed_intent_drift_response(
+    user_id: &str,
+    session_id: &str,
+    row: IntentDriftAssessmentRow,
+) -> ServiceResult<IntentDriftCheckResponseV2> {
+    IntentDriftCheckResponseV2::assessed(
+        user_id,
+        session_id,
+        row.assessment,
+        row.event_id,
+        row.created_at,
+    )
+    .map_err(internal_error)
 }
 
 fn extract_ask_user_audit(metadata: &Value) -> Option<&Value> {
@@ -1444,55 +1483,34 @@ impl IntrospectionService for DatabaseIntrospectionService {
         Ok(response)
     }
 
-    async fn get_drift_check(&self, user_id: &str, session_id: &str) -> ServiceResult<Value> {
+    async fn get_drift_check(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> ServiceResult<IntentDriftCheckResponseV2> {
         let pool = self.get_pool().await.map_err(internal_error)?;
         self.verify_session_owner(&pool, session_id, user_id)
             .await?;
 
-        // Original intent: earliest user-facing event.
-        let first = query(
-            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
+        let latest = query(
+            "SELECT event_id, IFNULL(CAST(metadata AS CHAR), '{}') AS metadata_json, \
+                    CAST(created_at AS CHAR) AS created_at \
              FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND (event_type = 'user_query' OR event_type = 'user_message') \
-             ORDER BY created_at ASC LIMIT 1",
+             WHERE session_id = ? AND user_id = ? AND event_type = ? \
+             ORDER BY created_at DESC, event_id DESC LIMIT 1",
         )
         .bind(session_id)
         .bind(user_id)
+        .bind(INTENT_DRIFT_ASSESSMENT_EVENT_TYPE)
         .fetch_optional(&pool)
         .await
         .map_err(internal_error)?;
 
-        let original_intent =
-            optional_drift_preview_from_row(first.as_ref(), "drift_original_intent_row")?;
-
-        // Current focus: last non-error event.
-        let last = query(
-            "SELECT SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 240) AS preview \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        let current_focus =
-            optional_drift_preview_from_row(last.as_ref(), "drift_current_focus_row")?;
-
-        let (drift_score, drift_level, signals) = compute_drift(&original_intent, &current_focus);
-
-        Ok(serde_json::json!({
-            "schema_version": 1,
-            "user_id": user_id,
-            "session_id": session_id,
-            "original_intent_preview": original_intent,
-            "current_focus_preview": current_focus,
-            "drift_score": drift_score,
-            "drift_level": drift_level,
-            "signals": signals,
-        }))
+        let Some(row) = latest.as_ref() else {
+            return unavailable_intent_drift_response(user_id, session_id);
+        };
+        let assessment = intent_drift_assessment_from_row(row)?;
+        assessed_intent_drift_response(user_id, session_id, assessment)
     }
 }
 
@@ -2315,23 +2333,54 @@ mod tests {
         }
     }
 
-    struct FakeDriftPreviewRow {
+    struct FakeIntentDriftAssessmentRow {
         failed_column: Option<&'static str>,
-        preview: &'static str,
+        empty_column: Option<&'static str>,
+        metadata_json: &'static str,
     }
 
-    impl FakeDriftPreviewRow {
-        fn with_preview(preview: &'static str) -> Self {
+    impl FakeIntentDriftAssessmentRow {
+        fn complete() -> Self {
             Self {
                 failed_column: None,
-                preview,
+                empty_column: None,
+                metadata_json: r#"{
+                    "schema_version": 1,
+                    "provenance": {
+                        "kind": "llm_judge",
+                        "invocation_id": "invocation-1",
+                        "provider": "test-provider",
+                        "model": "test-model",
+                        "provider_response_id": "response-1"
+                    },
+                    "verdict": "drifting",
+                    "score": 0.75,
+                    "level": "high",
+                    "evidence": ["tool activity no longer serves the judged objective"],
+                    "turn": 3,
+                    "round": 1
+                }"#,
             }
         }
 
         fn fail_on(column: &'static str) -> Self {
             Self {
                 failed_column: Some(column),
-                preview: "initial task",
+                ..Self::complete()
+            }
+        }
+
+        fn empty_on(column: &'static str) -> Self {
+            Self {
+                empty_column: Some(column),
+                ..Self::complete()
+            }
+        }
+
+        fn with_metadata(metadata_json: &'static str) -> Self {
+            Self {
+                metadata_json,
+                ..Self::complete()
             }
         }
 
@@ -2344,12 +2393,19 @@ mod tests {
         }
     }
 
-    impl IntrospectionRow for FakeDriftPreviewRow {
+    impl IntrospectionRow for FakeIntentDriftAssessmentRow {
         fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
             self.maybe_fail(column)?;
-            match column {
-                "preview" => Ok(self.preview.to_string()),
+            let value: Result<&str, sqlx::Error> = match column {
+                "event_id" => Ok("drift-assessment-1"),
+                "created_at" => Ok("2026-07-30 12:00:00.000000"),
+                "metadata_json" => Ok(self.metadata_json),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
+            };
+            match value {
+                Ok(_) if self.empty_column == Some(column) => Ok(String::new()),
+                Ok(value) => Ok(value.to_string()),
+                Err(error) => Err(error),
             }
         }
 
@@ -2817,33 +2873,83 @@ mod tests {
     }
 
     #[test]
-    fn drift_preview_row_decode_preserves_optional_absence_and_fails_loudly() {
-        let missing =
-            optional_drift_preview_from_row(None::<&FakeDriftPreviewRow>, "drift_preview_row")
-                .unwrap();
-        assert_eq!(missing, "");
-
-        let preview = optional_drift_preview_from_row(
-            Some(&FakeDriftPreviewRow::with_preview("initial task")),
-            "drift_preview_row",
-        )
-        .unwrap();
-        assert_eq!(preview, "initial task");
-
-        let empty = optional_drift_preview_from_row(
-            Some(&FakeDriftPreviewRow::with_preview("")),
-            "drift_preview_row",
-        )
-        .unwrap();
-        assert_eq!(empty, "");
-
-        assert_introspection_internal_error_mentions(
-            optional_drift_preview_from_row(
-                Some(&FakeDriftPreviewRow::fail_on("preview")),
-                "drift_preview_row",
-            ),
-            "preview",
+    fn intent_drift_projection_requires_llm_provenance_and_fails_loudly_on_malformed_fact() {
+        let row =
+            intent_drift_assessment_from_row(&FakeIntentDriftAssessmentRow::complete()).unwrap();
+        assert_eq!(row.event_id, "drift-assessment-1");
+        assert_eq!(
+            row.assessment.verdict,
+            crate::introspection::IntentDriftVerdict::Drifting
         );
+        assert_eq!(row.assessment.score, 0.75);
+        assert_eq!(
+            row.assessment.level,
+            crate::introspection::IntentDriftLevel::High
+        );
+        assert_eq!(row.assessment.provenance.invocation_id, "invocation-1");
+
+        let response =
+            assessed_intent_drift_response("owner-1", "session-1", row).expect("valid projection");
+        assert_eq!(response.schema_version, 2);
+        assert_eq!(
+            response.assessment_status,
+            crate::introspection::IntentDriftAssessmentStatus::Assessed
+        );
+        assert_eq!(
+            response.verdict,
+            Some(crate::introspection::IntentDriftVerdict::Drifting)
+        );
+        assert_eq!(response.score, Some(0.75));
+        assert_eq!(
+            response.level,
+            Some(crate::introspection::IntentDriftLevel::High)
+        );
+        assert_eq!(
+            response.source_event_id.as_deref(),
+            Some("drift-assessment-1")
+        );
+
+        for column in ["event_id", "created_at", "metadata_json"] {
+            assert_introspection_internal_error_mentions(
+                intent_drift_assessment_from_row(&FakeIntentDriftAssessmentRow::fail_on(column)),
+                column,
+            );
+        }
+        for column in ["event_id", "created_at"] {
+            assert_introspection_internal_error_mentions(
+                intent_drift_assessment_from_row(&FakeIntentDriftAssessmentRow::empty_on(column)),
+                "expected non-empty string",
+            );
+        }
+
+        for invalid in [
+            r#"{"schema_version":1,"provenance":{"kind":"heuristic","invocation_id":"inv-1","provider":"p","model":"m"},"verdict":"drifting","score":0.8,"level":"high","evidence":[],"turn":1,"round":0}"#,
+            r#"{"schema_version":2,"provenance":{"kind":"llm_judge","invocation_id":"inv-1","provider":"p","model":"m"},"verdict":"drifting","score":0.8,"level":"high","evidence":[],"turn":1,"round":0}"#,
+            r#"{"schema_version":1,"provenance":{"kind":"llm_judge","invocation_id":"inv-1","provider":"p","model":"m"},"verdict":"aligned","score":0.2,"level":"high","evidence":[],"turn":1,"round":0}"#,
+            r#"{"schema_version":1,"provenance":{"kind":"llm_judge","invocation_id":"inv-1","provider":"p","model":"m"},"verdict":"drifting","score":1.5,"level":"high","evidence":[],"turn":1,"round":0}"#,
+        ] {
+            assert_introspection_internal_error_mentions(
+                intent_drift_assessment_from_row(&FakeIntentDriftAssessmentRow::with_metadata(
+                    invalid,
+                )),
+                "metadata_json",
+            );
+        }
+    }
+
+    #[test]
+    fn missing_intent_drift_assessment_is_unavailable_not_aligned() {
+        let response = unavailable_intent_drift_response("owner-1", "session-1")
+            .expect("valid unavailable projection");
+        assert_eq!(response.schema_version, 2);
+        assert_eq!(
+            response.assessment_status,
+            crate::introspection::IntentDriftAssessmentStatus::Unavailable
+        );
+        assert!(response.verdict.is_none());
+        assert!(response.score.is_none());
+        assert!(response.level.is_none());
+        assert!(response.evidence.is_empty());
     }
 
     // ── summarize_contents ──────────────────────────────────────────────

@@ -2,6 +2,7 @@ use crate::cli::cli_config::cli_args::{
     Cli, Command, ConfigCmd, McpCmd, PermissionsSubcommand, ServeMode, SessionCaptureCmd,
     SessionCmd,
 };
+use crate::cli::cli_config::cli_utils::CliProfileIdentityAdmission;
 use crate::cli::session::session_state::ExplainMode;
 use clap::Parser;
 
@@ -52,6 +53,46 @@ fn cli_login_defaults_to_astra_user() {
             assert_eq!(args.password.as_deref(), Some("secret"));
         }
         other => panic!("expected login command, got {other:?}"),
+    }
+}
+
+#[test]
+fn profile_identity_admission_follows_the_typed_command_tree() {
+    let cases: &[(&[&str], CliProfileIdentityAdmission)] = &[
+        (
+            &["astra", "login"],
+            CliProfileIdentityAdmission::AuthenticationBootstrap,
+        ),
+        (
+            &["astra", "register"],
+            CliProfileIdentityAdmission::AuthenticationBootstrap,
+        ),
+        (
+            &["astra", "admin", "login"],
+            CliProfileIdentityAdmission::AuthenticationBootstrap,
+        ),
+        (
+            &["astra", "admin", "register"],
+            CliProfileIdentityAdmission::AuthenticationBootstrap,
+        ),
+        (
+            &["astra", "health"],
+            CliProfileIdentityAdmission::RequireBoundAccount,
+        ),
+        (
+            &["astra", "admin", "model", "list"],
+            CliProfileIdentityAdmission::RequireBoundAccount,
+        ),
+    ];
+
+    for (argv, expected) in cases {
+        let cli = Cli::try_parse_from(*argv).unwrap();
+        let actual = cli
+            .command
+            .as_ref()
+            .expect("test case has a command")
+            .profile_identity_admission();
+        assert_eq!(actual, *expected, "argv={argv:?}");
     }
 }
 

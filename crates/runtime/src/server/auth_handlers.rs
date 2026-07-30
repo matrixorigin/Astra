@@ -121,6 +121,27 @@ pub(super) async fn auth_logout_handler(
     }))
 }
 
+pub(super) async fn auth_reauthenticate_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AuthReauthenticateRequest>,
+) -> Result<Json<AuthReauthenticateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let proof = state
+        .auth_service
+        .reauthenticate(&user.user_id, request.into())
+        .await?;
+    tracing::info!(
+        target: "astra_runtime::auth",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        purpose = proof.purpose.as_str(),
+        "reauthentication proof issued"
+    );
+    Ok(Json(AuthReauthenticateResponse::from(proof)))
+}
+
 pub(super) async fn auth_me_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

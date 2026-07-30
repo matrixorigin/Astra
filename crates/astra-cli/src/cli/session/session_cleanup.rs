@@ -120,7 +120,10 @@ pub(crate) async fn finalize_session(state: &mut SessionState) {
                         operation_id: "memory_extraction_shutdown".to_string(),
                         logical_attempt: 0,
                     },
-                    messages: super::session_projection::history_as_messages(&state.history),
+                    messages: super::session_projection::history_as_messages_for(
+                        astra_core::history_work::HistoryWorkSite::CliSessionMemoryShutdownMaterialization,
+                        &state.history,
+                    ),
                     session_facts: shutdown_session_facts(state),
                     had_error: state
                         .last_turn_event
@@ -301,10 +304,12 @@ pub(crate) fn finalize_session_process_boundary(state: &mut SessionState) {
 }
 
 pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::SessionFacts {
-    let estimated_tokens = state
-        .total_prompt_tokens
-        .saturating_add(state.total_cache_read_tokens)
-        .saturating_add(state.total_cache_creation_tokens);
+    let estimated_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
+        state.total_prompt_tokens,
+        state.total_cache_read_tokens,
+        state.total_cache_creation_tokens,
+    )
+    .total_input_tokens();
     let last_error = state
         .last_turn_event
         .as_ref()

@@ -26,9 +26,7 @@ impl TaskResultArtifact {
 }
 
 fn task_output_dir() -> Result<PathBuf, String> {
-    Ok(dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
+    Ok(astra_runtime_env::local_state_root()
         .join("tasks")
         .join("outputs"))
 }

@@ -72,24 +72,49 @@ use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::tool_call_shape::tool_call_name;
 use astra_turn_core::tool_schema_prune::prune_tool_schemas;
 
+use super::{
+    BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES, BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES,
+    is_exact_bridge_identity,
+};
+
 const TOOL_RESULT_AUDIT_CHARS: usize = 4000;
 const ROOT_TURN_JOURNAL_HEADER: &str = "x-mo-root-turn-journal";
 
 type ActiveBridgeInference =
     Arc<tokio::sync::Mutex<Option<Arc<crate::turn::llm::durable::DurableInferenceInvocation>>>>;
 
-async fn settle_active_bridge_inference<T, F, Fut, E>(
+async fn settle_active_bridge_inference<T, F, Fut>(
     active: &Arc<tokio::sync::Mutex<Option<T>>>,
     settle: F,
-) -> Result<(), E>
+) -> Result<(), astra_core::ClassifiedError>
 where
-    F: FnOnce(T) -> Fut,
-    Fut: std::future::Future<Output = Result<(), E>>,
+    T: Send + 'static,
+    F: FnOnce(T) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), astra_core::ClassifiedError>> + Send + 'static,
 {
     let Some(invocation) = active.lock().await.take() else {
         return Ok(());
     };
-    settle(invocation).await
+    // `take` and `spawn` occur without an await between them. Once ownership
+    // leaves the shared slot, a response-body drop can detach this task but
+    // cannot cancel its durable terminal commit.
+    tokio::spawn(async move {
+        let result = settle(invocation).await;
+        if let Err(error) = &result {
+            astra_core::agent_error!(
+                "bridge",
+                "detached bridge inference settlement failed: {error}"
+            );
+        }
+        result
+    })
+    .await
+    .map_err(|error| {
+        bridge_stream_terminal_error(
+            astra_core::ErrorKind::ContractViolation,
+            format!("detached bridge inference settlement task failed: {error}"),
+        )
+    })?
 }
 
 fn bridge_inference_operation_id(user_query_event_id: &str) -> String {
@@ -111,31 +136,82 @@ fn bridge_stream_terminal_error(
     astra_core::ClassifiedError::new(kind, message)
 }
 
+fn bridge_forwarded_inference_ledger_error(
+    kind: astra_core::ErrorKind,
+    message: impl Into<String>,
+) -> astra_core::ClassifiedError {
+    astra_core::ClassifiedError::new(kind, message).with_details_json(
+        json!({
+            "source": "inference_execution_ledger",
+            "stage": "forwarded_provider_attempt_terminal",
+        })
+        .to_string(),
+    )
+}
+
 async fn finish_active_bridge_inference_error(
     active: &ActiveBridgeInference,
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
-    settle_active_bridge_inference(active, |invocation| async move {
-        invocation.finish_error(error).await
+    let error = error.clone();
+    settle_active_bridge_inference(active, move |invocation| async move {
+        invocation.finish_error(&error).await
     })
     .await
+}
+
+async fn finish_active_bridge_inference_error_with_partial(
+    active: &ActiveBridgeInference,
+    error: &astra_core::ClassifiedError,
+    usage: &Map<String, Value>,
+    provider_response_id: Option<String>,
+) -> Result<(), astra_core::ClassifiedError> {
+    let usage = durable_inference_usage_from_json(usage);
+    let error = error.clone();
+    settle_active_bridge_inference(active, move |invocation| async move {
+        invocation
+            .finish_error_with_partial_provider_facts(&error, usage, provider_response_id)
+            .await
+    })
+    .await
+}
+
+fn durable_inference_usage_from_json(usage: &Map<String, Value>) -> astra_services::InferenceUsage {
+    let observed = crate::turn::token_usage::TokenUsage::from_partial_json_map(usage);
+    astra_services::InferenceUsage {
+        input_tokens: observed.input_tokens,
+        output_tokens: observed.output_tokens,
+        cache_read_tokens: observed.cached_input_tokens,
+        cache_creation_tokens: observed.cache_creation_tokens,
+    }
 }
 
 async fn finish_active_bridge_inference(
     active: &ActiveBridgeInference,
     terminal: &astra_services::InferenceInvocationTerminal,
 ) -> Result<(), astra_core::ClassifiedError> {
-    settle_active_bridge_inference(active, |invocation| async move {
-        invocation.finish(terminal).await
+    let terminal = terminal.clone();
+    settle_active_bridge_inference(active, move |invocation| async move {
+        invocation.finish(&terminal).await
     })
     .await
 }
 
-async fn finish_disconnected_bridge_inference(active: &ActiveBridgeInference) {
+async fn finish_disconnected_bridge_inference(
+    active: &ActiveBridgeInference,
+    usage: astra_services::InferenceUsage,
+    provider_response_id: Option<String>,
+) {
     let terminal =
         crate::turn::llm::durable::terminal_from_error(&bridge_client_disconnect_error());
-    if let Err(error) = settle_active_bridge_inference(active, |invocation| async move {
-        invocation.finish_after_disconnect(&terminal).await
+    if let Err(error) = settle_active_bridge_inference(active, move |invocation| async move {
+        invocation
+            .finish_after_disconnect_with_partial_provider_facts(
+                &terminal,
+                usage,
+                provider_response_id,
+            )
+            .await
     })
     .await
     {
@@ -144,6 +220,26 @@ async fn finish_disconnected_bridge_inference(active: &ActiveBridgeInference) {
             "failed to converge inference invocation after client disconnect: {error}"
         );
     }
+}
+
+async fn refresh_bridge_provider_attempt_trace(
+    invocation: Option<&Arc<crate::turn::llm::durable::DurableInferenceInvocation>>,
+    trace: &mut Value,
+    round: u32,
+) -> bool {
+    let Some(invocation) = invocation else {
+        return false;
+    };
+    let provider_attempts = invocation.provider_attempt_facts().await;
+    if provider_attempts.is_empty() {
+        return false;
+    }
+    crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
+        trace,
+        &provider_attempts,
+        round,
+    );
+    true
 }
 
 /// Completion link in a per-session asynchronous persistence chain. The link
@@ -433,52 +529,6 @@ fn has_inprocess_persisted_events(
     core_event_count > 0 || (tool_events_persisted && tool_event_count > 0)
 }
 
-fn observe_context_compaction(
-    id: impl Into<String>,
-    phase: impl Into<String>,
-    history_before: &[Value],
-    result: &crate::turn::cloud::compaction::CompactResult,
-    fixed_context: &[Value],
-    visible_tools: &[Value],
-) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
-    result.boundary.as_ref()?;
-    if result.messages == history_before {
-        return None;
-    }
-
-    let estimate = |history: &[Value]| -> u64 {
-        fixed_context
-            .iter()
-            .chain(history)
-            .chain(visible_tools)
-            .map(crate::prompts::estimate_json_value_tokens)
-            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX))
-            .fold(0_u64, u64::saturating_add)
-    };
-    let tokens_before = estimate(history_before);
-    let tokens_after = estimate(&result.messages);
-    if tokens_after >= tokens_before {
-        return None;
-    }
-    let tier = serde_json::to_value(result.tier)
-        .ok()
-        .and_then(|value| value.as_str().map(ToString::to_string))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Some(
-        astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
-            id: id.into(),
-            phase: phase.into(),
-            tier,
-            messages_before: history_before.len().min(u64::MAX as usize) as u64,
-            messages_after: result.messages.len().min(u64::MAX as usize) as u64,
-            tokens_before,
-            tokens_after,
-            tokens_saved: tokens_before.saturating_sub(tokens_after),
-        },
-    )
-}
-
 fn bind_bridge_memoria_owner(
     client: Option<crate::turn::cloud::memoria_compact::HttpMemoriaPort>,
     user_id: &str,
@@ -572,10 +622,7 @@ fn load_bridge_pipeline_baseline(user_id: &str, session_id: &str) -> BridgePipel
                 }
                 let usage = bridge_usage_from_response_event(&event);
                 if let Some(usage) = usage.as_ref() {
-                    let total_input = usage
-                        .input_tokens
-                        .saturating_add(usage.cached_input_tokens)
-                        .saturating_add(usage.cache_creation_tokens);
+                    let total_input = usage.normalized_prompt_cache_usage().total_input_tokens();
                     if total_input > 0 {
                         raw_ratios.push(usage.cached_input_tokens as f64 / total_input as f64);
                     }
@@ -661,12 +708,24 @@ fn bridge_prompt_snapshot_from_journal_event(
     let tools = request
         .get("tools")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|tools| {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::BridgeJournalReplayClone,
+                tools,
+            );
+            tools.clone()
+        })
         .unwrap_or_default();
     let messages = request
         .get("messages")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|messages| {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::BridgeJournalReplayClone,
+                messages,
+            );
+            messages.clone()
+        })
         .unwrap_or_default();
     let model = metadata
         .get("model")
@@ -686,7 +745,13 @@ fn bridge_tool_schemas_from_journal_event(
         .and_then(Value::as_object)
         .and_then(|request| request.get("tools"))
         .and_then(Value::as_array)
-        .cloned()
+        .map(|tools| {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::BridgeJournalReplayClone,
+                tools,
+            );
+            tools.clone()
+        })
         .unwrap_or_default()
 }
 
@@ -698,7 +763,24 @@ fn bridge_prompt_snapshot_from_messages(
 ) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
     let system_prompt_text =
         astra_turn_core::cache_diagnostics::prompt_snapshot_system_text_from_messages(messages);
-    let tools_json = serde_json::to_string(tools).ok()?;
+    let tools_json = match serde_json::to_string(tools) {
+        Ok(tools_json) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_bytes(
+                    astra_core::history_work::HistoryWorkSite::BridgeJournalReplaySerialization,
+                    tools_json.len().try_into().unwrap_or(u64::MAX),
+                );
+            }
+            tools_json
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::BridgeJournalReplaySerialization,
+                &error,
+            );
+            return None;
+        }
+    };
     let cache_eligible_tokens = prompts::estimate_str_tokens(&system_prompt_text)
         + prompts::estimate_str_tokens(&tools_json);
     astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
@@ -1121,6 +1203,15 @@ fn record_full_llm_request_event(
             max_output_tokens,
         })
         .ok();
+    let capture_request = crate::turn::llm::exchange_capture::build_capture_request_json(
+        messages,
+        tools,
+        max_output_tokens,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgeRequestCaptureClone,
+        &capture_request,
+    );
     let mut evt = astra_services::session_journal::JournalEvent::llm_request_full(
         Some(session_id),
         turn,
@@ -1137,11 +1228,7 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "request": crate::turn::llm::exchange_capture::build_capture_request_json(
-                messages,
-                tools,
-                max_output_tokens,
-            ),
+            "request": capture_request,
             "prompt_request_id": prompt_request_plan.as_ref().map(|plan| plan.request_id.as_str()),
             "request_hash": prompt_request_plan.as_ref().map(|plan| plan.request_hash.as_str()),
             "request_summary": prompt_request_plan
@@ -1612,11 +1699,13 @@ impl InProcessChatTurnBridge {
     }
 }
 
-fn inprocess_session_info_event(session_id: &str, run_id: &str) -> Value {
+fn inprocess_session_info_event(session_id: &str, turn_chain_id: &str) -> Value {
     json!({
         "type": "session_info",
         "session_id": session_id,
-        "run_id": run_id,
+        "run_id": turn_chain_id,
+        "turn_chain_id": turn_chain_id,
+        "durable": false,
     })
 }
 
@@ -1647,10 +1736,18 @@ impl InProcessChatTurnBridge {
         let bridge_e2e_authorized = astra_turn_core::bridge_e2e_hooks::authorized(headers);
         #[cfg(not(feature = "bridge-e2e-hooks"))]
         let bridge_e2e_authorized = false;
-        let turn_chain_id =
-            header_str(headers, "x-mo-turn-chain-id").unwrap_or_else(|| Uuid::now_v7().to_string());
-        let user_query_event_id = header_str(headers, "x-mo-user-query-event-id")
-            .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let turn_chain_id = optional_exact_bridge_identity_header(
+            headers,
+            "x-mo-turn-chain-id",
+            BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES,
+        )?
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+        let user_query_event_id = optional_exact_bridge_identity_header(
+            headers,
+            "x-mo-user-query-event-id",
+            BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES,
+        )?
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
 
         // Parse request body
         let payload = parse_bridge_payload(&body)?;
@@ -1830,11 +1927,16 @@ impl InProcessChatTurnBridge {
             let disconnect_inference = active_inference.clone();
             tokio::spawn(async move {
                 cancel_token.cancelled().await;
-                finish_disconnected_bridge_inference(&disconnect_inference).await;
                 let snapshot = match disconnect_state.lock() {
                     Ok(guard) => guard.clone(),
-                    Err(_) => return,
+                    Err(poisoned) => poisoned.into_inner().clone(),
                 };
+                finish_disconnected_bridge_inference(
+                    &disconnect_inference,
+                    durable_inference_usage_from_json(&snapshot.usage),
+                    snapshot.provider_response_id.clone(),
+                )
+                .await;
                 if !snapshot.started || snapshot.finalized {
                     return;
                 }
@@ -1877,7 +1979,11 @@ impl InProcessChatTurnBridge {
             let active_inference = active_inference.clone();
             let turn_started = Instant::now();
             tracing::debug!(target: "astra_timing", "bridge stream started");
-            let run_id = uuid::Uuid::new_v4().to_string();
+            // `/chat/turn` exposes a correlation id, not a durable agent run.
+            // The Server-prepared turn chain is stable across tool-result
+            // continuations and therefore owns every transport event for the
+            // same user-visible turn.
+            let run_id = turn_chain_id.clone();
             let mut turn_event_buffer = bridge_should_create_turn_event_buffer(
                 full_llm_capture,
                 root_runtime_owns_turn_journal,
@@ -2480,6 +2586,10 @@ impl InProcessChatTurnBridge {
             // now route through the shared `wire_assembly::MemoriaContext`.
             // The summary adapter uses the same admitted route as the main
             // request, including forwarded headers and endpoint overrides.
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::BridgeCompactionFixedContextClone,
+                &llm_messages,
+            );
             let mut compaction_fixed_context = llm_messages.clone();
             if let Some(dynamic) = dynamic_msg.as_ref() {
                 compaction_fixed_context.push(dynamic.clone());
@@ -2513,14 +2623,16 @@ impl InProcessChatTurnBridge {
                 let compact_result = ctx
                     .compact(&raw, &compaction_fixed_context, &edge_tools)
                     .await;
-                if let Some(observation) = observe_context_compaction(
+                if let Some(observation) =
+                    crate::turn::wire_assembly::observe_context_compaction(
                     "initial",
-                    "initial",
+                    astra_turn_core::compaction_types::CompactionKind::WireAssembly,
                     &raw,
                     &compact_result,
                     &compaction_fixed_context,
                     &edge_tools,
-                ) {
+                )
+                {
                     context_compactions.push(observation);
                 }
 
@@ -2633,6 +2745,10 @@ impl InProcessChatTurnBridge {
             let mut usage = Map::new();
             let mut resolved_model = model_name.clone();
             let mut provider_response_id: Option<String> = None;
+            let mut provider_request_round = round_index;
+            let mut provider_attempt_inventory: Option<
+                Arc<crate::turn::llm::durable::DurableInferenceInvocation>,
+            > = None;
             let mut cloud_loop_turns: i64 = 0;
             let mut llm_steps: Vec<Value> = Vec::new();
 
@@ -2833,42 +2949,57 @@ impl InProcessChatTurnBridge {
                         max_output_tokens,
                     );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
-                    if let Ok(prompt_request_plan) =
-                        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                    let prompt_round = turn_event_buffer
+                        .as_ref()
+                        .map(|buffer| buffer.current_round())
+                        .unwrap_or(round_index);
+                    let prompt_request_plan =
+                        match astra_services::plan_prompt_request(
+                            astra_services::PromptRequestPlanInput {
                             user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
-                            round: turn_event_buffer
-                                .as_ref()
-                                .map(|buffer| buffer.current_round())
-                                .unwrap_or(round_index),
+                            round: prompt_round,
                             attempt: attempt_in_round,
                             source: "bridge_inprocess",
                             messages: &llm_messages,
                             tools: &pruned_tools,
                             max_output_tokens: Some(max_output_tokens),
-                        })
-                    {
-                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
-                            "bridge_inprocess e2e capture",
-                            shared_pool.clone(),
-                            astra_services::PromptRequestPersistInput {
-                                session_id: session_id.clone(),
-                                user_id: user_id.clone(),
-                                run_id: Some(run_id.clone()),
-                                turn: trace_turn,
-                                round: turn_event_buffer
-                                    .as_ref()
-                                    .map(|buffer| buffer.current_round())
-                                    .unwrap_or(round_index),
-                                attempt: attempt_in_round,
-                                source: "bridge_inprocess".to_string(),
-                                model: request_capture_model.clone(),
-                                provider: provider.clone(),
                             },
-                            prompt_request_plan,
-                        );
-                    }
+                        ) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                let error = bridge_stream_terminal_error(
+                                    astra_core::ErrorKind::ContractViolation,
+                                    format!(
+                                        "failed to plan prompt delta projection: {error}"
+                                    ),
+                                );
+                                yield render_classified_error_sse(
+                                    &error,
+                                    "prompt_delta_projection",
+                                    false,
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                        };
+                    crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                        "bridge_inprocess e2e capture",
+                        shared_pool.clone(),
+                        astra_services::PromptRequestPersistInput {
+                            session_id: session_id.clone(),
+                            user_id: user_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            turn: trace_turn,
+                            round: prompt_round,
+                            attempt: attempt_in_round,
+                            source: "bridge_inprocess".to_string(),
+                            model: request_capture_model.clone(),
+                            provider: provider.clone(),
+                        },
+                        prompt_request_plan,
+                    );
                     yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
@@ -2928,42 +3059,57 @@ impl InProcessChatTurnBridge {
                     // long note ~60 lines up for why this is here and not
                     // before the mutations).
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
-                    if let Ok(prompt_request_plan) =
-                        astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                    let prompt_round = turn_event_buffer
+                        .as_ref()
+                        .map(|buffer| buffer.current_round())
+                        .unwrap_or(round_index);
+                    let prompt_request_plan =
+                        match astra_services::plan_prompt_request(
+                            astra_services::PromptRequestPlanInput {
                             user_id: &user_id,
                             session_id: &session_id,
                             turn: trace_turn,
-                            round: turn_event_buffer
-                                .as_ref()
-                                .map(|buffer| buffer.current_round())
-                                .unwrap_or(round_index),
+                            round: prompt_round,
                             attempt: attempt_in_round,
                             source: "bridge_inprocess",
                             messages: &llm_messages,
                             tools: &pruned_tools,
                             max_output_tokens: Some(max_output_tokens),
-                        })
-                    {
-                        crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
-                            "bridge_inprocess live capture",
-                            shared_pool.clone(),
-                            astra_services::PromptRequestPersistInput {
-                                session_id: session_id.clone(),
-                                user_id: user_id.clone(),
-                                run_id: Some(run_id.clone()),
-                                turn: trace_turn,
-                                round: turn_event_buffer
-                                    .as_ref()
-                                    .map(|buffer| buffer.current_round())
-                                    .unwrap_or(round_index),
-                                attempt: attempt_in_round,
-                                source: "bridge_inprocess".to_string(),
-                                model: request_capture_model.clone(),
-                                provider: provider.clone(),
                             },
-                            prompt_request_plan,
-                        );
-                    }
+                        ) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                let error = bridge_stream_terminal_error(
+                                    astra_core::ErrorKind::ContractViolation,
+                                    format!(
+                                        "failed to plan prompt delta projection: {error}"
+                                    ),
+                                );
+                                yield render_classified_error_sse(
+                                    &error,
+                                    "prompt_delta_projection",
+                                    false,
+                                );
+                                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                                return;
+                            }
+                        };
+                    crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                        "bridge_inprocess live capture",
+                        shared_pool.clone(),
+                        astra_services::PromptRequestPersistInput {
+                            session_id: session_id.clone(),
+                            user_id: user_id.clone(),
+                            run_id: Some(run_id.clone()),
+                            turn: trace_turn,
+                            round: prompt_round,
+                            attempt: attempt_in_round,
+                            source: "bridge_inprocess".to_string(),
+                            model: request_capture_model.clone(),
+                            provider: provider.clone(),
+                        },
+                        prompt_request_plan,
+                    );
 
                     // wip-7: emit per-channel fingerprints ONLY — no raw
                     // text crosses the HTTP boundary. Raw channel content
@@ -3130,7 +3276,12 @@ impl InProcessChatTurnBridge {
                             };
                             *admission_active.lock().await = Some(invocation.clone());
                             if admission_cancel.is_cancelled() {
-                                finish_disconnected_bridge_inference(&admission_active).await;
+                                finish_disconnected_bridge_inference(
+                                    &admission_active,
+                                    astra_services::InferenceUsage::default(),
+                                    None,
+                                )
+                                .await;
                                 return Err(bridge_client_disconnect_error());
                             }
                             Ok::<_, astra_core::ClassifiedError>(invocation)
@@ -3170,6 +3321,7 @@ impl InProcessChatTurnBridge {
                                 return;
                             }
                         };
+                        provider_attempt_inventory = Some(invocation.clone());
                         let attempt_observer = invocation.attempt_observer_arc();
 
                         match call_llm_stream_with_attempt_observer(
@@ -3198,8 +3350,68 @@ impl InProcessChatTurnBridge {
                         )
                         .await
                         {
-                            Ok(s) => s.boxed(),
+                            Ok(s) => {
+                                let provider_attempts = invocation.provider_attempt_facts().await;
+                                if provider_attempts.is_empty() {
+                                    let error = bridge_stream_terminal_error(
+                                        astra_core::ErrorKind::ContractViolation,
+                                        "provider stream opened without a durably admitted physical request identity",
+                                    );
+                                    if let Err(ledger_error) =
+                                        finish_active_bridge_inference_error(
+                                            &active_inference,
+                                            &error,
+                                        )
+                                        .await
+                                    {
+                                        yield render_classified_error_sse(
+                                            &ledger_error,
+                                            "inference_ledger",
+                                            false,
+                                        );
+                                    } else {
+                                        yield render_classified_error_sse(
+                                            &error,
+                                            "provider_request_identity",
+                                            false,
+                                        );
+                                    }
+                                    mark_disconnect_capture_finalized(
+                                        &disconnect_capture_state,
+                                    );
+                                    return;
+                                }
+                                crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
+                                    &mut bridge_manifest_trace_json,
+                                    &provider_attempts,
+                                    prompt_round,
+                                );
+                                provider_request_round = prompt_round;
+                                yield render_sse(
+                                    &crate::turn::llm::context::context_meta_event_with_compactions(
+                                        &breakdown,
+                                        Some(&bridge_manifest_trace_json),
+                                        &context_compactions,
+                                    ),
+                                );
+                                s.boxed()
+                            }
                             Err(e) if e.kind == astra_core::ErrorKind::ContextWindow => {
+                            let provider_attempts = invocation.provider_attempt_facts().await;
+                            if !provider_attempts.is_empty() {
+                                crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
+                                    &mut bridge_manifest_trace_json,
+                                    &provider_attempts,
+                                    prompt_round,
+                                );
+                                yield render_sse(
+                                    &crate::turn::llm::context::context_meta_event_with_compactions(
+                                        &breakdown,
+                                        Some(&bridge_manifest_trace_json),
+                                        &context_compactions,
+                                    ),
+                                );
+                            }
                             record_full_llm_response_event(
                                 &mut turn_event_buffer,
                                 full_llm_capture,
@@ -3277,16 +3489,18 @@ impl InProcessChatTurnBridge {
                                     overrides,
                                 )
                                 .await;
-                            if let Some(observation) = observe_context_compaction(
+                            if let Some(observation) =
+                                crate::turn::wire_assembly::observe_context_compaction(
                                 format!(
                                     "context_window_retry:{round_ix}:{attempt_in_round}"
                                 ),
-                                "context_window_retry",
+                                astra_turn_core::compaction_types::CompactionKind::WireContextRetry,
                                 &retry_compaction_history,
                                 &compact_result,
                                 system_prefix,
                                 &round_edge_tools,
-                            ) {
+                            )
+                            {
                                 context_compactions.push(observation);
                             }
 
@@ -3317,6 +3531,9 @@ impl InProcessChatTurnBridge {
                                 &cache_cfg,
                                 &always_load_tool_names_for_bridge(&edge_profile),
                             );
+                            crate::turn::llm::context::clear_manifest_provider_request(
+                                &mut bridge_manifest_trace_json,
+                            );
                             crate::turn::llm::context::augment_manifest_trace_with_wire(
                                 &mut bridge_manifest_trace_json,
                                 &llm_messages,
@@ -3330,11 +3547,6 @@ impl InProcessChatTurnBridge {
                                 model_context_window,
                                 max_output_tokens / 2,
                             );
-                            yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
-                                &breakdown,
-                                Some(&bridge_manifest_trace_json),
-                                &context_compactions,
-                            ));
                             attempt_in_round = attempt_in_round.saturating_add(1);
                             record_full_llm_request_event(
                                 &mut turn_event_buffer,
@@ -3351,42 +3563,64 @@ impl InProcessChatTurnBridge {
                                 &pruned_tools,
                                 Some(max_output_tokens / 2),
                             );
-                            if let Ok(prompt_request_plan) =
-                                astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                            let prompt_round = turn_event_buffer
+                                .as_ref()
+                                .map(|buffer| buffer.current_round())
+                                .unwrap_or(round_index);
+                            let prompt_request_plan =
+                                match astra_services::plan_prompt_request(
+                                    astra_services::PromptRequestPlanInput {
                                     user_id: &user_id,
                                     session_id: &session_id,
                                     turn: trace_turn,
-                                    round: turn_event_buffer
-                                        .as_ref()
-                                        .map(|buffer| buffer.current_round())
-                                        .unwrap_or(round_index),
+                                    round: prompt_round,
                                     attempt: attempt_in_round,
                                     source: "bridge_inprocess",
                                     messages: &llm_messages,
                                     tools: &pruned_tools,
                                     max_output_tokens: Some(max_output_tokens / 2),
-                                })
-                            {
-                                crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
-                                    "bridge_inprocess retry capture",
-                                    shared_pool.clone(),
-                                    astra_services::PromptRequestPersistInput {
-                                        session_id: session_id.clone(),
-                                        user_id: user_id.clone(),
-                                        run_id: Some(run_id.clone()),
-                                        turn: trace_turn,
-                                        round: turn_event_buffer
-                                            .as_ref()
-                                            .map(|buffer| buffer.current_round())
-                                            .unwrap_or(round_index),
-                                        attempt: attempt_in_round,
-                                        source: "bridge_inprocess".to_string(),
-                                        model: request_capture_model.clone(),
-                                        provider: provider.clone(),
                                     },
-                                    prompt_request_plan,
-                                );
-                            }
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(error) => {
+                                        let error = bridge_stream_terminal_error(
+                                            astra_core::ErrorKind::ContractViolation,
+                                            format!(
+                                                "failed to plan retry prompt delta projection: {error}"
+                                            ),
+                                        );
+                                        yield render_classified_error_sse(
+                                            &error,
+                                            "prompt_delta_projection",
+                                            false,
+                                        );
+                                        mark_disconnect_capture_finalized(
+                                            &disconnect_capture_state,
+                                        );
+                                        return;
+                                    }
+                                };
+                            yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
+                                &breakdown,
+                                Some(&bridge_manifest_trace_json),
+                                &context_compactions,
+                            ));
+                            crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                                "bridge_inprocess retry capture",
+                                shared_pool.clone(),
+                                astra_services::PromptRequestPersistInput {
+                                    session_id: session_id.clone(),
+                                    user_id: user_id.clone(),
+                                    run_id: Some(run_id.clone()),
+                                    turn: trace_turn,
+                                    round: prompt_round,
+                                    attempt: attempt_in_round,
+                                    source: "bridge_inprocess".to_string(),
+                                    model: request_capture_model.clone(),
+                                    provider: provider.clone(),
+                                },
+                                prompt_request_plan,
+                            );
 
                             // Retry LLM call
                             match call_llm_stream_with_attempt_observer(
@@ -3415,12 +3649,73 @@ impl InProcessChatTurnBridge {
                             )
                             .await
                             {
-                                Ok(s) => s.boxed(),
-                                Err(e2) => {
-                                    if let Err(ledger_error) =
-                                        finish_active_bridge_inference_error(&active_inference, &e2)
+                                Ok(s) => {
+                                    let provider_attempts =
+                                        invocation.provider_attempt_facts().await;
+                                    if provider_attempts.is_empty() {
+                                        let error = bridge_stream_terminal_error(
+                                            astra_core::ErrorKind::ContractViolation,
+                                            "provider retry stream opened without a durably admitted physical request identity",
+                                        );
+                                        if let Err(ledger_error) =
+                                            finish_active_bridge_inference_error(
+                                                &active_inference,
+                                                &error,
+                                            )
                                             .await
+                                        {
+                                            yield render_classified_error_sse(
+                                                &ledger_error,
+                                                "inference_ledger",
+                                                false,
+                                            );
+                                        } else {
+                                            yield render_classified_error_sse(
+                                                &error,
+                                                "provider_request_identity",
+                                                false,
+                                            );
+                                        }
+                                        mark_disconnect_capture_finalized(
+                                            &disconnect_capture_state,
+                                        );
+                                        return;
+                                    }
+                                    crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
+                                        &mut bridge_manifest_trace_json,
+                                        &provider_attempts,
+                                        prompt_round,
+                                    );
+                                    provider_request_round = prompt_round;
+                                    yield render_sse(
+                                        &crate::turn::llm::context::context_meta_event_with_compactions(
+                                            &breakdown,
+                                            Some(&bridge_manifest_trace_json),
+                                            &context_compactions,
+                                        ),
+                                    );
+                                    s.boxed()
+                                }
+                                Err(e2) => {
+                                    let settlement =
+                                        finish_active_bridge_inference_error(&active_inference, &e2)
+                                            .await;
+                                    if refresh_bridge_provider_attempt_trace(
+                                        Some(&invocation),
+                                        &mut bridge_manifest_trace_json,
+                                        prompt_round,
+                                    )
+                                    .await
                                     {
+                                        yield render_sse(
+                                            &crate::turn::llm::context::context_meta_event_with_compactions(
+                                                &breakdown,
+                                                Some(&bridge_manifest_trace_json),
+                                                &context_compactions,
+                                            ),
+                                        );
+                                    }
+                                    if let Err(ledger_error) = settlement {
                                         yield render_classified_error_sse(
                                             &ledger_error,
                                             "inference_ledger",
@@ -3500,9 +3795,24 @@ impl InProcessChatTurnBridge {
                             }
                         }
                             Err(e) => {
-                            if let Err(ledger_error) =
-                                finish_active_bridge_inference_error(&active_inference, &e).await
+                            let settlement =
+                                finish_active_bridge_inference_error(&active_inference, &e).await;
+                            if refresh_bridge_provider_attempt_trace(
+                                Some(&invocation),
+                                &mut bridge_manifest_trace_json,
+                                prompt_round,
+                            )
+                            .await
                             {
+                                yield render_sse(
+                                    &crate::turn::llm::context::context_meta_event_with_compactions(
+                                        &breakdown,
+                                        Some(&bridge_manifest_trace_json),
+                                        &context_compactions,
+                                    ),
+                                );
+                            }
+                            if let Err(ledger_error) = settlement {
                                 yield render_classified_error_sse(
                                     &ledger_error,
                                     "inference_ledger",
@@ -3605,6 +3915,7 @@ impl InProcessChatTurnBridge {
                             partial_reasoning: loop_reasoning.clone(),
                             partial_tool_calls: loop_tool_calls.clone(),
                             usage: usage.clone(),
+                            provider_response_id: provider_response_id.clone(),
                         },
                     );
 
@@ -3646,20 +3957,10 @@ impl InProcessChatTurnBridge {
                                         &mut provider_response_id,
                                     ) {
                                         Ok(chunks) => {
-                                            for b in chunks {
-                                                if terminal_error_event.is_none() {
-                                                    terminal_error_event = forwarded_sse_error_event(&b);
-                                                }
-                                                if !ttft_logged && !loop_text.is_empty() {
-                                                    tracing::debug!(
-                                                        target: "astra_timing",
-                                                        elapsed_ms = turn_started.elapsed().as_millis(),
-                                                        "first text token (TTFT from stream start)"
-                                                    );
-                                                    ttft_logged = true;
-                                                }
-                                                yield b;
-                                            }
+                                            // Publish the accumulated provider facts before
+                                            // yielding bytes. Dropping the response body at a
+                                            // yield point must not leave the disconnect owner
+                                            // with an older partial snapshot.
                                             update_disconnect_capture_snapshot(
                                                 &disconnect_capture_state,
                                                 DisconnectCaptureSnapshot {
@@ -3683,21 +3984,53 @@ impl InProcessChatTurnBridge {
                                                     partial_reasoning: loop_reasoning.clone(),
                                                     partial_tool_calls: loop_tool_calls.clone(),
                                                     usage: usage.clone(),
+                                                    provider_response_id: provider_response_id.clone(),
                                                 },
                                             );
+                                            for b in chunks {
+                                                if terminal_error_event.is_none() {
+                                                    terminal_error_event = forwarded_sse_error_event(&b);
+                                                }
+                                                if !ttft_logged && !loop_text.is_empty() {
+                                                    tracing::debug!(
+                                                        target: "astra_timing",
+                                                        elapsed_ms = turn_started.elapsed().as_millis(),
+                                                        "first text token (TTFT from stream start)"
+                                                    );
+                                                    ttft_logged = true;
+                                                }
+                                                yield b;
+                                            }
                                         }
                                         Err(msg) => {
                                             let inference_error = bridge_stream_terminal_error(
                                                 astra_core::ErrorKind::StreamTransport,
                                                 format!("invalid provider SSE block: {msg}"),
                                             );
-                                            if let Err(ledger_error) =
-                                                finish_active_bridge_inference_error(
+                                            let settlement =
+                                                finish_active_bridge_inference_error_with_partial(
                                                     &active_inference,
                                                     &inference_error,
+                                                    &usage,
+                                                    provider_response_id.clone(),
                                                 )
-                                                .await
+                                                .await;
+                                            if refresh_bridge_provider_attempt_trace(
+                                                provider_attempt_inventory.as_ref(),
+                                                &mut bridge_manifest_trace_json,
+                                                provider_request_round,
+                                            )
+                                            .await
                                             {
+                                                yield render_sse(
+                                                    &crate::turn::llm::context::context_meta_event_with_compactions(
+                                                        &breakdown,
+                                                        Some(&bridge_manifest_trace_json),
+                                                        &context_compactions,
+                                                    ),
+                                                );
+                                            }
+                                            if let Err(ledger_error) = settlement {
                                                 yield render_classified_error_sse(
                                                     &ledger_error,
                                                     "inference_ledger",
@@ -3801,25 +4134,19 @@ impl InProcessChatTurnBridge {
                     };
                     match tail_result {
                         Ok(chunks) => {
-                            for b in chunks {
-                                if terminal_error_event.is_none() {
-                                    terminal_error_event = forwarded_sse_error_event(&b);
-                                }
-                                yield b;
-                            }
                             update_disconnect_capture_snapshot(
                                 &disconnect_capture_state,
-                        DisconnectCaptureSnapshot {
-                            started: true,
-                            finalized: false,
-                            session_id: session_id.clone(),
-                            user_id: user_id.clone(),
-                            turn: trace_turn,
-                            session_turn_source: trace_turn_source.to_string(),
-                            turn_chain_id: turn_chain_id.clone(),
-                            user_query_event_id: user_query_event_id.clone(),
-                            round_ix: capture_round_ix,
-                            agent_id: agent_id.clone(),
+                                DisconnectCaptureSnapshot {
+                                    started: true,
+                                    finalized: false,
+                                    session_id: session_id.clone(),
+                                    user_id: user_id.clone(),
+                                    turn: trace_turn,
+                                    session_turn_source: trace_turn_source.to_string(),
+                                    turn_chain_id: turn_chain_id.clone(),
+                                    user_query_event_id: user_query_event_id.clone(),
+                                    round_ix: capture_round_ix,
+                                    agent_id: agent_id.clone(),
                                     model_name: model_name.clone(),
                                     resolved_model: resolved_model.clone(),
                                     provider: provider.clone(),
@@ -3830,20 +4157,45 @@ impl InProcessChatTurnBridge {
                                     partial_reasoning: loop_reasoning.clone(),
                                     partial_tool_calls: loop_tool_calls.clone(),
                                     usage: usage.clone(),
+                                    provider_response_id: provider_response_id.clone(),
                                 },
                             );
+                            for b in chunks {
+                                if terminal_error_event.is_none() {
+                                    terminal_error_event = forwarded_sse_error_event(&b);
+                                }
+                                yield b;
+                            }
                         }
                         Err(msg) => {
                             let inference_error = bridge_stream_terminal_error(
                                 astra_core::ErrorKind::StreamTransport,
                                 format!("invalid provider SSE tail: {msg}"),
                             );
-                            if let Err(ledger_error) = finish_active_bridge_inference_error(
+                            let settlement =
+                                finish_active_bridge_inference_error_with_partial(
                                 &active_inference,
                                 &inference_error,
+                                &usage,
+                                provider_response_id.clone(),
+                            )
+                            .await;
+                            if refresh_bridge_provider_attempt_trace(
+                                provider_attempt_inventory.as_ref(),
+                                &mut bridge_manifest_trace_json,
+                                provider_request_round,
                             )
                             .await
                             {
+                                yield render_sse(
+                                    &crate::turn::llm::context::context_meta_event_with_compactions(
+                                        &breakdown,
+                                        Some(&bridge_manifest_trace_json),
+                                        &context_compactions,
+                                    ),
+                                );
+                            }
+                            if let Err(ledger_error) = settlement {
                                 yield render_classified_error_sse(
                                     &ledger_error,
                                     "inference_ledger",
@@ -3929,29 +4281,50 @@ impl InProcessChatTurnBridge {
                             .and_then(Value::as_str)
                             .unwrap_or("stream_error")
                             .to_string();
-                        if error_code != "inference_ledger" {
-                            let inference_error = if cc.is_cancelled() {
-                                bridge_client_disconnect_error()
-                            } else {
-                                bridge_stream_terminal_error(
-                                    forwarded_sse_error_kind(&error_event),
-                                    error_message.clone(),
-                                )
-                            };
-                            if let Err(ledger_error) = finish_active_bridge_inference_error(
+                        let inference_error = if cc.is_cancelled() {
+                            bridge_client_disconnect_error()
+                        } else if error_code == "inference_ledger" {
+                            bridge_forwarded_inference_ledger_error(
+                                forwarded_sse_error_kind(&error_event),
+                                error_message.clone(),
+                            )
+                        } else {
+                            bridge_stream_terminal_error(
+                                forwarded_sse_error_kind(&error_event),
+                                error_message.clone(),
+                            )
+                        };
+                        let settlement =
+                            finish_active_bridge_inference_error_with_partial(
                                 &active_inference,
                                 &inference_error,
+                                &usage,
+                                provider_response_id.clone(),
                             )
-                            .await
-                            {
-                                yield render_classified_error_sse(
-                                    &ledger_error,
-                                    "inference_ledger",
-                                    false,
-                                );
-                                mark_disconnect_capture_finalized(&disconnect_capture_state);
-                                return;
-                            }
+                            .await;
+                        if refresh_bridge_provider_attempt_trace(
+                            provider_attempt_inventory.as_ref(),
+                            &mut bridge_manifest_trace_json,
+                            provider_request_round,
+                        )
+                        .await
+                        {
+                            yield render_sse(
+                                &crate::turn::llm::context::context_meta_event_with_compactions(
+                                    &breakdown,
+                                    Some(&bridge_manifest_trace_json),
+                                    &context_compactions,
+                                ),
+                            );
+                        }
+                        if let Err(ledger_error) = settlement {
+                            yield render_classified_error_sse(
+                                &ledger_error,
+                                "inference_ledger",
+                                false,
+                            );
+                            mark_disconnect_capture_finalized(&disconnect_capture_state);
+                            return;
                         }
                         record_full_llm_response_event(
                             &mut turn_event_buffer,
@@ -4017,12 +4390,30 @@ impl InProcessChatTurnBridge {
                             astra_core::ErrorKind::StreamTransport,
                             "LLM stream ended without a completion summary",
                         );
-                        if let Err(ledger_error) = finish_active_bridge_inference_error(
-                            &active_inference,
-                            &inference_error,
+                        let settlement =
+                            finish_active_bridge_inference_error_with_partial(
+                                &active_inference,
+                                &inference_error,
+                                &usage,
+                                provider_response_id.clone(),
+                            )
+                            .await;
+                        if refresh_bridge_provider_attempt_trace(
+                            provider_attempt_inventory.as_ref(),
+                            &mut bridge_manifest_trace_json,
+                            provider_request_round,
                         )
                         .await
                         {
+                            yield render_sse(
+                                &crate::turn::llm::context::context_meta_event_with_compactions(
+                                    &breakdown,
+                                    Some(&bridge_manifest_trace_json),
+                                    &context_compactions,
+                                ),
+                            );
+                        }
+                        if let Err(ledger_error) = settlement {
                             yield render_classified_error_sse(
                                 &ledger_error,
                                 "inference_ledger",
@@ -4095,6 +4486,22 @@ impl InProcessChatTurnBridge {
                         return;
                     }
 
+                    if refresh_bridge_provider_attempt_trace(
+                        provider_attempt_inventory.as_ref(),
+                        &mut bridge_manifest_trace_json,
+                        provider_request_round,
+                    )
+                    .await
+                    {
+                        yield render_sse(
+                            &crate::turn::llm::context::context_meta_event_with_compactions(
+                                &breakdown,
+                                Some(&bridge_manifest_trace_json),
+                                &context_compactions,
+                            ),
+                        );
+                    }
+
                     let successful_usage =
                         crate::turn::token_usage::TokenUsage::from_partial_json_map(&usage);
                     let terminal = astra_services::InferenceInvocationTerminal::succeeded(
@@ -4162,9 +4569,8 @@ impl InProcessChatTurnBridge {
                 // total billable input (fresh + cached + creation). Cache hits still occupy
                 // context, so including them is the honest metric here.
                 let billable_input = usage_snapshot
-                    .input_tokens
-                    .saturating_add(usage_snapshot.cached_input_tokens)
-                    .saturating_add(usage_snapshot.cache_creation_tokens);
+                    .normalized_prompt_cache_usage()
+                    .total_input_tokens();
                 if billable_input > 0 {
                     last_measured_prompt = Some(billable_input);
                 }
@@ -4931,6 +5337,12 @@ impl InProcessChatTurnBridge {
             for await chunk in stream {
                 yield Ok::<_, std::io::Error>(chunk);
             }
+            // `[DONE]` is owned by this transport producer, not by provider
+            // streams or business terminal events. Reaching this point means
+            // the inner producer completed normally, including after emitting
+            // a classified error; abnormal termination never reaches this
+            // boundary.
+            yield Ok::<_, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
         };
         let body = Body::from_stream(body_stream);
         Ok(Response::builder()
@@ -4950,6 +5362,31 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(ToString::to_string)
+}
+
+fn optional_exact_bridge_identity_header(
+    headers: &HeaderMap,
+    name: &'static str,
+    max_bytes: usize,
+) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(raw_value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = raw_value.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("bridge header {name} must be valid visible text"),
+        )
+    })?;
+    if !is_exact_bridge_identity(value, max_bytes) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "bridge header {name} must be an exact non-empty identity of at most {max_bytes} bytes without leading/trailing whitespace or control characters"
+            ),
+        ));
+    }
+    Ok(Some(value.to_string()))
 }
 
 fn required_bridge_header(
@@ -5075,7 +5512,7 @@ impl Drop for CancelOnDrop {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct DisconnectCaptureSnapshot {
     started: bool,
     finalized: bool,
@@ -5097,12 +5534,50 @@ struct DisconnectCaptureSnapshot {
     partial_reasoning: String,
     partial_tool_calls: Vec<Value>,
     usage: Map<String, Value>,
+    provider_response_id: Option<String>,
+}
+
+impl Clone for DisconnectCaptureSnapshot {
+    fn clone(&self) -> Self {
+        record_bridge_disconnect_capture_clone(self);
+        Self {
+            started: self.started,
+            finalized: self.finalized,
+            session_id: self.session_id.clone(),
+            user_id: self.user_id.clone(),
+            turn: self.turn,
+            session_turn_source: self.session_turn_source.clone(),
+            turn_chain_id: self.turn_chain_id.clone(),
+            user_query_event_id: self.user_query_event_id.clone(),
+            round_ix: self.round_ix,
+            agent_id: self.agent_id.clone(),
+            model_name: self.model_name.clone(),
+            resolved_model: self.resolved_model.clone(),
+            provider: self.provider.clone(),
+            llm_messages: self.llm_messages.clone(),
+            pruned_tools: self.pruned_tools.clone(),
+            max_output_tokens: self.max_output_tokens,
+            partial_text: self.partial_text.clone(),
+            partial_reasoning: self.partial_reasoning.clone(),
+            partial_tool_calls: self.partial_tool_calls.clone(),
+            usage: self.usage.clone(),
+            provider_response_id: self.provider_response_id.clone(),
+        }
+    }
+}
+
+fn record_bridge_disconnect_capture_clone(snapshot: &DisconnectCaptureSnapshot) {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgeDisconnectCaptureClone,
+        &(&snapshot.llm_messages, &snapshot.pruned_tools),
+    );
 }
 
 fn update_disconnect_capture_snapshot(
     state: &Arc<Mutex<DisconnectCaptureSnapshot>>,
     snapshot: DisconnectCaptureSnapshot,
 ) {
+    record_bridge_disconnect_capture_clone(&snapshot);
     if let Ok(mut guard) = state.lock() {
         *guard = snapshot;
     }
@@ -5211,22 +5686,80 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
 
+    #[test]
+    fn disconnect_capture_clone_preserves_nested_wire_state() {
+        let snapshot = DisconnectCaptureSnapshot {
+            llm_messages: vec![json!({
+                "role": "user",
+                "content": {"text": "你好🚀", "parts": [1, true, null]}
+            })],
+            pruned_tools: vec![json!({
+                "type": "function",
+                "function": {"name": "读取", "parameters": {"type": "object"}}
+            })],
+            partial_tool_calls: vec![json!({"id": "call-1"})],
+            ..Default::default()
+        };
+
+        let cloned = snapshot.clone();
+
+        assert_eq!(cloned.llm_messages, snapshot.llm_messages);
+        assert_eq!(cloned.pruned_tools, snapshot.pruned_tools);
+        assert_eq!(cloned.partial_tool_calls, snapshot.partial_tool_calls);
+    }
+
     #[tokio::test]
     async fn active_inference_is_transferred_before_terminal_io() {
         let active = Arc::new(tokio::sync::Mutex::new(Some("invocation")));
 
         let settlement = settle_active_bridge_inference(&active, |owned| async move {
             assert_eq!(owned, "invocation");
-            Err::<(), _>("database unavailable")
+            Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::DatabaseError,
+                "database unavailable",
+            ))
         })
         .await
         .expect_err("settlement failure must remain observable");
 
-        assert_eq!(settlement, "database unavailable");
+        assert_eq!(settlement.message, "database unavailable");
         assert!(
             active.lock().await.is_none(),
             "a failed terminal write must not leave a stale invocation in the session slot"
         );
+    }
+
+    #[tokio::test]
+    async fn active_inference_terminal_io_outlives_a_cancelled_waiter() {
+        let active = Arc::new(tokio::sync::Mutex::new(Some("invocation")));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let completed = Arc::new(tokio::sync::Notify::new());
+
+        let task_active = active.clone();
+        let task_started = started.clone();
+        let task_release = release.clone();
+        let task_completed = completed.clone();
+        let waiter = tokio::spawn(async move {
+            settle_active_bridge_inference(&task_active, move |owned| async move {
+                assert_eq!(owned, "invocation");
+                task_started.notify_one();
+                task_release.notified().await;
+                task_completed.notify_one();
+                Ok(())
+            })
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("detached terminal owner must start");
+        waiter.abort();
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), completed.notified())
+            .await
+            .expect("terminal IO must finish after its original waiter is cancelled");
+        assert!(active.lock().await.is_none());
     }
 
     fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
@@ -5245,6 +5778,17 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("bridge_chat_"));
         assert_eq!(first.len(), "bridge_chat_".len() + 32);
+    }
+
+    #[test]
+    fn forwarded_ledger_error_keeps_the_durable_error_source() {
+        let error = bridge_forwarded_inference_ledger_error(
+            astra_core::ErrorKind::DatabaseError,
+            "provider terminal commit was unresolved",
+        );
+
+        assert!(crate::turn::llm::durable::is_ledger_error(&error));
+        assert_eq!(error.kind, astra_core::ErrorKind::DatabaseError);
     }
 
     #[test]
@@ -5463,6 +6007,41 @@ mod tests {
             .expect("collect response body")
             .to_bytes();
         String::from_utf8(body.to_vec()).expect("response body should be utf8")
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    fn assert_single_terminal_sse_done(body: &str) -> Vec<&str> {
+        let frames: Vec<_> = body
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty())
+            .collect();
+        assert!(
+            frames.len() >= 2,
+            "SSE response must contain an event followed by [DONE]: {body}"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.trim() == "data: [DONE]")
+                .count(),
+            1,
+            "SSE response must contain exactly one [DONE]: {body}"
+        );
+        assert_eq!(
+            frames.last().map(|frame| frame.trim()),
+            Some("data: [DONE]"),
+            "[DONE] must be the last non-empty SSE frame: {body}"
+        );
+        frames
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    fn json_from_sse_frame(frame: &str) -> Value {
+        let data = frame
+            .trim()
+            .strip_prefix("data: ")
+            .expect("typed SSE frame must use a data line");
+        serde_json::from_str(data).expect("typed SSE frame must contain JSON")
     }
 
     #[derive(Default)]
@@ -5851,9 +6430,9 @@ mod tests {
             runtime_contexts: Vec::new(),
         };
 
-        let observation = observe_context_compaction(
+        let observation = crate::turn::wire_assembly::observe_context_compaction(
             "initial",
-            "initial",
+            astra_turn_core::compaction_types::CompactionKind::WireAssembly,
             &before,
             &result,
             &[json!({"role": "system", "content": "stable"})],
@@ -5862,8 +6441,14 @@ mod tests {
         .expect("boundary must produce one observation");
 
         assert_eq!(observation.id, "initial");
-        assert_eq!(observation.phase, "initial");
-        assert_eq!(observation.tier, "compact_history");
+        assert_eq!(
+            observation.kind,
+            astra_turn_core::compaction_types::CompactionKind::WireAssembly
+        );
+        assert_eq!(
+            observation.tier,
+            crate::prompts::CompactionTier::CompactHistory
+        );
         assert_eq!(observation.messages_before, 3);
         assert_eq!(observation.messages_after, 3);
         assert!(observation.tokens_before > observation.tokens_after);
@@ -5891,8 +6476,15 @@ mod tests {
         };
 
         assert!(
-            observe_context_compaction("initial", "initial", &messages, &result, &[], &[])
-                .is_none()
+            crate::turn::wire_assembly::observe_context_compaction(
+                "initial",
+                astra_turn_core::compaction_types::CompactionKind::WireAssembly,
+                &messages,
+                &result,
+                &[],
+                &[]
+            )
+            .is_none()
         );
     }
 
@@ -6699,6 +7291,49 @@ mod tests {
     }
 
     #[test]
+    fn exact_bridge_identity_header_is_optional_but_never_normalized() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            optional_exact_bridge_identity_header(
+                &headers,
+                "x-mo-turn-chain-id",
+                BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES,
+            )
+            .expect("missing correlation header is optional"),
+            None
+        );
+
+        let exact = "c".repeat(BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mo-turn-chain-id", exact.parse().unwrap());
+        assert_eq!(
+            optional_exact_bridge_identity_header(
+                &headers,
+                "x-mo-turn-chain-id",
+                BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES,
+            )
+            .expect("bounded exact identity"),
+            Some(exact)
+        );
+
+        for invalid in [
+            " chain".to_string(),
+            "chain ".to_string(),
+            "c".repeat(BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES + 1),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-mo-turn-chain-id", invalid.parse().unwrap());
+            let error = optional_exact_bridge_identity_header(
+                &headers,
+                "x-mo-turn-chain-id",
+                BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES,
+            )
+            .expect_err("bridge identity must not be trimmed or truncated");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
     fn required_bridge_header_rejects_missing_or_blank_identity() {
         let mut headers = HeaderMap::new();
         let err = required_bridge_header(&headers, "x-mo-session-id")
@@ -6858,6 +7493,8 @@ mod tests {
         assert_eq!(event["type"], "session_info");
         assert_eq!(event["session_id"], "sess-1");
         assert_eq!(event["run_id"], "run-1");
+        assert_eq!(event["turn_chain_id"], "run-1");
+        assert_eq!(event["durable"], false);
     }
 
     // ── render_sse tests ────────────────────────────────────────────────
@@ -8048,12 +8685,33 @@ mod tests {
         let _env = EnvVarGuard::set("ASTRA_TEST_BRIDGE_SECRET", "bridge-journal-secret");
         let session_id = "00000000-0000-0000-0000-000000000132";
         let bridge = InProcessChatTurnBridge::new(bridge_test_matrixone(), bridge_test_encryptor());
-        let headers = bridge_test_headers(session_id, true);
+        let turn_chain_id = "00000000-0000-7000-8000-000000000132";
+        let mut headers = bridge_test_headers(session_id, true);
+        headers.insert("x-mo-turn-chain-id", turn_chain_id.parse().unwrap());
+        headers.insert(
+            "x-mo-user-query-event-id",
+            "00000000-0000-7000-8000-000000000133".parse().unwrap(),
+        );
 
         for (round_index, reply) in [(0_u32, "bridge round zero"), (1_u32, "bridge round one")] {
+            let (messages, tool_results) = if round_index == 0 {
+                (
+                    json!([{"role": "user", "content": "bridge round zero"}]),
+                    json!([]),
+                )
+            } else {
+                (
+                    json!([
+                        {"role": "assistant", "content": null, "tool_calls": [{"id": "call-1"}]},
+                        {"role": "tool", "tool_call_id": "call-1", "content": "done"}
+                    ]),
+                    json!([{"name": "bash", "output": "done"}]),
+                )
+            };
             let payload = json!({
                 "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-                "messages": [{"role": "user", "content": format!("bridge round {round_index}")}],
+                "messages": messages,
+                "tool_results": tool_results,
                 "edge_tools": [],
                 "round_index": round_index,
                 "test_llm_stream_blocks": [
@@ -8082,6 +8740,21 @@ mod tests {
                 .expect("bridge forward");
             let body = collect_response_body(response).await;
             assert!(body.contains(reply));
+            let frames = assert_single_terminal_sse_done(&body);
+            let turn_complete = json_from_sse_frame(frames[frames.len() - 2]);
+            assert_eq!(
+                turn_complete["type"], "turn_complete",
+                "turn_complete must immediately precede the transport terminator"
+            );
+            let session_info = frames
+                .iter()
+                .filter_map(|block| block.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data.trim()).ok())
+                .find(|event| event["type"] == "session_info")
+                .expect("bridge response must start with typed session_info");
+            assert_eq!(session_info["run_id"].as_str(), Some(turn_chain_id));
+            assert_eq!(session_info["turn_chain_id"].as_str(), Some(turn_chain_id));
+            assert_eq!(session_info["durable"].as_bool(), Some(false));
         }
 
         let llm_events = {
@@ -8170,6 +8843,10 @@ mod tests {
             .expect("bridge forward");
         let body = collect_response_body(response).await;
         assert!(body.contains("SSE_PARSE_ERROR"));
+        let frames = assert_single_terminal_sse_done(&body);
+        let error = json_from_sse_frame(frames[frames.len() - 2]);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["code"], "SSE_PARSE_ERROR");
 
         let journal = wait_for_journal_events(session_id).await;
         let llm_events: Vec<_> = journal

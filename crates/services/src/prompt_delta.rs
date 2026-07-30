@@ -355,6 +355,20 @@ pub async fn persist_prompt_request(
     }
 
     tx.commit().await.map_err(|error| error.to_string())?;
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_rows(
+            astra_core::history_work::HistoryWorkSite::PromptDeltaRows,
+            1_u64.saturating_add(delta_rows.len().try_into().unwrap_or(u64::MAX)),
+        );
+        let (unchanged_prefix_bytes, unchanged_prefix_rows) =
+            unchanged_prefix_work(input, &plan.request_id, &delta_rows);
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::PromptDeltaUnchangedPrefix,
+            unchanged_prefix_bytes,
+            unchanged_prefix_rows,
+            0,
+        );
+    }
     Ok(PromptRequestPersistResult {
         request_id: plan.request_id.clone(),
         request_hash: plan.request_hash.clone(),
@@ -533,6 +547,47 @@ struct PlannedPromptDelta {
     previous_chunk_hash: Option<String>,
 }
 
+fn string_bytes(value: &str) -> u64 {
+    value.len().try_into().unwrap_or(u64::MAX)
+}
+
+fn planned_prompt_delta_payload_bytes(
+    input: &PromptRequestPersistInput,
+    request_id: &str,
+    delta: &PlannedPromptDelta,
+) -> u64 {
+    [
+        string_bytes(&input.user_id),
+        string_bytes(&input.session_id),
+        string_bytes(request_id),
+        string_bytes(&delta.logical_key),
+        string_bytes(&delta.chunk_kind),
+        string_bytes(delta.op),
+        delta.chunk_id.as_deref().map_or(0, string_bytes),
+        delta.chunk_hash.as_deref().map_or(0, string_bytes),
+        delta.previous_chunk_hash.as_deref().map_or(0, string_bytes),
+        u64::try_from(std::mem::size_of::<i32>() * 2).unwrap_or(u64::MAX),
+    ]
+    .into_iter()
+    .fold(0_u64, u64::saturating_add)
+}
+
+fn unchanged_prefix_work(
+    input: &PromptRequestPersistInput,
+    request_id: &str,
+    delta_rows: &[PlannedPromptDelta],
+) -> (u64, u64) {
+    delta_rows
+        .iter()
+        .take_while(|delta| delta.op == "reuse")
+        .fold((0_u64, 0_u64), |(bytes, rows), delta| {
+            (
+                bytes.saturating_add(planned_prompt_delta_payload_bytes(input, request_id, delta)),
+                rows.saturating_add(1),
+            )
+        })
+}
+
 async fn load_previous_request_id(
     pool: &sqlx::Pool<sqlx::MySql>,
     input: &PromptRequestPersistInput,
@@ -571,9 +626,24 @@ async fn load_request_chunks(
     .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
-    rows.into_iter()
+    let chunks = rows
+        .into_iter()
         .map(|row| decode_existing_prompt_chunk(&row))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if astra_core::history_work::instrumentation_enabled() {
+        let bytes = chunks.iter().fold(0_u64, |total, chunk| {
+            total
+                .saturating_add(chunk.logical_key.len().try_into().unwrap_or(u64::MAX))
+                .saturating_add(chunk.chunk_hash.len().try_into().unwrap_or(u64::MAX))
+        });
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::PromptDeltaRead,
+            bytes,
+            chunks.len().try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
+    Ok(chunks)
 }
 
 struct PromptDeltaInsert<'a> {
@@ -624,6 +694,12 @@ fn build_chunk_plan(
     payload: &Value,
 ) -> Result<PromptChunkPlan, String> {
     let payload_json = astra_core::canonical_json_string(payload);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::PromptDeltaHash,
+            payload_json.len().try_into().unwrap_or(u64::MAX),
+        );
+    }
     let chunk_hash = sha256_hex(payload_json.as_bytes());
     Ok(PromptChunkPlan {
         logical_key: logical_key.to_string(),
@@ -675,9 +751,14 @@ fn content_kind(content: Option<&Value>) -> &'static str {
 }
 
 fn hash_json_value(value: &Value) -> Result<String, String> {
-    Ok(sha256_hex(
-        astra_core::canonical_json_string(value).as_bytes(),
-    ))
+    let canonical = astra_core::canonical_json_string(value);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::PromptDeltaHash,
+            canonical.len().try_into().unwrap_or(u64::MAX),
+        );
+    }
+    Ok(sha256_hex(canonical.as_bytes()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -824,6 +905,48 @@ mod tests {
         .expect("plan");
         assert_eq!(plan_a.request_hash, plan_b.request_hash);
         assert_eq!(plan_a.chunks[0].chunk_hash, plan_b.chunks[0].chunk_hash);
+    }
+
+    #[test]
+    fn unchanged_prefix_work_stops_at_first_changed_row() {
+        let input = PromptRequestPersistInput {
+            session_id: "session-1".to_string(),
+            user_id: "user-1".to_string(),
+            run_id: None,
+            turn: 2,
+            round: 0,
+            attempt: 0,
+            source: "test".to_string(),
+            model: "model".to_string(),
+            provider: "provider".to_string(),
+        };
+        let delta = |delta_seq, op| PlannedPromptDelta {
+            delta_seq,
+            logical_key: format!("message:{delta_seq}:user"),
+            chunk_kind: "message".to_string(),
+            position: delta_seq,
+            op,
+            chunk_id: Some(format!("chunk-{delta_seq}")),
+            chunk_hash: Some(format!("hash-{delta_seq}")),
+            previous_chunk_hash: Some(format!("previous-{delta_seq}")),
+        };
+        let rows = vec![
+            delta(0, "reuse"),
+            delta(1, "reuse"),
+            delta(2, "replace"),
+            delta(3, "reuse"),
+        ];
+
+        let (bytes, row_count) = unchanged_prefix_work(&input, "request-1", &rows);
+
+        assert_eq!(row_count, 2);
+        assert_eq!(
+            bytes,
+            planned_prompt_delta_payload_bytes(&input, "request-1", &rows[0]).saturating_add(
+                planned_prompt_delta_payload_bytes(&input, "request-1", &rows[1],)
+            ),
+            "a later reuse row is not part of the unchanged prefix"
+        );
     }
 
     #[test]

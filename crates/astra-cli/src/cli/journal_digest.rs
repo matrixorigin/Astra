@@ -1001,6 +1001,11 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
             total_duration_ms as f64 / n,
         )
     };
+    crate::cli::history_work::record_measured_work(
+        astra_core::history_work::HistoryWorkSite::CliJournalDigestMaterialization,
+        0,
+        events.len(),
+    );
 
     Ok(JournalDigest {
         schema_version: SCHEMA_VERSION,
@@ -1292,6 +1297,11 @@ pub(crate) fn run_digest(
     match fmt.as_str() {
         "json" => {
             let s = serde_json::to_string_pretty(&digest).map_err(|e| e.to_string())?;
+            crate::cli::history_work::record_existing_buffer(
+                astra_core::history_work::HistoryWorkSite::CliJournalDigestSerialization,
+                s.as_bytes(),
+                digest.turns.len(),
+            );
             println!("{s}");
         }
         "text" => print_text(&digest),

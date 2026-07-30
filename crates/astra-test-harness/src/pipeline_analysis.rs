@@ -141,9 +141,12 @@ fn raw_llm_response_cache_hit_ratio(event: &crate::session_capture::JournalEvent
         .get("cache_creation_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let total_input = input_tokens
-        .saturating_add(cache_read_tokens)
-        .saturating_add(cache_creation_tokens);
+    let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        input_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )
+    .total_input_tokens();
     if total_input == 0 {
         return None;
     }

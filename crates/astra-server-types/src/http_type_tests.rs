@@ -79,10 +79,6 @@ fn deserialization_applies_defaults() {
     assert!(q.after_updated_at.is_none());
     assert!(q.after_run_id.is_none());
 
-    // ChatRouteRequest
-    let q: ChatRouteRequest = serde_json::from_str("{}").unwrap();
-    assert_eq!(q.query, "");
-
     // LearningTriggerRequest
     let req: LearningTriggerRequest = serde_json::from_str("{}").unwrap();
     assert_eq!(req.days, 7);
@@ -103,6 +99,34 @@ fn deserialization_applies_defaults() {
     // FeedbackExportRequest
     let req: FeedbackExportRequest = serde_json::from_str("{}").unwrap();
     assert_eq!(req.format, "jsonl");
+}
+
+#[test]
+fn reauthentication_request_uses_closed_structured_purposes() {
+    let trust: AuthReauthenticateRequest = serde_json::from_value(json!({
+        "password": "correct horse battery staple",
+        "purpose": "device_trust"
+    }))
+    .unwrap();
+    assert_eq!(trust.purpose, ReauthenticationPurpose::DeviceTrust);
+
+    let reenroll: AuthReauthenticateRequest = serde_json::from_value(json!({
+        "password": "correct horse battery staple",
+        "purpose": "device_reenroll"
+    }))
+    .unwrap();
+    assert_eq!(reenroll.purpose, ReauthenticationPurpose::DeviceReenroll);
+
+    for invalid in [
+        json!({"password": "secret", "purpose": "trust this laptop"}),
+        json!({"password": "secret", "purpose": true}),
+        json!({"password": "secret", "purpose": "device_trust", "confirmed": true}),
+    ] {
+        assert!(
+            serde_json::from_value::<AuthReauthenticateRequest>(invalid).is_err(),
+            "reauthentication authority must not accept free-form intent or boolean self-attestation"
+        );
+    }
 }
 
 // ── deserialization with all fields ─────────────────────────────
@@ -622,12 +646,14 @@ fn cancel_run_response_serializes() {
 #[test]
 fn auth_token_response_serializes() {
     let resp = AuthTokenResponse {
+        user_id: "u1".into(),
         access_token: "at".into(),
         refresh_token: "rt".into(),
         token_type: "Bearer".into(),
         expires_in: 3600,
     };
     let v = serde_json::to_value(&resp).unwrap();
+    assert_eq!(v["user_id"], "u1");
     assert_eq!(v["access_token"], "at");
     assert_eq!(v["token_type"], "Bearer");
     assert_eq!(v["expires_in"], 3600);
@@ -1156,12 +1182,14 @@ fn auth_user_record_to_response() {
 #[test]
 fn auth_token_record_to_response() {
     let record = AuthTokenRecord {
+        user_id: "u1".into(),
         access_token: "access123".into(),
         refresh_token: "refresh456".into(),
         token_type: "Bearer".into(),
         expires_in: 7200,
     };
     let resp: AuthTokenResponse = record.into();
+    assert_eq!(resp.user_id, "u1");
     assert_eq!(resp.access_token, "access123");
     assert_eq!(resp.refresh_token, "refresh456");
     assert_eq!(resp.token_type, "Bearer");

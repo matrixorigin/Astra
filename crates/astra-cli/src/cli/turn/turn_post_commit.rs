@@ -37,6 +37,9 @@ pub(crate) struct TurnPostCommitJob {
     deferred_sidecars: Option<DeferredTurnSidecarWork>,
     plan_mirror: Option<PlanMirrorRefresh>,
     notification: Option<(notifications::NotificationConfig, Duration)>,
+    /// Keeps observed full-history payload residency accounted while this job
+    /// is waiting in the post-commit queue.
+    _queue_bytes: Option<astra_core::history_work::QueueBytesReservation>,
 }
 
 /// Result of a post-commit job. The event loop applies it only when the
@@ -97,6 +100,16 @@ pub(crate) fn prepare_turn_post_commit_job(
         deferred_sidecars: None,
         plan_mirror,
         notification,
+        _queue_bytes: None,
+    }
+}
+
+pub(crate) fn account_turn_post_commit_queue(job: &mut TurnPostCommitJob) {
+    if job._queue_bytes.is_none() {
+        job._queue_bytes = crate::cli::history_work::reserve_json_history_queue(
+            astra_core::history_work::HistoryWorkSite::CliPostCommitQueue,
+            &job.final_messages,
+        );
     }
 }
 
@@ -139,6 +152,9 @@ pub(crate) fn attach_deferred_sidecars(
 pub(crate) async fn execute_turn_post_commit_job(
     mut job: TurnPostCommitJob,
 ) -> TurnPostCommitCompletion {
+    // The worker has dequeued the job; keep execution-time ownership separate
+    // from queue residency.
+    job._queue_bytes = None;
     let started = Instant::now();
     let session_id = job.session_id.clone();
     let turn = job.turn;

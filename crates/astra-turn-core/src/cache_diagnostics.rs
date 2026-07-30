@@ -262,14 +262,35 @@ impl PromptStateSnapshot {
 /// Uses all `role=system` messages when present, otherwise falls back to the
 /// first message. Structured content arrays/objects are flattened into text using
 /// the same rules across CLI and runtime journal reconstruction.
+fn prompt_snapshot_scanned_input_bytes(
+    messages: &[serde_json::Value],
+) -> Result<u64, serde_json::Error> {
+    astra_core::history_work::serialized_bytes(messages)
+}
+
 #[must_use]
 pub fn prompt_snapshot_system_text_from_messages(messages: &[serde_json::Value]) -> String {
-    prompt_snapshot_selected_message_contents(messages)
+    let system_text = prompt_snapshot_selected_message_contents(messages)
         .into_iter()
         .map(prompt_snapshot_content_value_text)
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    if astra_core::history_work::instrumentation_enabled() {
+        match prompt_snapshot_scanned_input_bytes(messages) {
+            Ok(bytes) => astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::PromptCacheHistoryScan,
+                bytes,
+                u64::try_from(messages.len()).unwrap_or(u64::MAX),
+                0,
+            ),
+            Err(error) => astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::PromptCacheHistoryScan,
+                &error,
+            ),
+        }
+    }
+    system_text
 }
 
 /// Build a [`PromptStateSnapshot`] from a raw provider message list plus tool schemas.
@@ -1002,11 +1023,17 @@ fn hash_str(s: &str) -> u64 {
     hasher.finish()
 }
 
-struct HashWriter<'a>(&'a mut DefaultHasher);
+struct HashWriter<'a> {
+    hasher: &'a mut DefaultHasher,
+    bytes: u64,
+}
 
 impl std::io::Write for HashWriter<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf);
+        self.hasher.write(buf);
+        self.bytes = self
+            .bytes
+            .saturating_add(u64::try_from(buf.len()).unwrap_or(u64::MAX));
         Ok(buf.len())
     }
 
@@ -1017,22 +1044,58 @@ impl std::io::Write for HashWriter<'_> {
 
 fn hash_json_value(value: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    let mut writer = HashWriter(&mut hasher);
-    match serde_json::to_writer(&mut writer, value) {
-        Ok(()) => hasher.finish(),
-        Err(_) => hash_str(&value.to_string()),
+    let (serialization, serialized_bytes) = {
+        let mut writer = HashWriter {
+            hasher: &mut hasher,
+            bytes: 0,
+        };
+        let serialization = serde_json::to_writer(&mut writer, value);
+        (serialization, writer.bytes)
+    };
+    match serialization {
+        Ok(()) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    astra_core::history_work::HistoryWorkSite::PromptCacheHistoryScan,
+                    serialized_bytes,
+                    1,
+                    0,
+                );
+            }
+            hasher.finish()
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::PromptCacheHistoryScan,
+                &error,
+            );
+            hash_str(&value.to_string())
+        }
     }
 }
 
 fn hash_serialized_system_prompt(system_blocks: &[SerializedSystemBlock]) -> u64 {
     let mut hasher = DefaultHasher::new();
+    let mut hashed_bytes = 0_u64;
     for (idx, block) in system_blocks.iter().enumerate() {
         if idx > 0 {
             hasher.write(b"\n\n");
+            hashed_bytes = hashed_bytes.saturating_add(2);
         }
         hasher.write(block.text.as_bytes());
+        hashed_bytes =
+            hashed_bytes.saturating_add(u64::try_from(block.text.len()).unwrap_or(u64::MAX));
     }
     hasher.write_u8(0xff);
+    hashed_bytes = hashed_bytes.saturating_add(1);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::PromptCacheHistoryScan,
+            hashed_bytes,
+            u64::try_from(system_blocks.len()).unwrap_or(u64::MAX),
+            0,
+        );
+    }
     hasher.finish()
 }
 
@@ -1264,6 +1327,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn hash_writer_counts_the_exact_compact_json_stream() {
+        let value = json!({
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "α"}]},
+                {"role": "user", "content": {"nested": [true, 7, null]}}
+            ]
+        });
+        let expected = serde_json::to_vec(&value).expect("fixture serializes");
+        let mut hasher = DefaultHasher::new();
+        let mut writer = HashWriter {
+            hasher: &mut hasher,
+            bytes: 0,
+        };
+
+        serde_json::to_writer(&mut writer, &value).expect("hash stream serializes");
+
+        assert_eq!(
+            writer.bytes,
+            u64::try_from(expected.len()).unwrap_or(u64::MAX)
+        );
+    }
+
     fn make_tools(names: &[&str]) -> Vec<serde_json::Value> {
         names
             .iter()
@@ -1301,6 +1387,39 @@ mod tests {
         assert_eq!(
             prompt_snapshot_system_text_from_messages(&messages),
             "System rules\n\nSecond paragraph\n\ntail"
+        );
+    }
+
+    #[test]
+    fn prompt_snapshot_scan_measurement_counts_non_system_input_bytes() {
+        let messages = vec![
+            json!({"role": "system", "content": "S"}),
+            json!({"role": "user", "content": "用户输入".repeat(128)}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"large.rs\"}"
+                    }
+                }]
+            }),
+            json!({"role": "tool", "content": "evidence ".repeat(256)}),
+        ];
+        let output = prompt_snapshot_system_text_from_messages(&messages);
+        let scanned_bytes =
+            prompt_snapshot_scanned_input_bytes(&messages).expect("serialize scanned messages");
+
+        assert_eq!(output, "S");
+        assert_eq!(
+            scanned_bytes,
+            serde_json::to_vec(&messages).unwrap().len() as u64
+        );
+        assert!(
+            scanned_bytes > output.len() as u64,
+            "scan accounting must measure the input artifact, not selected system output"
         );
     }
 

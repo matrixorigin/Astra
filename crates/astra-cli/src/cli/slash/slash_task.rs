@@ -330,7 +330,14 @@ pub(crate) async fn handle_task_command(
             let bg_profile = profile.map(ToString::to_string);
             let bg_session_id = state.session_id.clone();
             let bg_model = state.model.clone();
-            let bg_history = state.history.clone();
+            let bg_history = crate::cli::history_work::clone_pair_history(
+                astra_core::history_work::HistoryWorkSite::CliTaskBackgroundHistoryClone,
+                &state.history,
+            );
+            let bg_history_queue_reservation = crate::cli::history_work::reserve_pair_history_queue(
+                astra_core::history_work::HistoryWorkSite::CliTaskBackgroundHistoryQueue,
+                &bg_history,
+            );
             let bg_cli_context = state.cli_context.clone();
             let bg_unified_skill_registry = state.unified_skill_registry.clone();
             let bg_messaging_metrics = state.messaging_metrics.clone();
@@ -365,6 +372,7 @@ pub(crate) async fn handle_task_command(
             // Spawn background task
             let bg_task_id = task_id.clone();
             tokio::spawn(async move {
+                let _bg_history_queue_reservation = bg_history_queue_reservation;
                 // Mark in-progress
                 let _ = svc_clone
                     .update_status(&bg_user_id, &bg_task_id, TaskStatus::InProgress)
@@ -420,6 +428,7 @@ pub(crate) async fn handle_task_command(
                     incremental_state: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: None,
+                    stream_json_emitter: None,
                     agent_live_event_sink: None,
                     approval_request_tx: None,
                     ask_user_request_tx: None,

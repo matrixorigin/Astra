@@ -1,5 +1,3 @@
-#[cfg(feature = "server")]
-mod chat_route;
 mod completions;
 #[cfg(feature = "server")]
 pub mod conflict_resolver;
@@ -19,6 +17,10 @@ pub mod ws_progress_callback;
 #[cfg(feature = "server")]
 use astra_core::{ErrorResponse, error_response};
 #[cfg(feature = "server")]
+use astra_services::auth::{
+    ReauthenticationProofRecord, ReauthenticationPurpose, ReauthenticationRequestData,
+};
+#[cfg(feature = "server")]
 use astra_services::auth::{SessionActivityCursor, SessionActivityRecord, SessionListCursor};
 #[cfg(feature = "server")]
 use astra_services::{
@@ -35,8 +37,6 @@ use axum::{Json, http::StatusCode};
 #[cfg(feature = "server")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "server")]
-pub use chat_route::{ChatRouteResponse, classify_chat_route};
 pub use completions::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, MAX_COMPLETION_OUTPUT_TOKENS,
@@ -82,10 +82,11 @@ pub struct AuthRefreshRequest {
 }
 
 #[cfg(feature = "server")]
-#[derive(Deserialize, Default)]
-pub struct ChatRouteRequest {
-    #[serde(default)]
-    pub query: String,
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthReauthenticateRequest {
+    pub password: String,
+    pub purpose: ReauthenticationPurpose,
 }
 
 #[cfg(feature = "server")]
@@ -369,6 +370,7 @@ pub struct AuthRegisterResponse {
 #[cfg(feature = "server")]
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthTokenResponse {
+    pub user_id: String,
     pub access_token: String,
     pub refresh_token: String,
     pub token_type: String,
@@ -379,6 +381,14 @@ pub struct AuthTokenResponse {
 #[derive(Serialize, PartialEq, Eq)]
 pub struct AuthLogoutResponse {
     pub message: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct AuthReauthenticateResponse {
+    pub proof: String,
+    pub purpose: ReauthenticationPurpose,
+    pub expires_in: u32,
 }
 
 #[cfg(feature = "server")]
@@ -1195,9 +1205,31 @@ impl From<AuthUserRecord> for AuthUserResponse {
 impl From<AuthTokenRecord> for AuthTokenResponse {
     fn from(value: AuthTokenRecord) -> Self {
         Self {
+            user_id: value.user_id,
             access_token: value.access_token,
             refresh_token: value.refresh_token,
             token_type: value.token_type,
+            expires_in: value.expires_in,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<AuthReauthenticateRequest> for ReauthenticationRequestData {
+    fn from(value: AuthReauthenticateRequest) -> Self {
+        Self {
+            password: value.password,
+            purpose: value.purpose,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<ReauthenticationProofRecord> for AuthReauthenticateResponse {
+    fn from(value: ReauthenticationProofRecord) -> Self {
+        Self {
+            proof: value.proof,
+            purpose: value.purpose,
             expires_in: value.expires_in,
         }
     }

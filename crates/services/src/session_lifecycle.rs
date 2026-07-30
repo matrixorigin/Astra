@@ -184,6 +184,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
         sql: "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
+        label: "session_device_challenges",
+        sql: "DELETE FROM session_device_challenges WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_device_leases",
         sql: "DELETE FROM session_device_leases WHERE session_id = ? AND user_id = ?",
     },

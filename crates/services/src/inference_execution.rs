@@ -29,6 +29,7 @@ pub struct InferenceInvocationInput {
 pub struct InferenceInvocationPlan {
     route_id: String,
     invocation_id: String,
+    admission_token: String,
     input: InferenceInvocationInput,
 }
 
@@ -39,6 +40,20 @@ pub struct InferenceProviderAttemptPlan {
     user_id: String,
     attempt_index: u32,
     provider: String,
+    admission_token: String,
+    wire: InferenceProviderWireIdentity,
+}
+
+/// Immutable identity of the exact serialized provider request body.
+///
+/// The runtime constructs this only after provider-specific request assembly.
+/// The service validates and persists it with the physical-attempt admission,
+/// before any network I/O is authorized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferenceProviderWireIdentity {
+    protocol: String,
+    provider_wire_hash: String,
+    provider_wire_bytes: u64,
 }
 
 impl InferenceInvocationPlan {
@@ -57,6 +72,80 @@ impl InferenceProviderAttemptPlan {
     #[must_use]
     pub fn attempt_id(&self) -> &str {
         &self.attempt_id
+    }
+
+    /// One provider request has exactly one physical-attempt identity.
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.attempt_id
+    }
+
+    #[must_use]
+    pub fn invocation_id(&self) -> &str {
+        &self.invocation_id
+    }
+
+    #[must_use]
+    pub fn attempt_index(&self) -> u32 {
+        self.attempt_index
+    }
+
+    #[must_use]
+    pub fn wire(&self) -> &InferenceProviderWireIdentity {
+        &self.wire
+    }
+}
+
+impl InferenceProviderWireIdentity {
+    pub fn new(
+        protocol: impl Into<String>,
+        provider_wire_hash: impl Into<String>,
+        provider_wire_bytes: u64,
+    ) -> ServiceResult<Self> {
+        let protocol = protocol.into();
+        if !matches!(
+            protocol.as_str(),
+            "openai_compatible" | "anthropic_messages" | "bedrock_converse"
+        ) {
+            return Err(ServiceError::invalid(
+                "provider_protocol must be one of the typed transport protocols",
+            ));
+        }
+        let provider_wire_hash = provider_wire_hash.into();
+        if provider_wire_hash.len() != 64
+            || !provider_wire_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ServiceError::invalid(
+                "provider_wire_hash must be an exact lowercase SHA-256 hex digest",
+            ));
+        }
+        if provider_wire_bytes == 0 {
+            return Err(ServiceError::invalid(
+                "provider_wire_bytes must describe a non-empty serialized request",
+            ));
+        }
+        Ok(Self {
+            protocol,
+            provider_wire_hash,
+            provider_wire_bytes,
+        })
+    }
+
+    #[must_use]
+    pub fn protocol(&self) -> &str {
+        &self.protocol
+    }
+
+    #[must_use]
+    pub fn provider_wire_hash(&self) -> &str {
+        &self.provider_wire_hash
+    }
+
+    #[must_use]
+    pub fn provider_wire_bytes(&self) -> u64 {
+        self.provider_wire_bytes
     }
 }
 
@@ -136,6 +225,10 @@ fn hash_identity(namespace: &str, fields: &[&str]) -> String {
     format!("{namespace}-{}", &digest[..INFERENCE_ID_HEX_LEN])
 }
 
+fn new_admission_token() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 pub fn plan_inference_invocation(
     input: InferenceInvocationInput,
 ) -> ServiceResult<InferenceInvocationPlan> {
@@ -185,6 +278,7 @@ pub fn plan_inference_invocation(
     Ok(InferenceInvocationPlan {
         route_id,
         invocation_id,
+        admission_token: new_admission_token(),
         input,
     })
 }
@@ -193,6 +287,7 @@ pub fn plan_inference_invocation(
 pub fn plan_inference_provider_attempt(
     invocation: &InferenceInvocationPlan,
     attempt_index: u32,
+    wire: InferenceProviderWireIdentity,
 ) -> InferenceProviderAttemptPlan {
     let attempt_index_text = attempt_index.to_string();
     InferenceProviderAttemptPlan {
@@ -207,6 +302,8 @@ pub fn plan_inference_provider_attempt(
         user_id: invocation.input.user_id.clone(),
         attempt_index,
         provider: invocation.input.provider.clone(),
+        admission_token: new_admission_token(),
+        wire,
     }
 }
 
@@ -339,12 +436,22 @@ async fn ensure_invocation_scope(
     Ok(())
 }
 
-async fn existing_invocation_status(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistedInvocationAdmissionFact {
+    route_id: String,
+    admission_token: String,
+    status: String,
+    terminal_fingerprint: Option<String>,
+}
+
+async fn load_invocation_admission_fact(
     db: &sqlx::Pool<sqlx::MySql>,
     plan: &InferenceInvocationPlan,
-) -> ServiceResult<Option<String>> {
+) -> ServiceResult<Option<PersistedInvocationAdmissionFact>> {
     sqlx::query(
-        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ? LIMIT 1",
+        "SELECT route_id, admission_token, status, terminal_fingerprint
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? LIMIT 1",
     )
     .bind(&plan.input.user_id)
     .bind(&plan.invocation_id)
@@ -358,22 +465,65 @@ async fn existing_invocation_status(
         )
     })?
     .map(|row| {
-        row.try_get::<String, _>("status").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode existing inference invocation status",
-                error,
-            )
+        Ok::<_, sqlx::Error>(PersistedInvocationAdmissionFact {
+            route_id: row.try_get("route_id")?,
+            admission_token: row.try_get("admission_token")?,
+            status: row.try_get("status")?,
+            terminal_fingerprint: row.try_get("terminal_fingerprint")?,
         })
     })
     .transpose()
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference invocation admission fact",
+            error,
+        )
+    })
 }
 
-fn existing_invocation_error(plan: &InferenceInvocationPlan, status: &str) -> ServiceError {
+fn existing_invocation_error(
+    plan: &InferenceInvocationPlan,
+    persisted: &PersistedInvocationAdmissionFact,
+) -> ServiceError {
     ServiceError::conflict(format!(
         "inference invocation {} already exists with status {status}; provider delivery must not be repeated",
-        plan.invocation_id
+        plan.invocation_id,
+        status = persisted.status,
     ))
+}
+
+fn validate_ambiguous_invocation_admission(
+    persisted: &PersistedInvocationAdmissionFact,
+    plan: &InferenceInvocationPlan,
+) -> ServiceResult<()> {
+    let mut mismatches = Vec::new();
+    if persisted.route_id != plan.route_id {
+        mismatches.push("route_id");
+    }
+    if persisted.admission_token != plan.admission_token {
+        mismatches.push("admission_token");
+    }
+    if !mismatches.is_empty() {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {} commit resolved to a different admission owner: {}",
+            plan.invocation_id,
+            mismatches.join(", ")
+        )));
+    }
+    if persisted.status == "admitted" && persisted.terminal_fingerprint.is_none() {
+        return Ok(());
+    }
+    Err(ServiceError::conflict(format!(
+        "inference invocation {} commit resolved to status {} with terminal fingerprint {}; provider delivery is not authorized",
+        plan.invocation_id,
+        persisted.status,
+        if persisted.terminal_fingerprint.is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    )))
 }
 
 /// Durably admit one logical inference.
@@ -387,8 +537,8 @@ pub async fn admit_inference_invocation(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
     let db = pool.get();
-    if let Some(status) = existing_invocation_status(db, plan).await? {
-        return Err(existing_invocation_error(plan, &status));
+    if let Some(persisted) = load_invocation_admission_fact(db, plan).await? {
+        return Err(existing_invocation_error(plan, &persisted));
     }
 
     let mut tx = db.begin().await.map_err(|error| {
@@ -433,9 +583,9 @@ pub async fn admit_inference_invocation(
         sqlx::query(
             "INSERT INTO inference_invocations
              (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
-              turn_index,
+              admission_token, turn_index,
               round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
         )
         .bind(&plan.invocation_id)
         .bind(&plan.route_id)
@@ -444,6 +594,7 @@ pub async fn admit_inference_invocation(
         .bind(plan.input.scope.kind())
         .bind(plan.input.scope.run_id())
         .bind(plan.input.scope.harness_run_id())
+        .bind(&plan.admission_token)
         .bind(plan.input.scope.turn().map(i64::from))
         .bind(plan.input.scope.round().map(i64::from))
         .bind(plan.input.scope.operation_id())
@@ -465,8 +616,8 @@ pub async fn admit_inference_invocation(
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation").await;
-        match existing_invocation_status(db, plan).await {
-            Ok(Some(status)) => return Err(existing_invocation_error(plan, &status)),
+        match load_invocation_admission_fact(db, plan).await {
+            Ok(Some(persisted)) => return Err(existing_invocation_error(plan, &persisted)),
             Ok(None) => return Err(error),
             Err(status_err) => {
                 tracing::error!(
@@ -478,22 +629,49 @@ pub async fn admit_inference_invocation(
             }
         }
     }
-    tx.commit().await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "commit inference admission",
-            error,
-        )
-    })?;
-    Ok(())
+    let Err(error) = tx.commit().await else {
+        return Ok(());
+    };
+    let commit_error = ServiceError::with_source(
+        ServiceErrorKind::Persistence,
+        "commit inference admission",
+        error,
+    );
+    match load_invocation_admission_fact(db, plan).await {
+        Ok(Some(persisted)) => validate_ambiguous_invocation_admission(&persisted, plan),
+        Ok(None) => Err(commit_error),
+        Err(read_error) => {
+            tracing::warn!(
+                invocation_id = %plan.invocation_id,
+                %read_error,
+                "inference admission commit is unresolved after authoritative re-read failed"
+            );
+            Err(commit_error)
+        }
+    }
 }
 
-async fn existing_provider_attempt_status(
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PersistedProviderAttemptFact {
+    invocation_id: String,
+    attempt_index: i64,
+    provider: String,
+    admission_token: String,
+    provider_protocol: String,
+    provider_wire_hash: String,
+    provider_wire_bytes: i64,
+    status: String,
+    terminal_fingerprint: Option<String>,
+}
+
+async fn load_provider_attempt_fact(
     db: &sqlx::Pool<sqlx::MySql>,
     attempt: &InferenceProviderAttemptPlan,
-) -> ServiceResult<Option<String>> {
+) -> ServiceResult<Option<PersistedProviderAttemptFact>> {
     sqlx::query(
-        "SELECT status FROM inference_provider_attempts
+        "SELECT invocation_id, attempt_index, provider, admission_token, provider_protocol,
+                provider_wire_hash, provider_wire_bytes, status, terminal_fingerprint
+         FROM inference_provider_attempts
          WHERE user_id = ? AND attempt_id = ? LIMIT 1",
     )
     .bind(&attempt.user_id)
@@ -508,15 +686,112 @@ async fn existing_provider_attempt_status(
         )
     })?
     .map(|row| {
-        row.try_get::<String, _>("status").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode inference provider attempt status",
-                error,
-            )
+        Ok::<_, sqlx::Error>(PersistedProviderAttemptFact {
+            invocation_id: row.try_get("invocation_id")?,
+            attempt_index: row.try_get("attempt_index")?,
+            provider: row.try_get("provider")?,
+            admission_token: row.try_get("admission_token")?,
+            provider_protocol: row.try_get("provider_protocol")?,
+            provider_wire_hash: row.try_get("provider_wire_hash")?,
+            provider_wire_bytes: row.try_get("provider_wire_bytes")?,
+            status: row.try_get("status")?,
+            terminal_fingerprint: row.try_get("terminal_fingerprint")?,
         })
     })
     .transpose()
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference provider attempt fact",
+            error,
+        )
+    })
+}
+
+fn validate_persisted_provider_attempt_identity(
+    persisted: &PersistedProviderAttemptFact,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+) -> ServiceResult<()> {
+    let mut mismatches = Vec::new();
+    if persisted.invocation_id != attempt.invocation_id {
+        mismatches.push("invocation_id");
+    }
+    if persisted.attempt_index != i64::from(attempt.attempt_index) {
+        mismatches.push("attempt_index");
+    }
+    if persisted.provider != attempt.provider {
+        mismatches.push("provider");
+    }
+    if persisted.admission_token != attempt.admission_token {
+        mismatches.push("admission_token");
+    }
+    if persisted.provider_protocol != attempt.wire.protocol {
+        mismatches.push("provider_protocol");
+    }
+    if persisted.provider_wire_hash != attempt.wire.provider_wire_hash {
+        mismatches.push("provider_wire_hash");
+    }
+    if persisted.provider_wire_bytes != provider_wire_bytes {
+        mismatches.push("provider_wire_bytes");
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(ServiceError::conflict(format!(
+        "inference provider attempt {} has conflicting immutable fields: {}",
+        attempt.attempt_id,
+        mismatches.join(", ")
+    )))
+}
+
+fn validate_ambiguous_provider_attempt_admission(
+    persisted: &PersistedProviderAttemptFact,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+) -> ServiceResult<()> {
+    validate_persisted_provider_attempt_identity(persisted, attempt, provider_wire_bytes)?;
+    if persisted.status == "started" && persisted.terminal_fingerprint.is_none() {
+        return Ok(());
+    }
+    Err(ServiceError::conflict(format!(
+        "inference provider attempt {} commit resolved to status {} with terminal fingerprint {}; provider delivery is not authorized",
+        attempt.attempt_id,
+        persisted.status,
+        if persisted.terminal_fingerprint.is_some() {
+            "present"
+        } else {
+            "missing"
+        }
+    )))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistedProviderTerminalMatch {
+    Started,
+    ExactTerminal,
+}
+
+fn classify_persisted_provider_terminal(
+    persisted: &PersistedProviderAttemptFact,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+    terminal: &InferenceInvocationTerminal,
+    fingerprint: &str,
+) -> ServiceResult<PersistedProviderTerminalMatch> {
+    validate_persisted_provider_attempt_identity(persisted, attempt, provider_wire_bytes)?;
+    if persisted.status == "started" && persisted.terminal_fingerprint.is_none() {
+        return Ok(PersistedProviderTerminalMatch::Started);
+    }
+    if persisted.status == terminal.status.as_str()
+        && persisted.terminal_fingerprint.as_deref() == Some(fingerprint)
+    {
+        return Ok(PersistedProviderTerminalMatch::ExactTerminal);
+    }
+    Err(ServiceError::conflict(format!(
+        "inference provider attempt {} terminal fact conflicts with its durable status/fingerprint",
+        attempt.attempt_id
+    )))
 }
 
 /// Serialize the two mutually exclusive lifecycle decisions for one logical
@@ -570,11 +845,13 @@ pub async fn begin_inference_provider_attempt(
     pool: &SharedPool,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    if let Some(status) = existing_provider_attempt_status(db, attempt).await? {
+    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+        validate_persisted_provider_attempt_identity(&persisted, attempt, provider_wire_bytes)?;
         return Err(ServiceError::conflict(format!(
-            "inference provider attempt {} already exists with status {status}; provider delivery must not be repeated",
-            attempt.attempt_id
+            "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
+            attempt.attempt_id, persisted.status
         )));
     }
     let mut tx = db.begin().await.map_err(|error| {
@@ -617,9 +894,10 @@ pub async fn begin_inference_provider_attempt(
     let result = sqlx::query(
         "INSERT INTO inference_provider_attempts
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
-          provider, status, started_at, terminal_at)
+          provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
+          status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, 'started', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, 'started', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND NOT EXISTS (
@@ -632,28 +910,56 @@ pub async fn begin_inference_provider_attempt(
     .bind(&attempt.attempt_id)
     .bind(i64::from(attempt.attempt_index))
     .bind(&attempt.provider)
+    .bind(&attempt.admission_token)
+    .bind(&attempt.wire.protocol)
+    .bind(&attempt.wire.provider_wire_hash)
+    .bind(provider_wire_bytes)
     .bind(&attempt.user_id)
     .bind(&attempt.invocation_id)
     .execute(&mut *tx)
     .await;
     match result {
-        Ok(result) if result.rows_affected() == 1 => tx.commit().await.map_err(|error| {
-            ServiceError::with_source(
+        Ok(result) if result.rows_affected() == 1 => {
+            let Err(error) = tx.commit().await else {
+                return Ok(());
+            };
+            let commit_error = ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "commit inference provider attempt admission",
                 error,
-            )
-        }),
+            );
+            match load_provider_attempt_fact(db, attempt).await {
+                Ok(Some(persisted)) => validate_ambiguous_provider_attempt_admission(
+                    &persisted,
+                    attempt,
+                    provider_wire_bytes,
+                ),
+                Ok(None) => Err(commit_error),
+                Err(read_error) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.attempt_id,
+                        %read_error,
+                        "provider attempt admission commit is unresolved after authoritative re-read failed"
+                    );
+                    Err(commit_error)
+                }
+            }
+        }
         Ok(_) => Err(ServiceError::conflict(format!(
             "inference invocation {} is not admitted for provider attempt {}",
             attempt.invocation_id, attempt.attempt_id
         ))),
         Err(error) => {
             rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-            if let Some(status) = existing_provider_attempt_status(db, attempt).await? {
+            if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+                validate_persisted_provider_attempt_identity(
+                    &persisted,
+                    attempt,
+                    provider_wire_bytes,
+                )?;
                 Err(ServiceError::conflict(format!(
-                    "inference provider attempt {} already exists with status {status}; provider delivery must not be repeated",
-                    attempt.attempt_id
+                    "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
+                    attempt.attempt_id, persisted.status
                 )))
             } else {
                 Err(ServiceError::with_source(
@@ -666,37 +972,58 @@ pub async fn begin_inference_provider_attempt(
     }
 }
 
-async fn existing_provider_attempt_fingerprint(
+async fn record_successful_attempt_debt_if_needed(
     db: &sqlx::Pool<sqlx::MySql>,
     attempt: &InferenceProviderAttemptPlan,
-) -> ServiceResult<Option<String>> {
-    sqlx::query(
-        "SELECT terminal_fingerprint FROM inference_provider_attempts
-         WHERE user_id = ? AND attempt_id = ? LIMIT 1",
-    )
-    .bind(&attempt.user_id)
-    .bind(&attempt.attempt_id)
-    .fetch_optional(db)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "load inference provider attempt fingerprint",
-            error,
+    terminal: &InferenceInvocationTerminal,
+    terminal_state: &DurableInferenceTerminal,
+) -> ServiceResult<()> {
+    if terminal.status == InferenceTerminalStatus::Succeeded {
+        record_inference_settlement_debt(
+            db,
+            &attempt.user_id,
+            &attempt.invocation_id,
+            terminal_state,
+            SettlementDebtMode::RequireQuiescent,
         )
-    })?
-    .map(|row| {
-        row.try_get::<Option<String>, _>("terminal_fingerprint")
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "decode inference provider attempt fingerprint",
-                    error,
-                )
-            })
-    })
-    .transpose()
-    .map(Option::flatten)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn recover_provider_terminal_after_unknown_write(
+    db: &sqlx::Pool<sqlx::MySql>,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+    terminal: &InferenceInvocationTerminal,
+    terminal_state: &DurableInferenceTerminal,
+    fingerprint: &str,
+    original_error: ServiceError,
+) -> ServiceResult<()> {
+    match load_provider_attempt_fact(db, attempt).await {
+        Ok(Some(persisted)) => match classify_persisted_provider_terminal(
+            &persisted,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            fingerprint,
+        )? {
+            PersistedProviderTerminalMatch::ExactTerminal => {
+                record_successful_attempt_debt_if_needed(db, attempt, terminal, terminal_state)
+                    .await
+            }
+            PersistedProviderTerminalMatch::Started => Err(original_error),
+        },
+        Ok(None) => Err(original_error),
+        Err(read_error) => {
+            tracing::warn!(
+                attempt_id = %attempt.attempt_id,
+                %read_error,
+                "provider attempt terminal write is unresolved after authoritative re-read failed"
+            );
+            Err(original_error)
+        }
+    }
 }
 
 pub async fn finish_inference_provider_attempt(
@@ -706,33 +1033,34 @@ pub async fn finish_inference_provider_attempt(
 ) -> ServiceResult<()> {
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
+    let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    if let Some(existing) = existing_provider_attempt_fingerprint(db, attempt).await? {
-        return if existing == fingerprint {
-            if terminal.status == InferenceTerminalStatus::Succeeded {
-                record_inference_settlement_debt(
-                    db,
-                    &attempt.user_id,
-                    &attempt.invocation_id,
-                    &terminal_state,
-                    SettlementDebtMode::RequireQuiescent,
-                )
-                .await?;
+    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+        match classify_persisted_provider_terminal(
+            &persisted,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            &fingerprint,
+        )? {
+            PersistedProviderTerminalMatch::ExactTerminal => {
+                record_successful_attempt_debt_if_needed(db, attempt, terminal, &terminal_state)
+                    .await?;
+                return Ok(());
             }
-            Ok(())
-        } else {
-            Err(ServiceError::conflict(format!(
-                "inference provider attempt {} terminal payload conflicts with its durable result",
-                attempt.attempt_id
-            )))
-        };
+            PersistedProviderTerminalMatch::Started => {}
+        }
     }
     let update = sqlx::query(
         "UPDATE inference_provider_attempts
          SET status = ?, terminal_fingerprint = ?, provider_response_id = ?,
              input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
              cache_creation_tokens = ?, error_kind = ?, error_message = ?, terminal_at = NOW(6)
-         WHERE user_id = ? AND attempt_id = ? AND status = 'started'",
+         WHERE user_id = ? AND attempt_id = ?
+           AND invocation_id = ? AND attempt_index = ? AND provider = ?
+           AND admission_token = ? AND provider_protocol = ?
+           AND provider_wire_hash = ? AND provider_wire_bytes = ?
+           AND status = 'started'",
     )
     .bind(&terminal_state.status)
     .bind(&fingerprint)
@@ -744,7 +1072,14 @@ pub async fn finish_inference_provider_attempt(
     .bind(&terminal_state.error_kind)
     .bind(&terminal_state.error_message)
     .bind(&attempt.user_id)
-    .bind(&attempt.attempt_id);
+    .bind(&attempt.attempt_id)
+    .bind(&attempt.invocation_id)
+    .bind(i64::from(attempt.attempt_index))
+    .bind(&attempt.provider)
+    .bind(&attempt.admission_token)
+    .bind(&attempt.wire.protocol)
+    .bind(&attempt.wire.provider_wire_hash)
+    .bind(provider_wire_bytes);
 
     let result = if terminal.status == InferenceTerminalStatus::Succeeded {
         // A successful physical response is final. Persist its recovery debt in
@@ -764,60 +1099,98 @@ pub async fn finish_inference_provider_attempt(
             "record a successful provider terminal",
         )
         .await?;
-        let result = update.execute(&mut *tx).await.map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "finish inference provider attempt",
-                error,
-            )
-        })?;
-        if result.rows_affected() == 1 {
-            write_inference_settlement_debt(
+        let result = match update.execute(&mut *tx).await {
+            Ok(result) => result,
+            Err(error) => {
+                let write_error = ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "finish inference provider attempt",
+                    error,
+                );
+                rollback_inference_tx(tx, "finish successful inference provider attempt").await;
+                return recover_provider_terminal_after_unknown_write(
+                    db,
+                    attempt,
+                    provider_wire_bytes,
+                    terminal,
+                    &terminal_state,
+                    &fingerprint,
+                    write_error,
+                )
+                .await;
+            }
+        };
+        if result.rows_affected() == 1
+            && let Err(error) = write_inference_settlement_debt(
                 &mut tx,
                 &attempt.user_id,
                 &attempt.invocation_id,
                 &terminal_state,
             )
-            .await?;
+            .await
+        {
+            rollback_inference_tx(tx, "record successful inference settlement debt").await;
+            return Err(error);
         }
-        tx.commit().await.map_err(|error| {
-            ServiceError::with_source(
+        if let Err(error) = tx.commit().await {
+            let commit_error = ServiceError::with_source(
                 ServiceErrorKind::Persistence,
                 "commit successful inference provider terminal",
                 error,
+            );
+            return recover_provider_terminal_after_unknown_write(
+                db,
+                attempt,
+                provider_wire_bytes,
+                terminal,
+                &terminal_state,
+                &fingerprint,
+                commit_error,
             )
-        })?;
+            .await;
+        }
         result
     } else {
-        update.execute(db).await.map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "finish inference provider attempt",
-                error,
-            )
-        })?
+        match update.execute(db).await {
+            Ok(result) => result,
+            Err(error) => {
+                let write_error = ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "finish inference provider attempt",
+                    error,
+                );
+                return recover_provider_terminal_after_unknown_write(
+                    db,
+                    attempt,
+                    provider_wire_bytes,
+                    terminal,
+                    &terminal_state,
+                    &fingerprint,
+                    write_error,
+                )
+                .await;
+            }
+        }
     };
     if result.rows_affected() == 1 {
         return Ok(());
     }
-    if let Some(existing) = existing_provider_attempt_fingerprint(db, attempt).await? {
-        return if existing == fingerprint {
-            if terminal.status == InferenceTerminalStatus::Succeeded {
-                record_inference_settlement_debt(
-                    db,
-                    &attempt.user_id,
-                    &attempt.invocation_id,
-                    &terminal_state,
-                    SettlementDebtMode::RequireQuiescent,
-                )
-                .await?;
+    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+        return match classify_persisted_provider_terminal(
+            &persisted,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            &fingerprint,
+        )? {
+            PersistedProviderTerminalMatch::ExactTerminal => {
+                record_successful_attempt_debt_if_needed(db, attempt, terminal, &terminal_state)
+                    .await
             }
-            Ok(())
-        } else {
-            Err(ServiceError::conflict(format!(
-                "inference provider attempt {} terminal payload conflicts with its durable result",
+            PersistedProviderTerminalMatch::Started => Err(ServiceError::conflict(format!(
+                "inference provider attempt {} terminal update changed no started row",
                 attempt.attempt_id
-            )))
+            ))),
         };
     }
     Err(ServiceError::conflict(format!(
@@ -1697,15 +2070,12 @@ mod tests {
     }
 
     #[test]
-    fn invocation_identity_is_stable_and_every_execution_fact_is_bound() {
-        let first = plan_inference_invocation(input()).expect("first plan");
-        let second = plan_inference_invocation(input()).expect("second plan");
-        assert_eq!(first, second);
-
+    fn invocation_identity_changes_with_inference_purpose() {
+        let primary = plan_inference_invocation(input()).expect("primary plan");
         let mut changed = input();
         changed.purpose = InferencePurpose::SubAgent;
         assert_ne!(
-            first.invocation_id,
+            primary.invocation_id,
             plan_inference_invocation(changed)
                 .expect("changed plan")
                 .invocation_id
@@ -1764,6 +2134,236 @@ mod tests {
         assert_ne!(run.invocation_id(), session.invocation_id());
         assert_ne!(run.invocation_id(), harness.invocation_id());
         assert_ne!(session.invocation_id(), harness.invocation_id());
+    }
+
+    #[test]
+    fn physical_request_identity_is_attempt_scoped_and_wire_exact() {
+        let invocation = plan_inference_invocation(input()).expect("invocation plan");
+        let wire = InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            4_096,
+        )
+        .expect("exact wire identity");
+        let first = plan_inference_provider_attempt(&invocation, 0, wire.clone());
+        let retry = plan_inference_provider_attempt(&invocation, 1, wire.clone());
+
+        assert_ne!(first.request_id(), retry.request_id());
+        assert_eq!(first.wire(), &wire);
+        assert_eq!(retry.wire(), &wire);
+        assert_eq!(wire.protocol(), "openai_compatible");
+        assert_eq!(
+            wire.provider_wire_hash(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(wire.provider_wire_bytes(), 4_096);
+    }
+
+    #[test]
+    fn independent_plans_have_distinct_admission_fences_for_the_same_logical_identity() {
+        let first_invocation = plan_inference_invocation(input()).expect("first invocation");
+        let second_invocation = plan_inference_invocation(input()).expect("second invocation");
+        assert_eq!(
+            first_invocation.invocation_id,
+            second_invocation.invocation_id
+        );
+        assert_eq!(first_invocation.route_id, second_invocation.route_id);
+        assert_ne!(
+            first_invocation.admission_token,
+            second_invocation.admission_token
+        );
+
+        let wire = InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            4_096,
+        )
+        .expect("wire identity");
+        let first_attempt = plan_inference_provider_attempt(&first_invocation, 0, wire.clone());
+        let second_attempt = plan_inference_provider_attempt(&second_invocation, 0, wire);
+        assert_eq!(first_attempt.attempt_id, second_attempt.attempt_id);
+        assert_ne!(
+            first_attempt.admission_token,
+            second_attempt.admission_token
+        );
+    }
+
+    #[test]
+    fn ambiguous_invocation_admission_requires_the_plans_fencing_token() {
+        let plan = plan_inference_invocation(input()).expect("invocation");
+        let exact = PersistedInvocationAdmissionFact {
+            route_id: plan.route_id.clone(),
+            admission_token: plan.admission_token.clone(),
+            status: "admitted".to_string(),
+            terminal_fingerprint: None,
+        };
+        validate_ambiguous_invocation_admission(&exact, &plan)
+            .expect("the commit belongs to this admission plan");
+
+        let mut different_owner = exact.clone();
+        different_owner.admission_token = new_admission_token();
+        assert_eq!(
+            validate_ambiguous_invocation_admission(&different_owner, &plan)
+                .expect_err("another admission owner must not authorize provider delivery")
+                .kind,
+            ServiceErrorKind::Conflict
+        );
+
+        let mut terminal = exact;
+        terminal.status = "failed".to_string();
+        terminal.terminal_fingerprint = Some("a".repeat(64));
+        assert_eq!(
+            validate_ambiguous_invocation_admission(&terminal, &plan)
+                .expect_err("a terminal invocation cannot authorize provider delivery")
+                .kind,
+            ServiceErrorKind::Conflict
+        );
+    }
+
+    fn provider_attempt_fact(
+        attempt: &InferenceProviderAttemptPlan,
+        status: &str,
+        terminal_fingerprint: Option<&str>,
+    ) -> PersistedProviderAttemptFact {
+        PersistedProviderAttemptFact {
+            invocation_id: attempt.invocation_id.clone(),
+            attempt_index: i64::from(attempt.attempt_index),
+            provider: attempt.provider.clone(),
+            admission_token: attempt.admission_token.clone(),
+            provider_protocol: attempt.wire.protocol.clone(),
+            provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
+            provider_wire_bytes: i64::try_from(attempt.wire.provider_wire_bytes).unwrap(),
+            status: status.to_string(),
+            terminal_fingerprint: terminal_fingerprint.map(str::to_string),
+        }
+    }
+
+    fn exact_provider_attempt() -> InferenceProviderAttemptPlan {
+        let invocation = plan_inference_invocation(input()).expect("invocation plan");
+        plan_inference_provider_attempt(
+            &invocation,
+            0,
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                4_096,
+            )
+            .expect("exact wire identity"),
+        )
+    }
+
+    #[test]
+    fn ambiguous_attempt_admission_accepts_only_the_exact_started_wire_fact() {
+        let attempt = exact_provider_attempt();
+        let exact = provider_attempt_fact(&attempt, "started", None);
+        validate_ambiguous_provider_attempt_admission(&exact, &attempt, 4_096)
+            .expect("the row committed by the ambiguous admission is authoritative");
+
+        let mut wrong_invocation = exact.clone();
+        wrong_invocation.invocation_id.push_str("-other");
+        let mut wrong_index = exact.clone();
+        wrong_index.attempt_index += 1;
+        let mut wrong_provider = exact.clone();
+        wrong_provider.provider.push_str("-other");
+        let mut wrong_owner = exact.clone();
+        wrong_owner.admission_token = new_admission_token();
+        let mut wrong_protocol = exact.clone();
+        wrong_protocol.provider_protocol = "anthropic_messages".to_string();
+        let mut wrong_wire = exact.clone();
+        wrong_wire.provider_wire_hash = "f".repeat(64);
+        let mut wrong_wire_bytes = exact.clone();
+        wrong_wire_bytes.provider_wire_bytes += 1;
+        for drifted in [
+            wrong_invocation,
+            wrong_index,
+            wrong_provider,
+            wrong_owner,
+            wrong_protocol,
+            wrong_wire,
+            wrong_wire_bytes,
+        ] {
+            assert_eq!(
+                validate_ambiguous_provider_attempt_admission(&drifted, &attempt, 4_096)
+                    .expect_err("any immutable identity drift must fail closed")
+                    .kind,
+                ServiceErrorKind::Conflict
+            );
+        }
+
+        let terminal = provider_attempt_fact(&attempt, "failed", Some(&"a".repeat(64)));
+        assert_eq!(
+            validate_ambiguous_provider_attempt_admission(&terminal, &attempt, 4_096)
+                .expect_err("a terminal row cannot authorize provider redelivery")
+                .kind,
+            ServiceErrorKind::Conflict
+        );
+    }
+
+    #[test]
+    fn ambiguous_attempt_terminal_requires_exact_wire_status_and_fingerprint() {
+        let attempt = exact_provider_attempt();
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::DeliveryUnknown,
+            usage: InferenceUsage {
+                input_tokens: 200,
+                output_tokens: 50,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+            },
+            provider_response_id: Some("provider-partial".to_string()),
+            error_kind: Some("stream_transport".to_string()),
+            error_message: Some("partial delivery".to_string()),
+        };
+        let fingerprint = terminal_fingerprint(&terminal).expect("terminal fingerprint");
+        let exact = provider_attempt_fact(&attempt, terminal.status.as_str(), Some(&fingerprint));
+        assert_eq!(
+            classify_persisted_provider_terminal(&exact, &attempt, 4_096, &terminal, &fingerprint,)
+                .expect("the exact terminal replay is authoritative"),
+            PersistedProviderTerminalMatch::ExactTerminal
+        );
+        assert_eq!(
+            classify_persisted_provider_terminal(
+                &provider_attempt_fact(&attempt, "started", None),
+                &attempt,
+                4_096,
+                &terminal,
+                &fingerprint,
+            )
+            .expect("a still-open row is distinguishable from an exact terminal"),
+            PersistedProviderTerminalMatch::Started
+        );
+
+        let wrong_fingerprint =
+            provider_attempt_fact(&attempt, terminal.status.as_str(), Some(&"b".repeat(64)));
+        assert_eq!(
+            classify_persisted_provider_terminal(
+                &wrong_fingerprint,
+                &attempt,
+                4_096,
+                &terminal,
+                &fingerprint,
+            )
+            .expect_err("a different terminal fact must fail closed")
+            .kind,
+            ServiceErrorKind::Conflict
+        );
+    }
+
+    #[test]
+    fn provider_wire_identity_rejects_ambiguous_or_fabricated_values() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert!(InferenceProviderWireIdentity::new("", hash, 1).is_err());
+        assert!(InferenceProviderWireIdentity::new("openai compatible", hash, 1).is_err());
+        assert!(
+            InferenceProviderWireIdentity::new(
+                "openai_compatible",
+                "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+                1,
+            )
+            .is_err()
+        );
+        assert!(InferenceProviderWireIdentity::new("openai_compatible", "abcd", 1).is_err());
+        assert!(InferenceProviderWireIdentity::new("openai_compatible", hash, 0).is_err());
     }
 
     #[tokio::test]

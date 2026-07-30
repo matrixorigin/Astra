@@ -18,6 +18,10 @@ pub fn build_turn_hook_args(
     run_observer: bool,
     run_reflection_learning: bool,
 ) -> Map<String, Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::TailPersistHistoryClone,
+        messages,
+    );
     Map::from_iter([
         ("user_id".to_string(), Value::String(user_id.to_string())),
         (

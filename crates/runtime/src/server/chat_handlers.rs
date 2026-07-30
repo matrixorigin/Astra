@@ -415,15 +415,6 @@ pub(super) async fn dispatch_chat_turn_bridge(
             },
         );
     }
-    if let Some(force_intent) = prepared.force_intent.as_deref() {
-        bridge_headers.insert(
-            HeaderName::from_static("x-mo-force-intent"),
-            match safe_header_value(force_intent) {
-                Ok(v) => v,
-                Err(r) => return r,
-            },
-        );
-    }
     if let Some(execution_state_b64) = prepared.execution_state_b64.as_deref() {
         bridge_headers.insert(
             HeaderName::from_static("x-mo-execution-state-b64"),
@@ -474,15 +465,6 @@ pub(super) async fn dispatch_chat_turn_bridge(
     }
 }
 
-pub(super) async fn chat_route_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<ChatRouteRequest>,
-) -> Result<Json<ChatRouteResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _ = state.auth_service.current_user(&headers).await?;
-    Ok(Json(classify_chat_route(request.query)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,7 +483,6 @@ mod tests {
             "x-mo-tools-changed",
             "x-mo-user-query-b64",
             "x-mo-routing-meta-b64",
-            "x-mo-force-intent",
             "x-mo-execution-state-b64",
             "x-mo-bridge-test-secret",
         ];
@@ -558,11 +539,12 @@ mod tests {
     fn dispatch_header_count() {
         // Base headers: 4 (secret, user-id, username-b64, capabilities)
         // + authorization passthrough: 1
-        // + optional from prepared: 11 (session-id, full-llm-capture, session-turn, turn-chain-id,
-        //   user-query-event-id, tools-changed, task-hint, user-query-b64,
-        //   routing-meta-b64, force-intent, execution-state-b64)
-        // Total possible: 16
-        assert_eq!(4 + 1 + 11, 16);
+        // + optional from prepared: 9 (session-id, full-llm-capture, session-turn, turn-chain-id,
+        //   user-query-event-id, tools-changed, user-query-b64, routing-meta-b64,
+        //   execution-state-b64)
+        // + bridge E2E test-secret passthrough: 1
+        // Total possible: 15
+        assert_eq!(4 + 1 + 9 + 1, 15);
     }
 }
 

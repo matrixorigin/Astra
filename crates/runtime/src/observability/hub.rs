@@ -240,7 +240,7 @@ impl ObservabilityHub {
 
     // ─── Query Observation ──────────────────────────────────────────────────
 
-    /// Observe a user query (updates profile and scenario detection).
+    /// Observe a user query for non-semantic usage statistics.
     pub fn observe_query(&self, user_id: &str, query: &str) {
         self.profile_manager.observe_query(user_id, query);
     }
@@ -372,7 +372,7 @@ pub(crate) fn with_signal_attribution(
 
 /// Hook called at the start of each turn.
 pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, query: &str) {
-    // Update scenario detection
+    // Update query statistics without interpreting the query as intent.
     hub.observe_query(user_id, query);
 
     // Record query in session
@@ -380,7 +380,6 @@ pub fn on_turn_start(hub: &ObservabilityHub, session_id: &str, user_id: &str, qu
         let mut session = astra_core::sync_poison::recover_rwlock_write(&session);
         let latest_profile = hub.profiles().get_profile(user_id);
         session.profile.preferences = latest_profile.preferences;
-        session.profile.current_scenario = latest_profile.current_scenario;
         session.profile.stats = latest_profile.stats;
         session.profile.updated_at = latest_profile.updated_at;
         let behavior = session.observe_query_behavior(query);
@@ -500,9 +499,6 @@ pub fn on_turn_end(
     timing: TurnTiming,
 ) {
     session.record_turn_timing(timing);
-
-    // Drift detection: System A (stall.rs detect_intent_drift) handles hot-path correction.
-    // System B observability drift removed — duplicate signal path, zero integration.
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

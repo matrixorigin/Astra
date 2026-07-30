@@ -161,6 +161,103 @@ fn scrape_event_ingestion_metrics(state: &AppState) {
     registry.set_counter_absolute("astra_event_ingestion_errors_total", &[], stats.errors);
 }
 
+fn scrape_history_work_metrics(state: &AppState) {
+    const BYTES: &str = "astra_history_work_bytes_total";
+    const ROWS: &str = "astra_history_work_db_rows_total";
+    const EVENTS: &str = "astra_history_work_operations_total";
+    const ADMISSION: &str = "astra_history_work_admission_units_total";
+    const ACCOUNTING_ERRORS: &str = "astra_history_work_accounting_errors_total";
+    const QUEUE_HELD: &str = "astra_history_queue_held_bytes";
+    const QUEUE_PEAK: &str = "astra_history_queue_peak_bytes";
+    const SITE_INFO: &str = "astra_history_work_site_info";
+    const ENABLED: &str = "astra_history_work_instrumentation_enabled";
+
+    let registry = state.metrics_registry();
+    registry.register_gauge(
+        ENABLED,
+        "Whether ASTRA_HISTORY_WORK_TRACE is enabled for this process.",
+    );
+    let enabled = astra_core::history_work::instrumentation_enabled();
+    registry.set_gauge(ENABLED, &[], if enabled { 1.0 } else { 0.0 });
+    if !enabled {
+        return;
+    }
+
+    registry.register_counter(
+        BYTES,
+        "Observed bytes cloned, hashed, serialized, read, or retained by low-cardinality history-work site.",
+    );
+    registry.register_counter(
+        ROWS,
+        "Observed database rows read or written by low-cardinality history-work site.",
+    );
+    registry.register_counter(
+        EVENTS,
+        "Observed history-work operations by low-cardinality site.",
+    );
+    registry.register_counter(
+        ADMISSION,
+        "Observed admission weight units by low-cardinality history-work site.",
+    );
+    registry.register_counter(
+        ACCOUNTING_ERRORS,
+        "Counter saturation or measurement failures; non-zero means the affected history-work measurements are incomplete.",
+    );
+    registry.register_gauge(
+        QUEUE_HELD,
+        "Current queued history bytes retained by low-cardinality work site.",
+    );
+    registry.register_gauge(
+        QUEUE_PEAK,
+        "Process peak queued history bytes retained by low-cardinality work site.",
+    );
+    registry.register_gauge(
+        SITE_INFO,
+        "Static owner and normal-path primary target phase for each instrumented history-work site.",
+    );
+
+    let snapshot = astra_core::history_work::HistoryWorkSnapshot::capture();
+    for (site, measurement) in snapshot.sites {
+        let labels = &[("site", site.as_str())];
+        if measurement.bytes != 0 {
+            registry.set_counter_absolute(BYTES, labels, measurement.bytes);
+        }
+        if measurement.rows != 0 {
+            registry.set_counter_absolute(ROWS, labels, measurement.rows);
+        }
+        if measurement.events != 0 {
+            registry.set_counter_absolute(EVENTS, labels, measurement.events);
+        }
+        if measurement.admission_units != 0 {
+            registry.set_counter_absolute(ADMISSION, labels, measurement.admission_units);
+        }
+        if measurement.accounting_errors != 0 {
+            registry.set_counter_absolute(ACCOUNTING_ERRORS, labels, measurement.accounting_errors);
+        }
+        registry.set_gauge(
+            SITE_INFO,
+            &[
+                ("site", site.as_str()),
+                ("owner", site.owner()),
+                ("primary_target_phase", site.primary_target_phase_label()),
+            ],
+            1.0,
+        );
+        registry.set_gauge(
+            QUEUE_HELD,
+            &[("site", site.as_str())],
+            measurement.queue_current_bytes as f64,
+        );
+        if measurement.queue_peak_bytes != 0 {
+            registry.set_gauge(
+                QUEUE_PEAK,
+                &[("site", site.as_str())],
+                measurement.queue_peak_bytes as f64,
+            );
+        }
+    }
+}
+
 pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResponse> {
     Json(RootResponse {
         name: state.service_info.name,
@@ -246,6 +343,7 @@ pub(super) async fn metrics_handler(State(state): State<AppState>) -> impl IntoR
     crate::server::ws_handler::register_ws_run_stream_poll_metrics(&state.metrics_registry());
     crate::capacity_model::scrape_capacity_metrics_from_env(&state.metrics_registry());
     scrape_event_ingestion_metrics(&state);
+    scrape_history_work_metrics(&state);
     crate::turn::bridge::llm_stream::rate_limit_cooldown()
         .scrape_metrics(&state.metrics_registry());
     let body = state.metrics_registry().render_prometheus();

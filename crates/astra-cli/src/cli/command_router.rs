@@ -3,7 +3,10 @@ use crate::cli::arg_render::{
     render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
     render_permissions_args, render_review_args, render_task_args, render_team_args,
 };
-use crate::cli::auth_flow::{clear_profile_auth, do_login, do_register, is_auth_error};
+use crate::cli::auth_flow::{
+    clear_profile_auth, do_login, do_register, is_auth_error, parse_auth_tokens,
+    save_refreshed_profile_tokens,
+};
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
     TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
@@ -11,8 +14,8 @@ use crate::cli::cli_config::cli_args::{
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
     clear_profile_last_session_if_matches_or_warn, cli_user_id, get_profile_and_token,
-    load_credentials, map_thin_err, mutate_credentials, persist_profile_last_session, prefix_chars,
-    print_json_or_raw, profile_name, prompt_or, prompt_password_masked, validate_cli_session_id,
+    load_credentials, map_thin_err, persist_profile_last_session, prefix_chars, print_json_or_raw,
+    profile_name, prompt_or, prompt_password_masked, validate_cli_session_id,
 };
 use crate::cli::config_manager::{
     execute_config_command, latest_artifact_id, resolve_download_output_path,
@@ -41,8 +44,6 @@ use crate::cli::skill_catalog::{
 use crate::cli::slash::slash_bug::handle_bug_command;
 use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_info::handle_info_command;
-#[cfg(feature = "harness")]
-use crate::cli::slash::slash_inspect;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
 use crate::cli::slash::{slash_agent, slash_router, slash_task, slash_team, slash_telemetry};
@@ -684,6 +685,7 @@ async fn execute_headless_task_body(
         bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx,
+        stream_json_emitter: None,
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
         #[cfg(feature = "harness")]
@@ -1493,6 +1495,7 @@ async fn execute_cli_command_impl(
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
                 stream_event_tx: None,
+                stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
                 #[cfg(feature = "harness")]
@@ -1618,24 +1621,8 @@ async fn execute_cli_command_impl(
                 .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let new_access = value
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?
-                .to_string();
-            let new_refresh = value
-                .get("refresh_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?
-                .to_string();
-            mutate_credentials(|creds| {
-                let name = profile_name(profile.as_deref(), creds);
-                let entry = creds.profiles.entry(name).or_default();
-                entry.access_token = Some(new_access.clone());
-                entry.refresh_token = Some(new_refresh.clone());
-            })?;
+            let tokens = parse_auth_tokens(&body)?;
+            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
             println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
@@ -2051,6 +2038,7 @@ async fn execute_cli_command_impl(
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
                 stream_event_tx,
+                stream_json_emitter: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(harness_sink.clone()),
                 #[cfg(feature = "harness")]
@@ -2124,9 +2112,6 @@ async fn execute_cli_command_impl(
                 &mut sr,
                 turn_start,
             );
-
-            #[cfg(feature = "harness")]
-            append_headless_inspect_snapshot(&mut sr, &message, &harness_sink);
 
             // Output result
             if args.json {
@@ -2539,92 +2524,12 @@ fn final_json_output(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Valu
     final_json_output_with_context(sr, exit_code, trace_id, request_id)
 }
 
-#[cfg(feature = "harness")]
-fn message_requests_headless_inspect(message: &str) -> bool {
-    fn normalize(raw: &str) -> String {
-        raw.trim_matches(|c: char| {
-            matches!(
-                c,
-                '"' | '\''
-                    | '`'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | ','
-                    | '.'
-                    | ':'
-                    | ';'
-                    | '!'
-                    | '?'
-            )
-        })
-        .to_ascii_lowercase()
+fn final_stream_json_result(sr: &StreamResult, exit_code: ExitCode) -> serde_json::Value {
+    let mut result = final_json_output(sr, exit_code);
+    if let Some(object) = result.as_object_mut() {
+        object.remove("run_id");
     }
-
-    for line in message.lines() {
-        if line.split_whitespace().next().map(normalize).as_deref() == Some("/inspect") {
-            return true;
-        }
-    }
-
-    let tokens: Vec<String> = message.split_whitespace().map(normalize).collect();
-    tokens.iter().enumerate().any(|(idx, token)| {
-        if token != "/inspect" {
-            return false;
-        }
-        let prev = idx
-            .checked_sub(1)
-            .and_then(|i| tokens.get(i).map(String::as_str));
-        let prev2 = idx
-            .checked_sub(2)
-            .and_then(|i| tokens.get(i).map(String::as_str));
-        matches!(
-            prev,
-            Some("use" | "run" | "execute" | "invoke" | "call" | "show" | "append" | "appends")
-        ) || (prev == Some("the")
-            && matches!(
-                prev2,
-                Some(
-                    "use"
-                        | "run"
-                        | "execute"
-                        | "invoke"
-                        | "call"
-                        | "show"
-                        | "append"
-                        | "appends"
-                        | "appended"
-                )
-            ))
-    })
-}
-
-#[cfg(feature = "harness")]
-fn append_headless_inspect_snapshot(
-    sr: &mut StreamResult,
-    message: &str,
-    sink: &std::sync::Arc<astra_harness::InMemorySnapshotSink>,
-) {
-    if !message_requests_headless_inspect(message) {
-        return;
-    }
-
-    use astra_harness::SnapshotSink;
-    let snapshot_text = match sink.latest() {
-        Some(snapshot) => slash_inspect::format_snapshot_summary(&snapshot),
-        None => "No harness snapshot available yet.".to_string(),
-    };
-
-    if !sr.full_text.is_empty() && !sr.full_text.ends_with('\n') {
-        sr.full_text.push('\n');
-    }
-    if !sr.full_text.is_empty() {
-        sr.full_text.push('\n');
-    }
-    sr.full_text.push_str(&snapshot_text);
+    result
 }
 
 fn final_json_output_with_context(
@@ -2633,7 +2538,12 @@ fn final_json_output_with_context(
     trace_id: Option<String>,
     request_id: Option<String>,
 ) -> serde_json::Value {
-    let total_prompt_tokens = sr.prompt_tokens + sr.cache_read_tokens + sr.cache_creation_tokens;
+    let total_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
+        sr.prompt_tokens,
+        sr.cache_read_tokens,
+        sr.cache_creation_tokens,
+    )
+    .total_input_tokens();
     let mut tool_result_class_counts = serde_json::Map::new();
     for class in sr
         .tool_call_records
@@ -2758,6 +2668,14 @@ pub(crate) async fn run_print_mode(
         session_routing.task_scope_session_id(),
     )
     .await;
+    let session_turn = session_routing.next_server_turn_index();
+    let stream_json_emitter = if output_format == "stream-json" {
+        Some(crate::cli::stream::stream_json::StreamJsonEmitter::stdout(
+            session_turn,
+        )?)
+    } else {
+        None
+    };
 
     let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
         api,
@@ -2780,6 +2698,7 @@ pub(crate) async fn run_print_mode(
         bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx: None,
+        stream_json_emitter: stream_json_emitter.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
         #[cfg(feature = "harness")]
@@ -2793,7 +2712,7 @@ pub(crate) async fn run_print_mode(
     let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
         pre_loaded_messages: continuation_messages.take(),
         activated_deferred_tool_names,
-        turn_index: Some(session_routing.next_server_turn_index()),
+        turn_index: Some(session_turn),
         ..Default::default()
     };
     let turn_start = std::time::Instant::now();
@@ -2809,7 +2728,47 @@ pub(crate) async fn run_print_mode(
     .await
     {
         Ok(sr) => sr,
-        Err(e) => return Err(e.error),
+        Err(e) => {
+            let error = e.error;
+            let partial = e.partial;
+            if let Some(emitter) = stream_json_emitter.as_ref() {
+                let total_prompt_tokens = astra_turn_types::NormalizedPromptCacheUsage::new(
+                    partial.prompt_tokens,
+                    partial.cache_read_tokens,
+                    partial.cache_creation_tokens,
+                )
+                .total_input_tokens();
+                let result_session_id = partial.session_id.clone().or_else(|| session_id.clone());
+                let (trace_id, request_id) = gateway_env_context();
+                emitter.emit_result(
+                    result_session_id.as_deref(),
+                    serde_json::json!({
+                        "trace_id": trace_id,
+                        "request_id": request_id,
+                        "session_id": partial.session_id,
+                        "text": partial.partial_text,
+                        "final_state": "failed",
+                        "interruption_kind": serde_json::Value::Null,
+                        "prompt_tokens": total_prompt_tokens,
+                        "fresh_prompt_tokens": partial.prompt_tokens,
+                        "cache": {
+                            "hit": partial.cache_read_tokens > 0,
+                            "read_tokens": partial.cache_read_tokens,
+                            "creation_tokens": partial.cache_creation_tokens,
+                        },
+                        "completion_tokens": partial.completion_tokens,
+                        "tool_calls_count": partial.tool_calls_count,
+                        "tools_used": partial.tools_used,
+                        "persistence_error": serde_json::Value::Null,
+                        "exit_code": serde_json::Value::Null,
+                        "success": false,
+                        "error_kind": serde_json::Value::Null,
+                        "error": &error,
+                    }),
+                )?;
+            }
+            return Err(error);
+        }
     };
 
     let exit_code = finalize_one_shot_stream_result(
@@ -2821,12 +2780,21 @@ pub(crate) async fn run_print_mode(
     );
 
     match output_format {
-        "json" | "stream-json" => {
+        "json" => {
             let json_output = final_json_output(&sr, exit_code);
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json_output).unwrap_or_default()
             );
+        }
+        "stream-json" => {
+            let emitter = stream_json_emitter.as_ref().ok_or_else(|| {
+                "stream-json output selected without a protocol emitter".to_string()
+            })?;
+            emitter.emit_result(
+                sr.session_id.as_deref(),
+                final_stream_json_result(&sr, exit_code),
+            )?;
         }
         _ => {
             // text mode: just the response
@@ -3045,8 +3013,6 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
 #[cfg(test)]
 mod exit_code_tests {
     use super::{ExitCode, StreamResult, compute_exit_code};
-    #[cfg(feature = "harness")]
-    use super::{append_headless_inspect_snapshot, message_requests_headless_inspect};
     use crate::cli::stream::streaming_types::VerdictEvent;
 
     fn empty_stream_result() -> StreamResult {
@@ -3096,62 +3062,6 @@ mod exit_code_tests {
                 ..Default::default()
             });
         assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
-    }
-
-    #[cfg(feature = "harness")]
-    #[test]
-    fn headless_inspect_request_appends_latest_snapshot() {
-        use astra_harness::{DecisionRecord, HookPoint, RuntimeSnapshot, SnapshotSink};
-
-        let sink = astra_harness::InMemorySnapshotSink::arc();
-        let mut snapshot = RuntimeSnapshot::empty();
-        snapshot.session_id = "s1".to_string();
-        snapshot.turn_number = 1;
-        snapshot.turns_used = 2;
-        snapshot.tool_calls_this_session = 1;
-        snapshot.unique_tools_used = vec!["bash".to_string()];
-        snapshot.last_tool_called = Some("bash".to_string());
-        sink.update(&DecisionRecord {
-            session_id: "s1".to_string(),
-            turn: 1,
-            point: HookPoint::PostToolBatch,
-            wall_time_unix_millis: 0,
-            monotonic_millis_since_session: 0,
-            snapshot,
-        });
-
-        let mut sr = empty_stream_result();
-        sr.full_text = "done".to_string();
-        append_headless_inspect_snapshot(
-            &mut sr,
-            "Run a command, then use /inspect to show the snapshot.",
-            &sink,
-        );
-
-        assert!(sr.full_text.contains("done"));
-        assert!(sr.full_text.contains("Harness Snapshot"));
-        assert!(sr.full_text.contains("Tool calls:"));
-        assert!(sr.full_text.contains("Unique tools:        bash"));
-    }
-
-    #[cfg(feature = "harness")]
-    #[test]
-    fn headless_inspect_request_requires_slash_token() {
-        assert!(message_requests_headless_inspect("Then use /inspect."));
-        assert!(message_requests_headless_inspect("/inspect"));
-        assert!(message_requests_headless_inspect(
-            "The headless CLI should append the /inspect snapshot."
-        ));
-        assert!(message_requests_headless_inspect(
-            "The harness runner automatically appends the /inspect snapshot."
-        ));
-        assert!(!message_requests_headless_inspect(
-            "Mention inspection, but do not run the command"
-        ));
-        assert!(!message_requests_headless_inspect("What is `/inspect`?"));
-        assert!(!message_requests_headless_inspect(
-            "https://example.com/inspect"
-        ));
     }
 
     #[test]
@@ -3426,7 +3336,7 @@ mod exit_code_tests {
 
 #[cfg(test)]
 mod final_json_output_tests {
-    use super::{ExitCode, StreamResult, final_json_output_with_context};
+    use super::{ExitCode, StreamResult, final_json_output_with_context, final_stream_json_result};
 
     fn stream_result_for_json() -> StreamResult {
         StreamResult {
@@ -3529,6 +3439,16 @@ mod final_json_output_tests {
             output["persistence_error"],
             "failed to append one-shot journal events"
         );
+    }
+
+    #[test]
+    fn stream_json_result_does_not_alias_local_execution_as_durable_run() {
+        let sr = stream_result_for_json();
+        let output = final_stream_json_result(&sr, ExitCode::Success);
+
+        assert!(output.get("run_id").is_none());
+        assert_eq!(output["session_id"], "session-1");
+        assert_eq!(output["success"], true);
     }
 }
 

@@ -26,6 +26,7 @@
 //!   `cache_read_input_tokens` and `cache_creation_input_tokens`. Use values
 //!   directly.
 
+use astra_turn_types::NormalizedPromptCacheUsage;
 use serde_json::{Map, Value};
 
 /// Normalized per-call token usage. All fields are disjoint buckets.
@@ -38,11 +39,17 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    pub fn normalized_prompt_cache_usage(self) -> NormalizedPromptCacheUsage {
+        NormalizedPromptCacheUsage::new(
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_creation_tokens,
+        )
+    }
+
     pub fn total_tokens(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cached_input_tokens)
-            .saturating_add(self.cache_creation_tokens)
-            .saturating_add(self.output_tokens)
+        self.normalized_prompt_cache_usage()
+            .total_tokens_with_output(self.output_tokens)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -316,6 +323,124 @@ mod tests {
                 *expected,
                 "dialect for {provider}"
             );
+        }
+    }
+
+    #[test]
+    fn provider_usage_matrix_normalizes_disjoint_input_buckets() {
+        struct Case {
+            name: &'static str,
+            dialect: UsageDialect,
+            usage: Value,
+            expected: Option<NormalizedPromptCacheUsage>,
+        }
+
+        let cases = [
+            Case {
+                name: "openai inclusive cache details",
+                dialect: UsageDialect::OpenAi,
+                usage: json!({
+                    "prompt_tokens": 1100,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 800,
+                        "cache_creation_input_tokens": 100
+                    }
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 200,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                }),
+            },
+            Case {
+                name: "openai compatible disjoint aliases",
+                dialect: UsageDialect::OpenAi,
+                usage: json!({
+                    "prompt_tokens": 200,
+                    "completion_tokens": 50,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 100
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 200,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                }),
+            },
+            Case {
+                name: "anthropic disjoint cache fields",
+                dialect: UsageDialect::AnthropicMessages,
+                usage: json!({
+                    "input_tokens": 200,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 100
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 200,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                }),
+            },
+            Case {
+                name: "bedrock disjoint cache fields",
+                dialect: UsageDialect::BedrockConverse,
+                usage: json!({
+                    "inputTokens": 200,
+                    "outputTokens": 50,
+                    "cacheReadInputTokens": 800,
+                    "cacheWriteInputTokens": 100
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 200,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                }),
+            },
+            Case {
+                name: "missing usage",
+                dialect: UsageDialect::OpenAi,
+                usage: json!({}),
+                expected: None,
+            },
+            Case {
+                name: "contradictory inclusive values saturate fresh only",
+                dialect: UsageDialect::OpenAi,
+                usage: json!({
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 800,
+                        "cache_creation_input_tokens": 100
+                    }
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 0,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                }),
+            },
+        ];
+
+        for case in cases {
+            let normalized = case
+                .usage
+                .as_object()
+                .and_then(|usage| extract_usage(case.dialect, usage))
+                .map(TokenUsage::normalized_prompt_cache_usage);
+            assert_eq!(normalized, case.expected, "case: {}", case.name);
+            if let Some(usage) = normalized {
+                assert_eq!(
+                    usage.total_input_tokens(),
+                    usage
+                        .fresh_input_tokens
+                        .saturating_add(usage.cache_read_tokens)
+                        .saturating_add(usage.cache_creation_tokens),
+                    "case: {}",
+                    case.name
+                );
+            }
         }
     }
 

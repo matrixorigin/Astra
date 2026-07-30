@@ -61,6 +61,26 @@ async fn schema_rationalization_runtime_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let reauthentication = column_names(&pool, &schema, "auth_reauthentication_proofs").await;
+    for expected in [
+        "proof_id",
+        "user_id",
+        "purpose",
+        "proof_hash",
+        "expires_at",
+        "consumed_at",
+    ] {
+        assert!(
+            reauthentication.iter().any(|column| column == expected),
+            "auth_reauthentication_proofs missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "auth_reauthentication_proofs").await,
+        ["user_id", "proof_id"],
+        "reauthentication proofs must be owner-bound"
+    );
+
     for removed in [
         "prompt_chunks",
         "harness_sources",
@@ -1318,6 +1338,7 @@ async fn phase2_web_hydration_schema_contract() {
         "session_id",
         "device_id",
         "device_fingerprint",
+        "device_key_hash",
         "trust_level",
         "status",
         "last_monotonic_id",
@@ -1339,6 +1360,29 @@ async fn phase2_web_hydration_schema_contract() {
         unique_key_columns(&pool, &schema, "session_device_leases", "uq_session_device").await,
         ["user_id", "session_id", "device_id"],
         "device leases must enforce owner/session/device uniqueness"
+    );
+
+    let challenges = column_names(&pool, &schema, "session_device_challenges").await;
+    for expected in [
+        "challenge_id",
+        "user_id",
+        "session_id",
+        "device_id",
+        "device_fingerprint",
+        "purpose",
+        "challenge_digest",
+        "expires_at",
+        "consumed_at",
+    ] {
+        assert!(
+            challenges.iter().any(|column| column == expected),
+            "session_device_challenges missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_device_challenges").await,
+        ["user_id", "challenge_id"],
+        "device challenges must be owner-bound"
     );
 
     let lease_events = column_names(&pool, &schema, "session_device_lease_events").await;

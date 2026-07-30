@@ -229,7 +229,7 @@ impl WorkspaceTrustLedger {
     /// Default ledger location: `~/.astra/trusted_workspaces.json`.
     #[must_use]
     pub fn default_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".astra").join("trusted_workspaces.json"))
+        Some(astra_runtime_env::local_state_root().join("trusted_workspaces.json"))
     }
 
     /// Construct an empty ledger at a specific path. Use when you

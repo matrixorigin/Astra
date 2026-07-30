@@ -462,10 +462,12 @@ pub(crate) fn handle_cost_command(arg: &str, state: &SessionState) {
                 // Denominator = full billable input (fresh + cache-read + cache-creation)
                 // so cache-creation-heavy sessions don't report misleadingly high hit
                 // rates.
-                let total_input = state
-                    .total_prompt_tokens
-                    .saturating_add(state.total_cache_read_tokens)
-                    .saturating_add(state.total_cache_creation_tokens);
+                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+                    state.total_prompt_tokens,
+                    state.total_cache_read_tokens,
+                    state.total_cache_creation_tokens,
+                )
+                .total_input_tokens();
                 let cache_pct =
                     state.total_cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0;
                 let saved =

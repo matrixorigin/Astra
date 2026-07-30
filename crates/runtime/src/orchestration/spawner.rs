@@ -4055,7 +4055,19 @@ pub(crate) fn build_inherited_child_prefix(
     // A future telemetry layer (PR 5.6+) may want to emit a
     // "reconstruct failed" event here; currently no sink is wired
     // through so the failure is silent.
-    match reconstruct_messages(prefix, Vec::new()) {
+    let reconstruction = reconstruct_messages(prefix, Vec::new());
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ForkPrefixReconstruction,
+            u64::try_from(prefix.size_bytes()).unwrap_or(u64::MAX),
+            reconstruction
+                .as_ref()
+                .map(|result| u64::try_from(result.prefix_len).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            0,
+        );
+    }
+    match reconstruction {
         Ok(r) => {
             let frozen_tools: Option<Vec<serde_json::Value>> = {
                 let entries = prefix.tool_schemas();

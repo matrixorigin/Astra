@@ -1160,6 +1160,10 @@ pub async fn compact_with_memoria(
 
     if !should_retrieve {
         // Fall back to pure truncation
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         let mut msgs = messages.to_vec();
         return CompactionEngine::compact_tiered(
             &mut msgs,
@@ -1171,6 +1175,10 @@ pub async fn compact_with_memoria(
     }
 
     let Some(client) = client else {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         let mut msgs = messages.to_vec();
         return CompactionEngine::compact_tiered(
             &mut msgs,
@@ -1181,6 +1189,10 @@ pub async fn compact_with_memoria(
         );
     };
     let Some(sid) = session_id else {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         let mut msgs = messages.to_vec();
         return CompactionEngine::compact_tiered(
             &mut msgs,
@@ -1237,6 +1249,10 @@ pub async fn compact_with_memoria(
 
     // Apply truncation against a budget that leaves room for typed runtime
     // context. Retrieval results are never inserted into history messages.
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        messages,
+    );
     let mut msgs = messages.to_vec();
     let mut result = CompactionEngine::compact_tiered(
         &mut msgs,

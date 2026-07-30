@@ -350,6 +350,93 @@ impl LlmContextManifestTrace {
     }
 }
 
+/// Attach every durably admitted physical request, its exact serialized
+/// provider-body composition, and its complete durable terminal when present.
+///
+/// Each durable attempt is admitted from the same immutable bytes used by its
+/// HTTP body. The complete array is authoritative; `request_identity` is only
+/// a latest-attempt projection for the existing turn-trace summary.
+pub(crate) fn augment_manifest_trace_with_provider_attempts(
+    trace: &mut Value,
+    attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+    round: u32,
+) {
+    let Some(latest) = attempts.last() else {
+        return;
+    };
+    let Some(trace) = trace.as_object_mut() else {
+        return;
+    };
+    let latest_response_id = latest
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.provider_response_id.as_deref());
+    trace.insert(
+        "request_identity".to_string(),
+        json!({
+            "request_id": latest.request.request_id,
+            "request_hash": latest.request.request_hash,
+            "round": round,
+            "attempt": latest.request.attempt,
+            "provider_response_id": latest_response_id,
+        }),
+    );
+    trace.insert(
+        "provider_request_attempts".to_string(),
+        Value::Array(
+            attempts
+                .iter()
+                .map(|attempt| {
+                    let request = &attempt.request;
+                    let terminal = attempt.terminal.as_ref();
+                    json!({
+                        "authority": "exact_serialized_provider_body_v1",
+                        "request_id": request.request_id,
+                        "request_hash": request.request_hash,
+                        "round": round,
+                        "attempt": request.attempt,
+                        "protocol": request.protocol.as_str(),
+                        "provider_response_id": terminal
+                            .and_then(|terminal| terminal.provider_response_id.as_deref()),
+                        "terminal_status": terminal.map(|terminal| terminal.status.as_str()),
+                        "usage": terminal.map(|terminal| json!({
+                            "input_tokens": terminal.usage.input_tokens,
+                            "output_tokens": terminal.usage.output_tokens,
+                            "cache_read_tokens": terminal.usage.cache_read_tokens,
+                            "cache_creation_tokens": terminal.usage.cache_creation_tokens,
+                        })),
+                        "error_kind": terminal
+                            .and_then(|terminal| terminal.error_kind.as_deref()),
+                        "error_message": terminal
+                            .and_then(|terminal| terminal.error_message.as_deref()),
+                        "serialized_bytes": request.provider_wire_bytes,
+                        "composition_bytes": {
+                            "system": request.composition.system_bytes,
+                            "conversation": request.composition.conversation_bytes,
+                            "tool_schema": request.composition.tool_schema_bytes,
+                            "provider_envelope": request.composition.provider_envelope_bytes,
+                            "total": request.composition.total_bytes(),
+                        },
+                        "composition_items": {
+                            "system": request.composition.system_items,
+                            "conversation": request.composition.conversation_items,
+                            "tool_schema": request.composition.tool_schema_items,
+                        },
+                    })
+                })
+                .collect(),
+        ),
+    );
+}
+
+pub(crate) fn clear_manifest_provider_request(trace: &mut Value) {
+    let Some(trace) = trace.as_object_mut() else {
+        return;
+    };
+    trace.remove("request_identity");
+    trace.remove("provider_request_attempts");
+}
+
 fn runtime_manifest_with_memory_context(
     mut manifest: Option<Value>,
     provider_source: Option<&str>,
@@ -372,6 +459,7 @@ fn runtime_manifest_with_memory_context(
     manifest
 }
 
+#[cfg(test)]
 pub(crate) fn context_meta_event(
     breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     context_manifest_trace: Option<&Value>,
@@ -390,6 +478,10 @@ pub(crate) fn context_meta_event_with_compactions(
         "system_prompt_breakdown": breakdown,
     });
     if let Some(trace) = context_manifest_trace {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            trace,
+        );
         event["context_manifest_trace"] = trace.clone();
     }
     if !compactions.is_empty() {
@@ -427,6 +519,17 @@ fn canonical_wire_sha256(value: &Value) -> String {
     let canonical = canonical_wire_value(value);
     let bytes =
         serde_json::to_vec(&canonical).expect("serde_json::Value serialization is infallible");
+    if astra_core::history_work::instrumentation_enabled() {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            bytes_len,
+        );
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceHash,
+            bytes_len,
+        );
+    }
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
@@ -761,6 +864,23 @@ pub(crate) struct ContextManifestProjection {
     pub items: Vec<astra_services::ContextManifestItemWrite>,
 }
 
+fn is_tool_result_wire_message(message: &Value) -> bool {
+    if matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("tool" | "tool_result")
+    ) {
+        return true;
+    }
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
 /// Build the persisted context-manifest projection for a single LLM call.
 ///
 /// This is deliberately inside `llm_context` so manifest rows are derived by
@@ -772,16 +892,18 @@ pub(crate) fn build_context_manifest_projection(
 ) -> ContextManifestProjection {
     let budget_allocation = astra_services::budget_for_turn_intent(Some(input.turn_intent));
     let budget = budget_allocation.budget.clone();
-    let message_tokens = input
-        .pre_llm_messages
-        .iter()
-        .map(estimate_json_tokens)
-        .fold(0_u32, u32::saturating_add);
-    let tool_result_tokens = input
-        .tool_results
-        .iter()
-        .map(estimate_json_tokens)
-        .fold(0_u32, u32::saturating_add);
+    let (message_tokens, tool_result_tokens) =
+        input
+            .pre_llm_messages
+            .iter()
+            .fold((0_u32, 0_u32), |(messages, tool_results), message| {
+                let tokens = estimate_json_tokens(message);
+                if is_tool_result_wire_message(message) {
+                    (messages, tool_results.saturating_add(tokens))
+                } else {
+                    (messages.saturating_add(tokens), tool_results)
+                }
+            });
     let total_estimated_tokens = input.result_prompt_tokens.unwrap_or_else(|| {
         message_tokens
             .saturating_add(tool_result_tokens)
@@ -897,11 +1019,11 @@ pub(crate) fn build_context_manifest_projection(
         || input.observed_cache_read_tokens.is_some()
         || input.observed_cache_creation_tokens.is_some()
     {
-        Some(astra_turn_types::NormalizedPromptCacheUsage {
-            fresh_input_tokens: input.observed_fresh_input_tokens.unwrap_or_default(),
-            cache_read_tokens: input.observed_cache_read_tokens.unwrap_or_default(),
-            cache_creation_tokens: input.observed_cache_creation_tokens.unwrap_or_default(),
-        })
+        Some(astra_turn_types::NormalizedPromptCacheUsage::new(
+            input.observed_fresh_input_tokens.unwrap_or_default(),
+            input.observed_cache_read_tokens.unwrap_or_default(),
+            input.observed_cache_creation_tokens.unwrap_or_default(),
+        ))
     } else {
         None
     };
@@ -1518,11 +1640,29 @@ fn stabilize_tool_schema_wire_order(
             .cmp(&right_bucket)
             .then_with(|| left_name.unwrap_or("").cmp(right_name.unwrap_or("")))
             .then_with(|| {
-                serde_json::to_string(left)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(right).unwrap_or_default())
+                serialized_tool_schema_wire_sort_key(left)
+                    .cmp(&serialized_tool_schema_wire_sort_key(right))
             })
     });
+}
+
+fn serialized_tool_schema_wire_sort_key(schema: &Value) -> String {
+    let site = astra_core::history_work::HistoryWorkSite::ToolSchemaWireSortSerialization;
+    match serde_json::to_string(schema) {
+        Ok(serialized) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_bytes(
+                    site,
+                    serialized.len().try_into().unwrap_or(u64::MAX),
+                );
+            }
+            serialized
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            String::new()
+        }
+    }
 }
 
 fn tool_schema_wire_bucket(
@@ -1578,6 +1718,10 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
             astra_turn_core::cache_placement::CacheProtocol::None
         )
     {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            current_tool_schemas,
+        );
         return current_tool_schemas.to_vec();
     }
 
@@ -1599,8 +1743,16 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 
     if stabilized.is_empty() {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            current_tool_schemas,
+        );
         current_tool_schemas.to_vec()
     } else {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            &stabilized,
+        );
         stabilized
     }
 }
@@ -1636,7 +1788,7 @@ pub(crate) struct BridgeRetryWireRebuildInput<'a> {
 }
 
 pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> {
-    messages
+    let compactable_history = messages
         .iter()
         .filter(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message))
         .cloned()
@@ -1644,7 +1796,12 @@ pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> 
             crate::turn::wire_assembly::strip_runtime_context_from_tool_message(&mut message);
             message
         })
-        .collect()
+        .collect::<Vec<_>>();
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        &compactable_history,
+    );
+    compactable_history
 }
 
 pub(crate) fn rebuild_bridge_retry_wire_messages(
@@ -1655,7 +1812,12 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         .iter()
         .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
         .count();
-    let mut messages = input.previous_messages[..system_prefix_count].to_vec();
+    let retained_system_prefix = &input.previous_messages[..system_prefix_count];
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        retained_system_prefix,
+    );
+    let mut messages = retained_system_prefix.to_vec();
     let mut compacted_messages = input.compacted_messages;
     crate::turn::wire_assembly::maybe_append_continuation_prompt(
         &mut compacted_messages,
@@ -1677,6 +1839,10 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         synthetic_tail_prefix_end,
         input.cache_cfg,
         input.session_id,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderRetryRetention,
+        &messages,
     );
     messages
 }
@@ -1778,12 +1944,20 @@ pub(crate) fn augment_manifest_trace_with_wire(
         .filter(|message| message_role(message) != "system")
         .cloned()
         .collect();
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+        &conversation_messages,
+    );
     let conversation_roles: Vec<String> = conversation_messages.iter().map(message_role).collect();
     let system_messages: Vec<Value> = messages
         .iter()
         .filter(|message| message_role(message) == "system")
         .cloned()
         .collect();
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+        &system_messages,
+    );
     let stable_system_prefix = stable_cache_prefix(&system_messages);
     let stable_tool_prefix = stable_cache_prefix(tool_schemas);
     let cache_layout = if message_cache_control_count + tool_cache_control_count > 0 {
@@ -1820,9 +1994,22 @@ pub(crate) fn augment_manifest_trace_with_wire(
         .sum();
 
     if let Some(trace_obj) = trace.as_object_mut() {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            messages,
+        );
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            &system_messages,
+        );
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            tool_schemas,
+        );
         trace_obj.insert(
             "wire".to_string(),
             serde_json::json!({
+                "projection_authority": "pre_provider_messages_and_tools_v1",
                 "message_count": messages.len(),
                 "tool_schema_count": tool_schemas.len(),
                 "message_roles": message_roles.clone(),
@@ -1855,13 +2042,18 @@ pub(crate) fn augment_manifest_trace_with_wire(
 }
 
 fn stable_cache_prefix(values: &[Value]) -> Vec<Value> {
-    match values
+    let prefix = match values
         .iter()
         .rposition(|value| cache_control_count(value) > 0)
     {
-        Some(last_marker) => values[..=last_marker].to_vec(),
-        None => values.to_vec(),
-    }
+        Some(last_marker) => &values[..=last_marker],
+        None => values,
+    };
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+        prefix,
+    );
+    prefix.to_vec()
 }
 
 #[cfg(test)]
@@ -2632,8 +2824,8 @@ mod context_cache_contract_tests {
         let compactions = vec![
             astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
                 id: "initial".to_string(),
-                phase: "initial".to_string(),
-                tier: "compact_history".to_string(),
+                kind: astra_turn_core::compaction_types::CompactionKind::WireAssembly,
+                tier: astra_turn_core::compaction_types::CompactionTier::CompactHistory,
                 messages_before: 18,
                 messages_after: 10,
                 tokens_before: 12_000,
@@ -2664,24 +2856,97 @@ mod context_cache_contract_tests {
             pre_llm_messages: &messages,
             tool_results: &[],
             schema_tokens: 7,
-            result_prompt_tokens: Some(500),
-            observed_fresh_input_tokens: Some(100),
-            observed_cache_read_tokens: Some(300),
+            result_prompt_tokens: Some(1_100),
+            observed_fresh_input_tokens: Some(200),
+            observed_cache_read_tokens: Some(800),
             observed_cache_creation_tokens: Some(100),
-            observed_output_tokens: Some(20),
+            observed_output_tokens: Some(50),
             assembly_trace: None,
             turn_intent: "implementation",
             reason: "test",
             context_window_tokens: 64_000,
         });
 
+        let normalized = serde_json::from_value::<astra_turn_types::NormalizedPromptCacheUsage>(
+            projection.manifest_json["normalized_prompt_cache_usage"].clone(),
+        )
+        .expect("manifest usage must retain its typed provider-neutral shape");
         assert_eq!(
-            projection.manifest_json["normalized_prompt_cache_usage"],
+            normalized,
+            astra_turn_types::NormalizedPromptCacheUsage::new(200, 800, 100)
+        );
+        assert_eq!(normalized.cache_creation_tokens, 100);
+        assert_eq!(normalized.total_input_tokens(), 1_100);
+        assert_eq!(projection.total_estimated_tokens, 1_100);
+        assert_eq!(
+            projection.manifest_json["observed_usage"]["output_tokens"],
+            50
+        );
+    }
+
+    #[test]
+    fn context_manifest_estimates_each_final_wire_zone_once() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
             json!({
-                "fresh_input_tokens": 100,
-                "cache_read_tokens": 300,
-                "cache_creation_tokens": 100
-            })
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "file body"
+                }]
+            }),
+        ];
+        let duplicate_runtime_projection = vec![json!({
+            "name": "read_file",
+            "tool_call_id": "call-1",
+            "result": "file body"
+        })];
+        let schema_tokens = 7;
+        let projection = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &messages,
+            tool_results: &duplicate_runtime_projection,
+            schema_tokens,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+
+        let expected_wire_tokens = messages
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(schema_tokens, u32::saturating_add);
+        assert_eq!(projection.total_estimated_tokens, expected_wire_tokens);
+        let zone_used_total = projection.manifest_json["zones"]
+            .as_object()
+            .expect("zones must be an object")
+            .values()
+            .filter_map(|zone| zone.get("used_tokens").and_then(Value::as_u64))
+            .sum::<u64>();
+        assert_eq!(
+            zone_used_total,
+            u64::from(expected_wire_tokens),
+            "mutually exclusive manifest zones must reconcile with the final-wire estimate"
         );
     }
 
@@ -2818,6 +3083,155 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn every_physical_request_identity_is_derived_from_its_exact_serialized_bytes() {
+        let messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "task"}),
+        ];
+        let tools = vec![tool("read_file")];
+        let mut attempts = Vec::new();
+        for (attempt, max_tokens, status, response_id, usage, error_kind, error_message) in [
+            (
+                0_u32,
+                4_096_u32,
+                astra_services::InferenceTerminalStatus::DeliveryUnknown,
+                "provider-partial",
+                astra_services::InferenceUsage {
+                    input_tokens: 200,
+                    output_tokens: 50,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                },
+                Some("stream_transport"),
+                Some("provider stream ended after partial delivery"),
+            ),
+            (
+                1,
+                2_048,
+                astra_services::InferenceTerminalStatus::Succeeded,
+                "provider-success",
+                astra_services::InferenceUsage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_read_tokens: 400,
+                    cache_creation_tokens: 20,
+                },
+                None,
+                None,
+            ),
+        ] {
+            let body = json!({
+                "model": "provider-model",
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "stream": true,
+            });
+            let prepared = crate::turn::llm::client::PreparedProviderRequest::from_json(
+                &body,
+                crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            )
+            .expect("prepare provider body once");
+            let wire = prepared.identity();
+            attempts.push(crate::turn::llm::durable::DurableProviderAttemptFact {
+                request: crate::turn::llm::durable::DurableProviderRequestIdentity {
+                    request_id: format!("attempt-{attempt}"),
+                    request_hash: wire.provider_wire_hash.clone(),
+                    attempt,
+                    protocol: wire.protocol,
+                    provider_wire_bytes: wire.provider_wire_bytes,
+                    composition: wire.composition.clone(),
+                },
+                terminal: Some(astra_services::InferenceInvocationTerminal {
+                    status,
+                    usage,
+                    provider_response_id: Some(response_id.to_string()),
+                    error_kind: error_kind.map(str::to_string),
+                    error_message: error_message.map(str::to_string),
+                }),
+            });
+        }
+        let mut trace = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut trace, &messages, &tools);
+        augment_manifest_trace_with_provider_attempts(&mut trace, &attempts, 3);
+
+        assert_eq!(
+            trace["provider_request_attempts"].as_array().unwrap().len(),
+            2
+        );
+        for (index, attempt) in attempts.iter().enumerate() {
+            let projected = &trace["provider_request_attempts"][index];
+            assert_eq!(
+                projected["composition_bytes"]["total"],
+                projected["serialized_bytes"]
+            );
+            assert_eq!(projected["request_id"], attempt.request.request_id);
+            assert_eq!(projected["request_hash"], attempt.request.request_hash);
+        }
+        assert_ne!(
+            trace["provider_request_attempts"][0]["request_hash"],
+            trace["provider_request_attempts"][1]["request_hash"]
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["terminal_status"],
+            "delivery_unknown"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["provider_response_id"],
+            "provider-partial"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["usage"],
+            json!({
+                "input_tokens": 200,
+                "output_tokens": 50,
+                "cache_read_tokens": 800,
+                "cache_creation_tokens": 100,
+            })
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["error_kind"],
+            "stream_transport"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["error_message"],
+            "provider stream ended after partial delivery"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][1]["terminal_status"],
+            "succeeded"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][1]["usage"],
+            json!({
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_read_tokens": 400,
+                "cache_creation_tokens": 20,
+            })
+        );
+        assert!(trace["provider_request_attempts"][1]["error_kind"].is_null());
+        assert!(trace["provider_request_attempts"][1]["error_message"].is_null());
+        assert_eq!(
+            trace["request_identity"]["request_id"],
+            attempts[1].request.request_id
+        );
+        assert_eq!(
+            trace["request_identity"]["provider_response_id"],
+            "provider-success"
+        );
+        assert_eq!(
+            trace["wire"]["projection_authority"], "pre_provider_messages_and_tools_v1",
+            "the pre-provider projection remains explicitly distinct from exact body facts"
+        );
+
+        clear_manifest_provider_request(&mut trace);
+        assert!(trace.get("request_identity").is_none());
+        assert!(trace.get("provider_request_attempts").is_none());
+        assert!(trace["wire"].get("projection_authority").is_some());
+    }
+
+    #[test]
     fn augment_manifest_trace_records_final_wire_cache_control_counts() {
         let mut trace = json!({"source": "llm_context"});
         let messages = vec![
@@ -2840,6 +3254,10 @@ mod context_cache_contract_tests {
         augment_manifest_trace_with_wire(&mut trace, &messages, &tools);
 
         assert_eq!(trace["wire"]["message_count"], 2);
+        assert_eq!(
+            trace["wire"]["projection_authority"],
+            "pre_provider_messages_and_tools_v1"
+        );
         assert_eq!(trace["wire"]["tool_schema_count"], 1);
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);

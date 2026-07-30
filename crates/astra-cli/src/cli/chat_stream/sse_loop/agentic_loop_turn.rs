@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
 use astra_runtime::{
     pipeline::step_recorder::StepRecorder,
     prompts,
@@ -21,7 +22,6 @@ use astra_runtime::{
     turn::agentic_turn_telemetry::{
         capture_first_surface_report_if_empty, record_first_latency_ms_since,
     },
-    turn::boost_domain_hints::{domain_hints_debug_strings, domain_hints_from_boost_terms},
     turn::chat_turn_api_error::{
         CHAT_TURN_POST_MAX_RETRIES, chat_turn_http_error_with_compact_body,
     },
@@ -274,6 +274,7 @@ struct PrepareChatTurnRequest<'a> {
     message: &'a str,
     user_intent: &'a str,
     semantic_query_override: Option<&'a str>,
+    turn_intent: Option<&'a TurnIntent>,
     history: &'a [(String, String)],
     recent_tools: &'a [String],
     executor: Arc<ToolExecutor>,
@@ -468,7 +469,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     let normalized_prompt =
         astra_turn_core::runtime_scaffolding::normalize_prompt_facing_runtime_messages(
-            ctx.messages.to_vec(),
+            crate::cli::history_work::clone_json_history(
+                astra_core::history_work::HistoryWorkSite::CliPromptNormalizationClone,
+                ctx.messages,
+            ),
         );
     let prompt_messages = normalized_prompt.messages;
     let mut runtime_required_texts = Vec::new();
@@ -497,12 +501,15 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             // turn regardless of content. Short read-only questions get a
             // capped effort — multi-step / modification turns pass through
             // unchanged. See `ThinkingConfig::scale_for_turn` for the policy.
-            let signals =
-                astra_turn_core::thinking_config::TurnComplexitySignals::from_message(ctx.message);
+            let signals = thinking_complexity_signals(ctx.message, ctx.turn_intent);
             cfg.scale_for_turn(signals)
         }
         None => astra_turn_core::thinking_config::ThinkingConfig::Off,
     };
+    crate::cli::history_work::record_json_history(
+        astra_core::history_work::HistoryWorkSite::CliPromptPayloadClone,
+        &prompt_messages,
+    );
     let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
         messages: &prompt_messages,
         user_intent: Some(ctx.user_intent),
@@ -625,8 +632,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             !ctx.history.is_empty(),
         );
     let semantic_query_str = memory_retrieval_decision.query();
-    let mut boost_terms =
-        astra_turn_core::retrieval::extract_boost_terms_from_pairs(ctx.history, semantic_query_str);
     {
         match memory_retrieval_decision {
             astra_turn_core::retrieval::CrossSessionMemoryDecision::Skip { query, reason } => {
@@ -658,11 +663,6 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
                     for repo in &projection.preferred_repos {
                         ctx.executor.add_preferred_repo(repo);
                     }
-                    astra_turn_core::retrieval::append_boost_terms_from_ranked_memory(
-                        &mut boost_terms,
-                        query,
-                        &projection.ranked,
-                    );
                     // Send "useful" feedback for retrieved memories (fire-and-forget)
                     ctx.executor.memory_feedback_useful(projection.feedback_ids);
                 }
@@ -673,32 +673,34 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
 
     touch_prep_ui_phase(&ctx.prep_ui_phase, "Preparing tools…");
 
-    let memory_domain_hints = domain_hints_from_boost_terms(&boost_terms);
+    let judged_domain_hints = ctx
+        .turn_intent
+        .and_then(|intent| intent.domain)
+        .map(|domain| vec![domain.as_str().to_string()])
+        .unwrap_or_default();
     // Consume the one-shot strategy/correction reset marker. Tool health is
     // advisory only and never mutates the hard schema restriction set.
     let _ = std::mem::take(ctx.widen_selection_pending);
-    ctx.step_recorder.record_perceive(
-        semantic_query_str,
-        &[],
-        &domain_hints_debug_strings(&memory_domain_hints),
-        &boost_terms,
-    );
+    ctx.step_recorder
+        .record_perceive(semantic_query_str, &[], &judged_domain_hints);
 
     // Skill activation is handled exclusively by the `skill` tool in the agentic loop
     // (see turn/skill_tool.rs + partition_and_execute_skills). The model decides when
     // to invoke skills by calling the tool, rather than having skills pre-injected by
     // the tool surface builder.
 
+    let typed_tool_surface_allowed = match ctx.turn_intent {
+        Some(intent) => intent.communicative_act.uses_tool_surface(),
+        None => true,
+    };
     let (turn_schemas, surface_report, surface_latency_ms) = {
         let sel_start = Instant::now();
         touch_prep_ui_phase(&ctx.prep_ui_phase, "Loading schemas…");
         let budget = ctx.registry.default_schema_budget();
-        let (mut schemas, mut report) = ctx.registry.build_initial_surface_with_report_ctx(
-            semantic_query_str,
-            budget,
-            ctx.recent_tools,
-        );
-        if !ctx.tool_results.is_empty() {
+        let (mut schemas, mut report) = ctx
+            .registry
+            .build_turn_surface_with_report(ctx.turn_intent, budget);
+        if typed_tool_surface_allowed && !ctx.tool_results.is_empty() {
             retain_invoked_tool_schemas(
                 &mut schemas,
                 &mut report,
@@ -715,51 +717,53 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     let mut turn_schemas = turn_schemas;
     let mut surface_report = surface_report;
     let mut activated_deferred_tool_names = Vec::new();
-    if let Some(ref allowed) = ctx.skill_allowed_tools {
-        astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
-            &mut turn_schemas,
-            &mut surface_report,
-            allowed,
-            ctx.all_schemas,
-        );
-    }
-    if !ctx.plan_mode_active {
-        if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
-            let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
-            astra_turn_core::tool_schema_prune::inject_required_tool_names(
+    if typed_tool_surface_allowed {
+        if let Some(ref allowed) = ctx.skill_allowed_tools {
+            astra_turn_core::tool_schema_prune::inject_skill_allowed_tools(
                 &mut turn_schemas,
                 &mut surface_report,
-                &required_refs,
+                allowed,
                 ctx.all_schemas,
             );
         }
-        // Materialize deferred tools selected in retained conversation
-        // context. A successful call cannot revoke a schema that later turns
-        // may still need; only reset or a real surface change may remove it.
-        let activated = ctx
-            .executor
-            .activated_deferred_tool_names_for_schema_injection();
-        if !activated.is_empty() {
-            let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
-            astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                &mut turn_schemas,
-                &mut surface_report,
-                &refs,
-                ctx.all_schemas,
-            );
-            activated_deferred_tool_names = activated;
-        }
-        if surface_report
-            .visible_tools
-            .iter()
-            .any(|name| name == "bash")
-        {
-            astra_turn_core::tool_schema_prune::inject_required_tool_names(
-                &mut turn_schemas,
-                &mut surface_report,
-                BASH_BACKGROUND_TASK_CONTROL_TOOLS,
-                ctx.all_schemas,
-            );
+        if !ctx.plan_mode_active {
+            if let Some(required) = ctx.executor.take_pending_round_tool_boost() {
+                let required_refs: Vec<&str> = required.iter().map(String::as_str).collect();
+                astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                    &mut turn_schemas,
+                    &mut surface_report,
+                    &required_refs,
+                    ctx.all_schemas,
+                );
+            }
+            // Materialize deferred tools selected in retained conversation
+            // context. A successful call cannot revoke a schema that later turns
+            // may still need; only reset or a real surface change may remove it.
+            let activated = ctx
+                .executor
+                .activated_deferred_tool_names_for_schema_injection();
+            if !activated.is_empty() {
+                let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
+                astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                    &mut turn_schemas,
+                    &mut surface_report,
+                    &refs,
+                    ctx.all_schemas,
+                );
+                activated_deferred_tool_names = activated;
+            }
+            if surface_report
+                .visible_tools
+                .iter()
+                .any(|name| name == "bash")
+            {
+                astra_turn_core::tool_schema_prune::inject_required_tool_names(
+                    &mut turn_schemas,
+                    &mut surface_report,
+                    BASH_BACKGROUND_TASK_CONTROL_TOOLS,
+                    ctx.all_schemas,
+                );
+            }
         }
     }
     let had_tools_before_runtime_filter = runtime_filter_turn_schemas_and_report(
@@ -774,14 +778,18 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     // never consumed. See test
     // `surface_report_from_visible_schemas_is_single_source_for_budget`.
 
-    let (inject_tools, surface_reason) = tool_surface_should_inject(
-        &turn_schemas,
-        &surface_report,
-        had_tools_before_runtime_filter,
-        !ctx.recent_tools.is_empty(),
-        !ctx.tool_results.is_empty(),
-        ctx.plan_mode_active,
-    );
+    let (inject_tools, surface_reason) = if typed_tool_surface_allowed {
+        tool_surface_should_inject(
+            &turn_schemas,
+            &surface_report,
+            had_tools_before_runtime_filter,
+            !ctx.recent_tools.is_empty(),
+            !ctx.tool_results.is_empty(),
+            ctx.plan_mode_active,
+        )
+    } else {
+        (false, "typed_non_work_act")
+    };
     tracing::trace!(
         target: "astra.tool_surface",
         reason = surface_reason,
@@ -1183,6 +1191,29 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     }
 }
 
+fn thinking_complexity_signals(
+    message: &str,
+    turn_intent: Option<&TurnIntent>,
+) -> astra_turn_core::thinking_config::TurnComplexitySignals {
+    let typed_lightweight = turn_intent.is_some_and(|intent| {
+        intent.workspace_mutation == WorkspaceMutationIntent::ReadOnly
+            && intent.requested_scenario == Some(Scenario::QuickAnswer)
+    });
+    let continues_current_objective = turn_intent.is_some_and(|intent| {
+        matches!(
+            intent.objective_relation,
+            astra_turn_types::ObjectiveRelation::Continue
+                | astra_turn_types::ObjectiveRelation::Refine
+                | astra_turn_types::ObjectiveRelation::Correct
+        )
+    });
+    astra_turn_core::thinking_config::TurnComplexitySignals {
+        input_char_len: message.trim().chars().count(),
+        typed_lightweight,
+        continues_current_objective,
+    }
+}
+
 fn inject_runtime_turn_overrides(
     payload: &mut Value,
     is_plan_subtask: bool,
@@ -1251,6 +1282,7 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub message: &'a str,
     pub user_intent: &'a str,
     pub semantic_query_override: Option<&'a str>,
+    pub turn_intent: Option<&'a TurnIntent>,
     pub history: &'a [(String, String)],
     pub recent_tools: &'a [String],
     pub project_root: &'a Path,
@@ -1299,6 +1331,9 @@ pub(crate) struct ChatTurnSseFetchRequest<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
+    /// Strict machine observation stream for one-shot `stream-json`.
+    pub stream_json_emitter:
+        Option<std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     /// Optional channel for async tool approval requests during plan execution.
     pub approval_request_tx: Option<crate::cli::chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -1388,9 +1423,25 @@ async fn chat_turn_post_payload_after_prepare(
     quiet: bool,
     ui: &ChatTurnSseFetchUi,
     stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
+    stream_json_emitter: Option<
+        &std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>,
+    >,
     prepare: PrepareChatTurnRequest<'_>,
-) -> Result<(astra_thin_client::HttpResponse, ChatTurnPrepLineGuard, u64), String> {
+) -> Result<
+    (
+        astra_thin_client::HttpResponse,
+        ChatTurnPrepLineGuard,
+        u64,
+        Option<crate::cli::stream::stream_json::StreamJsonExchange>,
+    ),
+    String,
+> {
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
+    let (current_session_id, session_turn, round_index) = (
+        prepare.current_session_id,
+        prepare.session_turn,
+        prepare.round_index,
+    );
     let prepared = prepare_chat_turn_payload(prepare).await;
 
     if let Some(tx) = stream_event_tx {
@@ -1402,6 +1453,17 @@ async fn chat_turn_post_payload_after_prepare(
     }
 
     touch_prep_ui_phase(&ui.prep_ui_phase, "Sending…");
+    // `exchange_started` is the logical `/chat/turn` request boundary. The
+    // thin client may perform internal 429 transport retries, which are not
+    // exposed as separate exchanges. If the request fails or returns a
+    // non-success status, this observer is dropped without an
+    // `exchange_finished`; only a protocol `[DONE]` can close it.
+    let stream_json_exchange = match stream_json_emitter {
+        Some(emitter) => {
+            Some(emitter.start_exchange(current_session_id, session_turn, round_index)?)
+        }
+        None => None,
+    };
     let http_mark = Instant::now();
     let resp = api
         .post_chat_turn_retry_429(token, &prepared.payload, CHAT_TURN_POST_MAX_RETRIES, quiet)
@@ -1417,7 +1479,12 @@ async fn chat_turn_post_payload_after_prepare(
             .dim()
         );
     }
-    Ok((resp, prep_line, prepared.pinned_tool_schema_tokens))
+    Ok((
+        resp,
+        prep_line,
+        prepared.pinned_tool_schema_tokens,
+        stream_json_exchange,
+    ))
 }
 
 pub(crate) async fn fetch_chat_turn_sse(
@@ -1437,6 +1504,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         render_policy,
         message,
         user_intent,
+        turn_intent,
         history,
         recent_tools,
         project_root,
@@ -1467,6 +1535,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         cancel_token,
         plan_assemble_line_release,
         stream_event_tx,
+        stream_json_emitter,
         approval_request_tx,
         ask_user_request_tx,
         skill_resolver,
@@ -1511,72 +1580,75 @@ pub(crate) async fn fetch_chat_turn_sse(
     };
     let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
-    let (resp, prep_line, prepared_schema_tokens) = chat_turn_post_payload_after_prepare(
-        api,
-        token,
-        render_policy.is_silent(),
-        &ui,
-        stream_event_tx.as_ref(),
-        PrepareChatTurnRequest {
-            messages,
-            runtime_required_texts,
-            active_system_skills,
-            runtime_volatile_texts,
-            runtime_volatile_injections,
-            ephemeral_prefix,
-            current_session_id,
-            offering_id,
-            model,
-            context_window_tokens,
-            effective_input_budget_tokens,
-            explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
-                ExplainMode::Off => AgenticExplainUiMode::Off,
-                ExplainMode::On => AgenticExplainUiMode::On,
-                ExplainMode::Verbose => AgenticExplainUiMode::Verbose,
-            }),
-            project_root,
-            message,
-            user_intent,
-            semantic_query_override,
-            history,
-            recent_tools,
-            executor: Arc::clone(&executor),
-            registry,
-            tool_results,
-            all_schemas,
-            valid_tool_names,
-            turn_guard,
-            restricted_tools,
-            widen_selection_pending,
-            step_recorder,
-            file_context,
-            assembly_start,
-            telem,
-            is_plan_subtask,
-            plan_subtask_id,
-            timing_phases: ui.timing,
-            prep_ui_phase: ui.prep_ui_phase.clone(),
-            skill_effort,
-            skill_agent_type,
-            interaction_mode,
-            turn_policy,
-            skill_allowed_tools,
-            previous_confidence_fallback,
-            round_index,
-            session_turn,
-            turn_chain_id,
-            user_query_event_id,
-            denial_pressure: perm_manager.denial_pressure(),
-            recent_rejections: perm_manager.recent_rejections(),
-            observability_hub,
-            append_system_prompt,
-            plan_resume_hint,
-            plan_mode_active: perm_manager.mode()
-                == crate::cli::permission_manager::PermissionMode::Plan,
-            lessons_text: lessons_text_ref,
-        },
-    )
-    .await?;
+    let (resp, prep_line, prepared_schema_tokens, stream_json_exchange) =
+        chat_turn_post_payload_after_prepare(
+            api,
+            token,
+            render_policy.is_silent(),
+            &ui,
+            stream_event_tx.as_ref(),
+            stream_json_emitter.as_ref(),
+            PrepareChatTurnRequest {
+                messages,
+                runtime_required_texts,
+                active_system_skills,
+                runtime_volatile_texts,
+                runtime_volatile_injections,
+                ephemeral_prefix,
+                current_session_id,
+                offering_id,
+                model,
+                context_window_tokens,
+                effective_input_budget_tokens,
+                explain: AgenticChatExplainFlags::from_explain_ui_mode(match explain {
+                    ExplainMode::Off => AgenticExplainUiMode::Off,
+                    ExplainMode::On => AgenticExplainUiMode::On,
+                    ExplainMode::Verbose => AgenticExplainUiMode::Verbose,
+                }),
+                project_root,
+                message,
+                user_intent,
+                semantic_query_override,
+                turn_intent,
+                history,
+                recent_tools,
+                executor: Arc::clone(&executor),
+                registry,
+                tool_results,
+                all_schemas,
+                valid_tool_names,
+                turn_guard,
+                restricted_tools,
+                widen_selection_pending,
+                step_recorder,
+                file_context,
+                assembly_start,
+                telem,
+                is_plan_subtask,
+                plan_subtask_id,
+                timing_phases: ui.timing,
+                prep_ui_phase: ui.prep_ui_phase.clone(),
+                skill_effort,
+                skill_agent_type,
+                interaction_mode,
+                turn_policy,
+                skill_allowed_tools,
+                previous_confidence_fallback,
+                round_index,
+                session_turn,
+                turn_chain_id,
+                user_query_event_id,
+                denial_pressure: perm_manager.denial_pressure(),
+                recent_rejections: perm_manager.recent_rejections(),
+                observability_hub,
+                append_system_prompt,
+                plan_resume_hint,
+                plan_mode_active: perm_manager.mode()
+                    == crate::cli::permission_manager::PermissionMode::Plan,
+                lessons_text: lessons_text_ref,
+            },
+        )
+        .await?;
 
     *pinned_tool_schema_tokens = prepared_schema_tokens;
 
@@ -1628,6 +1700,7 @@ pub(crate) async fn fetch_chat_turn_sse(
         pre_clear_lines,
         auth_profile,
         cancel_token,
+        stream_json_exchange,
     )
     .await;
     if ui.timing {
@@ -1653,8 +1726,9 @@ mod tests {
         PrepareChatTurnRequest, PrepareTurnTelemetry, build_retained_history_turns,
         chat_turn_budget_pressure, inject_bridge_turn_identity, inject_runtime_turn_overrides,
         msg_content, prepare_chat_turn_payload, project_cross_session_memory_hits,
-        retained_history_messages,
+        retained_history_messages, thinking_complexity_signals,
     };
+    use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
     use astra_runtime::turn::agentic_loop::host::{
         ASK_USER_TOOL_NAME, TurnInteractionMode, VolatileInjection,
     };
@@ -1665,6 +1739,33 @@ mod tests {
         EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS, EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS,
     };
     use serde_json::{Value, json};
+
+    #[test]
+    fn thinking_complexity_consumes_typed_llm_intent_without_text_matching() {
+        let unjudged = thinking_complexity_signals("fix implement 修复 为什么", None);
+        assert!(!unjudged.typed_lightweight);
+        assert!(!unjudged.continues_current_objective);
+
+        let quick_answer = TurnIntent::default()
+            .with_requested_scenario(Scenario::QuickAnswer)
+            .with_workspace_mutation(WorkspaceMutationIntent::ReadOnly);
+        let judged = thinking_complexity_signals("arbitrary wording", Some(&quick_answer));
+        assert!(judged.typed_lightweight);
+        assert!(!judged.continues_current_objective);
+
+        let continuation = quick_answer
+            .clone()
+            .with_objective_relation(astra_turn_types::ObjectiveRelation::Continue);
+        let continued = thinking_complexity_signals("unrelated wording", Some(&continuation));
+        assert!(continued.typed_lightweight);
+        assert!(continued.continues_current_objective);
+
+        let mutating = quick_answer.with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
+        assert!(
+            !thinking_complexity_signals("why?", Some(&mutating)).typed_lightweight,
+            "typed mutation intent must override a quick-answer scenario"
+        );
+    }
 
     fn schema(name: &str) -> serde_json::Value {
         json!({
@@ -1757,6 +1858,7 @@ mod tests {
             message,
             user_intent: semantic_query_override.unwrap_or(message),
             semantic_query_override,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -1950,6 +2052,7 @@ mod tests {
                 message: "continue",
                 user_intent: "continue",
                 semantic_query_override: None,
+                turn_intent: None,
                 history: &history,
                 recent_tools: &recent_tools,
                 executor,
@@ -2649,6 +2752,7 @@ mod tests {
             message: "inspect the repo state",
             user_intent: "inspect the repo state",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -2835,6 +2939,7 @@ mod tests {
             message: "inspect the repo state",
             user_intent: "inspect the repo state",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -2910,8 +3015,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_chat_turn_payload_surface_edges_preserve_activation() {
+    async fn prepare_chat_turn_payload_honors_typed_non_work_act_and_preserves_activation() {
         use crate::edge_tools::ToolExecutor;
+        use astra_config::user_profile::{TurnCommunicativeAct, TurnIntent};
         use astra_pipeline::step_recorder::StepRecorder;
         use astra_runtime::{
             tool_registry::ToolRegistry,
@@ -2923,8 +3029,8 @@ mod tests {
         let temp_dir = tempfile::tempdir().unwrap();
         let all_schemas = astra_tools::schemas::all_tool_schemas();
         let registry = ToolRegistry::new(all_schemas.clone());
-        let empty_schemas: Vec<Value> = Vec::new();
-        let empty_registry = ToolRegistry::new(empty_schemas.clone());
+        let social_intent =
+            TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
         let executor = Arc::new(ToolExecutor::new(temp_dir.path()));
         let empty_surface_message = "empty tool surface";
         let messages = vec![json!({"role": "user", "content": empty_surface_message})];
@@ -2962,12 +3068,13 @@ mod tests {
             message: empty_surface_message,
             user_intent: empty_surface_message,
             semantic_query_override: None,
+            turn_intent: Some(&social_intent),
             history: &history,
             recent_tools: &recent_tools,
             executor: Arc::clone(&executor),
-            registry: &empty_registry,
+            registry: &registry,
             tool_results: &tool_results,
-            all_schemas: &empty_schemas,
+            all_schemas: &all_schemas,
             valid_tool_names: &mut valid_tool_names,
             turn_guard: &turn_guard,
             restricted_tools: &mut restricted_tools,
@@ -3010,7 +3117,7 @@ mod tests {
         let edge_tools = payload["edge_tools"].as_array().unwrap();
         assert!(
             edge_tools.is_empty(),
-            "an explicitly empty tool surface without pending context should not include full tool schemas: {:?}",
+            "a typed social turn should not include tool schemas: {:?}",
             edge_tools
                 .iter()
                 .filter_map(|schema| schema["function"]["name"].as_str())
@@ -3085,6 +3192,7 @@ mod tests {
             message: empty_surface_message,
             user_intent: empty_surface_message,
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: Arc::clone(&executor),
@@ -3187,6 +3295,7 @@ mod tests {
             message: "inspect the repository",
             user_intent: "inspect the repository",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: Arc::clone(&executor),
@@ -3306,6 +3415,7 @@ mod tests {
             message: "run make check",
             user_intent: "run make check",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -3433,6 +3543,7 @@ mod tests {
             message,
             user_intent,
             semantic_query_override: Some(semantic_query_override),
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -3592,6 +3703,7 @@ mod tests {
             message: "implement the approved plan",
             user_intent: "implement the approved plan",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -3723,6 +3835,7 @@ mod tests {
             message: "remember this",
             user_intent: "remember this",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -3848,6 +3961,7 @@ mod tests {
             message: "no deferred tools",
             user_intent: "no deferred tools",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -3958,6 +4072,7 @@ mod tests {
             message: "delegate review with parallel agents",
             user_intent: "delegate review with parallel agents",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -4076,6 +4191,7 @@ mod tests {
             message: "fan out this work",
             user_intent: "fan out this work",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -4190,6 +4306,7 @@ mod tests {
             message: "update the file",
             user_intent: "update the file",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor: executor.clone(),
@@ -4261,6 +4378,7 @@ mod tests {
             message: "update the file",
             user_intent: "update the file",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -4370,6 +4488,7 @@ mod tests {
             message: "fix the bug",
             user_intent: "fix the bug",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,
@@ -4475,6 +4594,7 @@ mod tests {
             message: "hi",
             user_intent: "hi",
             semantic_query_override: None,
+            turn_intent: None,
             history: &history,
             recent_tools: &recent_tools,
             executor,

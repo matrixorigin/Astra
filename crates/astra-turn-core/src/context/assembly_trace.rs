@@ -38,6 +38,19 @@ pub struct ContextAssemblyTrace {
     /// Session identifier.
     pub session_id: String,
 
+    /// Identity of the latest concrete model request represented by this
+    /// assembly. A turn may issue several rounds and provider retries; the
+    /// durable per-request manifest retains the sequence while this
+    /// turn-level view deliberately points at the latest active request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_identity: Option<ModelRequestTraceIdentity>,
+
+    /// Phase-0 shadow evidence comparing the current lossy CLI pair-history
+    /// continuation with the complete typed messages produced by the turn.
+    /// This is measurement only and never selects prompt history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_shadow: Option<ContinuationShadowTrace>,
+
     /// Breakdown of system prompt components.
     pub system_prompt: SystemPromptBreakdown,
 
@@ -78,6 +91,8 @@ impl Default for ContextAssemblyTrace {
             turn_id: String::new(),
             timestamp: SystemTime::now(),
             session_id: String::new(),
+            request_identity: None,
+            continuation_shadow: None,
             system_prompt: SystemPromptBreakdown::default(),
             history: HistorySelectionTrace::default(),
             memory: MemoryRetrievalTrace::default(),
@@ -86,6 +101,40 @@ impl Default for ContextAssemblyTrace {
             explanations: Vec::new(),
         }
     }
+}
+
+/// Stable identity for one concrete provider-bound request.
+///
+/// `round` identifies the logical model round and `attempt` identifies a
+/// retry of that exact round. The request ID and hash are generated from the
+/// final wire plan, so tracing never invents identity from mutable counters
+/// after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestTraceIdentity {
+    pub request_id: String,
+    pub request_hash: String,
+    pub round: u32,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
+}
+
+/// One candidate continuation projection in the Phase-0 shadow comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationProjectionTrace {
+    pub prompt_hash: String,
+    pub estimated_tokens: u64,
+    pub serialized_bytes: u64,
+    pub message_count: u32,
+    pub complete_tool_groups: u32,
+}
+
+/// Side-by-side evidence for the current CLI continuation loss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinuationShadowTrace {
+    pub pair_history: ContinuationProjectionTrace,
+    pub complete_final_messages: ContinuationProjectionTrace,
+    pub dropped_tool_groups: u32,
 }
 
 /// Normalize arbitrary memory content into a one-line preview suitable for
@@ -445,6 +494,16 @@ impl ContextAssemblyTraceBuilder {
 
     pub fn with_system_prompt(mut self, breakdown: SystemPromptBreakdown) -> Self {
         self.trace.system_prompt = breakdown;
+        self
+    }
+
+    pub fn with_request_identity(mut self, identity: ModelRequestTraceIdentity) -> Self {
+        self.trace.request_identity = Some(identity);
+        self
+    }
+
+    pub fn with_continuation_shadow(mut self, shadow: ContinuationShadowTrace) -> Self {
+        self.trace.continuation_shadow = Some(shadow);
         self
     }
 

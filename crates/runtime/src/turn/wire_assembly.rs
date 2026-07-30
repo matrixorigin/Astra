@@ -31,6 +31,52 @@ pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runt
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
 const TOOL_RUNTIME_CONTEXT_SUFFIX: &str = "</runtime-context-after-tool>";
 
+/// Convert a Memoria boundary into a typed provider-wire observation.
+///
+/// The shared estimator covers the fixed prefix, compacted history, and
+/// visible tool schemas so server and bridge callers report the same facts.
+pub(crate) fn observe_context_compaction(
+    id: impl Into<String>,
+    kind: astra_turn_core::compaction_types::CompactionKind,
+    history_before: &[Value],
+    result: &CompactResult,
+    fixed_context: &[Value],
+    visible_tools: &[Value],
+) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
+    result.boundary.as_ref()?;
+    if result.messages == history_before {
+        return None;
+    }
+
+    let estimate = |history: &[Value]| -> u64 {
+        fixed_context
+            .iter()
+            .chain(history)
+            .chain(visible_tools)
+            .map(crate::prompts::estimate_json_value_tokens)
+            .map(|tokens| u64::try_from(tokens).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add)
+    };
+    let tokens_before = estimate(history_before);
+    let tokens_after = estimate(&result.messages);
+    if tokens_after >= tokens_before {
+        return None;
+    }
+
+    Some(
+        astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
+            id: id.into(),
+            kind,
+            tier: result.tier,
+            messages_before: history_before.len().min(u64::MAX as usize) as u64,
+            messages_after: result.messages.len().min(u64::MAX as usize) as u64,
+            tokens_before,
+            tokens_after,
+            tokens_saved: tokens_before - tokens_after,
+        },
+    )
+}
+
 /// Preflight estimate for the final provider payload.
 ///
 /// This is deliberately observational: provider tokenizers remain the hard
@@ -279,6 +325,36 @@ struct ResolvedBudget {
     tier: CompactionTier,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SerializedHistoryMeasurement {
+    chars: usize,
+    bytes: u64,
+}
+
+fn serialized_history_measurement(history: &[Value]) -> SerializedHistoryMeasurement {
+    history.iter().fold(
+        SerializedHistoryMeasurement { chars: 0, bytes: 0 },
+        |measurement, message| match serde_json::to_string(message) {
+            Ok(encoded) => SerializedHistoryMeasurement {
+                chars: measurement.chars.saturating_add(encoded.chars().count()),
+                bytes: measurement
+                    .bytes
+                    .saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX)),
+            },
+            Err(error) => {
+                astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::HistoryBudgetEstimationSerialization,
+                    &error,
+                );
+                SerializedHistoryMeasurement {
+                    chars: measurement.chars.saturating_add(1),
+                    ..measurement
+                }
+            }
+        },
+    )
+}
+
 fn history_budget_chars(
     budget: &crate::prompts::ContextBudget,
     fixed_context_tokens: usize,
@@ -295,16 +371,17 @@ fn history_budget_chars(
         return available_tokens.saturating_mul(4);
     }
 
-    let history_chars = history
-        .iter()
-        .map(|message| {
-            serde_json::to_string(message)
-                .map(|encoded| encoded.chars().count())
-                .unwrap_or(1)
-        })
-        .sum::<usize>();
+    let measurement = serialized_history_measurement(history);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::HistoryBudgetEstimationSerialization,
+            measurement.bytes,
+            u64::try_from(history.len()).unwrap_or(u64::MAX),
+            0,
+        );
+    }
     let ascii_ceiling = history_tokens.saturating_mul(4);
-    available_tokens.saturating_mul(history_chars.min(ascii_ceiling)) / history_tokens
+    available_tokens.saturating_mul(measurement.chars.min(ascii_ceiling)) / history_tokens
 }
 
 impl BudgetOverrides {
@@ -626,6 +703,10 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
             apply_anthropic_cache_metadata(&mut llm_messages, cache_cfg, session_id);
         }
     }
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
+        &llm_messages,
+    );
     llm_messages
 }
 
@@ -819,6 +900,103 @@ mod tests {
     }
 
     #[test]
+    fn context_compaction_observation_preserves_typed_wire_facts() {
+        use crate::turn::cloud::compaction::{CompactBoundary, CompactResult, CompactTrigger};
+        use astra_turn_core::compaction_types::CompactionKind;
+
+        let before = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "检查约束"}]}),
+            json!({"role": "assistant", "content": "analysis ".repeat(800)}),
+            json!({"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": {"rows": [1, 2, 3]}}),
+            json!({"role": "user", "content": "continue"}),
+        ];
+        let after = vec![
+            json!({"role": "system", "content": "structured summary"}),
+            before.last().expect("latest user").clone(),
+        ];
+        let result = CompactResult {
+            messages: after,
+            boundary: Some(CompactBoundary::new(
+                CompactTrigger::Auto,
+                CompactionTier::CompactHistory,
+            )),
+            tier: CompactionTier::CompactHistory,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+
+        let observation = observe_context_compaction(
+            "wire-1",
+            CompactionKind::WireAssembly,
+            &before,
+            &result,
+            &[json!({"role": "system", "content": "fixed"})],
+            &[json!({"type": "function", "function": {"name": "lookup"}})],
+        )
+        .expect("a shrinking boundary is observable");
+
+        assert_eq!(observation.kind, CompactionKind::WireAssembly);
+        assert_eq!(observation.tier, CompactionTier::CompactHistory);
+        assert_eq!(observation.messages_before, 5);
+        assert_eq!(observation.messages_after, 2);
+        assert!(observation.tokens_before > observation.tokens_after);
+        assert_eq!(
+            observation.tokens_saved,
+            observation.tokens_before - observation.tokens_after
+        );
+        assert!(observation.is_consistent());
+    }
+
+    #[test]
+    fn context_compaction_observation_requires_boundary_and_prompt_reduction() {
+        use crate::turn::cloud::compaction::{CompactResult, CompactTrigger};
+        use astra_turn_core::compaction_types::CompactionKind;
+
+        let messages = vec![json!({"role": "user", "content": "stable"})];
+        let no_boundary = CompactResult {
+            messages: Vec::new(),
+            boundary: None,
+            tier: CompactionTier::CompactHistory,
+            session_memory_context: None,
+            retrieved_memory_entries: Vec::new(),
+            runtime_contexts: Vec::new(),
+        };
+        assert!(
+            observe_context_compaction(
+                "wire-2",
+                CompactionKind::WireAssembly,
+                &messages,
+                &no_boundary,
+                &[],
+                &[]
+            )
+            .is_none()
+        );
+
+        let unchanged = CompactResult {
+            messages: messages.clone(),
+            boundary: Some(crate::turn::cloud::compaction::CompactBoundary::new(
+                CompactTrigger::Auto,
+                CompactionTier::CompactHistory,
+            )),
+            ..no_boundary
+        };
+        assert!(
+            observe_context_compaction(
+                "wire-3",
+                CompactionKind::WireContextRetry,
+                &messages,
+                &unchanged,
+                &[],
+                &[]
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn budget_overrides_default_is_all_none() {
         // Default means "use the context's model-derived budget knobs" — the
         // main path relies on this; a non-None default would silently change
@@ -872,6 +1050,44 @@ mod tests {
         assert!(
             (4_600..=4_700).contains(&available),
             "character budgets must reflect the estimator's observed density: {available}"
+        );
+    }
+
+    #[test]
+    fn history_budget_measurement_reuses_exact_nested_unicode_serialization() {
+        let history = vec![
+            json!({
+                "role": "user",
+                "content": {
+                    "text": "你好🚀",
+                    "parts": ["alpha", {"nested": true}]
+                }
+            }),
+            json!({"role": "assistant", "content": ["résumé", null, 42]}),
+        ];
+        let encoded = history
+            .iter()
+            .map(|message| serde_json::to_string(message).expect("serialize history value"))
+            .collect::<Vec<_>>();
+        let measurement = serialized_history_measurement(&history);
+
+        assert_eq!(
+            measurement.bytes,
+            encoded
+                .iter()
+                .map(|message| message.len() as u64)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            measurement.chars,
+            encoded
+                .iter()
+                .map(|message| message.chars().count())
+                .sum::<usize>()
+        );
+        assert!(
+            measurement.bytes > measurement.chars as u64,
+            "UTF-8 byte accounting must not collapse to character count"
         );
     }
 

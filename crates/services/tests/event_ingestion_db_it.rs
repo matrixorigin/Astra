@@ -45,6 +45,7 @@ fn test_event_for_user(
         parent_event_id: None,
         parent_event_ids: vec![],
         causal_chain_id: None,
+        history_work_queue_reservation: None,
     }
 }
 

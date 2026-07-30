@@ -301,7 +301,11 @@ pub(crate) async fn stream_chat_sse(
     //      up the same key)
     // Pre-fix these were different ("ephemeral" vs None), so the
     // parent capture never happened and fork-cache probes were dead.
-    let parent_turn_run_id = format!("run-{}", uuid::Uuid::new_v4());
+    let parent_turn_run_id = p
+        .stream_json_emitter
+        .as_ref()
+        .map(|emitter| emitter.execution_id().to_string())
+        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
     let term_width = terminal_width_usize();
     // Tool policy and cache behavior follow the resolved model name, never the
     // opaque Offering identity used for admission.
@@ -702,6 +706,7 @@ pub(crate) async fn stream_chat_sse(
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx.clone(),
+        stream_json_emitter: p.stream_json_emitter.clone(),
         pending_ordered_stream_events: std::collections::VecDeque::new(),
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
@@ -842,7 +847,6 @@ pub(crate) async fn stream_chat_sse(
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),
-            intent_tool_turns: Vec::new(),
             verdict_events: Vec::new(),
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
@@ -856,9 +860,6 @@ pub(crate) async fn stream_chat_sse(
             exploration_family_advisory_emitted: false,
             stronger_exploration_family_advisory_emitted: false,
             exploration_family_advisory_family: None,
-            intent_drift_advisory_emitted: false,
-            drift_nudge_count: 0,
-            last_drift_correction_round: 0,
             nudge_count: 0,
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
@@ -992,8 +993,13 @@ pub(crate) async fn stream_chat_sse(
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
         session_turn: current_session_turn,
-        bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
-        bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
+        bridge_turn_chain_id: Some(parent_turn_run_id.clone()),
+        bridge_user_query_event_id: Some(
+            p.stream_json_emitter
+                .as_ref()
+                .map(|emitter| emitter.user_query_event_id().to_string())
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        ),
         turn_event_buffer: None,
         harness: {
             #[cfg(feature = "harness")]
@@ -1155,6 +1161,14 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
+    // `turn_intent` is populated only by the strict LLM judge. Preserve
+    // unknown as `None`; post-turn consumers must not reclassify user text.
+    let routing_domain_hint = state
+        .turn_intent
+        .as_ref()
+        .and_then(|intent| intent.domain)
+        .map(|domain| domain.as_str().to_string());
+
     // Forward explain / verdict to TUI stream (if wired).
     if let Some(ref tx) = p.stream_event_tx {
         let explain_turns = state.telemetry.explain_turns.clone();
@@ -1189,7 +1203,7 @@ pub(crate) async fn stream_chat_sse(
                 cache_creation_tokens: Some(state.total_cache_creation),
                 tool_count: Some(tool_count),
                 llm_rounds: Some(state.llm_rounds_completed),
-                routing_domain_hint: None,
+                routing_domain_hint: routing_domain_hint.clone(),
                 assistant_output: Some(&state.final_text),
                 tool_call_records: &state.stall.tool_call_records,
                 visible_tools: Vec::new(),
@@ -1251,7 +1265,7 @@ pub(crate) async fn stream_chat_sse(
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         memoria_ms: state.telemetry.first_memoria_ms,
-        routing_domain_hint: None,
+        routing_domain_hint,
         entity_learn_skipped_no_domain: false,
         pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
         turn_observability_events: state
@@ -1363,6 +1377,10 @@ fn load_turn_messages(
     current_message: &str,
 ) -> Vec<serde_json::Value> {
     if let Some(msgs) = pre_loaded_messages {
+        crate::cli::history_work::record_json_history(
+            astra_core::history_work::HistoryWorkSite::CliPromptContinuationSanitization,
+            &msgs,
+        );
         let (mut msgs, invalid_turn_semantics_dropped) = astra_turn_core::prompt_facing::
             recover_canonical_continuation_messages_with_turn_semantics(msgs);
         if invalid_turn_semantics_dropped > 0 {
@@ -1374,6 +1392,10 @@ fn load_turn_messages(
         msgs.push(json!({"role": "user", "content": current_message}));
         return msgs;
     }
+    crate::cli::history_work::record_pair_history(
+        astra_core::history_work::HistoryWorkSite::CliPromptHistoryMaterialization,
+        history,
+    );
     openai_messages_from_repl_history(history, current_message)
 }
 

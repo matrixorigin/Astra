@@ -21,6 +21,9 @@ pub const RUNS: &str = "/runs";
 /// `GET` — optional tool capacity from server and connected edge providers.
 pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
 
+/// `GET` — latest durable LLM intent-drift assessment for a session.
+pub const INTROSPECTION_DRIFT_CHECK: &str = "/introspection/drift-check";
+
 /// `POST` — edge registry (`edge_agent_registry` + JWT); body: [`crate::protocol::EdgeRegisterRequest`].
 pub const AGENTS_EDGE: &str = "/agents/edge";
 
@@ -58,6 +61,26 @@ pub fn session_resume(id: &str) -> String {
 #[inline]
 pub fn session_state(id: &str) -> String {
     format!("/sessions/{id}/state")
+}
+
+#[inline]
+pub fn session_device_enroll(id: &str) -> String {
+    format!("/sessions/{id}/device/enroll")
+}
+
+#[inline]
+pub fn session_device_challenge(id: &str) -> String {
+    format!("/sessions/{id}/device/challenge")
+}
+
+#[inline]
+pub fn session_device_trust(id: &str) -> String {
+    format!("/sessions/{id}/device/trust")
+}
+
+#[inline]
+pub fn session_device_revoke(id: &str) -> String {
+    format!("/sessions/{id}/device/revoke")
 }
 
 #[inline]
@@ -185,6 +208,7 @@ pub const AUTH_REGISTER: &str = "/auth/register";
 pub const AUTH_LOGIN: &str = "/auth/login";
 pub const AUTH_REFRESH: &str = "/auth/refresh";
 pub const AUTH_LOGOUT: &str = "/auth/logout";
+pub const AUTH_REAUTHENTICATE: &str = "/auth/reauthenticate";
 pub const AUTH_ME: &str = "/auth/me";
 
 pub const HEALTH: &str = "/health";
@@ -269,9 +293,6 @@ pub const CONTEXT: &str = "/context";
 pub fn context_capture(context_capture_id: &str) -> String {
     format!("/context/{context_capture_id}")
 }
-
-/// Non-streaming chat routing helper (server `chat_route_handler`).
-pub const CHAT_ROUTE: &str = "/chat/route";
 
 /// Lightweight LLM proxy for verification judge / edge components.
 pub const COMPLETIONS: &str = "/v1/chat/completions";
@@ -403,6 +424,7 @@ mod tests {
             AUTH_LOGIN,
             AUTH_REFRESH,
             AUTH_LOGOUT,
+            AUTH_REAUTHENTICATE,
             AUTH_ME,
             HEALTH,
             MODELS,
@@ -415,7 +437,6 @@ mod tests {
             MEMORY_PURGE,
             AGENT_JOBS,
             CONTEXT,
-            CHAT_ROUTE,
             COMPLETIONS,
             ADMIN_INIT,
             ADMIN_REGISTER,
@@ -450,6 +471,17 @@ mod tests {
     #[test]
     fn session_state_path() {
         assert_eq!(session_state("s1"), "/sessions/s1/state");
+    }
+
+    #[test]
+    fn session_device_paths_are_one_explicit_protocol_family() {
+        assert_eq!(session_device_enroll("s1"), "/sessions/s1/device/enroll");
+        assert_eq!(
+            session_device_challenge("s1"),
+            "/sessions/s1/device/challenge"
+        );
+        assert_eq!(session_device_trust("s1"), "/sessions/s1/device/trust");
+        assert_eq!(session_device_revoke("s1"), "/sessions/s1/device/revoke");
     }
 
     #[test]

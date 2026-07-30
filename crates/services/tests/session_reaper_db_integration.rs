@@ -330,9 +330,9 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
     sqlx::query(
         "INSERT INTO inference_invocations
          (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
-          harness_run_id, turn_index, round_index, operation_id, logical_attempt,
+          harness_run_id, admission_token, turn_index, round_index, operation_id, logical_attempt,
           purpose, status)
-         VALUES (?, ?, ?, ?, 'run', ?, NULL, 1, 0, 'reaper-delete', 0,
+         VALUES (?, ?, ?, ?, 'run', ?, NULL, REPEAT('e', 32), 1, 0, 'reaper-delete', 0,
                  'primary_agent', 'admitted')",
     )
     .bind(&invocation_id)

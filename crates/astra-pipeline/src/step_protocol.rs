@@ -241,8 +241,6 @@ pub struct MemoryContext {
     pub retrieved_memory_ids: Vec<String>,
     /// Domain hints extracted from memory
     pub domain_hints: Vec<String>,
-    /// Boost terms for tool surface
-    pub boost_terms: Vec<String>,
     /// Provenance: which memories influenced this step
     pub provenance: Vec<String>,
     /// Memory governance actions triggered during this step
@@ -996,7 +994,6 @@ pub enum StepPayload {
         memory_context: Vec<String>,
     },
     Plan {
-        intent_signals: Vec<String>,
         available_tool_count: usize,
         budget_tokens: u64,
         restricted_tools: Vec<String>,
@@ -1023,11 +1020,8 @@ pub enum StepPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepResult {
     Perceive {
-        intent_signals: Vec<String>,
-        intent_confidence: f64,
         entities: Vec<String>,
         memory_matches: usize,
-        boost_terms: Vec<String>,
     },
     Plan {
         visible_tools: Vec<String>,
@@ -1685,7 +1679,6 @@ mod tests {
         .with_memory_context(MemoryContext {
             retrieved_memory_ids: vec!["mem-1".into()],
             domain_hints: vec!["github".into()],
-            boost_terms: vec!["pr".into()],
             provenance: vec!["mem-1".into()],
             ..Default::default()
         })
@@ -2561,11 +2554,8 @@ mod tests {
     fn step_result_variants_serialize() {
         let results = vec![
             StepResult::Perceive {
-                intent_signals: vec!["is_code_review".into()],
-                intent_confidence: 0.85,
                 entities: vec!["main.rs".into()],
                 memory_matches: 3,
-                boost_terms: vec!["code".into(), "review".into()],
             },
             StepResult::Plan {
                 visible_tools: vec!["grep".into()],
@@ -2593,7 +2583,6 @@ mod tests {
         let mc = MemoryContext::default();
         assert!(mc.retrieved_memory_ids.is_empty());
         assert!(mc.domain_hints.is_empty());
-        assert!(mc.boost_terms.is_empty());
         assert!(mc.provenance.is_empty());
     }
 
@@ -2602,7 +2591,6 @@ mod tests {
         let mc = MemoryContext {
             retrieved_memory_ids: vec!["mem-1".into(), "mem-2".into()],
             domain_hints: vec!["github".into()],
-            boost_terms: vec!["pr".into(), "review".into()],
             provenance: vec!["mem-1".into()],
             ..Default::default()
         };
@@ -2668,7 +2656,6 @@ mod tests {
         let mc = MemoryContext {
             retrieved_memory_ids: vec!["m1".into()],
             domain_hints: vec![],
-            boost_terms: vec![],
             provenance: vec![],
             governance_actions: vec![
                 MemoryGovernanceAction::Retrieved {

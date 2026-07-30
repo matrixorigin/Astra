@@ -33,9 +33,17 @@ pub fn bind_all(plan: &ContextPlan, sources: &ContextSources<'_>) -> ContextBoun
     let sections = bind_sections(plan, sources);
 
     // Messages come from TurnState
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextBinding,
+        &sources.turn.messages,
+    );
     let messages = sources.turn.messages.clone();
 
     // Tool schemas from AgentContext
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextBinding,
+        &sources.agent.tool_schemas,
+    );
     let tool_schemas = sources.agent.tool_schemas.clone();
 
     ContextBound {

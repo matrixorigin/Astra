@@ -7030,6 +7030,7 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "user_intent_accepted",
     "user_intent_applied",
     "context_meta",
+    "compaction",
     "session_info",
     "turn_complete",
     "turn_done",
@@ -7074,21 +7075,28 @@ fn insert_if_present(
     }
 }
 
+const EXTERNAL_EXECUTION_BOUNDARY_FIELDS: &[&str] = &[
+    "workspace",
+    "executor",
+    "transport",
+    "route",
+    "status",
+    "success",
+    "duration_ms",
+    "error_kind",
+    "reason",
+    "blocked",
+    "skipped",
+    "cancelled",
+    "agent_id",
+    "agent_status",
+];
+
 fn copy_execution_boundary_fields(
     out: &mut serde_json::Map<String, serde_json::Value>,
     data: &serde_json::Map<String, serde_json::Value>,
 ) {
-    for key in [
-        "workspace",
-        "executor",
-        "transport",
-        "route",
-        "success",
-        "duration_ms",
-        "error_kind",
-        "reason",
-        "blocked",
-    ] {
+    for key in EXTERNAL_EXECUTION_BOUNDARY_FIELDS {
         insert_if_present(out, data, key);
     }
 }
@@ -7450,6 +7458,15 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "compaction" => {
+            let mut out = serde_json::json!({ "type": "compaction" });
+            if let Some(obj) = out.as_object_mut() {
+                for (key, value) in &data {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+            out
+        }
         "run_paused" => {
             // Pause/resume lifecycle events had been falling through
             // the `_` catch-all in pre-wip-7 code, which relied on
@@ -7580,20 +7597,10 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         "type".to_string(),
         serde_json::Value::String("tool_call_end".to_string()),
     )]);
-    for key in [
-        "call_id",
-        "tool",
-        "workspace",
-        "executor",
-        "transport",
-        "route",
-        "status",
-        "success",
-        "duration_ms",
-        "error_kind",
-        "reason",
-        "blocked",
-    ] {
+    for key in ["call_id", "tool"]
+        .into_iter()
+        .chain(EXTERNAL_EXECUTION_BOUNDARY_FIELDS.iter().copied())
+    {
         if let Some(value) = source.get(key) {
             out.insert(key.to_string(), value.clone());
         }
@@ -10322,6 +10329,37 @@ mod tests {
     }
 
     #[test]
+    fn compaction_events_are_projected_without_losing_typed_fields() {
+        let client_ready = json!({
+            "type": "compaction",
+            "data": {
+                "kind": "wire_assembly",
+                "tokens_freed": 5_000
+            }
+        });
+        assert_eq!(
+            transform_run_event_for_client(client_ready.clone()),
+            client_ready
+        );
+
+        let projected = transform_run_event_for_client(make_event(
+            "compaction",
+            json!({
+                "kind": "wire_context_retry",
+                "pressure": 0.91,
+                "tokens_before": 16_000,
+                "tokens_after": 6_000,
+                "tokens_freed": 10_000
+            }),
+        ));
+        assert_eq!(projected["type"], "compaction");
+        assert_eq!(projected["kind"], "wire_context_retry");
+        assert_eq!(projected["tokens_before"], 16_000);
+        assert_eq!(projected["tokens_after"], 6_000);
+        assert_eq!(projected["tokens_freed"], 10_000);
+    }
+
+    #[test]
     fn large_tool_results_are_bounded_on_the_external_client_surface() {
         let output = "界".repeat(EXTERNAL_TOOL_RESULT_INLINE_MAX_BYTES);
         let original_bytes = serde_json::to_string(&serde_json::Value::String(output.clone()))
@@ -10396,6 +10434,36 @@ mod tests {
                 .len()
                 < 16 * 1024
         );
+    }
+
+    #[test]
+    fn external_tool_call_end_preserves_typed_agent_wait_boundary() {
+        let transformed = transform_run_event_for_client(json!({
+            "type": "tool_call_end",
+            "call_id": "call-agent",
+            "tool": "agent",
+            "result": {
+                "status": "waiting",
+                "reason": "executor_offline",
+                "agent_id": "reviewer@run-1",
+            },
+            "status": "failed",
+            "success": false,
+            "blocked": true,
+            "error_kind": "executor_offline",
+            "reason": "executor_offline",
+            "agent_id": "reviewer@run-1",
+            "agent_status": "waiting",
+            "provider_internal": "must-not-cross-the-external-boundary",
+        }));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["call_id"], "call-agent");
+        assert_eq!(transformed["agent_id"], "reviewer@run-1");
+        assert_eq!(transformed["agent_status"], "waiting");
+        assert_eq!(transformed["blocked"], true);
+        assert_eq!(transformed["error_kind"], "executor_offline");
+        assert!(transformed.get("provider_internal").is_none());
     }
 
     #[test]

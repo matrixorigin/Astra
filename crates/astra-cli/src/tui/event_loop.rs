@@ -2318,16 +2318,6 @@ fn context_trace_count(state: &crate::cli::session::session_state::SessionState)
         .unwrap_or(0)
 }
 
-fn total_input_tokens(
-    fresh_prompt_tokens: u64,
-    cache_read_tokens: u64,
-    cache_creation_tokens: u64,
-) -> u64 {
-    fresh_prompt_tokens
-        .saturating_add(cache_read_tokens)
-        .saturating_add(cache_creation_tokens)
-}
-
 fn context_window_from_trace(
     trace: &ContextAssemblyTrace,
 ) -> Option<astra_turn_types::ContextWindowUsage> {
@@ -7387,11 +7377,13 @@ pub(crate) async fn run_tui_session(
                                     let turn_completion = state.total_completion_tokens - pre_completion_tokens;
                                     let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
                                     let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
-                                    let turn_input = total_input_tokens(
-                                        turn_prompt,
-                                        turn_cache_read,
-                                        turn_cache_creation,
-                                    );
+                                    let turn_input =
+                                        astra_turn_types::NormalizedPromptCacheUsage::new(
+                                            turn_prompt,
+                                            turn_cache_read,
+                                            turn_cache_creation,
+                                        )
+                                        .total_input_tokens();
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -7586,7 +7578,7 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Login { username, password } = &result {
-                                        match crate::cli::auth_flow::do_login(api, profile, username, password).await {
+                                        match crate::cli::auth_flow::do_login_for_session(api, profile, username, password, &mut state).await {
                                             Ok(token) => {
                                                 chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
                                                 let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
@@ -7622,36 +7614,28 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
                                     if let bottom_pane::view::ViewResult::Register { username, email, password } = &result {
-                                        match crate::cli::auth_flow::do_register(api, profile, username, email, password).await {
-                                            Ok(_) => {
-                                                chat_widget.commit_system(history_cell::system::SystemCell::response("Registered — logging in…"));
-                                                match crate::cli::auth_flow::do_login(api, profile, username, password).await {
-                                                    Ok(token) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Logged in as {username}")));
-                                                        let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
-                                                        if let Some(notice) = sync_report.user_notice() {
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::warning(notice),
-                                                            );
-                                                        }
-                                                        if let Some(model) = sync_default_model_after_auth(
-                                                            api,
-                                                            &token,
-                                                            &mut state,
-                                                            &mut bottom_pane,
-                                                        )
-                                                        .await
-                                                        {
-                                                            chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::response(
-                                                                    format!("Default model: {model}"),
-                                                                ),
-                                                            );
-                                                        }
-                                                    }
-                                                    Err(e) => {
-                                                        chat_widget.commit_system(history_cell::system::SystemCell::error(format!("Auto-login failed: {e}")));
-                                                    }
+                                        match crate::cli::auth_flow::do_register_for_session(api, profile, username, email, password, &mut state).await {
+                                            Ok(token) => {
+                                                chat_widget.commit_system(history_cell::system::SystemCell::response(format!("Registered and logged in as {username}")));
+                                                let sync_report = crate::post_auth_cloud_resync(profile, &mut state).await;
+                                                if let Some(notice) = sync_report.user_notice() {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::warning(notice),
+                                                    );
+                                                }
+                                                if let Some(model) = sync_default_model_after_auth(
+                                                    api,
+                                                    &token,
+                                                    &mut state,
+                                                    &mut bottom_pane,
+                                                )
+                                                .await
+                                                {
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::response(
+                                                            format!("Default model: {model}"),
+                                                        ),
+                                                    );
                                                 }
                                             }
                                             Err(e) => {
@@ -13425,12 +13409,6 @@ mod tests {
     fn ambient_flush_waits_while_deferred_slash_pair_is_pending() {
         assert!(!should_flush_ambient_commits(true));
         assert!(should_flush_ambient_commits(false));
-    }
-
-    #[test]
-    fn total_input_tokens_includes_cache_buckets_exactly_once() {
-        assert_eq!(total_input_tokens(1200, 800, 100), 2100);
-        assert_eq!(total_input_tokens(0, 5000, 0), 5000);
     }
 
     #[test]

@@ -442,6 +442,7 @@ async fn run_turn(
         bg_task_list_cache: None,
         bash_detach_slot: None,
         stream_event_tx: Some(stream_tx),
+        stream_json_emitter: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]

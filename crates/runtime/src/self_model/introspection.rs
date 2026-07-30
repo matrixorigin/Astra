@@ -182,7 +182,7 @@ pub async fn get_drift_check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(params): Query<DriftCheckQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<IntentDriftCheckResponseV2>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let resp = state
         .introspection_service

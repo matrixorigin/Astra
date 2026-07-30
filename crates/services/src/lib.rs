@@ -146,7 +146,8 @@ pub use auth::{
     ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
     ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, ExternalSessionRecord, FernetTokenEncryptor,
-    HttpExternalProviderClient, ProviderRequestDescriptor, SessionCreateRequestData,
+    HttpExternalProviderClient, ProviderRequestDescriptor, ReauthenticationProofRecord,
+    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
@@ -204,10 +205,10 @@ pub use harness::{
 };
 pub use inference_execution::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
-    InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
-    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
-    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
-    plan_inference_provider_attempt, reconcile_inference_settlements,
+    InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
+    InferenceUsage, admit_inference_invocation, begin_inference_provider_attempt,
+    declare_inference_settlement, finish_inference_invocation, finish_inference_provider_attempt,
+    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -306,8 +307,8 @@ pub use session_artifact_store::{
     MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX, OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord,
     SessionArtifactJsonStore, SessionArtifactListCursor, SessionArtifactListPage,
     SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
-    SessionArtifactStoreError, StoredSessionArtifact, local_owner_user_id,
-    local_session_artifact_store,
+    SessionArtifactStoreError, StoredSessionArtifact, configure_local_owner_scope,
+    local_owner_scope, local_owner_user_id, local_session_artifact_store,
 };
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,

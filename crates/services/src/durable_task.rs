@@ -2601,6 +2601,7 @@ impl MatrixOneDurableTaskLifecycle {
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         });
     }
 
@@ -3738,6 +3739,7 @@ impl LocalDurableTaskLifecycle {
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         });
     }
 

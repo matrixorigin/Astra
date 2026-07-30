@@ -4092,6 +4092,7 @@ mod model_catalog_loading_tests {
         credentials.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("user-id-1".into()),
                 access_token: Some(access_token.into()),
                 refresh_token: Some(refresh_token.into()),
                 ..Default::default()
@@ -4118,6 +4119,7 @@ mod model_catalog_loading_tests {
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "fresh-access",
                 "refresh_token": "refresh-new"
             })))

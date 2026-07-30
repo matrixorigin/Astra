@@ -812,7 +812,7 @@ fn build_introspect_action_hints(
     // ── 2. Strategy change hint ──
     let stall = &snapshot.stall_state;
     let has_active_corrections = !stall.advisory_signals.is_empty();
-    let nudge_pressure = stall.nudge_count >= 2 || stall.drift_nudge_count >= 2;
+    let nudge_pressure = stall.nudge_count >= 2;
     if has_active_corrections || nudge_pressure {
         let mut parts: Vec<String> = Vec::new();
         if has_active_corrections {
@@ -823,10 +823,7 @@ fn build_introspect_action_hints(
             ));
         }
         if nudge_pressure {
-            parts.push(format!(
-                "nudges={} drift={}",
-                stall.nudge_count, stall.drift_nudge_count
-            ));
+            parts.push(format!("nudges={}", stall.nudge_count));
         }
         hints.push(ObservationActionHint {
             target_type: "strategy_change".to_string(),

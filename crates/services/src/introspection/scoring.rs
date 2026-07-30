@@ -553,16 +553,26 @@ pub fn parse_token_usage(raw: &str) -> Option<Value> {
 /// `cache_creation_tokens`) from a canonical [`TokenUsage`]-shaped JSON value.
 /// Returns `None` when no recognizable input field is present.
 pub fn billable_input_from_canonical(usage: &Value) -> Option<i64> {
-    let input = usage.get("input_tokens").and_then(Value::as_i64)?;
-    let cached = usage
-        .get("cached_input_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let creation = usage
-        .get("cache_creation_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    Some(input + cached + creation)
+    let input = u64::try_from(usage.get("input_tokens").and_then(Value::as_i64)?).ok()?;
+    let cached = u64::try_from(
+        usage
+            .get("cached_input_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    )
+    .ok()?;
+    let creation = u64::try_from(
+        usage
+            .get("cache_creation_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(0),
+    )
+    .ok()?;
+    i64::try_from(
+        astra_turn_types::NormalizedPromptCacheUsage::new(input, cached, creation)
+            .total_input_tokens(),
+    )
+    .ok()
 }
 
 pub fn parse_relevance_scores(raw: &str) -> HashMap<String, f64> {
@@ -577,105 +587,6 @@ pub fn parse_relevance_scores(raw: &str) -> HashMap<String, f64> {
     obj.iter()
         .filter_map(|(k, v)| v.as_f64().map(|f| (k.clone(), f)))
         .collect()
-}
-
-/// Drift score + categorical level + surfaceable signals for a session.
-///
-/// Treats the agent's "focus" as drifting from the original user intent to
-/// whatever event most recently wrote to the journal. Compares token sets
-/// via Jaccard distance — cheap, deterministic, and decent for short
-/// English/Chinese text. `drift_score` is in `[0.0, 1.0]`; level bins
-/// follow the 0.2 / 0.5 / 0.8 cuts.
-///
-/// Signals populate from simple heuristics (scope widening, no overlap at
-/// all, short-original-long-current) so the LLM has something to read
-/// beyond the raw score.
-#[must_use]
-pub fn compute_drift(
-    original_intent: &str,
-    current_focus: &str,
-) -> (f64, &'static str, Vec<String>) {
-    let original_tokens = tokenise(original_intent);
-    let current_tokens = tokenise(current_focus);
-
-    if original_tokens.is_empty() || current_tokens.is_empty() {
-        // Nothing to compare against — report as aligned and let the LLM
-        // decide whether the session has just started.
-        return (0.0, "aligned", vec!["insufficient history".into()]);
-    }
-
-    let intersection: usize = original_tokens
-        .iter()
-        .filter(|t| current_tokens.contains(*t))
-        .count();
-    let union: usize = original_tokens
-        .iter()
-        .chain(current_tokens.iter())
-        .collect::<std::collections::HashSet<_>>()
-        .len()
-        .max(1);
-
-    let jaccard = (intersection as f64) / (union as f64);
-    let drift = (1.0 - jaccard).clamp(0.0, 1.0);
-
-    let level = if drift < 0.2 {
-        "aligned"
-    } else if drift < 0.5 {
-        "mild"
-    } else if drift < 0.8 {
-        "moderate"
-    } else {
-        "high"
-    };
-
-    let mut signals = Vec::new();
-    if intersection == 0 {
-        signals.push("no token overlap with original intent".to_string());
-    }
-    if current_tokens.len() > original_tokens.len().saturating_mul(3) {
-        signals.push("current focus is much broader than original scope".to_string());
-    }
-    if original_tokens.len() > current_tokens.len().saturating_mul(3) {
-        signals.push("current focus is much narrower than original scope".to_string());
-    }
-
-    (drift, level, signals)
-}
-
-/// Tokenise a short text for Jaccard comparison. Two strategies:
-///
-/// 1. **Latin / space-separated**: split on non-alphanumeric, keep tokens
-///    with ≥2 chars. Standard word tokenisation.
-/// 2. **CJK**: characters in the CJK Unified Ideographs range
-///    (U+4E00..=U+9FFF) are additionally segmented into character bigrams
-///    so "列出所有文件" → {"列出", "出所", "所有", "有文", "文件"}.
-///    Without this, a spaceless Chinese sentence is a single token and any
-///    partial overlap collapses to 0% or 100%.
-///
-/// Both strategies run simultaneously; results merge into one set.
-fn tokenise(s: &str) -> std::collections::HashSet<String> {
-    let lower = s.to_lowercase();
-    let mut tokens: std::collections::HashSet<String> = lower
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.chars().count() >= 2)
-        .map(str::to_string)
-        .collect();
-
-    // CJK bigrams: slide a 2-character window over CJK runs.
-    let chars: Vec<char> = lower.chars().collect();
-    for window in chars.windows(2) {
-        if is_cjk(window[0]) && is_cjk(window[1]) {
-            tokens.insert(format!("{}{}", window[0], window[1]));
-        }
-    }
-
-    tokens
-}
-
-fn is_cjk(c: char) -> bool {
-    ('\u{4E00}'..='\u{9FFF}').contains(&c)
-        || ('\u{3400}'..='\u{4DBF}').contains(&c) // Extension A
-        || ('\u{F900}'..='\u{FAFF}').contains(&c) // Compatibility
 }
 
 #[cfg(test)]
@@ -870,121 +781,48 @@ mod tests {
         assert_eq!(result.quality, None);
     }
 
-    // ── compute_drift ──────────────────────────────────────────────────
-
     #[test]
-    fn compute_drift_identical_is_fully_aligned() {
-        let (score, level, signals) = compute_drift("list all rust files", "list all rust files");
-        assert!((score - 0.0).abs() < f64::EPSILON);
-        assert_eq!(level, "aligned");
-        assert!(signals.is_empty());
+    fn billable_input_uses_all_canonical_input_buckets() {
+        let usage = serde_json::json!({
+            "input_tokens": 11,
+            "cached_input_tokens": 13,
+            "cache_creation_tokens": 17,
+            "output_tokens": 19,
+        });
+
+        assert_eq!(billable_input_from_canonical(&usage), Some(41));
     }
 
     #[test]
-    fn compute_drift_completely_unrelated_is_high() {
-        let (score, level, signals) =
-            compute_drift("list all rust files", "deploy the website to production");
-        assert!(score > 0.8, "expected high drift score, got {score}");
-        assert_eq!(level, "high");
-        assert!(signals.iter().any(|s| s.contains("no token overlap")));
-    }
-
-    #[test]
-    fn compute_drift_empty_inputs_return_aligned_with_signal() {
-        let (score, level, signals) = compute_drift("", "anything");
-        assert!((score - 0.0).abs() < f64::EPSILON);
-        assert_eq!(level, "aligned");
-        assert!(signals.iter().any(|s| s.contains("insufficient")));
-    }
-
-    #[test]
-    fn compute_drift_broader_scope_emits_signal() {
-        // original has 2 tokens, current has 7 → >3x → "broader" signal
-        let (_score, _level, signals) = compute_drift(
-            "list files",
-            "list all rust files in src and tests and examples",
-        );
-        assert!(
-            signals.iter().any(|s| s.contains("broader")),
-            "expected broader-scope signal in: {signals:?}"
-        );
-    }
-
-    #[test]
-    fn compute_drift_level_bins() {
-        // Partial overlap: 2/4 = 0.5 → drift 0.5 → moderate.
-        let (score, level, _) = compute_drift("alpha beta gamma delta", "alpha beta epsilon zeta");
-        assert!(
-            (0.5..0.8).contains(&score),
-            "score out of moderate bin: {score}"
-        );
-        assert_eq!(level, "moderate");
-
-        // Small overlap: 1/5 = 0.2 → drift 0.8 → high
-        let (score, level, _) = compute_drift("alpha beta gamma", "alpha delta epsilon");
-        assert!(score >= 0.8);
-        assert_eq!(level, "high");
-    }
-
-    #[test]
-    fn compute_drift_chinese_partial_overlap() {
-        // CJK text has no spaces — the tokeniser must produce meaningful
-        // sub-tokens so two partially-overlapping Chinese sentences don't
-        // collapse to 0.0 or 1.0 drift.
-        let (score, level, _) = compute_drift("列出所有 Rust 文件", "列出所有 Python 文件");
-        assert!(
-            (0.01..0.99).contains(&score),
-            "Chinese partial overlap must produce intermediate drift, got {score}"
-        );
-        assert_ne!(level, "aligned");
-        assert_ne!(level, "high");
-    }
-
-    #[test]
-    fn compute_drift_chinese_identical() {
-        let (score, level, _) = compute_drift("分析这个项目的结构", "分析这个项目的结构");
-        assert!(
-            score < 0.01,
-            "identical Chinese must be aligned, got {score}"
-        );
-        assert_eq!(level, "aligned");
-    }
-
-    #[test]
-    fn compute_drift_chinese_unrelated() {
-        let (score, _, _) = compute_drift("列出所有文件", "部署到生产环境");
-        assert!(
-            score > 0.5,
-            "unrelated Chinese must have high drift, got {score}"
-        );
-    }
-
-    #[test]
-    fn compute_drift_pure_cjk_partial_overlap() {
-        // Pure CJK without spaces — the tokeniser must still produce
-        // meaningful sub-tokens. "列出所有文件" and "列出测试文件" share
-        // "列出" and "文件" but differ in "所有" vs "测试".
-        let (score, level, _) = compute_drift("列出所有文件", "列出测试文件");
-        assert!(
-            (0.01..0.99).contains(&score),
-            "pure CJK partial overlap must have intermediate drift, got {score}"
-        );
-        assert_ne!(level, "aligned");
-    }
-
-    #[test]
-    fn compute_drift_score_is_always_in_unit_interval() {
-        for (a, b) in [
-            ("a b c", "a b c"),
-            ("a", "z"),
-            ("", ""),
-            ("alpha beta", "alpha beta gamma delta"),
+    fn billable_input_rejects_negative_buckets() {
+        for usage in [
+            serde_json::json!({"input_tokens": -1}),
+            serde_json::json!({"input_tokens": 1, "cached_input_tokens": -1}),
+            serde_json::json!({"input_tokens": 1, "cache_creation_tokens": -1}),
         ] {
-            let (score, _, _) = compute_drift(a, b);
-            assert!(
-                (0.0..=1.0).contains(&score),
-                "score {score} out of [0,1] for ({a:?}, {b:?})"
-            );
+            assert_eq!(billable_input_from_canonical(&usage), None);
         }
+    }
+
+    #[test]
+    fn billable_input_rejects_bucket_and_sum_overflow() {
+        let bucket_outside_i64 = serde_json::json!({
+            "input_tokens": u64::MAX,
+        });
+        assert_eq!(billable_input_from_canonical(&bucket_outside_i64), None);
+
+        let sum_outside_i64 = serde_json::json!({
+            "input_tokens": i64::MAX,
+            "cached_input_tokens": 1,
+            "cache_creation_tokens": 0,
+        });
+        assert_eq!(billable_input_from_canonical(&sum_outside_i64), None);
+
+        let saturating_u64_sum = serde_json::json!({
+            "input_tokens": i64::MAX,
+            "cached_input_tokens": i64::MAX,
+            "cache_creation_tokens": i64::MAX,
+        });
+        assert_eq!(billable_input_from_canonical(&saturating_u64_sum), None);
     }
 }

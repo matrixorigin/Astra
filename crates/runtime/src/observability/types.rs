@@ -74,17 +74,6 @@ pub struct ObservabilitySession {
     /// Turn at which the last per-turn token budget change occurred.
     pub last_token_budget_change_turn: Option<u32>,
 
-    /// Set to `true` when the previous turn ended in a `UserCancelled`
-    /// interruption. The adaptive profile layer consumes this flag at the
-    /// start of the next turn to *skip* scenario re-detection: the tool
-    /// history of a cancelled turn is an aborted plan, not evidence of a
-    /// deliberate agent behavior pattern (e.g. "exploration"). Without this
-    /// gate, a Ctrl+C during a focused read-only task leaks into the
-    /// detector as many `glob`/`grep`/`view` calls and falsely boosts the
-    /// `Exploration` scenario, which in turn inflates the tool budget for
-    /// the *next* turn.
-    pub previous_turn_user_cancelled: bool,
-
     /// Most recent [`StrategyApplication`] summary, if any, published into
     /// observability for self-model rendering so the agent passively "knows"
     /// what tool-surface surfaces were adjusted (blocked/boosted/widened).
@@ -166,7 +155,7 @@ pub struct ObservabilitySession {
     pub injection_history: astra_turn_core::injection_tracking::InjectionHistory,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ObservabilitySessionRollbackSnapshot {
     pub config: RuntimeConfig,
     pub original_query: Option<String>,

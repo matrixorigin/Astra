@@ -1039,7 +1039,13 @@ impl HybridRestoreService {
                     permission_mode: metadata_state.permission_mode.clone(),
                     conversation_messages: heavy_state
                         .as_ref()
-                        .map(|heavy| heavy.messages.clone())
+                        .map(|heavy| {
+                            astra_core::history_work::record_serialized_value(
+                                astra_core::history_work::HistoryWorkSite::SessionRestoreHydration,
+                                &heavy.messages,
+                            );
+                            heavy.messages.clone()
+                        })
                         .filter(|messages| !messages.is_empty())
                         .unwrap_or(transcript_messages),
                     activated_deferred_tool_names: heavy_state
@@ -1279,6 +1285,20 @@ impl HybridRestoreService {
                     "content": content,
                 })),
                 _ => {}
+            }
+        }
+        if astra_core::history_work::instrumentation_enabled() {
+            match astra_core::history_work::serialized_bytes(&messages) {
+                Ok(bytes) => astra_core::history_work::record_operation(
+                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
+                    bytes,
+                    rows.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                ),
+                Err(error) => astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
+                    &error,
+                ),
             }
         }
         Ok(messages)

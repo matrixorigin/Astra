@@ -27,6 +27,7 @@ pub mod effects;
 pub mod execution_state_summary;
 pub(crate) mod exit_code;
 pub mod followup_suggestion;
+pub(crate) mod history_work;
 pub mod http_task_service;
 pub mod http_team_store;
 pub mod interactive_chat;

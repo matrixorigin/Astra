@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::time::Instant;
 
 use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
+use crate::compaction_types::{CompactionKind, CompactionTier};
 
 /// Per-channel fingerprint emitted by the bridge via the
 /// `injection_freshness` SSE event. Carries only opaque metadata
@@ -45,16 +46,30 @@ pub struct BridgeInjectionFingerprints {
 /// The bridge may emit `context_meta` more than once for one HTTP turn, so
 /// `id` is stable within that turn and lets consumers de-duplicate repeated
 /// snapshots without conflating distinct retry compactions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextCompactionObservation {
     pub id: String,
-    pub phase: String,
-    pub tier: String,
+    pub kind: CompactionKind,
+    pub tier: CompactionTier,
     pub messages_before: u64,
     pub messages_after: u64,
     pub tokens_before: u64,
     pub tokens_after: u64,
     pub tokens_saved: u64,
+}
+
+impl ContextCompactionObservation {
+    /// Whether all redundant counters agree with one another.
+    ///
+    /// This validates only typed structural facts; it never interprets
+    /// provider text or human-facing labels.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        !self.id.trim().is_empty()
+            && self.messages_before >= self.messages_after
+            && self.tokens_before >= self.tokens_after
+            && self.tokens_saved == self.tokens_before - self.tokens_after
+    }
 }
 
 /// State collected from one `/chat/turn` SSE stream (excluding edge executor bookkeeping).
@@ -502,10 +517,7 @@ fn apply_one_event(
                     else {
                         continue;
                     };
-                    if observation.id.trim().is_empty()
-                        || observation.phase.trim().is_empty()
-                        || observation.tier.trim().is_empty()
-                    {
+                    if !observation.is_consistent() {
                         continue;
                     }
                     if let Some(existing) = accum
@@ -2045,7 +2057,7 @@ mod context_manifest_trace_sse_tests {
         let mut effects = Vec::new();
         let initial = json!({
             "id": "initial",
-            "phase": "initial",
+            "kind": "wire_assembly",
             "tier": "compact_history",
             "messages_before": 18,
             "messages_after": 10,
@@ -2055,7 +2067,7 @@ mod context_manifest_trace_sse_tests {
         });
         let retry = json!({
             "id": "context_window_retry:2:1",
-            "phase": "context_window_retry",
+            "kind": "wire_context_retry",
             "tier": "aggressive_prune",
             "messages_before": 22,
             "messages_after": 8,
@@ -2063,11 +2075,22 @@ mod context_manifest_trace_sse_tests {
             "tokens_after": 6_000,
             "tokens_saved": 10_000
         });
+        let inconsistent = json!({
+            "id": "inconsistent",
+            "kind": "wire_context_retry",
+            "tier": "aggressive_prune",
+            "messages_before": 8,
+            "messages_after": 12,
+            "tokens_before": 6_000,
+            "tokens_after": 7_000,
+            "tokens_saved": 99
+        });
 
         for compactions in [
             json!([initial.clone()]),
             json!([initial.clone()]),
             json!([initial, retry.clone()]),
+            json!([inconsistent]),
         ] {
             let block = format!(
                 "data: {}\n\n",

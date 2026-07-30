@@ -10,6 +10,7 @@
 //! The crate deliberately avoids `runtime` / `services` so any front-end can depend on it without pulling the cognitive engine. It depends on `astra-runtime-env` only for the shared runtime capability vocabulary.
 
 pub mod client;
+pub mod device_proof;
 pub mod edge;
 pub mod error;
 pub mod paths;
@@ -23,6 +24,10 @@ pub use astra_server_types::{
     SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 pub use client::ThinClient;
+pub use device_proof::{
+    ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
+    ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, device_challenge_proof,
+};
 pub use edge::{
     ASTRA_EDGE_ID_HEADER, advertise_executor, builtin_capability_preset,
     edge_register_with_capabilities, edge_runtime_environment_capabilities,

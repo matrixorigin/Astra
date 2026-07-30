@@ -430,6 +430,15 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     use astra_turn_core::pipeline_config::PipelineConfig;
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        conversation_messages,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        tool_schemas,
+    );
+
     // Build ExternalSources from bridge-side signals. Guidance derived from
     // the exact visible surface is rebuilt every turn but remains cacheable
     // until that surface changes.
@@ -550,6 +559,14 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         user_id: None,
     };
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        tool_schemas,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        conversation_messages,
+    );
     let agent = AgentContext {
         tool_schemas: tool_schemas.to_vec(),
         ..Default::default()
@@ -593,6 +610,14 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
                 error = ?abort,
                 "bridge pipeline abort during system assembly — returning empty system"
             );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+                conversation_messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+                tool_schemas,
+            );
             return BridgePipelineOutcome {
                 primary_system: json!({"role": "system", "content": ""}),
                 dynamic_system: None,
@@ -621,6 +646,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     sections.extend(trace_extra_sections);
 
     let tier = output.plan.compact_tier;
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        &output.optimized.tool_schemas,
+    );
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
 
     let (primary_system, dynamic_system) = if uses_anthropic_protocol {

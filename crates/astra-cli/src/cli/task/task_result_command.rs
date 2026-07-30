@@ -153,36 +153,14 @@ mod tests {
     use crate::cli::stream::streaming_types::StreamResult;
     use astra_services::TaskService as _;
 
-    struct CliUserIdGuard {
-        previous: Option<String>,
-    }
-
-    impl CliUserIdGuard {
-        fn set(value: &str) -> Self {
-            let previous = std::env::var("ASTRA_CLI_USER_ID").ok();
-            unsafe {
-                std::env::set_var("ASTRA_CLI_USER_ID", value);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for CliUserIdGuard {
-        fn drop(&mut self) {
-            unsafe {
-                if let Some(previous) = self.previous.as_deref() {
-                    std::env::set_var("ASTRA_CLI_USER_ID", previous);
-                } else {
-                    std::env::remove_var("ASTRA_CLI_USER_ID");
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     #[serial_test::serial]
     async fn resolve_task_result_task_id_uses_cli_user_id_scope() {
-        let _user = CliUserIdGuard::set("task-user");
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "task-profile",
+            Some("task-user"),
+        )
+        .expect("install test profile identity");
         let tmp = tempfile::tempdir().unwrap();
         let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
         let expected = svc

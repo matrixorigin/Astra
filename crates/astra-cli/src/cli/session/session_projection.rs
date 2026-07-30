@@ -590,6 +590,14 @@ pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
         .collect()
 }
 
+pub(crate) fn history_as_messages_for(
+    site: astra_core::history_work::HistoryWorkSite,
+    history: &[(String, String)],
+) -> Vec<serde_json::Value> {
+    crate::cli::history_work::record_pair_history(site, history);
+    history_as_messages(history)
+}
+
 /// Checkpoint-derived metadata available to CSL projection.
 ///
 /// This is intentionally empty: the conversation state log is prompt material,

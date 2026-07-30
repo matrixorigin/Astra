@@ -14,6 +14,9 @@
 
 use astra_core::{EvidenceRef, MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
+use astra_services::introspection::{
+    IntentDriftAssessmentStatus, IntentDriftLevel, IntentDriftVerdict,
+};
 use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
@@ -5595,6 +5598,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         })
         .await;
     shutdown.signal();
@@ -6110,8 +6114,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let session_id = Uuid::new_v4().to_string();
     let owner_query_event_id = Uuid::new_v4().to_string();
     let owner_llm_event_id = Uuid::new_v4().to_string();
+    let owner_drift_assessment_event_id = Uuid::new_v4().to_string();
+    let owner_legacy_drift_event_id = Uuid::new_v4().to_string();
     let other_query_event_id = Uuid::new_v4().to_string();
     let other_llm_event_id = Uuid::new_v4().to_string();
+    let other_drift_assessment_event_id = Uuid::new_v4().to_string();
     let owner_context_id = Uuid::new_v4().to_string();
     let other_context_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
@@ -6121,7 +6128,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_query_event_id.clone(), owner_llm_event_id.clone()],
+        &[
+            owner_query_event_id.clone(),
+            owner_llm_event_id.clone(),
+            owner_drift_assessment_event_id.clone(),
+            owner_legacy_drift_event_id.clone(),
+        ],
         std::slice::from_ref(&owner_decision_id),
     )
     .await;
@@ -6129,14 +6141,18 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &other_user_id,
         std::slice::from_ref(&session_id),
-        &[other_query_event_id.clone(), other_llm_event_id.clone()],
+        &[
+            other_query_event_id.clone(),
+            other_llm_event_id.clone(),
+            other_drift_assessment_event_id.clone(),
+        ],
         std::slice::from_ref(&other_decision_id),
     )
     .await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 2)",
+         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 4)",
     )
     .bind(&session_id)
     .bind(&owner_user_id)
@@ -6210,6 +6226,78 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert mixed owner event");
+    }
+
+    for (event_id, user_id, event_type, metadata, created_at) in [
+        (
+            &owner_drift_assessment_event_id,
+            &owner_user_id,
+            astra_services::introspection::INTENT_DRIFT_ASSESSMENT_EVENT_TYPE,
+            serde_json::json!({
+                "schema_version": 1,
+                "provenance": {
+                    "kind": "llm_judge",
+                    "invocation_id": "owner-drift-invocation",
+                    "provider": "owner-provider",
+                    "model": "owner-model",
+                    "provider_response_id": "owner-response"
+                },
+                "verdict": "drifting",
+                "score": 0.42,
+                "level": "moderate",
+                "evidence": ["owner-visible structured evidence"],
+                "turn": 1,
+                "round": 2
+            }),
+            "2026-06-01 10:04:00.000000",
+        ),
+        (
+            &owner_legacy_drift_event_id,
+            &owner_user_id,
+            "drift_detected",
+            serde_json::json!({
+                "severity": 0.99,
+                "evidence": ["ambiguous legacy evidence must not be projected"]
+            }),
+            "2026-06-01 10:06:00.000000",
+        ),
+        (
+            &other_drift_assessment_event_id,
+            &other_user_id,
+            astra_services::introspection::INTENT_DRIFT_ASSESSMENT_EVENT_TYPE,
+            serde_json::json!({
+                "schema_version": 1,
+                "provenance": {
+                    "kind": "llm_judge",
+                    "invocation_id": "other-drift-invocation",
+                    "provider": "other-provider",
+                    "model": "other-model",
+                    "provider_response_id": "other-response"
+                },
+                "verdict": "drifting",
+                "score": 0.99,
+                "level": "high",
+                "evidence": ["foreign evidence must not be projected"],
+                "turn": 9,
+                "round": 9
+            }),
+            "2026-06-01 10:05:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, event_type, metadata, created_at) \
+             VALUES (?, ?, ?, ?, CAST(? AS JSON), ?)",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(event_type)
+        .bind(metadata.to_string())
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert mixed owner drift assessment");
     }
 
     for (
@@ -6319,12 +6407,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         )
         .await
         .expect("owner reflect report");
-    assert_eq!(report.data_coverage.events, 2);
+    assert_eq!(report.data_coverage.events, 4);
     assert_eq!(report.data_coverage.decisions, 1);
     let view = report.view.as_ref().expect("reflect report includes view");
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
-    assert_eq!(view.data_coverage.events, 2);
+    assert_eq!(view.data_coverage.events, 4);
     assert_eq!(view.data_coverage.decisions, 1);
     assert!(!report.summary.is_empty());
     assert!(
@@ -6387,14 +6475,45 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .get_drift_check(&owner_user_id, &session_id)
         .await
         .expect("owner drift check");
-    assert_eq!(drift["original_intent_preview"], "owner original intent");
-    assert_eq!(drift["current_focus_preview"], "owner current focus");
+    assert_eq!(drift.schema_version, 2);
+    assert_eq!(
+        drift.assessment_status,
+        IntentDriftAssessmentStatus::Assessed
+    );
+    assert_eq!(drift.verdict, Some(IntentDriftVerdict::Drifting));
+    assert_eq!(drift.score, Some(0.42));
+    assert_eq!(drift.level, Some(IntentDriftLevel::Moderate));
+    assert_eq!(
+        drift
+            .provenance
+            .as_ref()
+            .expect("assessed drift must carry LLM provenance")
+            .invocation_id,
+        "owner-drift-invocation",
+    );
+    assert_eq!(
+        drift.evidence,
+        vec!["owner-visible structured evidence".to_string()]
+    );
+    assert_ne!(
+        drift.source_event_id.as_deref(),
+        Some(owner_legacy_drift_event_id.as_str())
+    );
+    assert_ne!(
+        drift.source_event_id.as_deref(),
+        Some(other_drift_assessment_event_id.as_str())
+    );
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_query_event_id, owner_llm_event_id],
+        &[
+            owner_query_event_id,
+            owner_llm_event_id,
+            owner_drift_assessment_event_id,
+            owner_legacy_drift_event_id,
+        ],
         &[owner_decision_id],
     )
     .await;
@@ -6402,7 +6521,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &other_user_id,
         &[session_id],
-        &[other_query_event_id, other_llm_event_id],
+        &[
+            other_query_event_id,
+            other_llm_event_id,
+            other_drift_assessment_event_id,
+        ],
         &[other_decision_id],
     )
     .await;

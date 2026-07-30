@@ -19,7 +19,7 @@ use crate::{
     cloud::compact_prompt::{
         COMPACT_SYSTEM_PROMPT, build_compact_user_prompt, render_messages_for_summary,
     },
-    cloud::grouping::{drop_oldest_rounds, flatten_rounds, group_by_api_round},
+    cloud::grouping::{ApiRound, drop_oldest_rounds, flatten_rounds, group_by_api_round},
 };
 
 /// Maximum number of PTL retry attempts before giving up and returning `None`.
@@ -27,6 +27,67 @@ pub const MAX_PTL_RETRIES: usize = 3;
 
 /// Minimum number of API rounds to keep when dropping for PTL retry.
 pub const MIN_ROUNDS_TO_KEEP: usize = 1;
+
+fn cloud_summary_serialization_dimensions(rendered: &str, source_rows: usize) -> (u64, u64) {
+    (
+        u64::try_from(rendered.len()).unwrap_or(u64::MAX),
+        u64::try_from(source_rows).unwrap_or(u64::MAX),
+    )
+}
+
+fn record_summary_prompt_clone(messages: &[Value]) {
+    if !astra_core::history_work::instrumentation_enabled() {
+        return;
+    }
+    match astra_core::history_work::serialized_bytes(messages) {
+        Ok(bytes) => astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
+            bytes,
+            messages.len().try_into().unwrap_or(u64::MAX),
+            0,
+        ),
+        Err(error) => astra_core::history_work::record_serialization_failure(
+            astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
+            &error,
+        ),
+    }
+}
+
+fn record_summary_rounds_clone(rounds: &[ApiRound]) {
+    if !astra_core::history_work::instrumentation_enabled() {
+        return;
+    }
+    let mut bytes = 0_u64;
+    let mut rows = 0_u64;
+    for round in rounds {
+        for message in round
+            .user_messages
+            .iter()
+            .chain(round.assistant_message.iter())
+            .chain(round.tool_messages.iter())
+        {
+            match astra_core::history_work::serialized_bytes(message) {
+                Ok(message_bytes) => {
+                    bytes = bytes.saturating_add(message_bytes);
+                    rows = rows.saturating_add(1);
+                }
+                Err(error) => {
+                    astra_core::history_work::record_serialization_failure(
+                        astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
+                        &error,
+                    );
+                    return;
+                }
+            }
+        }
+    }
+    astra_core::history_work::record_operation(
+        astra_core::history_work::HistoryWorkSite::CloudSummaryPromptClone,
+        bytes,
+        rows,
+        0,
+    );
+}
 
 /// Inline compact instruction appended as a trailing user message in the
 /// cache-friendly summary path. Kept short and stable so the main loop's
@@ -102,8 +163,20 @@ pub async fn generate_compact_summary(
 
     for attempt in 0..=MAX_PTL_RETRIES {
         let msgs_for_summary = flatten_rounds(&system_msgs, &rounds);
+        record_summary_prompt_clone(&msgs_for_summary);
         let rendered = render_messages_for_summary(&msgs_for_summary);
+        if astra_core::history_work::instrumentation_enabled() {
+            let (bytes, rows) =
+                cloud_summary_serialization_dimensions(&rendered, msgs_for_summary.len());
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::CloudSummarySerialization,
+                bytes,
+                rows,
+                0,
+            );
+        }
         let prompt_messages = build_summary_messages(&rendered);
+        record_summary_prompt_clone(&prompt_messages);
 
         match client
             .summarize(
@@ -140,6 +213,7 @@ pub async fn generate_compact_summary(
                     new_rounds.len()
                 );
                 rounds = new_rounds.to_vec();
+                record_summary_rounds_clone(&rounds);
             }
             Ok(_) => unreachable!(),
             Err(e) => {
@@ -220,6 +294,7 @@ pub async fn generate_inline_summary(
             "role": "user",
             "content": INLINE_COMPACT_INSTRUCTION,
         }));
+        record_summary_prompt_clone(&messages);
 
         match client
             .summarize(
@@ -254,6 +329,7 @@ pub async fn generate_inline_summary(
                     new_rounds.len()
                 );
                 rounds = new_rounds.to_vec();
+                record_summary_rounds_clone(&rounds);
             }
             Ok(_) => unreachable!(),
             Err(e) => {
@@ -454,6 +530,24 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .contains("some conversation")
+        );
+    }
+
+    #[test]
+    fn cloud_summary_serialization_counts_exact_utf8_artifact_and_source_rows() {
+        let messages = vec![
+            json!({"role": "user", "content": "你好🚀"}),
+            json!({"role": "assistant", "content": "résumé"}),
+        ];
+        let rendered = render_messages_for_summary(&messages);
+
+        assert_eq!(
+            cloud_summary_serialization_dimensions(&rendered, messages.len()),
+            (rendered.len() as u64, 2)
+        );
+        assert!(
+            rendered.len() > rendered.chars().count(),
+            "measurement must count the existing UTF-8 artifact bytes"
         );
     }
 

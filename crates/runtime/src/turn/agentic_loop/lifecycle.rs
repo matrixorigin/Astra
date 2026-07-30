@@ -91,18 +91,7 @@ fn apply_judged_turn_intent_to_observability(
 ) {
     if let Some(session) = &state.telemetry.observability_session {
         let mut session = astra_core::sync_poison::recover_rwlock_write(session);
-        if let Some(scenario) = intent.requested_scenario {
-            if !intent.prohibited_scenarios.contains(&scenario) {
-                session.profile.set_scenario(scenario);
-            }
-        } else if session
-            .profile
-            .current_scenario
-            .is_some_and(|scenario| intent.prohibited_scenarios.contains(&scenario))
-        {
-            session.profile.current_scenario = None;
-            session.profile.touch();
-        }
+        session.profile.apply_judged_turn_intent(intent);
         let is_correction = intent.objective_relation
             == astra_turn_types::ObjectiveRelation::Correct
             || intent.feedback.is_some_and(|feedback| {
@@ -1244,7 +1233,6 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
     pressure: f64,
     tokens_measured: u64,
     state: &mut AgenticLoopState,
-    quiet: bool,
     host: &mut H,
     kind: CompactionKind,
     audit_label: &str,
@@ -1288,19 +1276,17 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
             outcome.total_tokens_freed,
             pressure,
         );
-        if !quiet {
-            let event = CompactionEvent::new(
-                kind,
-                pressure,
-                outcome.total_tokens_freed,
-                tokens_measured,
-                max_tokens,
-                messages_removed,
-                messages_after,
-                layer_descriptions,
-            );
-            host.on_compaction(event);
-        }
+        let event = CompactionEvent::new(
+            kind,
+            pressure,
+            outcome.total_tokens_freed,
+            tokens_measured,
+            max_tokens,
+            messages_removed,
+            messages_after,
+            layer_descriptions,
+        );
+        host.on_compaction(event);
         if let Some(ref mut sess) = state.pipeline_session {
             sess.record_compaction_audit(
                 audit_label,
@@ -1636,9 +1622,9 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
         }
         TurnIntentJudgeOutcome::FixedDefault => {
-            // The baseline profile is constructed once from deterministic
-            // request heuristics. Do not retain or synthesize judge-owned
-            // semantics when no judge result exists.
+            // The baseline profile is a text-independent fixed default. Do not
+            // retain or synthesize judge-owned semantics without a typed LLM
+            // result.
             state.turn_intent = None;
         }
         TurnIntentJudgeOutcome::Unavailable => {
@@ -1950,7 +1936,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // When pipeline_session is active, use its pressure model (predictive
         // with reserves) and cascade-aware limits. Otherwise fall back to
         // legacy inline estimation.
-        let (pressure, pressure_estimate_tokens) = estimate_context_pressure(
+        let (mut pressure, mut pressure_estimate_tokens) = estimate_context_pressure(
             &state.messages,
             state.pinned_tool_schema_tokens as usize,
             state.max_turn_input_tokens,
@@ -1963,13 +1949,39 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             && state.compact_tier_applied < CompactionTier::CompactHistory
             && state.messages.len() > 10
         {
-            host.maybe_pre_turn_compact(state, pressure, quiet).await;
+            if let Some(event) = host.maybe_pre_turn_compact(state, pressure).await {
+                state.context_compression_triggered = true;
+                state
+                    .compaction_effectiveness
+                    .record_compaction(event.tokens_freed);
+                state.step_recorder.record_compaction_with_kind(
+                    &event.kind.to_string(),
+                    event.messages_removed.min(u32::MAX as usize) as u32,
+                    event.tokens_freed,
+                    event.pressure,
+                );
+                if let Some(ref mut sess) = state.pipeline_session {
+                    let audit_label = event.kind.to_string();
+                    sess.record_compaction_audit(
+                        &audit_label,
+                        event.messages_removed.min(u32::MAX as usize) as u32,
+                        event.tokens_freed.min(u64::from(u32::MAX)) as u32,
+                    );
+                    sess.stats.record_compaction(event.tokens_freed);
+                }
+                host.on_compaction(event);
+                (pressure, pressure_estimate_tokens) = estimate_context_pressure(
+                    &state.messages,
+                    state.pinned_tool_schema_tokens as usize,
+                    state.max_turn_input_tokens,
+                );
+            }
         }
 
         // Pre-turn pressure warning: when context is near the model-adaptive
         // warning threshold, emit a non-intrusive advisory so the user knows
         // compaction is imminent.
-        if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) && !quiet {
+        if pressure >= CompactionTier::pre_turn_warning(state.max_turn_input_tokens) {
             let warning = CompactionEvent::new(
                 CompactionKind::PressureWarning,
                 pressure,
@@ -2027,19 +2039,17 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         };
         if mc.results_compacted > 0 {
             state.context_compression_triggered = true;
-            if !quiet {
-                let event = CompactionEvent::new(
-                    CompactionKind::Microcompact,
-                    pressure,
-                    mc.tokens_saved as u64,
-                    pressure_estimate_tokens,
-                    state.max_turn_input_tokens,
-                    mc.results_compacted,
-                    state.messages.len(),
-                    vec![format!("microcompact: ~{} tokens", mc.tokens_saved)],
-                );
-                host.on_compaction(event);
-            }
+            let event = CompactionEvent::new(
+                CompactionKind::Microcompact,
+                pressure,
+                mc.tokens_saved as u64,
+                pressure_estimate_tokens,
+                state.max_turn_input_tokens,
+                mc.results_compacted,
+                state.messages.len(),
+                vec![format!("microcompact: ~{} tokens", mc.tokens_saved)],
+            );
+            host.on_compaction(event);
             state.step_recorder.record_compaction_with_kind(
                 "microcompact",
                 mc.results_compacted as u32,
@@ -2079,15 +2089,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             } else {
                 (CompactionKind::ProactiveDefault, "default")
             };
-            run_proactive_compaction(
-                post_mc_pressure,
-                post_mc_tokens,
-                state,
-                quiet,
-                host,
-                kind,
-                label,
-            );
+            run_proactive_compaction(post_mc_pressure, post_mc_tokens, state, host, kind, label);
         }
     }
 
@@ -2106,7 +2108,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
                 estimated_pressure,
                 estimated_tokens,
                 state,
-                quiet,
                 host,
                 CompactionKind::Resume,
                 "resume",
@@ -3227,52 +3228,6 @@ mod tests {
         assert!(!state.task_profile.verification_required);
     }
 
-    #[tokio::test]
-    async fn prepare_turn_iteration_does_not_infer_code_review_without_judge_intent() {
-        let mut host = MockHost::new(Vec::new());
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "please inspect the current changes".into();
-        state.user_intent = state.message.clone();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_ne!(guard.profile.current_scenario, Some(Scenario::CodeReview));
-    }
-
-    #[tokio::test]
-    async fn prepare_turn_iteration_does_not_infer_quick_answer_without_judge_intent() {
-        let mut host = MockHost::new(Vec::new());
-        let hub = make_hub();
-        let session = make_session();
-        let mut state = make_state();
-        state.telemetry.observability_hub = Some(hub);
-        state.telemetry.observability_session = Some(session.clone());
-        state.message = "where is the auth flow defined?".into();
-        state.user_intent = state.message.clone();
-        state.task_profile =
-            astra_turn_core::chat_turn_heuristics::infer_task_execution_profile(&state.message);
-        state.messages = vec![json!({"role": "user", "content": state.message.clone()})];
-
-        let prepared = prepare_turn_iteration(&mut host, &mut state, 0)
-            .await
-            .expect("turn should prepare");
-
-        assert!(matches!(prepared, PreparedTurnIteration::Ready(_)));
-        let guard = astra_core::sync_poison::recover_rwlock_read(&session);
-        assert_ne!(guard.profile.current_scenario, Some(Scenario::QuickAnswer));
-    }
-
     #[test]
     fn auto_route_tool_call_id_is_deterministic_and_sanitized() {
         assert_eq!(
@@ -4324,6 +4279,10 @@ mod tests {
             state.context_compression_triggered,
             "quiet/headless rendering must not erase the turn-level compression fact"
         );
+        assert!(
+            !host.compaction_events.is_empty(),
+            "quiet mode must preserve structured compaction callbacks"
+        );
         let compaction_event = state
             .step_recorder
             .events()
@@ -4346,6 +4305,93 @@ mod tests {
                 "proactive_default" | "proactive_aggressive"
             ),
             "unexpected compaction strategy: {compaction_kind}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_changes_only_compaction_rendering_not_typed_runtime_facts() {
+        #[derive(Debug)]
+        struct Capture {
+            messages: Vec<serde_json::Value>,
+            callbacks: Vec<CompactionEvent>,
+            durable_facts: Vec<(
+                astra_pipeline::step_protocol::StepEventType,
+                Option<serde_json::Value>,
+            )>,
+            effectiveness: (u64, bool, u64, u32, u32),
+            compression_triggered: bool,
+            tier: CompactionTier,
+            rendered_summaries: Vec<String>,
+        }
+
+        let mut captures = Vec::new();
+        for quiet in [true, false] {
+            let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
+            let mut state = high_pressure_cjk_state(32_000, 10_000);
+
+            let prepared = prepare_turn_iteration(&mut host, &mut state, 1)
+                .await
+                .expect("the shared compaction input must be accepted");
+            let PreparedTurnIteration::Ready(prep) = prepared else {
+                panic!("compaction fixture must remain ready for provider execution");
+            };
+            assert_eq!(
+                prep.quiet, quiet,
+                "render policy must be the only varied input"
+            );
+
+            let durable_facts = state
+                .step_recorder
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.event_type
+                        == astra_pipeline::step_protocol::StepEventType::CompactionFired
+                })
+                .map(|event| (event.event_type.clone(), event.payload.clone()))
+                .collect();
+            captures.push(Capture {
+                messages: state.messages,
+                callbacks: host.compaction_events,
+                durable_facts,
+                effectiveness: (
+                    state.compaction_effectiveness.last_tokens_freed,
+                    state.compaction_effectiveness.last_was_insufficient,
+                    state.compaction_effectiveness.cumulative_tokens_freed,
+                    state.compaction_effectiveness.attempt_count,
+                    state.compaction_effectiveness.consecutive_futile_attempts,
+                ),
+                compression_triggered: state.context_compression_triggered,
+                tier: state.compact_tier_applied,
+                rendered_summaries: host.rendered_compaction_summaries,
+            });
+        }
+
+        let quiet = &captures[0];
+        let rendered = &captures[1];
+        assert!(!quiet.callbacks.is_empty(), "fixture must actually compact");
+        assert_eq!(quiet.callbacks, rendered.callbacks);
+        assert_eq!(quiet.durable_facts, rendered.durable_facts);
+        assert_eq!(quiet.effectiveness, rendered.effectiveness);
+        assert_eq!(quiet.compression_triggered, rendered.compression_triggered);
+        assert_eq!(quiet.tier, rendered.tier);
+        assert_eq!(
+            quiet.messages, rendered.messages,
+            "quiet must not alter the compacted conversation"
+        );
+
+        assert!(
+            quiet.rendered_summaries.is_empty(),
+            "quiet suppresses rendering only"
+        );
+        assert_eq!(
+            rendered.rendered_summaries,
+            rendered
+                .callbacks
+                .iter()
+                .map(|event| event.summary.clone())
+                .collect::<Vec<_>>(),
+            "rendered mode projects every typed callback without changing it"
         );
     }
 

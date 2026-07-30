@@ -13,6 +13,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/auth/login", post(auth_handlers::auth_login_handler))
         .route("/auth/refresh", post(auth_handlers::auth_refresh_handler))
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
+        .route(
+            "/auth/reauthenticate",
+            post(auth_handlers::auth_reauthenticate_handler),
+        )
         .route("/auth/me", get(auth_handlers::auth_me_handler))
         .route(
             "/memory/store",
@@ -103,7 +107,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/chat", post(chat_handlers::chat_handler))
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))
         .route("/chat/turn", post(chat_handlers::chat_turn_handler))
-        .route("/chat/route", post(chat_handlers::chat_route_handler))
         .route(
             "/runtime/capabilities",
             get(capability_handlers::runtime_capabilities_handler),

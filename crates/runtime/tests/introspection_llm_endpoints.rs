@@ -31,7 +31,10 @@ use astra_runtime::{
     },
 };
 use astra_services::introspection::{
-    IntrospectionService, ServiceResult, SkillsIntrospectionResponse,
+    INTENT_DRIFT_ASSESSMENT_SCHEMA_VERSION, IntentDriftAssessmentProvenance,
+    IntentDriftAssessmentProvenanceKind, IntentDriftAssessmentV1, IntentDriftCheckResponseV2,
+    IntentDriftLevel, IntentDriftVerdict, IntrospectionService, ServiceResult,
+    SkillsIntrospectionResponse,
 };
 
 // ─── Stubs ──────────────────────────────────────────────────────────────────
@@ -165,17 +168,34 @@ impl IntrospectionService for StubIntrospection {
         }))
     }
 
-    async fn get_drift_check(&self, user_id: &str, session_id: &str) -> ServiceResult<Value> {
-        Ok(json!({
-            "schema_version": 1,
-            "user_id": user_id,
-            "session_id": session_id,
-            "original_intent_preview": "list all rust files",
-            "current_focus_preview": "editing Cargo.toml",
-            "drift_score": 0.42,
-            "drift_level": "moderate",
-            "signals": ["scope widened"],
-        }))
+    async fn get_drift_check(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> ServiceResult<IntentDriftCheckResponseV2> {
+        Ok(IntentDriftCheckResponseV2::assessed(
+            user_id,
+            session_id,
+            IntentDriftAssessmentV1 {
+                schema_version: INTENT_DRIFT_ASSESSMENT_SCHEMA_VERSION,
+                provenance: IntentDriftAssessmentProvenance {
+                    kind: IntentDriftAssessmentProvenanceKind::LlmJudge,
+                    invocation_id: "invocation-1".into(),
+                    provider: "test-provider".into(),
+                    model: "test-model".into(),
+                    provider_response_id: None,
+                },
+                verdict: IntentDriftVerdict::Drifting,
+                score: 0.42,
+                level: IntentDriftLevel::Moderate,
+                evidence: vec!["the judged tool trajectory no longer serves the objective".into()],
+                turn: 3,
+                round: 1,
+            },
+            "assessment-event-1",
+            "2026-07-30 12:00:00.000000",
+        )
+        .expect("valid assessed projection"))
     }
 }
 
@@ -278,16 +298,21 @@ async fn drift_check_returns_versioned_schema() {
     let app = build_test_app();
     let (status, body) = get_json(app, "/introspection/drift-check?session_id=s1").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["schema_version"], 1);
+    assert_eq!(body["schema_version"], 2);
     assert_eq!(body["session_id"], "s1");
-    assert!(body["drift_score"].is_number());
-    let drift = body["drift_score"].as_f64().unwrap();
+    assert_eq!(body["assessment_status"], "assessed");
+    assert_eq!(body["verdict"], "drifting");
+    assert!(body["score"].is_number());
+    let drift = body["score"].as_f64().unwrap();
     assert!(
         (0.0..=1.0).contains(&drift),
-        "drift_score must be in [0,1], got {drift}"
+        "assessment score must be in [0,1], got {drift}"
     );
-    assert!(body["drift_level"].is_string());
-    assert!(body["signals"].is_array());
+    assert_eq!(body["level"], "moderate");
+    assert!(body["evidence"].is_array());
+    assert_eq!(body["provenance"]["kind"], "llm_judge");
+    assert!(body.get("original_intent_preview").is_none());
+    assert!(body.get("current_focus_preview").is_none());
 }
 
 #[tokio::test]

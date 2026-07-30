@@ -12,7 +12,8 @@
 //!
 //! * **Fail-open**: DB errors log a warning and return defaults / proceed.
 //! * **Atomic counters**: `ON DUPLICATE KEY UPDATE` for race-free increments.
-//! * **Zero = unlimited**: a limit of `0` means no cap (admin/premium users).
+//! * **No implicit token price policy**: daily tokens are unlimited unless an
+//!   administrator writes a finite per-user limit; `0` means no cap.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -36,7 +37,7 @@ impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
             max_concurrent_sessions: 5,
-            max_tokens_per_day: 2_000_000, // ~$6 at GPT-4 pricing
+            max_tokens_per_day: 0,
             max_disk_bytes: 1_073_741_824, // 1 GB
             max_concurrent_bash: 3,
             max_sessions_per_day: 50,
@@ -201,7 +202,7 @@ impl DatabaseResourceGovernor {
             CREATE TABLE IF NOT EXISTS resource_limits (
                 user_id       VARCHAR(255) PRIMARY KEY,
                 max_concurrent_sessions INT     NOT NULL DEFAULT 5,
-                max_tokens_per_day      BIGINT  NOT NULL DEFAULT 2000000,
+                max_tokens_per_day      BIGINT  NOT NULL DEFAULT 0,
                 max_disk_bytes          BIGINT  NOT NULL DEFAULT 1073741824,
                 max_concurrent_bash     INT     NOT NULL DEFAULT 3,
                 max_sessions_per_day    INT     NOT NULL DEFAULT 50,
@@ -653,8 +654,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_budget_denied_when_exhausted() {
+    async fn configured_token_budget_denies_at_limit() {
         let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_tokens_per_day: 1_000,
+                ..Default::default()
+            },
+        )
+        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -662,24 +671,31 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        tokens_consumed: 2_000_000,
+                        tokens_consumed: 1_000,
                         ..Default::default()
                     },
                 },
             );
         }
         match gov.check_session_create("u1").await {
-            LimitCheck::Denied { limit, reason } => {
+            LimitCheck::Denied { limit, .. } => {
                 assert_eq!(limit, ResourceLimitKind::DailyTokens);
-                assert!(reason.contains("token budget"));
             }
             _ => panic!("expected denied"),
         }
     }
 
     #[tokio::test]
-    async fn token_budget_allows_within_limit() {
+    async fn configured_token_budget_allows_below_limit() {
         let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_tokens_per_day: 1_000,
+                ..Default::default()
+            },
+        )
+        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -687,7 +703,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        tokens_consumed: 1_999_999,
+                        tokens_consumed: 999,
                         ..Default::default()
                     },
                 },
@@ -697,20 +713,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unlimited_token_budget() {
+    async fn default_token_budget_is_unlimited() {
         let gov = InMemoryResourceGovernor::new();
-        gov.set_limits(
-            "admin",
-            ResourceLimits {
-                max_tokens_per_day: 0,
-                ..Default::default()
-            },
-        )
-        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
-                "admin".into(),
+                "u1".into(),
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
@@ -720,7 +728,9 @@ mod tests {
                 },
             );
         }
-        assert_eq!(gov.check_session_create("admin").await, LimitCheck::Allowed);
+        assert_eq!(gov.get_limits("u1").await.max_tokens_per_day, 0);
+        assert_eq!(gov.check_session_create("u1").await, LimitCheck::Allowed);
+        assert_eq!(gov.check_token_budget("u1").await, LimitCheck::Allowed);
     }
 
     #[tokio::test]
@@ -864,27 +874,6 @@ mod tests {
         }
     }
 
-    /// Zero limit means unlimited — check_token_budget must allow.
-    #[tokio::test]
-    async fn token_budget_zero_means_unlimited() {
-        let gov = InMemoryResourceGovernor::new();
-        let user = "u-unlimited";
-        gov.set_limits(
-            user,
-            ResourceLimits {
-                max_tokens_per_day: 0, // unlimited
-                ..Default::default()
-            },
-        )
-        .await;
-        gov.record_tokens(user, 999_999_999).await;
-        assert_eq!(
-            gov.check_token_budget(user).await,
-            LimitCheck::Allowed,
-            "zero limit means unlimited"
-        );
-    }
-
     /// P0-A: record_tokens must be called after each run so check_token_budget
     /// sees up-to-date usage. Simulates two runs consuming 600 tokens each
     /// against a 1000-token daily cap.
@@ -934,7 +923,7 @@ mod tests {
         let user = "u-daily-reset";
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
 
-        // Simulate yesterday's usage: at the daily cap
+        // Simulate arbitrary prior-day usage.
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -943,7 +932,7 @@ mod tests {
                     date: yesterday,
                     usage: ResourceUsage {
                         sessions_created: 50,
-                        tokens_consumed: 2_000_000,
+                        tokens_consumed: 12_345,
                         tool_calls: 999,
                         active_sessions: 2, // live sessions survive reset
                     },

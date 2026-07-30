@@ -5,8 +5,10 @@ use crossterm::{
     style::Stylize,
     terminal,
 };
+use sha2::{Digest, Sha256};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{LazyLock, RwLock};
 
 pub(crate) use astra_credentials::{CredentialStore, CredentialsFile, Profile};
 
@@ -80,12 +82,184 @@ pub(crate) fn normalize_model_override_owned(model: Option<String>) -> Option<St
     astra_core::model_override::normalize_model_override_owned(model)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliProfileIdentity {
+    profile_name: String,
+    account_id: Option<String>,
+    local_owner_id: String,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CliOwnerAuthSnapshot {
+    pub(crate) owner_scope: astra_services::OwnerScope,
+    pub(crate) access_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliProfileIdentityAdmission {
+    RequireBoundAccount,
+    AuthenticationBootstrap,
+}
+
+static CLI_PROFILE_IDENTITY: LazyLock<RwLock<Option<CliProfileIdentity>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+fn local_profile_owner_id(profile_name: &str, account_id: Option<&str>) -> Result<String, String> {
+    let profile_name = profile_name.trim();
+    if profile_name.is_empty() {
+        return Err("CLI profile name must not be empty".to_string());
+    }
+    let account_id = account_id.map(str::trim);
+    if account_id.is_some_and(str::is_empty) {
+        return Err("CLI profile account_id must not be empty".to_string());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-cli-local-owner-v1\0profile\0");
+    hasher.update(profile_name.as_bytes());
+    hasher.update(b"\0account\0");
+    hasher.update(account_id.unwrap_or("anonymous").as_bytes());
+    Ok(format!("cli-profile-v1:{:x}", hasher.finalize()))
+}
+
+pub(crate) fn cli_profile_owner_scope(
+    profile_name: &str,
+    account_id: Option<&str>,
+) -> Result<astra_services::OwnerScope, String> {
+    astra_services::OwnerScope::user(local_profile_owner_id(profile_name, account_id)?)
+}
+
+pub(crate) fn install_cli_profile_identity(
+    profile_name: impl Into<String>,
+    account_id: Option<String>,
+) -> Result<(), String> {
+    let profile_name = profile_name.into();
+    let owner_scope = cli_profile_owner_scope(&profile_name, account_id.as_deref())?;
+    let local_owner_id = owner_scope.id().to_string();
+    astra_services::configure_local_owner_scope(owner_scope);
+    let identity = CliProfileIdentity {
+        profile_name,
+        account_id,
+        local_owner_id,
+    };
+    match CLI_PROFILE_IDENTITY.write() {
+        Ok(mut current) => *current = Some(identity),
+        Err(poisoned) => {
+            tracing::warn!("CLI profile identity lock was poisoned; replacing the stored identity");
+            *poisoned.into_inner() = Some(identity);
+        }
+    }
+    Ok(())
+}
+
+fn current_cli_profile_identity() -> Option<CliProfileIdentity> {
+    match CLI_PROFILE_IDENTITY.read() {
+        Ok(current) => current.clone(),
+        Err(poisoned) => {
+            tracing::warn!("CLI profile identity lock was poisoned; recovering stored identity");
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
+/// Atomically describe which owner a background cloud operation belongs to.
+///
+/// The credential file is checked against the captured account id before its
+/// token is returned. During an account switch, a worker therefore observes
+/// either the old matching owner/token pair, the new matching pair, or no
+/// token; it can never send one owner's outbox with another owner's token.
+pub(crate) fn cli_owner_auth_snapshot() -> CliOwnerAuthSnapshot {
+    let Some(identity) = current_cli_profile_identity() else {
+        return CliOwnerAuthSnapshot {
+            owner_scope: astra_services::local_owner_scope(),
+            access_token: None,
+        };
+    };
+    let owner_scope = astra_services::OwnerScope::user(identity.local_owner_id.clone())
+        .expect("installed CLI owner identity is valid");
+    let access_token = load_credentials()
+        .profiles
+        .get(&identity.profile_name)
+        .filter(|profile| profile.account_id == identity.account_id)
+        .and_then(bound_profile_access_token)
+        .map(ToString::to_string);
+    CliOwnerAuthSnapshot {
+        owner_scope,
+        access_token,
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestCliProfileIdentityGuard {
+    previous_identity: Option<CliProfileIdentity>,
+    previous_owner: astra_services::OwnerScope,
+}
+
+#[cfg(test)]
+impl Drop for TestCliProfileIdentityGuard {
+    fn drop(&mut self) {
+        astra_services::configure_local_owner_scope(self.previous_owner.clone());
+        match CLI_PROFILE_IDENTITY.write() {
+            Ok(mut current) => *current = self.previous_identity.clone(),
+            Err(poisoned) => *poisoned.into_inner() = self.previous_identity.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_cli_profile_identity_for_test(
+    profile_name: &str,
+    account_id: Option<&str>,
+) -> Result<TestCliProfileIdentityGuard, String> {
+    let previous_identity = match CLI_PROFILE_IDENTITY.read() {
+        Ok(current) => current.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let previous_owner = astra_services::local_owner_scope();
+    install_cli_profile_identity(profile_name, account_id.map(str::to_string))?;
+    Ok(TestCliProfileIdentityGuard {
+        previous_identity,
+        previous_owner,
+    })
+}
+
+pub(crate) fn configure_cli_profile_identity(
+    cli_profile: Option<&str>,
+    admission: CliProfileIdentityAdmission,
+) -> Result<(), String> {
+    let creds = credential_store()
+        .load()
+        .map_err(|error| error.to_string())?;
+    let name = profile_name(cli_profile, &creds);
+    let profile = creds.profiles.get(&name);
+    let account_id = profile.and_then(|profile| profile.account_id.clone());
+    let has_auth_credentials = profile
+        .is_some_and(|profile| profile.access_token.is_some() || profile.refresh_token.is_some());
+    if admission == CliProfileIdentityAdmission::RequireBoundAccount
+        && has_auth_credentials
+        && account_id.is_none()
+    {
+        return Err(format!(
+            "profile '{name}' has credentials without a server-issued account_id; log in again to bind its local state"
+        ));
+    }
+    install_cli_profile_identity(name, account_id)
+}
+
+pub(crate) fn bound_profile_access_token(profile: &Profile) -> Option<&str> {
+    profile
+        .account_id
+        .as_deref()
+        .filter(|account_id| !account_id.trim().is_empty())?;
+    profile
+        .access_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+}
+
 pub(crate) fn cli_user_id() -> String {
-    std::env::var("ASTRA_CLI_USER_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    current_cli_profile_identity()
+        .and_then(|identity| identity.account_id)
+        .unwrap_or_else(astra_services::local_owner_user_id)
 }
 
 pub(crate) fn get_profile_and_token(
@@ -98,10 +272,17 @@ pub(crate) fn get_profile_and_token(
         .get(&name)
         .cloned()
         .ok_or_else(|| format!("no profile '{name}', run login first"))?;
-    let token = profile
-        .access_token
-        .clone()
-        .ok_or_else(|| format!("profile '{name}' is not logged in"))?;
+    let token = bound_profile_access_token(&profile)
+        .map(ToString::to_string)
+        .ok_or_else(|| {
+            if profile.account_id.is_none() {
+                format!(
+                    "profile '{name}' has no server-issued account_id; log in again to bind its local state"
+                )
+            } else {
+                format!("profile '{name}' is not logged in")
+            }
+        })?;
     Ok((creds, name, profile, token))
 }
 
@@ -843,15 +1024,18 @@ pub(crate) fn git_snapshot(cwd: Option<&str>) -> (Option<String>, Option<String>
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialsFile, Profile, clear_profile_last_session_if_matches, cli_user_id,
-        compact_or_raw, credentials_path, format_error_with_context, git_snapshot,
-        is_astra_session_auth_error, load_credentials, local_resumable_last_session_id,
-        local_session_is_resumable, mutate_credentials, normalize_model_override,
-        persist_profile_last_session, persist_profile_memoria_api_key, profile_name,
-        read_api_error, save_credentials, session_is_resumable, status_hint, status_hint_for,
-        urlencoding, validated_resumable_last_session_id,
+        CliProfileIdentityAdmission, CredentialsFile, Profile,
+        clear_profile_last_session_if_matches, cli_owner_auth_snapshot, cli_user_id,
+        compact_or_raw, configure_cli_profile_identity, credentials_path,
+        format_error_with_context, get_profile_and_token, git_snapshot,
+        install_cli_profile_identity_for_test, is_astra_session_auth_error, load_credentials,
+        local_profile_owner_id, local_resumable_last_session_id, local_session_is_resumable,
+        mutate_credentials, normalize_model_override, persist_profile_last_session,
+        persist_profile_memoria_api_key, profile_name, read_api_error, save_credentials,
+        session_is_resumable, status_hint, status_hint_for, urlencoding,
+        validated_resumable_last_session_id,
     };
-    use astra_services::session_journal;
+    use astra_services::{SessionArtifactStore as _, session_journal};
     use std::sync::{Mutex, OnceLock};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -889,6 +1073,168 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("lock poisoned")
+    }
+
+    #[test]
+    fn profile_and_account_identity_partition_every_local_state_root() {
+        let temp = tempfile::tempdir().expect("temporary session root");
+        let _journal_root = session_journal::JournalDirGuard::new(temp.path());
+        let cases = [
+            ("profile-a", Some("account-1")),
+            ("profile-b", Some("account-1")),
+            ("profile-a", Some("account-2")),
+            ("profile-a", None),
+        ];
+        let owner_ids = cases
+            .iter()
+            .map(|(profile, account)| {
+                local_profile_owner_id(profile, *account).expect("valid profile identity")
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            owner_ids.len(),
+            cases.len(),
+            "profile name, account identity, and anonymous state must each affect the namespace"
+        );
+
+        let owner_a_id =
+            local_profile_owner_id("profile-a", Some("account-1")).expect("owner A id");
+        let owner_b_id =
+            local_profile_owner_id("profile-b", Some("account-1")).expect("owner B id");
+        let owner_a = astra_services::OwnerScope::user(owner_a_id.clone()).expect("owner A");
+        let owner_b = astra_services::OwnerScope::user(owner_b_id.clone()).expect("owner B");
+        let session_id = "same-session-id";
+
+        let writer_a =
+            session_journal::JournalWriter::for_owner(&owner_a, session_id).expect("journal A");
+        let writer_b =
+            session_journal::JournalWriter::for_owner(&owner_b, session_id).expect("journal B");
+        writer_a
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("model-a"),
+            ))
+            .expect("append A");
+        writer_b
+            .append(&session_journal::JournalEvent::session_start(
+                Some(session_id),
+                Some("model-b"),
+            ))
+            .expect("append B");
+
+        let events_a =
+            session_journal::read_journal_for_user(&owner_a_id, session_id).expect("read A");
+        let events_b =
+            session_journal::read_journal_for_user(&owner_b_id, session_id).expect("read B");
+        assert_eq!(events_a.len(), 1);
+        assert_eq!(events_b.len(), 1);
+        assert_eq!(events_a[0].model.as_deref(), Some("model-a"));
+        assert_eq!(events_b[0].model.as_deref(), Some("model-b"));
+
+        let artifacts = astra_services::local_session_artifact_store();
+        let cache_a = artifacts
+            .session_path_for_owner(&owner_a, session_id, "cache/prompt.json")
+            .expect("cache A");
+        let cache_b = artifacts
+            .session_path_for_owner(&owner_b, session_id, "cache/prompt.json")
+            .expect("cache B");
+        assert_ne!(cache_a, cache_b);
+
+        let outbox_a = astra_services::SyncOutboxStore::for_owner(&owner_a).expect("outbox A");
+        let outbox_b = astra_services::SyncOutboxStore::for_owner(&owner_b).expect("outbox B");
+        assert_ne!(outbox_a.path(), outbox_b.path());
+        outbox_a
+            .enqueue_journal_event(&events_a[0])
+            .expect("enqueue A");
+        outbox_b
+            .enqueue_journal_event(&events_b[0])
+            .expect("enqueue B");
+        assert_eq!(outbox_a.status().expect("status A").pending, 1);
+        assert_eq!(outbox_b.status().expect("status B").pending, 1);
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn owner_auth_snapshot_never_pairs_stale_owner_with_replaced_account_token() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity_guard =
+            install_cli_profile_identity_for_test("profile-a", Some("account-a")).unwrap();
+        let mut credentials = CredentialsFile::default();
+        credentials.profiles.insert(
+            "profile-a".to_string(),
+            Profile {
+                account_id: Some("account-a".to_string()),
+                access_token: Some("token-a".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+
+        let before = cli_owner_auth_snapshot();
+        assert_eq!(before.access_token.as_deref(), Some("token-a"));
+
+        credentials.profiles.insert(
+            "profile-a".to_string(),
+            Profile {
+                account_id: Some("account-b".to_string()),
+                access_token: Some("token-b".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+
+        let transition_window = cli_owner_auth_snapshot();
+        assert_eq!(transition_window.owner_scope, before.owner_scope);
+        assert_eq!(
+            transition_window.access_token, None,
+            "an account mismatch must pause delivery instead of borrowing the replacement token"
+        );
+
+        let _new_identity_guard =
+            install_cli_profile_identity_for_test("profile-a", Some("account-b")).unwrap();
+        let after = cli_owner_auth_snapshot();
+        assert_ne!(after.owner_scope, before.owner_scope);
+        assert_eq!(after.access_token.as_deref(), Some("token-b"));
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn unbound_credentials_can_only_enter_authentication_bootstrap_without_token_authority() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity_guard =
+            install_cli_profile_identity_for_test("test-guard", Some("test-account")).unwrap();
+        let mut credentials = CredentialsFile {
+            current_profile: Some("admin".to_string()),
+            ..Default::default()
+        };
+        credentials.profiles.insert(
+            "admin".to_string(),
+            Profile {
+                access_token: Some("legacy-access".to_string()),
+                refresh_token: Some("legacy-refresh".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&credentials).unwrap();
+
+        let error =
+            configure_cli_profile_identity(None, CliProfileIdentityAdmission::RequireBoundAccount)
+                .expect_err("ordinary commands must reject credentials without server identity");
+        assert!(error.contains("server-issued account_id"), "{error}");
+
+        configure_cli_profile_identity(None, CliProfileIdentityAdmission::AuthenticationBootstrap)
+            .expect("login/register must reach the server to obtain account_id");
+        assert_eq!(
+            cli_owner_auth_snapshot().access_token,
+            None,
+            "anonymous bootstrap state must never inherit an unbound credential"
+        );
+        let token_error = get_profile_and_token(None)
+            .expect_err("unbound profiles must not authorize authenticated operations");
+        assert!(
+            token_error.contains("server-issued account_id"),
+            "{token_error}"
+        );
     }
 
     struct CliOverlayGuard;
@@ -1673,6 +2019,7 @@ mod tests {
     fn test_profile_debug_masks_secrets() {
         let profile = Profile {
             username: Some("alice".into()),
+            account_id: Some("account-1".into()),
             access_token: Some("sk-secret-token-12345".into()),
             refresh_token: Some("rt-refresh-abcdef".into()),
             last_session_id: Some("sess-001".into()),
@@ -1680,6 +2027,10 @@ mod tests {
         };
         let dbg = format!("{:?}", profile);
         assert!(dbg.contains("alice"), "username should be visible");
+        assert!(
+            dbg.contains("account-1"),
+            "server account identity should be visible"
+        );
         assert!(dbg.contains("sess-001"), "session_id should be visible");
         assert!(!dbg.contains("sk-secret"), "access_token must be masked");
         assert!(!dbg.contains("rt-refresh"), "refresh_token must be masked");

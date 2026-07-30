@@ -125,7 +125,10 @@ impl MemoryInferencePort for CliServerMemoryInferenceClient {
         let mut completion = astra_thin_client::CompletionRequest::from_session_scope(
             operation,
             &request.invocation_scope,
-            request.messages.to_vec(),
+            crate::cli::history_work::clone_json_history(
+                astra_core::history_work::HistoryWorkSite::CliMemoryInferenceRequestClone,
+                request.messages,
+            ),
         )
         .map_err(|error| ClassifiedError::new(ErrorKind::InvalidRequest, error))?
         .with_offering_id(&self.offering_id)

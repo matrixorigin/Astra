@@ -388,6 +388,14 @@ impl ForkPrefix {
         beta_headers.dedup();
 
         let canonical = Arc::new(canonical_prefix_bytes);
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::ForkPrefixHash,
+                canonical.len().try_into().unwrap_or(u64::MAX),
+                0,
+                0,
+            );
+        }
         let prefix_hash = sha256(&canonical);
 
         Self {
@@ -550,6 +558,14 @@ fn sha256(bytes: &[u8]) -> ContentHash {
 /// side and any future re-capture must agree bit-for-bit.
 pub fn hash_tool_schema(value: &serde_json::Value) -> (Vec<u8>, ContentHash) {
     let canonical = crate::canonical_json::to_vec(value);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ForkToolSchemaHash,
+            canonical.len().try_into().unwrap_or(u64::MAX),
+            1,
+            0,
+        );
+    }
     let hash = sha256(&canonical);
     (canonical, hash)
 }

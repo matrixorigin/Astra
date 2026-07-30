@@ -105,6 +105,8 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          \n\
          Output ONLY a JSON object with these fields:\n\
          {\n  \
+            \"domain\": \"github\" | \"git\" | \"code\" | \"memory\" | \"web\" | \"system\" | \"database\" | null,\n  \
+            \"communicative_act\": \"task\" | \"question\" | \"acknowledgement\" | \"social\" | \"unknown\",\n  \
             \"requested_scenario\": <scenario | null>,\n  \
             \"prohibited_scenarios\": [<scenario>, ...],\n  \
             \"objective_relation\": \"acknowledge\" | \"continue\" | \"refine\" | \"correct\" | \"replace\" | \"unknown\",\n  \
@@ -119,6 +121,13 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
            benchmark_comparison\n\
          \n\
          Rules:\n\
+         - domain: select the primary work domain only when reliable, otherwise null. This is the sole domain classification consumed by runtime telemetry.\n\
+         - communicative_act describes what response behavior this exact message requests:\n  \
+             * \"task\": asks the agent to perform work or take an action.\n  \
+             * \"question\": asks for a substantive answer or analysis; tools may be needed.\n  \
+             * \"acknowledgement\": only accepts or confirms prior output, with no follow-up work requested.\n  \
+             * \"social\": purely social interaction, with no substantive answer or action requested.\n  \
+             * \"unknown\": no reliable classification. Prefer this for ambiguity; do not infer from isolated words.\n\
          - requested_scenario: pick the BEST single scenario the user is asking for, or null when ambiguous.\n\
          - prohibited_scenarios: include any scenario the user explicitly rejected (e.g. \"don't review, just continue\" → [\"code_review\"]).\n\
          - objective_relation describes how this exact message changes the existing objective:\n  \
@@ -139,25 +148,25 @@ pub fn build_turn_intent_prompt(ctx: &TurnIntentJudgeContext) -> String {
          \n\
          Examples:\n\
          User: \"please inspect the current changes\"\n\
-         {\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"domain\":\"code\",\"communicative_act\":\"task\",\"requested_scenario\":\"code_review\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"fix it\" (after assistant proposed an implementation)\n\
-         {\"requested_scenario\":null,\"prohibited_scenarios\":[],\"objective_relation\":\"continue\",\"feedback\":null,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"domain\":null,\"communicative_act\":\"task\",\"requested_scenario\":null,\"prohibited_scenarios\":[],\"objective_relation\":\"continue\",\"feedback\":null,\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"还有什么？\" (after assistant was working on a task)\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"domain\":null,\"communicative_act\":\"question\",\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"当前的实现，能够想起来吗？\"\n\
-         {\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
+         {\"domain\":null,\"communicative_act\":\"question\",\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":false}\n\
          \n\
          User: \"不对，我要的是系统性修复，不是临时补丁\"\n\
-         {\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"domain\":\"code\",\"communicative_act\":\"task\",\"requested_scenario\":\"refactoring\",\"prohibited_scenarios\":[],\"objective_relation\":\"correct\",\"feedback\":{\"kind\":\"correction\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"don't review this, just continue the implementation\"\n\
-         {\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"objective_relation\":\"refine\",\"feedback\":{\"kind\":\"requirement\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
+         {\"domain\":\"code\",\"communicative_act\":\"task\",\"requested_scenario\":\"implementation\",\"prohibited_scenarios\":[\"code_review\"],\"objective_relation\":\"refine\",\"feedback\":{\"kind\":\"requirement\",\"target\":\"approach\"},\"workspace_mutation\":\"must_mutate\",\"browser_verification_required\":false}\n\
          \n\
          User: \"test the game in a browser and verify the canvas works\"\n\
-         {\"requested_scenario\":\"testing\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":true}\n\
+         {\"domain\":\"web\",\"communicative_act\":\"task\",\"requested_scenario\":\"testing\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\",\"feedback\":null,\"workspace_mutation\":\"read_only\",\"browser_verification_required\":true}\n\
          \n",
     );
 
@@ -214,35 +223,8 @@ pub fn turn_intent_judge_messages(ctx: &TurnIntentJudgeContext) -> Vec<Value> {
 /// Strict: unknown fields or enum values produce `Err` so callers cannot
 /// silently construct a degraded intent from an obsolete schema.
 pub fn parse_turn_intent_response(raw: &str) -> Result<TurnIntent, TurnIntentJudgeError> {
-    let trimmed = raw.trim();
-
-    // Strip any markdown fence wrapping. Models occasionally hedge despite
-    // the prompt explicitly forbidding it.
-    let unfenced = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .map(|s| s.strip_suffix("```").unwrap_or(s))
-        .unwrap_or(trimmed)
-        .trim();
-
-    // Some models emit prose around the JSON. Try a substring extraction as
-    // a fallback before giving up.
-    let json_text = if let Ok(value) = serde_json::from_str::<serde_json::Value>(unfenced) {
-        Ok(value)
-    } else if let (Some(start), Some(end)) = (unfenced.find('{'), unfenced.rfind('}'))
-        && start < end
-    {
-        serde_json::from_str::<serde_json::Value>(&unfenced[start..=end])
-    } else {
-        Err(serde_json::from_str::<serde_json::Value>(unfenced).unwrap_err())
-    };
-
-    let value = json_text.map_err(|_| TurnIntentJudgeError::Malformed {
+    serde_json::from_str(raw.trim()).map_err(|_| TurnIntentJudgeError::Malformed {
         raw: truncate(raw, 256),
-    })?;
-
-    serde_json::from_value(value).map_err(|error| TurnIntentJudgeError::Malformed {
-        raw: truncate(&format!("{error}: {raw}"), 256),
     })
 }
 
@@ -261,7 +243,9 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use astra_config::user_profile::{Scenario, WorkspaceMutationIntent};
+    use astra_config::user_profile::{
+        Scenario, TurnCommunicativeAct, TurnIntentDomain, WorkspaceMutationIntent,
+    };
     use astra_turn_types::{ObjectiveRelation, UserFeedback, UserFeedbackKind, UserFeedbackTarget};
 
     #[test]
@@ -278,6 +262,8 @@ mod tests {
         assert!(prompt.contains("Has prior assistant turn: yes"));
         assert!(prompt.contains("read_file, bash"));
         assert!(prompt.contains("\"objective_relation\""));
+        assert!(prompt.contains("\"domain\""));
+        assert!(prompt.contains("\"communicative_act\""));
         assert!(prompt.contains("\"feedback\""));
         assert!(prompt.contains("\"workspace_mutation\""));
         assert!(prompt.contains("\"browser_verification_required\": <boolean>"));
@@ -317,16 +303,34 @@ mod tests {
 
     #[test]
     fn parses_clean_json() {
-        let raw = r#"{"requested_scenario":"code_review","prohibited_scenarios":[],"objective_relation":"replace"}"#;
+        let raw = r#"{"domain":"github","communicative_act":"task","requested_scenario":"code_review","prohibited_scenarios":[],"objective_relation":"replace"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
+        assert_eq!(intent.domain, Some(TurnIntentDomain::GitHub));
+        assert_eq!(intent.communicative_act, TurnCommunicativeAct::Task);
         assert_eq!(intent.requested_scenario, Some(Scenario::CodeReview));
         assert!(intent.prohibited_scenarios.is_empty());
         assert_eq!(intent.objective_relation, ObjectiveRelation::Replace);
     }
 
     #[test]
+    fn parses_every_communicative_act_as_a_typed_value() {
+        for (wire, expected) in [
+            ("task", TurnCommunicativeAct::Task),
+            ("question", TurnCommunicativeAct::Question),
+            ("acknowledgement", TurnCommunicativeAct::Acknowledgement),
+            ("social", TurnCommunicativeAct::Social),
+            ("unknown", TurnCommunicativeAct::Unknown),
+        ] {
+            let raw = format!(r#"{{"communicative_act":"{wire}","objective_relation":"unknown"}}"#);
+            let intent = parse_turn_intent_response(&raw).unwrap();
+            assert_eq!(intent.communicative_act, expected);
+        }
+    }
+
+    #[test]
     fn parses_refinement_with_prohibition_and_feedback() {
         let raw = r#"{
+          "communicative_act": "task",
           "requested_scenario": "implementation",
           "prohibited_scenarios": ["code_review"],
           "objective_relation": "refine",
@@ -354,7 +358,7 @@ mod tests {
 
     #[test]
     fn parses_benchmark_comparison_scenario() {
-        let raw = r#"{"requested_scenario":"benchmark_comparison","prohibited_scenarios":[],"objective_relation":"replace"}"#;
+        let raw = r#"{"communicative_act":"task","requested_scenario":"benchmark_comparison","prohibited_scenarios":[],"objective_relation":"replace"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
         assert_eq!(
             intent.requested_scenario,
@@ -365,6 +369,7 @@ mod tests {
     #[test]
     fn parses_structured_correction_as_one_relation() {
         let raw = r#"{
+          "communicative_act": "task",
           "requested_scenario": "refactoring",
           "prohibited_scenarios": [],
           "objective_relation": "correct",
@@ -378,35 +383,55 @@ mod tests {
 
     #[test]
     fn parses_null_requested_scenario_as_none() {
-        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"continue"}"#;
+        let raw = r#"{"domain":null,"communicative_act":"task","requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"continue"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
+        assert_eq!(intent.domain, None);
         assert_eq!(intent.requested_scenario, None);
     }
 
     #[test]
-    fn parses_markdown_fenced_response() {
-        let raw = "```json\n{\"requested_scenario\":\"debugging\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\"}\n```";
+    fn missing_domain_stays_unknown_instead_of_inferred_from_text() {
+        let raw = r#"{"communicative_act":"task","requested_scenario":"implementation","objective_relation":"replace"}"#;
         let intent = parse_turn_intent_response(raw).unwrap();
-        assert_eq!(intent.requested_scenario, Some(Scenario::Debugging));
+        assert_eq!(intent.domain, None);
     }
 
     #[test]
-    fn parses_response_with_surrounding_prose() {
-        let raw = "Here is the classification:\n{\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\"}\nLet me know if you need more.";
-        let intent = parse_turn_intent_response(raw).unwrap();
-        assert_eq!(intent.requested_scenario, Some(Scenario::QuickAnswer));
+    fn unknown_domain_returns_malformed() {
+        let raw =
+            r#"{"domain":"frontend","communicative_act":"task","objective_relation":"replace"}"#;
+        let err = parse_turn_intent_response(raw).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn rejects_markdown_fenced_response() {
+        let raw = "```json\n{\"communicative_act\":\"task\",\"requested_scenario\":\"debugging\",\"prohibited_scenarios\":[],\"objective_relation\":\"replace\"}\n```";
+        assert!(matches!(
+            parse_turn_intent_response(raw),
+            Err(TurnIntentJudgeError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_response_with_surrounding_prose() {
+        let raw = "Here is the classification:\n{\"communicative_act\":\"question\",\"requested_scenario\":\"quick_answer\",\"prohibited_scenarios\":[],\"objective_relation\":\"unknown\"}\nLet me know if you need more.";
+        assert!(matches!(
+            parse_turn_intent_response(raw),
+            Err(TurnIntentJudgeError::Malformed { .. })
+        ));
     }
 
     #[test]
     fn unknown_scenario_returns_malformed() {
-        let raw = r#"{"requested_scenario":"mystery","prohibited_scenarios":[],"objective_relation":"unknown"}"#;
+        let raw = r#"{"communicative_act":"task","requested_scenario":"mystery","prohibited_scenarios":[],"objective_relation":"unknown"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
     fn unknown_objective_relation_returns_malformed() {
-        let raw = r#"{"requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"sometimes"}"#;
+        let raw = r#"{"communicative_act":"question","requested_scenario":null,"prohibited_scenarios":[],"objective_relation":"sometimes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
@@ -441,13 +466,28 @@ mod tests {
 
     #[test]
     fn missing_objective_relation_is_malformed() {
-        let err = parse_turn_intent_response("{}").unwrap_err();
+        let err = parse_turn_intent_response(r#"{"communicative_act":"unknown"}"#).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn missing_communicative_act_is_malformed() {
+        let err = parse_turn_intent_response(r#"{"objective_relation":"unknown"}"#).unwrap_err();
+        assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
+    }
+
+    #[test]
+    fn unknown_communicative_act_is_malformed() {
+        let err = parse_turn_intent_response(
+            r#"{"communicative_act":"conversation","objective_relation":"unknown"}"#,
+        )
+        .unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
     fn malformed_feedback_returns_malformed() {
-        let raw = r#"{"objective_relation":"correct","feedback":{"kind":"correction","target":"unknown_target"}}"#;
+        let raw = r#"{"communicative_act":"task","objective_relation":"correct","feedback":{"kind":"correction","target":"unknown_target"}}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
@@ -455,6 +495,7 @@ mod tests {
     #[test]
     fn parses_workspace_mutation_and_browser_requirement() {
         let raw = r#"{
+          "communicative_act": "task",
           "requested_scenario": "testing",
           "prohibited_scenarios": [],
           "objective_relation": "replace",
@@ -469,14 +510,14 @@ mod tests {
 
     #[test]
     fn unknown_workspace_mutation_returns_malformed() {
-        let raw = r#"{"objective_relation":"unknown","workspace_mutation":"sometimes"}"#;
+        let raw = r#"{"communicative_act":"unknown","objective_relation":"unknown","workspace_mutation":"sometimes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
 
     #[test]
     fn non_boolean_browser_requirement_returns_malformed() {
-        let raw = r#"{"objective_relation":"unknown","browser_verification_required":"yes"}"#;
+        let raw = r#"{"communicative_act":"unknown","objective_relation":"unknown","browser_verification_required":"yes"}"#;
         let err = parse_turn_intent_response(raw).unwrap_err();
         assert!(matches!(err, TurnIntentJudgeError::Malformed { .. }));
     }
@@ -485,7 +526,7 @@ mod tests {
     fn schema_rejects_scenario_aliases() {
         for alias in ["review", "debug", "impl", "quick"] {
             let raw = format!(
-                r#"{{"requested_scenario":"{alias}","prohibited_scenarios":[],"objective_relation":"unknown"}}"#
+                r#"{{"communicative_act":"task","requested_scenario":"{alias}","prohibited_scenarios":[],"objective_relation":"unknown"}}"#
             );
             assert!(
                 matches!(

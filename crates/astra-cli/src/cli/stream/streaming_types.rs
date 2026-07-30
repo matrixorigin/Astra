@@ -162,7 +162,8 @@ pub(crate) struct StreamResult {
     pub(crate) context_ms: Option<u64>,
     /// Memoria search time in milliseconds (subset of context_ms).
     pub(crate) memoria_ms: Option<u64>,
-    /// Routing domain label for this user line (filled in REPL when writing the journal row).
+    /// LLM-judged routing domain for this user line. `None` means the strict
+    /// turn-intent judge was unavailable or returned no reliable domain.
     pub(crate) routing_domain_hint: Option<String>,
     /// Entity graph skipped learning: success with tools but no routing domain.
     pub(crate) entity_learn_skipped_no_domain: bool,
@@ -237,16 +238,6 @@ impl StreamResult {
         }
         latest_user_input_from_messages(primary_line, &self.final_messages)
     }
-
-    /// Filled by the REPL after the agentic loop returns (routing + entity-learn eligibility).
-    pub(crate) fn set_repl_learning_journal_fields(
-        &mut self,
-        routing_domain_hint: Option<String>,
-        entity_learn_skipped_no_domain: bool,
-    ) {
-        self.routing_domain_hint = routing_domain_hint;
-        self.entity_learn_skipped_no_domain = entity_learn_skipped_no_domain;
-    }
 }
 
 pub(crate) fn format_background_agent_results(results: &[(String, String)]) -> Option<String> {
@@ -305,6 +296,8 @@ fn user_inputs_from_current_turn(
     if primary.is_empty() {
         return Vec::new();
     }
+    let measure_history_work = astra_core::history_work::instrumentation_enabled();
+    let mut projected_bytes = 0_u64;
     let user_contents = messages
         .iter()
         .filter_map(|message| {
@@ -313,9 +306,23 @@ fn user_inputs_from_current_turn(
                 return None;
             }
             let content = message.get("content")?.as_str()?.trim();
-            (!content.is_empty()).then(|| content.to_string())
+            (!content.is_empty()).then(|| {
+                if measure_history_work {
+                    projected_bytes = projected_bytes
+                        .saturating_add(content.len().try_into().unwrap_or(u64::MAX));
+                }
+                content.to_string()
+            })
         })
         .collect::<Vec<_>>();
+    if measure_history_work {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::CliTurnUserInputProjection,
+            projected_bytes,
+            messages.len().try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
 
     let Some(start) = user_contents
         .iter()

@@ -10,6 +10,8 @@ use astra_services::{
     SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
     build_presigned_artifact_download,
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +24,14 @@ const MAX_TRANSCRIPT_LIMIT: u32 = 200;
 const DEFAULT_RESUMABLE_SESSION_LIMIT: u32 = 20;
 const MAX_RESUMABLE_SESSION_LIMIT: u32 = 50;
 const DEVICE_LEASE_TTL_HOURS: i64 = 2;
+const DEVICE_CHALLENGE_TTL_SECONDS: i64 = 120;
+const DEVICE_PROTOCOL_VALUE_MAX_LEN: usize = 128;
+const DEVICE_PROOF_MAX_LEN: usize = 128;
+const DEVICE_ID_HEADER: &str = "x-astra-device-id";
+const DEVICE_FINGERPRINT_HEADER: &str = "x-astra-device-fingerprint";
+const DEVICE_CHALLENGE_ID_HEADER: &str = "x-astra-device-challenge-id";
+const DEVICE_PROOF_HEADER: &str = "x-astra-device-proof";
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Deserialize, Default)]
 pub(crate) struct ResumableSessionsQuery {
@@ -41,40 +51,6 @@ pub(crate) struct SessionStateQuery {
     pub known_revision_hash: Option<String>,
     #[serde(default)]
     pub client_cache_empty: bool,
-    #[serde(default)]
-    pub device_id: Option<String>,
-    #[serde(default)]
-    pub device_fingerprint: Option<String>,
-}
-
-fn required_session_state_device_fingerprint(
-    query: &SessionStateQuery,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    query
-        .device_fingerprint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "device_fingerprint is required for session state synchronization",
-            )
-        })
-}
-
-fn optional_session_state_device_id(
-    query: &SessionStateQuery,
-) -> Result<Option<String>, (StatusCode, Json<ErrorResponse>)> {
-    match query.device_id.as_deref() {
-        Some(value) if value.trim().is_empty() => Err(error_response(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "device_id must be non-empty when provided",
-        )),
-        Some(value) => Ok(Some(value.trim().to_string())),
-        None => Ok(None),
-    }
 }
 
 #[derive(Serialize)]
@@ -337,13 +313,69 @@ pub(crate) struct DeviceRevokeRequest {
     pub reason: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DeviceTrustRequest {
     pub device_id: String,
-    #[serde(default)]
-    pub step_up_confirmation: bool,
+    pub device_fingerprint: String,
+    pub challenge_id: String,
+    pub device_proof: String,
+    pub reauthentication_proof: String,
     #[serde(default)]
     pub expected_last_monotonic_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeviceProofPurpose {
+    Hydrate,
+    Trust,
+}
+
+impl DeviceProofPurpose {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hydrate => "hydrate",
+            Self::Trust => "trust",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceEnrollRequest {
+    pub device_id: String,
+    pub device_fingerprint: String,
+    #[serde(default)]
+    pub reauthentication_proof: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DeviceEnrollResponse {
+    pub lease: DeviceLeaseResponse,
+    pub device_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeviceChallengeRequest {
+    pub device_id: String,
+    pub device_fingerprint: String,
+    pub purpose: DeviceProofPurpose,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DeviceChallengeResponse {
+    pub challenge_id: String,
+    pub challenge: String,
+    pub purpose: DeviceProofPurpose,
+    pub expires_in: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedDeviceIdentity {
+    device_id: String,
+    device_fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -461,22 +493,19 @@ pub(crate) async fn get_session_state_handler(
         .session_service
         .get_session(session_id.clone(), user.user_id.clone())
         .await?;
-    let device_fingerprint = required_session_state_device_fingerprint(&query)?;
-    let device_id = optional_session_state_device_id(&query)?;
     let pool = state
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
-    if let Some(device_id) = device_id.as_deref() {
-        ensure_device_lease(
-            pool,
-            &session.user_id,
-            &session.session_id,
-            device_id,
-            &device_fingerprint,
-        )
-        .await?;
-    }
+    let device = verify_device_proof_from_headers(
+        pool,
+        &session.user_id,
+        &session.session_id,
+        &headers,
+        DeviceProofPurpose::Hydrate,
+    )
+    .await?;
+    let device_fingerprint = device.device_fingerprint;
 
     let transcript_high_watermark =
         transcript_high_watermark(pool, &session.user_id, &session.session_id).await?;
@@ -1155,6 +1184,194 @@ pub(crate) async fn list_session_devices_handler(
     }))
 }
 
+pub(crate) async fn enroll_session_device_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceEnrollRequest>,
+) -> Result<(StatusCode, Json<DeviceEnrollResponse>), (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let _ = state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let device_id = validate_device_protocol_value("device_id", &request.device_id)?;
+    let device_fingerprint =
+        validate_device_protocol_value("device_fingerprint", &request.device_fingerprint)?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+
+    let existing = sqlx::query(
+        "SELECT device_key_hash
+         FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND device_id = ?
+         LIMIT 1",
+    )
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(device_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(internal_error)?;
+
+    let device_key = new_device_secret("dk");
+    let device_key_hash = sha256_raw_hex(device_key.as_bytes());
+    let expires_at = chrono::Utc::now() + chrono::Duration::hours(DEVICE_LEASE_TTL_HOURS);
+    let status = if let Some(row) = existing {
+        let prior_key_hash = session_row_string(&row, "device_key_hash").map_err(internal_error)?;
+        let proof = request.reauthentication_proof.as_deref().ok_or_else(|| {
+            error_response(
+                StatusCode::FORBIDDEN,
+                "verified reauthentication is required to re-enroll a device",
+            )
+        })?;
+        state
+            .auth_service
+            .consume_reauthentication_proof(
+                &user.user_id,
+                astra_services::auth::ReauthenticationPurpose::DeviceReenroll,
+                proof,
+            )
+            .await?;
+        let result = sqlx::query(
+            "UPDATE session_device_leases
+             SET device_fingerprint = ?, device_key_hash = ?, trust_level = 'new_device',
+                 status = 'active', last_monotonic_id = 0, expires_at = ?,
+                 revoked_at = NULL, updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND device_id = ? AND device_key_hash = ?",
+        )
+        .bind(device_fingerprint)
+        .bind(&device_key_hash)
+        .bind(expires_at.naive_utc())
+        .bind(&user.user_id)
+        .bind(&session_id)
+        .bind(device_id)
+        .bind(prior_key_hash)
+        .execute(pool.get())
+        .await
+        .map_err(internal_error)?;
+        if result.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "device changed during verified re-enrollment",
+            ));
+        }
+        StatusCode::OK
+    } else {
+        let result = sqlx::query(
+            "INSERT INTO session_device_leases
+             (lease_id, user_id, session_id, device_id, device_fingerprint, device_key_hash,
+              trust_level, status, last_monotonic_id, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'new_device', 'active', 0, ?, NOW(6), NOW(6))",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user.user_id)
+        .bind(&session_id)
+        .bind(device_id)
+        .bind(device_fingerprint)
+        .bind(&device_key_hash)
+        .bind(expires_at.naive_utc())
+        .execute(pool.get())
+        .await;
+        match result {
+            Ok(_) => StatusCode::CREATED,
+            Err(error) if is_duplicate_key_error(&error) => {
+                return Err(error_response(
+                    StatusCode::CONFLICT,
+                    "device enrollment raced with another request; retry with verified reauthentication",
+                ));
+            }
+            Err(error) => return Err(internal_error(error)),
+        }
+    };
+
+    sqlx::query(
+        "DELETE FROM session_device_challenges
+         WHERE user_id = ? AND session_id = ? AND device_id = ?",
+    )
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(device_id)
+    .execute(pool.get())
+    .await
+    .map_err(internal_error)?;
+
+    let lease = load_device_response(pool, &user.user_id, &session_id, device_id).await?;
+    Ok((status, Json(DeviceEnrollResponse { lease, device_key })))
+}
+
+pub(crate) async fn create_session_device_challenge_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceChallengeRequest>,
+) -> Result<Json<DeviceChallengeResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let _ = state
+        .session_service
+        .get_session(session_id.clone(), user.user_id.clone())
+        .await?;
+    let device_id = validate_device_protocol_value("device_id", &request.device_id)?;
+    let device_fingerprint =
+        validate_device_protocol_value("device_fingerprint", &request.device_fingerprint)?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let active = sqlx::query(
+        "SELECT 1
+         FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND device_id = ? AND device_fingerprint = ?
+           AND status = 'active' AND expires_at > NOW(6)
+         LIMIT 1",
+    )
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(device_id)
+    .bind(device_fingerprint)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(internal_error)?
+    .is_some();
+    if !active {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "active device enrollment is required",
+        ));
+    }
+
+    let challenge_id = Uuid::new_v4().to_string();
+    let challenge = new_device_secret("dc");
+    let challenge_digest = sha256_raw_hex(challenge.as_bytes());
+    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CHALLENGE_TTL_SECONDS);
+    sqlx::query(
+        "INSERT INTO session_device_challenges
+         (challenge_id, user_id, session_id, device_id, device_fingerprint, purpose,
+          challenge_digest, expires_at, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(&challenge_id)
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(device_id)
+    .bind(device_fingerprint)
+    .bind(request.purpose.as_str())
+    .bind(challenge_digest)
+    .bind(expires_at.naive_utc())
+    .execute(pool.get())
+    .await
+    .map_err(internal_error)?;
+
+    Ok(Json(DeviceChallengeResponse {
+        challenge_id,
+        challenge,
+        purpose: request.purpose,
+        expires_in: DEVICE_CHALLENGE_TTL_SECONDS as u32,
+    }))
+}
+
 pub(crate) async fn revoke_session_device_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -1203,6 +1420,12 @@ pub(crate) async fn revoke_session_device_handler(
          WHERE lease_id = ",
     );
     update.push_bind(&lease.lease_id);
+    update.push(" AND user_id = ");
+    update.push_bind(&lease.user_id);
+    update.push(" AND session_id = ");
+    update.push_bind(&lease.session_id);
+    update.push(" AND device_id = ");
+    update.push_bind(&lease.device_id);
     update.push(" AND status = 'active'");
     if let Some(expected) = request.expected_last_monotonic_id {
         update.push(" AND last_monotonic_id = ");
@@ -1219,6 +1442,16 @@ pub(crate) async fn revoke_session_device_handler(
             "device lease revoke CAS conflict",
         ));
     }
+    sqlx::query(
+        "DELETE FROM session_device_challenges
+         WHERE user_id = ? AND session_id = ? AND device_id = ?",
+    )
+    .bind(&user.user_id)
+    .bind(&session_id)
+    .bind(&lease.device_id)
+    .execute(pool.get())
+    .await
+    .map_err(internal_error)?;
 
     let payload = insert_device_lease_event(
         pool,
@@ -1228,7 +1461,7 @@ pub(crate) async fn revoke_session_device_handler(
     )
     .await?;
     if let Ok(value) = serde_json::to_value(&payload) {
-        super::device_lease_sweeper::publish_device_lease_event(value);
+        super::device_lease_sweeper::publish_device_lease_event(&user.user_id, &session_id, value);
     }
     Ok(Json(DeviceRevokeResponse {
         event: payload,
@@ -1247,16 +1480,35 @@ pub(crate) async fn trust_session_device_handler(
         .session_service
         .get_session(session_id.clone(), user.user_id.clone())
         .await?;
-    if !request.step_up_confirmation {
-        return Err(error_response(
-            StatusCode::FORBIDDEN,
-            "step-up confirmation is required to trust a new device",
-        ));
-    }
     let pool = state
         .shared_pool
         .as_ref()
         .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let device_id = validate_device_protocol_value("device_id", &request.device_id)?;
+    let device_fingerprint =
+        validate_device_protocol_value("device_fingerprint", &request.device_fingerprint)?;
+    let challenge_id = validate_device_protocol_value("challenge_id", &request.challenge_id)?;
+    validate_device_proof_value(&request.device_proof)?;
+    let verified = verify_device_proof(
+        pool,
+        &user.user_id,
+        &session_id,
+        device_id,
+        device_fingerprint,
+        challenge_id,
+        &request.device_proof,
+        DeviceProofPurpose::Trust,
+    )
+    .await?;
+    debug_assert_eq!(verified.device_id, device_id);
+    state
+        .auth_service
+        .consume_reauthentication_proof(
+            &user.user_id,
+            astra_services::auth::ReauthenticationPurpose::DeviceTrust,
+            &request.reauthentication_proof,
+        )
+        .await?;
 
     let mut update = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "UPDATE session_device_leases
@@ -1267,8 +1519,10 @@ pub(crate) async fn trust_session_device_handler(
     update.push(" AND user_id = ");
     update.push_bind(&user.user_id);
     update.push(" AND device_id = ");
-    update.push_bind(&request.device_id);
-    update.push(" AND status = 'active' AND trust_level = 'new_device'");
+    update.push_bind(device_id);
+    update.push(" AND device_fingerprint = ");
+    update.push_bind(device_fingerprint);
+    update.push(" AND status = 'active' AND expires_at > NOW(6) AND trust_level = 'new_device'");
     if let Some(expected) = request.expected_last_monotonic_id {
         update.push(" AND last_monotonic_id = ");
         update.push_bind(expected);
@@ -1294,7 +1548,7 @@ pub(crate) async fn trust_session_device_handler(
     )
     .bind(&session_id)
     .bind(&user.user_id)
-    .bind(&request.device_id)
+    .bind(device_id)
     .fetch_one(pool.get())
     .await
     .map_err(internal_error)?;
@@ -1344,12 +1598,12 @@ pub(crate) async fn session_device_events_handler(
             ));
         }
         while let Ok(event) = rx.recv().await {
-            if event.get("session_id").and_then(serde_json::Value::as_str) != Some(session_id.as_str()) {
+            if !event.belongs_to(&user.user_id, &session_id) {
                 continue;
             }
             yield Ok::<_, std::convert::Infallible>(format!(
                 "data: {}\n\n",
-                serde_json::to_string(&event).unwrap_or_default()
+                serde_json::to_string(&event.payload).unwrap_or_default()
             ));
         }
     };
@@ -1770,93 +2024,273 @@ async fn update_session_state_revision(
     Ok(result.rows_affected() > 0)
 }
 
-async fn ensure_device_lease(
-    pool: &SharedPool,
+fn validate_device_protocol_value<'a>(
+    field: &str,
+    value: &'a str,
+) -> Result<&'a str, (StatusCode, Json<ErrorResponse>)> {
+    let valid = !value.is_empty()
+        && value.trim() == value
+        && value.len() <= DEVICE_PROTOCOL_VALUE_MAX_LEN
+        && value.bytes().all(|byte| byte.is_ascii_graphic());
+    if !valid {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{field} must be 1..={DEVICE_PROTOCOL_VALUE_MAX_LEN} visible ASCII bytes without padding"
+            ),
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_device_proof_value(proof: &str) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let decoded_len = URL_SAFE_NO_PAD
+        .decode(proof)
+        .ok()
+        .map(|decoded| decoded.len());
+    if proof.is_empty()
+        || proof.trim() != proof
+        || proof.len() > DEVICE_PROOF_MAX_LEN
+        || decoded_len != Some(32)
+    {
+        return Err(error_response(
+            StatusCode::UNAUTHORIZED,
+            "device proof is malformed",
+        ));
+    }
+    Ok(())
+}
+
+fn required_device_header<'a>(
+    headers: &'a HeaderMap,
+    name: &'static str,
+) -> Result<&'a str, (StatusCode, Json<ErrorResponse>)> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                format!("required device proof header is missing or invalid: {name}"),
+            )
+        })
+}
+
+fn new_device_secret(prefix: &str) -> String {
+    format!(
+        "{prefix}_{}_{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    )
+}
+
+fn sha256_raw_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn append_device_proof_field(message: &mut String, value: &str) {
+    message.push_str(&value.len().to_string());
+    message.push(':');
+    message.push_str(value);
+    message.push('\n');
+}
+
+fn device_proof_message(
+    purpose: DeviceProofPurpose,
     user_id: &str,
     session_id: &str,
     device_id: &str,
     device_fingerprint: &str,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let expires_at = chrono::Utc::now() + chrono::Duration::hours(DEVICE_LEASE_TTL_HOURS);
-    let updated = refresh_device_lease(
+    challenge_id: &str,
+    challenge_digest: &str,
+) -> Vec<u8> {
+    let mut message = String::from("astra-device-proof-v1\n");
+    for value in [
+        purpose.as_str(),
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        challenge_id,
+        challenge_digest,
+    ] {
+        append_device_proof_field(&mut message, value);
+    }
+    message.into_bytes()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_device_proof_signature(
+    device_key_hash: &str,
+    purpose: DeviceProofPurpose,
+    user_id: &str,
+    session_id: &str,
+    device_id: &str,
+    device_fingerprint: &str,
+    challenge_id: &str,
+    challenge_digest: &str,
+    proof: &str,
+) -> bool {
+    let Ok(proof_bytes) = URL_SAFE_NO_PAD.decode(proof) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha256::new_from_slice(device_key_hash.as_bytes()) else {
+        return false;
+    };
+    mac.update(&device_proof_message(
+        purpose,
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        challenge_id,
+        challenge_digest,
+    ));
+    mac.verify_slice(&proof_bytes).is_ok()
+}
+
+async fn verify_device_proof_from_headers(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    headers: &HeaderMap,
+    purpose: DeviceProofPurpose,
+) -> Result<VerifiedDeviceIdentity, (StatusCode, Json<ErrorResponse>)> {
+    let device_id = validate_device_protocol_value(
+        "device_id",
+        required_device_header(headers, DEVICE_ID_HEADER)?,
+    )?;
+    let device_fingerprint = validate_device_protocol_value(
+        "device_fingerprint",
+        required_device_header(headers, DEVICE_FINGERPRINT_HEADER)?,
+    )?;
+    let challenge_id = validate_device_protocol_value(
+        "challenge_id",
+        required_device_header(headers, DEVICE_CHALLENGE_ID_HEADER)?,
+    )?;
+    let proof = required_device_header(headers, DEVICE_PROOF_HEADER)?;
+    validate_device_proof_value(proof)?;
+    verify_device_proof(
         pool,
         user_id,
         session_id,
         device_id,
         device_fingerprint,
-        expires_at,
+        challenge_id,
+        proof,
+        purpose,
     )
     .await
-    .map_err(|error| {
-        internal_error(format!(
-            "refresh device lease failed for session {session_id} device {device_id}: {error}"
-        ))
-    })?;
-    if updated {
-        return Ok(());
-    }
-
-    let insert_result = sqlx::query(
-        "INSERT INTO session_device_leases
-         (lease_id, user_id, session_id, device_id, device_fingerprint, trust_level,
-          status, last_monotonic_id, expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'new_device', 'active', 0, ?, NOW(6), NOW(6))",
-    )
-    .bind(Uuid::new_v4().to_string())
-    .bind(user_id)
-    .bind(session_id)
-    .bind(device_id)
-    .bind(device_fingerprint)
-    .bind(expires_at.naive_utc())
-    .execute(pool.get())
-    .await;
-
-    match insert_result {
-        Ok(_) => Ok(()),
-        Err(error) if is_duplicate_key_error(&error) => {
-            refresh_device_lease(
-                pool,
-                user_id,
-                session_id,
-                device_id,
-                device_fingerprint,
-                expires_at,
-            )
-            .await
-            .map_err(|source| {
-                internal_error(format!(
-                    "refresh device lease after duplicate failed for session {session_id} device {device_id}: {source}"
-                ))
-            })?;
-            Ok(())
-        }
-        Err(error) => Err(internal_error(format!(
-            "insert device lease failed for session {session_id} device {device_id}: {error}"
-        ))),
-    }
 }
 
-async fn refresh_device_lease(
+#[allow(clippy::too_many_arguments)]
+async fn verify_device_proof(
     pool: &SharedPool,
     user_id: &str,
     session_id: &str,
     device_id: &str,
     device_fingerprint: &str,
-    expires_at: chrono::DateTime<chrono::Utc>,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE session_device_leases
-         SET device_fingerprint = ?, status = 'active', expires_at = ?, revoked_at = NULL, updated_at = NOW(6)
-         WHERE session_id = ? AND device_id = ? AND user_id = ?",
+    challenge_id: &str,
+    proof: &str,
+    purpose: DeviceProofPurpose,
+) -> Result<VerifiedDeviceIdentity, (StatusCode, Json<ErrorResponse>)> {
+    let row = sqlx::query(
+        "SELECT c.challenge_digest, l.device_key_hash
+         FROM session_device_challenges c
+         JOIN session_device_leases l
+           ON l.user_id = c.user_id AND l.session_id = c.session_id
+          AND l.device_id = c.device_id AND l.device_fingerprint = c.device_fingerprint
+         WHERE c.user_id = ? AND c.session_id = ? AND c.device_id = ?
+           AND c.device_fingerprint = ? AND c.challenge_id = ? AND c.purpose = ?
+           AND c.consumed_at IS NULL AND c.expires_at > NOW(6)
+           AND l.status = 'active' AND l.expires_at > NOW(6)
+         LIMIT 1",
     )
-    .bind(device_fingerprint)
-    .bind(expires_at.naive_utc())
+    .bind(user_id)
     .bind(session_id)
     .bind(device_id)
+    .bind(device_fingerprint)
+    .bind(challenge_id)
+    .bind(purpose.as_str())
+    .fetch_optional(pool.get())
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "device challenge is invalid, expired, consumed, or no longer active",
+        )
+    })?;
+    let challenge_digest = session_row_string(&row, "challenge_digest").map_err(internal_error)?;
+    let device_key_hash = session_row_string(&row, "device_key_hash").map_err(internal_error)?;
+    if !verify_device_proof_signature(
+        &device_key_hash,
+        purpose,
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        challenge_id,
+        &challenge_digest,
+        proof,
+    ) {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "device proof verification failed",
+        ));
+    }
+
+    let consumed = sqlx::query(
+        "UPDATE session_device_challenges
+         SET consumed_at = NOW(6)
+         WHERE user_id = ? AND session_id = ? AND device_id = ?
+           AND challenge_id = ? AND purpose = ?
+           AND consumed_at IS NULL AND expires_at > NOW(6)",
+    )
     .bind(user_id)
+    .bind(session_id)
+    .bind(device_id)
+    .bind(challenge_id)
+    .bind(purpose.as_str())
     .execute(pool.get())
-    .await?;
-    Ok(result.rows_affected() > 0)
+    .await
+    .map_err(internal_error)?;
+    if consumed.rows_affected() != 1 {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "device challenge was already consumed",
+        ));
+    }
+    if purpose == DeviceProofPurpose::Hydrate {
+        let renewed_until = chrono::Utc::now() + chrono::Duration::hours(DEVICE_LEASE_TTL_HOURS);
+        let renewed = sqlx::query(
+            "UPDATE session_device_leases
+             SET expires_at = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND session_id = ? AND device_id = ?
+               AND device_fingerprint = ? AND device_key_hash = ?
+               AND status = 'active' AND expires_at > NOW(6)",
+        )
+        .bind(renewed_until.naive_utc())
+        .bind(user_id)
+        .bind(session_id)
+        .bind(device_id)
+        .bind(device_fingerprint)
+        .bind(&device_key_hash)
+        .execute(pool.get())
+        .await
+        .map_err(internal_error)?;
+        if renewed.rows_affected() != 1 {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "device enrollment changed before hydration",
+            ));
+        }
+    }
+
+    Ok(VerifiedDeviceIdentity {
+        device_id: device_id.to_string(),
+        device_fingerprint: device_fingerprint.to_string(),
+    })
 }
 
 async fn transcript_high_watermark(
@@ -1942,6 +2376,30 @@ fn decode_device_response(row: &impl RowExt) -> Result<DeviceLeaseResponse, Stri
         last_monotonic_id: session_row_i64(row, "last_monotonic_id")?,
         expires_at: session_row_string(row, "expires_at")?,
     })
+}
+
+async fn load_device_response(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    device_id: &str,
+) -> Result<DeviceLeaseResponse, (StatusCode, Json<ErrorResponse>)> {
+    let row = sqlx::query(
+        "SELECT lease_id, session_id, device_id, device_fingerprint, trust_level,
+                status, last_monotonic_id,
+                DATE_FORMAT(expires_at, '%Y-%m-%dT%H:%i:%s') AS expires_at
+         FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND device_id = ?
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(device_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(internal_error)?
+    .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "device lease not found"))?;
+    decode_device_response(&row).map_err(internal_error)
 }
 
 fn decode_device_lease_row(row: &impl RowExt) -> Result<DeviceLeaseRow, String> {
@@ -2535,76 +2993,178 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn session_state_rejects_missing_or_blank_device_identity_before_pool_access() {
-        let session_service = Arc::new(RecordingSessionService::with_owned_session());
-        let state = build_state(Arc::new(RecordingAuthService), session_service.clone());
-        let session_id = "session-device-state".to_string();
-
-        for (query, expected_detail) in [
-            (
-                SessionStateQuery::default(),
-                "device_fingerprint is required for session state synchronization",
-            ),
-            (
-                SessionStateQuery {
-                    device_fingerprint: Some("   ".to_string()),
-                    ..SessionStateQuery::default()
-                },
-                "device_fingerprint is required for session state synchronization",
-            ),
-            (
-                SessionStateQuery {
-                    device_fingerprint: Some("fingerprint-1".to_string()),
-                    device_id: Some("   ".to_string()),
-                    ..SessionStateQuery::default()
-                },
-                "device_id must be non-empty when provided",
-            ),
-        ] {
-            let err = match get_session_state_handler(
-                State(state.clone()),
-                Path(session_id.clone()),
-                auth_headers(),
-                Query(query),
-            )
-            .await
-            {
-                Ok(_) => panic!("invalid device identity must fail before durable state access"),
-                Err(err) => err,
-            };
-            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
-            assert_eq!(err.1.detail, expected_detail);
+    #[test]
+    fn device_protocol_identifiers_enforce_syntax_without_normalizing_identity() {
+        let max = "a".repeat(DEVICE_PROTOCOL_VALUE_MAX_LEN);
+        for accepted in ["device-1", "sha256:abc_DEF.123", max.as_str()] {
+            assert_eq!(
+                validate_device_protocol_value("device_id", accepted).unwrap(),
+                accepted
+            );
         }
-
-        let calls = session_service.get_session_calls.lock().await.clone();
-        assert_eq!(
-            calls,
-            vec![
-                (session_id.clone(), "artifact-owner".to_string()),
-                (session_id.clone(), "artifact-owner".to_string()),
-                (session_id, "artifact-owner".to_string()),
-            ],
-            "handler should still verify session ownership before rejecting device identity"
-        );
+        let too_long = "a".repeat(DEVICE_PROTOCOL_VALUE_MAX_LEN + 1);
+        for rejected in [
+            "",
+            " device-1",
+            "device-1 ",
+            "device 1",
+            "device\n1",
+            "设备-1",
+            too_long.as_str(),
+        ] {
+            let err = validate_device_protocol_value("device_id", rejected).unwrap_err();
+            assert_eq!(err.0, StatusCode::UNPROCESSABLE_ENTITY);
+        }
     }
 
     #[test]
-    fn session_state_device_identity_normalizes_valid_values() {
-        let query = SessionStateQuery {
-            device_fingerprint: Some("  fp-1  ".to_string()),
-            device_id: Some("  device-1  ".to_string()),
-            ..SessionStateQuery::default()
-        };
+    fn session_state_requires_all_structured_device_proof_headers() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (DEVICE_ID_HEADER, "device-1"),
+            (DEVICE_FINGERPRINT_HEADER, "fp-1"),
+            (DEVICE_CHALLENGE_ID_HEADER, "challenge-1"),
+            (DEVICE_PROOF_HEADER, "proof-1"),
+        ] {
+            let err = required_device_header(&headers, name).unwrap_err();
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+            headers.insert(name, HeaderValue::from_static(value));
+            assert_eq!(required_device_header(&headers, name).unwrap(), value);
+        }
+    }
 
-        assert_eq!(
-            required_session_state_device_fingerprint(&query).unwrap(),
-            "fp-1"
-        );
-        assert_eq!(
-            optional_session_state_device_id(&query).unwrap().as_deref(),
-            Some("device-1")
-        );
+    #[test]
+    fn device_proof_is_bound_to_every_authority_dimension() {
+        let key_hash = sha256_raw_hex(b"dk_test_secret");
+        let challenge_digest = sha256_raw_hex(b"dc_test_nonce");
+        let proof = "eynZMCSGx0fBYdE0b-maiJBHVaZgLBrmOOYV6j5CXYo";
+        assert!(verify_device_proof_signature(
+            &key_hash,
+            DeviceProofPurpose::Hydrate,
+            "user-17",
+            "session:a",
+            "laptop-2",
+            "sha256:abcdef",
+            "challenge-9",
+            &challenge_digest,
+            proof,
+        ));
+
+        let mutations = [
+            (
+                sha256_raw_hex(b"other-key"),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:a",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Trust,
+                "user-17",
+                "session:a",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-18",
+                "session:a",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:b",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:a",
+                "laptop-3",
+                "sha256:abcdef",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:a",
+                "laptop-2",
+                "sha256:fedcba",
+                "challenge-9",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:a",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-10",
+                challenge_digest.clone(),
+            ),
+            (
+                key_hash.clone(),
+                DeviceProofPurpose::Hydrate,
+                "user-17",
+                "session:a",
+                "laptop-2",
+                "sha256:abcdef",
+                "challenge-9",
+                sha256_raw_hex(b"other-nonce"),
+            ),
+        ];
+        for (key, purpose, user, session, device, fingerprint, challenge, digest) in mutations {
+            assert!(
+                !verify_device_proof_signature(
+                    &key,
+                    purpose,
+                    user,
+                    session,
+                    device,
+                    fingerprint,
+                    challenge,
+                    &digest,
+                    proof,
+                ),
+                "mutating any bound authority dimension must invalidate the proof"
+            );
+        }
+    }
+
+    #[test]
+    fn device_trust_request_rejects_boolean_self_attestation() {
+        let result = serde_json::from_value::<DeviceTrustRequest>(serde_json::json!({
+            "device_id": "device-1",
+            "device_fingerprint": "fp-1",
+            "challenge_id": "challenge-1",
+            "device_proof": "proof",
+            "reauthentication_proof": "reauth",
+            "step_up_confirmation": true
+        }));
+        let error = match result {
+            Ok(_) => panic!("legacy request-body self-attestation must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("step_up_confirmation"));
     }
 
     #[test]

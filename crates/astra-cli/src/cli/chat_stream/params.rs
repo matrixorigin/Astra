@@ -468,6 +468,10 @@ pub(crate) struct ChatTurnParams<'a> {
     /// When present, `CliSseStreamHost` forwards fine-grained events through this channel
     /// even when `quiet` / `suppress_intermediate_output` are true.
     pub(crate) stream_event_tx: Option<StreamEventTx>,
+    /// Strict protocol observation sink used only by
+    /// `--output-format stream-json`. Ordinary CLI/TUI turns leave this unset
+    /// and do not clone or retain raw SSE events.
+    pub(crate) stream_json_emitter: Option<Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     /// App-level live lane for spawned child agents. Unlike
     /// `stream_event_tx`, senders cloned into background children do
     /// not control the parent turn's `TurnComplete`.
@@ -630,6 +634,8 @@ pub(crate) struct BasicCliChatContext<'a> {
     pub bash_detach_slot: Option<astra_tools::detach::DetachShellSlot>,
     /// Optional channel for forwarding stream events (used by --stream-events).
     pub stream_event_tx: Option<StreamEventTx>,
+    /// Strict protocol observation sink used only by `stream-json`.
+    pub stream_json_emitter: Option<Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     /// Shared harness snapshot sink for /inspect command (non-REPL one-shot paths).
     #[cfg(feature = "harness")]
     pub harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
@@ -692,6 +698,7 @@ impl<'a> ChatTurnParams<'a> {
             incremental_state: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
+            stream_json_emitter: ctx.stream_json_emitter.clone(),
             agent_live_event_sink: None,
             approval_request_tx: None,
             ask_user_request_tx: None,

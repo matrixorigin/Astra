@@ -726,9 +726,6 @@ pub(crate) async fn complete_session_startup(
 
     tracer.phase("config_load");
 
-    // Session-scoped confidence calibrator: thresholds adapt to correction rates
-    let _confidence_calibrator =
-        std::sync::Arc::new(astra_turn_core::routing_metrics::ConfidenceCalibrator::default());
     let pipeline_modules = session_runtime::create_tui_pipeline_modules(api, profile);
     tracer.phase("pipeline_modules");
 

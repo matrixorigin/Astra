@@ -671,6 +671,10 @@ fn memory_entry_from_value(value: &Value) -> Option<MemoryEntry> {
 
 /// Build TurnState from AgenticLoopState.
 pub(crate) fn build_turn_state(state: &AgenticLoopState, user_content: &str) -> TurnState {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        &state.messages,
+    );
     TurnState {
         messages: state.messages.clone(),
         tool_results: vec![],

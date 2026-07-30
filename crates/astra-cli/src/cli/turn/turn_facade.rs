@@ -67,7 +67,12 @@ fn should_retry_without_session(
 fn retry_pre_loaded_messages(
     pre_loaded_messages: &Option<Vec<serde_json::Value>>,
 ) -> Option<Vec<serde_json::Value>> {
-    pre_loaded_messages.clone()
+    pre_loaded_messages.as_deref().map(|messages| {
+        crate::cli::history_work::clone_json_history(
+            astra_core::history_work::HistoryWorkSite::CliTurnRetryHistoryClone,
+            messages,
+        )
+    })
 }
 
 pub(crate) async fn execute_basic_cli_turn<'a>(

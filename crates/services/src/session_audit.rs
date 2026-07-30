@@ -1500,11 +1500,13 @@ fn parse_turn_token_usage(raw: &str, context: &str) -> AuditResult<ParsedTurnTok
     )?;
     let output_tokens = required_token_count(usage.output_tokens, context, "output_tokens")?;
     let total_tokens = required_token_count(usage.total_tokens, context, "total_tokens")?;
-    let expected_total = input_tokens
-        .checked_add(cached_input_tokens)
-        .and_then(|value| value.checked_add(cache_creation_tokens))
-        .and_then(|value| value.checked_add(output_tokens))
-        .ok_or_else(|| audit_decode_error(context, "total_tokens", "token total overflow"))?;
+    let expected_total = astra_turn_types::NormalizedPromptCacheUsage::new(
+        input_tokens,
+        cached_input_tokens,
+        cache_creation_tokens,
+    )
+    .checked_total_tokens_with_output(output_tokens)
+    .ok_or_else(|| audit_decode_error(context, "total_tokens", "token total overflow"))?;
     if total_tokens != expected_total {
         return Err(audit_decode_error(
             context,

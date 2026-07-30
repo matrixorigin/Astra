@@ -19,6 +19,15 @@ pub struct AdminArgs {
     pub command: Option<Command>,
 }
 
+impl AdminArgs {
+    pub(crate) fn is_authentication_bootstrap(&self) -> bool {
+        matches!(
+            self.command.as_ref(),
+            Some(Command::Login(_) | Command::Register(_))
+        )
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Interactive,

@@ -39,6 +39,11 @@ pub struct CredentialsFile {
 pub struct Profile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Stable server-issued account identity used to scope all local state for
+    /// this profile. Usernames are display attributes and must not be used as
+    /// an ownership boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -53,6 +58,7 @@ impl std::fmt::Debug for Profile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Profile")
             .field("username", &self.username)
+            .field("account_id", &self.account_id)
             .field("access_token", &self.access_token.as_ref().map(|_| "***"))
             .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
             .field("last_session_id", &self.last_session_id)

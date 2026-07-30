@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use astra_config::ToolSurfaceConfig;
+use astra_config::{ToolSurfaceConfig, user_profile::TurnIntent};
 
 use super::DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS;
 use astra_turn_core::section_types::estimate_text_tokens;
@@ -18,74 +18,13 @@ fn sort_schemas_by_name(schemas: &mut [Value]) {
     });
 }
 
-fn split_ascii_words(text: &str) -> Vec<&str> {
-    text.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|word| !word.is_empty())
-        .collect()
-}
-
-fn is_pure_conversational_query(query: &str) -> bool {
-    const CONVERSATIONAL_THRESHOLD_CHARS: usize = 20;
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return true;
-    }
-
-    let lower = trimmed.to_lowercase();
-    let has_content = lower
-        .chars()
-        .any(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(&c));
-    if !has_content {
-        return true;
-    }
-    if lower.chars().count() > CONVERSATIONAL_THRESHOLD_CHARS {
-        return false;
-    }
-
-    const CONVERSATIONAL_CN: &[&str] = &["你好", "谢谢", "再见", "好的", "是的", "不是", "嗯"];
-    let compact_cjk: String = lower
-        .chars()
-        .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
-        .collect();
-    if CONVERSATIONAL_CN
-        .iter()
-        .any(|phrase| compact_cjk == *phrase)
-    {
-        return true;
-    }
-
-    const CONVERSATIONAL_EN: &[&str] = &[
-        "hello",
-        "hi",
-        "hey",
-        "thanks",
-        "thank you",
-        "bye",
-        "goodbye",
-        "yes",
-        "no",
-        "ok",
-        "okay",
-        "sure",
-        "yep",
-        "nope",
-    ];
-    let words = split_ascii_words(&lower);
-    CONVERSATIONAL_EN.iter().any(|phrase| {
-        let phrase_words = split_ascii_words(phrase);
-        words == phrase_words
-            || (phrase_words.len() == 1
-                && matches!(phrase_words[0], "hello" | "hi" | "hey")
-                && words == [phrase_words[0], "there"])
-    })
-}
-
 /// The main tool surface interface.
 ///
 /// ```text
 /// let registry = ToolRegistry::new(all_tool_schemas());
-/// let surface = registry.build_initial_surface("matrixorigin memoria最新的pr?");
-/// // surface contains the stable always_load tools; deferred tools are activated explicitly
+/// let surface = registry.build_turn_surface(None);
+/// // Unknown intent keeps the stable always_load tools; deferred tools are
+/// // activated explicitly.
 /// ```
 pub struct ToolRegistry {
     all_schemas: Vec<Value>,
@@ -258,43 +197,33 @@ impl ToolRegistry {
         })
     }
 
-    /// Build the visible tool surface for a given user query and conversation turn.
+    /// Build the visible tool surface for a typed turn intent.
     ///
-    /// Returns tool schemas to include in the LLM request.
-    /// AlwaysLoad tools are included deterministically. Non-always_load built-ins are
-    /// deferred and must be activated explicitly through `tool_search`.
-    pub fn build_initial_surface(&self, query: &str) -> Vec<Value> {
+    /// Explicitly social or acknowledgement-only turns are tool-free. Task,
+    /// question, unknown, and unavailable judge results keep the stable
+    /// always-load surface. Deferred tools still require explicit activation.
+    pub fn build_turn_surface(&self, intent: Option<&TurnIntent>) -> Vec<Value> {
         let (schemas, _report) =
-            self.build_initial_surface_with_report(query, self.schema_budget_tokens);
+            self.build_turn_surface_with_report(intent, self.schema_budget_tokens);
         schemas
     }
 
-    /// Build a tool surface with a custom schema-token budget, returning both schemas and a report.
-    pub fn build_initial_surface_with_report(
+    /// Build a typed turn surface with a custom schema-token budget and report.
+    pub fn build_turn_surface_with_report(
         &self,
-        query: &str,
+        intent: Option<&TurnIntent>,
         schema_budget: u32,
     ) -> (Vec<Value>, ToolSelectionReport) {
-        self.build_initial_surface_with_report_ctx(query, schema_budget, &[])
-    }
-
-    /// Build a tool surface with context from recent turns.
-    pub fn build_initial_surface_with_report_ctx(
-        &self,
-        query: &str,
-        schema_budget: u32,
-        recent_tools: &[String],
-    ) -> (Vec<Value>, ToolSelectionReport) {
-        // Conversational short-circuit: pure greetings/acks need no tools. If
-        // recent tools exist, preserve tool continuity for follow-up turns.
-        if recent_tools.is_empty() && is_pure_conversational_query(query) {
-            let report = ToolSelectionReport {
-                visible_tools: Vec::new(),
-                visible_count: 0,
-                schema_budget_used: 0,
-                schema_budget_total: schema_budget,
-            };
-            return (Vec::new(), report);
+        if intent.is_some_and(|intent| !intent.communicative_act.uses_tool_surface()) {
+            return (
+                Vec::new(),
+                ToolSelectionReport {
+                    visible_count: 0,
+                    visible_tools: Vec::new(),
+                    schema_budget_used: 0,
+                    schema_budget_total: schema_budget,
+                },
+            );
         }
 
         let schemas = self.always_load_only();
@@ -308,25 +237,6 @@ impl ToolRegistry {
         };
 
         (schemas.as_ref().clone(), report)
-    }
-
-    /// Pipeline-integrated tool surface using a pre-computed RoutingDecision.
-    ///
-    /// Routing decides whether this is a tool-bearing turn. The built-in
-    /// surface is deterministic: only always_load schemas are returned. Deferred
-    /// tools stay deferred until explicitly activated via `tool_search`.
-    pub fn build_routed_surface(&self, schema_budget: u32) -> (Vec<Value>, ToolSelectionReport) {
-        let schemas = self.always_load_only();
-        let names = Self::visible_names(schemas.as_ref());
-        (
-            schemas.as_ref().clone(),
-            ToolSelectionReport {
-                visible_count: names.len() as u32,
-                visible_tools: names,
-                schema_budget_used: 0,
-                schema_budget_total: schema_budget,
-            },
-        )
     }
 
     /// Return only always_load tools.
@@ -482,6 +392,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_config::user_profile::{TurnCommunicativeAct, TurnIntentDomain};
     use serde_json::json;
 
     fn sample_schema(name: &str) -> Value {
@@ -571,7 +482,7 @@ mod tests {
         assert!(reg.schema_by_name("skill").is_some());
         assert!(!reg.always_load_schemas.iter().any(|(n, _)| n == "skill"));
 
-        let (selected, report) = reg.build_initial_surface_with_report("use the skill tool", 800);
+        let (selected, report) = reg.build_turn_surface_with_report(None, 800);
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"skill".to_string()),
@@ -647,7 +558,7 @@ mod tests {
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) = reg.build_initial_surface_with_report("fetch this web page", 0);
+        let (selected, report) = reg.build_turn_surface_with_report(None, 0);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(names.contains(&"web_fetch".to_string()));
@@ -669,8 +580,7 @@ mod tests {
         };
         let reg = ToolRegistry::new_with_tool_surface(schemas, &cfg);
 
-        let (selected, report) =
-            reg.build_initial_surface_with_report("grep for UserSession in the code", 0);
+        let (selected, report) = reg.build_turn_surface_with_report(None, 0);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(
@@ -689,112 +599,57 @@ mod tests {
         );
     }
 
-    // ── Tool surface observability integration (Pass B) ──
-    //
-    // These tests verify the real `build_initial_surface_with_report_ctx` path. They exercise
-    // both the conversational short-circuit and the non-conversational
-    // always_load-only branch.
-    // Stderr content is not captured (no stable API in tokio tests),
-    // but the flag guard ensures the hot path runs without panic
-    // when observability is on — which is what we'd regress if the
-    // obs module grew a lifetime bug or serde panic.
-
     #[test]
-    fn build_initial_surface_with_report_ctx_conversational_path_does_not_panic_with_obs_on() {
-        let mut schemas = vec![sample_schema("bash"), sample_schema("read_file")];
-        // Ensure a always_load + non-always_load mix so construction keeps the deferred
-        // schema lookupable while the conversational path returns no tools.
-        schemas.push(sample_schema("github"));
-        let registry = ToolRegistry::new(schemas);
-        // "hello" is the conversational short-circuit case.
-        let (out_schemas, report) =
-            registry.build_initial_surface_with_report_ctx("hello", 800, &[]);
-        assert!(out_schemas.is_empty());
-        assert_eq!(report.visible_count as usize, out_schemas.len());
-    }
-
-    #[test]
-    fn conversational_without_recent_tools_shortcircuits() {
-        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
-        let registry = ToolRegistry::new(schemas);
-        // "谢谢" with no recent_tools → should short-circuit to no tools.
-        let (out, report) = registry.build_initial_surface_with_report_ctx("谢谢", 800, &[]);
-        assert_eq!(
-            report.visible_count, 0,
-            "conversational + no recent_tools should return no tools"
-        );
-        assert!(
-            out.is_empty(),
-            "pure conversational turns should be tool-free"
-        );
-    }
-
-    #[test]
-    fn conversational_shortcut_requires_pure_ack_or_greeting() {
-        assert!(is_pure_conversational_query("hello there"));
-        assert!(is_pure_conversational_query("谢谢"));
-        assert!(!is_pure_conversational_query("hi fix the tests"));
-        assert!(!is_pure_conversational_query("你好请修复测试"));
-    }
-
-    #[test]
-    fn conversational_with_recent_tools_preserves_tool_surface() {
-        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
-        let registry = ToolRegistry::new(schemas);
-        let recent_tools = vec!["read_file".to_string()];
-
-        let (out, report) =
-            registry.build_initial_surface_with_report_ctx("hello", 800, &recent_tools);
-
-        assert!(!out.is_empty());
-        assert_eq!(report.visible_count as usize, out.len());
-    }
-
-    #[test]
-    fn build_initial_surface_with_report_ctx_non_conversational_path_returns_always_load_tools() {
-        let schemas = vec![
-            sample_schema("bash"),
-            sample_schema("read_file"),
-            sample_schema("grep"),
-            sample_schema("list_dir"),
-        ];
-        let registry = ToolRegistry::new(schemas);
-        // Analytical-ish query forces the non-conversational always_load-only path.
-        let (out, report) = registry.build_initial_surface_with_report_ctx(
-            "search for TODO in source files",
-            800,
-            &[],
-        );
-        assert!(!out.is_empty());
-        assert!(report.visible_count > 0);
-    }
-
-    #[test]
-    fn text_triggers_do_not_promote_deferred_or_unowned_tools() {
+    fn typed_domains_do_not_promote_deferred_or_unowned_tools() {
         let schemas: Vec<Value> = TOOL_CATALOG
             .iter()
             .map(|tool| sample_schema(tool.name))
             .collect();
         let registry = ToolRegistry::new(schemas);
 
-        let (out, report) = registry.build_initial_surface_with_report_ctx(
-            "please use mo_query and powershell to inspect the database",
-            800,
-            &[],
-        );
-        let names = ToolRegistry::visible_names(&out);
+        for domain in [
+            TurnIntentDomain::GitHub,
+            TurnIntentDomain::Git,
+            TurnIntentDomain::Code,
+            TurnIntentDomain::Memory,
+            TurnIntentDomain::Web,
+            TurnIntentDomain::System,
+            TurnIntentDomain::Database,
+        ] {
+            let intent = TurnIntent::default()
+                .with_communicative_act(TurnCommunicativeAct::Task)
+                .with_domain(domain);
+            let (out, report) = registry.build_turn_surface_with_report(Some(&intent), 800);
+            let names = ToolRegistry::visible_names(&out);
 
-        assert!(
-            names.contains(&"tool_search".to_string()),
-            "tool_search should remain the explicit activation path: {names:?}"
-        );
-        for hidden in ["mo_query", "rollback_database_snapshots", "powershell"] {
             assert!(
-                !names.contains(&hidden.to_string()),
-                "{hidden} must not become visible merely because the user text mentioned it"
+                names.contains(&"tool_search".to_string()),
+                "tool_search should remain the explicit activation path: {names:?}"
             );
+            for hidden in ["mo_query", "rollback_database_snapshots", "powershell"] {
+                assert!(
+                    !names.contains(&hidden.to_string()),
+                    "{hidden} must not become visible for typed domain {domain:?}"
+                );
+            }
+            assert_eq!(report.visible_count as usize, out.len());
         }
-        assert_eq!(report.visible_count as usize, out.len());
+    }
+
+    #[test]
+    fn unavailable_or_unknown_intent_preserves_recovery_surface() {
+        let schemas: Vec<Value> = TOOL_CATALOG.iter().map(|t| sample_schema(t.name)).collect();
+        let registry = ToolRegistry::new(schemas);
+        let unknown = TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Unknown);
+
+        let unavailable = registry.build_turn_surface(None);
+        let judged_unknown = registry.build_turn_surface(Some(&unknown));
+
+        assert_eq!(
+            ToolRegistry::visible_names(&unavailable),
+            ToolRegistry::visible_names(&judged_unknown)
+        );
+        assert!(!unavailable.is_empty());
     }
 }
 

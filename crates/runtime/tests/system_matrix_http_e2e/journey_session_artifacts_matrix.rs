@@ -2620,20 +2620,27 @@ pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_r
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let mut saw_partial = false;
+    let mut received = Vec::new();
     let mut buf = [0_u8; 4096];
     while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.read(&mut buf)).await {
         if read == 0 {
             break;
         }
-        let text = String::from_utf8_lossy(&buf[..read]);
-        if text.contains(partial_text) {
+        received.extend_from_slice(&buf[..read]);
+        if received
+            .windows(partial_text.len())
+            .any(|window| window == partial_text.as_bytes())
+        {
             saw_partial = true;
             break;
         }
     }
     assert!(
         saw_partial,
-        "should receive partial streamed text before disconnect"
+        "should receive partial streamed text before disconnect; provider_stream_hits={} provider_nonstream_hits={} received_bytes={}",
+        hits.stream_hits.load(Ordering::SeqCst),
+        hits.nonstream_hits.load(Ordering::SeqCst),
+        received.len(),
     );
     drop(socket);
 

@@ -871,13 +871,7 @@ impl PermissionSettings {
 
     /// Like [`Self::load_user`] but returns the structured error.
     pub fn try_load_user() -> PermissionSettingsLoadOutcome {
-        let Some(home) = dirs::home_dir() else {
-            return PermissionSettingsLoadOutcome {
-                settings: Self::default(),
-                error: None,
-            };
-        };
-        let path = home.join(".astra").join("permissions.json");
+        let path = astra_runtime_env::local_state_root().join("permissions.json");
         Self::try_load_inner(&path)
     }
 
@@ -934,19 +928,8 @@ impl PermissionSettings {
         Self::user_settings_dir(home).join("permissions.json")
     }
 
-    fn user_home() -> io::Result<PathBuf> {
-        dirs::home_dir().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "home directory not found for ~/.astra/permissions.json",
-            )
-        })
-    }
-
-    fn save_user_in_home(&self, home: &Path) -> io::Result<()> {
-        let dir = Self::user_settings_dir(home);
-        let path = Self::user_settings_path(home);
-        self.save_to_file(&dir, &path)
+    fn save_user_in_root(&self, root: &Path) -> io::Result<()> {
+        self.save_to_file(root, &root.join("permissions.json"))
     }
 
     /// Load → mutate → save with a process-wide exclusive lock.
@@ -1055,28 +1038,30 @@ impl PermissionSettings {
     where
         F: FnOnce(&mut Self) -> Result<(), E>,
     {
-        let home = Self::user_home().map_err(|e| ModifyError::Io {
-            stage: "resolve home directory",
-            source: e,
-        })?;
-        Self::modify_user_in_home(&home, mutate)
+        Self::modify_user_in_root(&astra_runtime_env::local_state_root(), mutate)
+    }
+
+    fn modify_user_in_root<F, E>(root: &Path, mutate: F) -> Result<Self, ModifyError<E>>
+    where
+        F: FnOnce(&mut Self) -> Result<(), E>,
+    {
+        let path = root.join("permissions.json");
+        let lock_path = root.join("permissions.lock");
+        Self::modify_file(
+            root,
+            &path,
+            &lock_path,
+            "create Astra local-state root",
+            mutate,
+            |settings| settings.save_user_in_root(root),
+        )
     }
 
     fn modify_user_in_home<F, E>(home: &Path, mutate: F) -> Result<Self, ModifyError<E>>
     where
         F: FnOnce(&mut Self) -> Result<(), E>,
     {
-        let dir = Self::user_settings_dir(home);
-        let path = Self::user_settings_path(home);
-        let lock_path = dir.join("permissions.lock");
-        Self::modify_file(
-            &dir,
-            &path,
-            &lock_path,
-            "create ~/.astra/",
-            mutate,
-            |settings| settings.save_user_in_home(home),
-        )
+        Self::modify_user_in_root(&Self::user_settings_dir(home), mutate)
     }
     fn parsed_allow_rules(&self) -> Vec<PermissionRule> {
         self.allow
@@ -2963,8 +2948,7 @@ impl PermissionManager {
 
         let target_path = home
             .map(PermissionSettings::user_settings_path)
-            .or_else(|| dirs::home_dir().map(|home| PermissionSettings::user_settings_path(&home)))
-            .unwrap_or_else(|| PathBuf::from("~/.astra/permissions.json"));
+            .unwrap_or_else(|| astra_runtime_env::local_state_root().join("permissions.json"));
         let timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)

@@ -5,9 +5,9 @@ use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
-    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
-    SessionRecord, SessionService, SessionUpdateRequestData, build_app,
+    AuthTokenRecord, AuthUserRecord, DatabaseSessionService, ErrorResponse, HealthChecker,
+    ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
+    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use astra_services::runs::{
     CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunInteractionKind,
@@ -22,8 +22,13 @@ use astra_services::{
     DatabaseSessionArtifactStore, DatabaseStateProjectionStore, DelegationProjectionUpsert,
     SessionArtifactJsonRecord, SessionArtifactJsonStore, next_action_confidence_action,
 };
+use astra_thin_client::{
+    ASTRA_DEVICE_CHALLENGE_ID_HEADER, ASTRA_DEVICE_FINGERPRINT_HEADER, ASTRA_DEVICE_ID_HEADER,
+    ASTRA_DEVICE_PROOF_HEADER, DeviceProofPurpose, device_challenge_proof,
+};
 use async_trait::async_trait;
 use axum::{Json, Router, http::HeaderMap, http::StatusCode};
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -32,6 +37,8 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 const HTTP_TOKEN: &str = "Bearer e2e-joint-token";
+const OWNER_A_HTTP_TOKEN: &str = "Bearer e2e-owner-a-token";
+const OWNER_B_HTTP_TOKEN: &str = "Bearer e2e-owner-b-token";
 
 static SHARED_BOOTSTRAP: tokio::sync::OnceCell<MatrixOneSettings> =
     tokio::sync::OnceCell::const_new();
@@ -64,6 +71,111 @@ async fn setup_pool() -> SharedPool {
 
 fn id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
+}
+
+async fn enroll_device(
+    client: &Client,
+    addr: SocketAddr,
+    session_id: &str,
+    device_id: &str,
+    device_fingerprint: &str,
+) -> String {
+    enroll_device_as(
+        client,
+        addr,
+        HTTP_TOKEN,
+        session_id,
+        device_id,
+        device_fingerprint,
+    )
+    .await
+}
+
+async fn enroll_device_as(
+    client: &Client,
+    addr: SocketAddr,
+    authorization: &str,
+    session_id: &str,
+    device_id: &str,
+    device_fingerprint: &str,
+) -> String {
+    let response: Value = client
+        .post(format!("http://{addr}/sessions/{session_id}/device/enroll"))
+        .header("authorization", authorization)
+        .json(&json!({
+            "device_id": device_id,
+            "device_fingerprint": device_fingerprint
+        }))
+        .send()
+        .await
+        .expect("device enrollment must reach router")
+        .error_for_status()
+        .expect("new device enrollment must succeed")
+        .json()
+        .await
+        .expect("device enrollment response must be JSON");
+    response
+        .get("device_key")
+        .and_then(Value::as_str)
+        .expect("enrollment returns the device key exactly once")
+        .to_string()
+}
+
+struct DeviceChallengeIdentity<'a> {
+    user_id: &'a str,
+    session_id: &'a str,
+    device_id: &'a str,
+    device_fingerprint: &'a str,
+    device_key: &'a str,
+}
+
+async fn issue_device_challenge_proof(
+    client: &Client,
+    addr: SocketAddr,
+    identity: DeviceChallengeIdentity<'_>,
+    purpose: DeviceProofPurpose,
+) -> (String, String) {
+    let DeviceChallengeIdentity {
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        device_key,
+    } = identity;
+    let response: Value = client
+        .post(format!(
+            "http://{addr}/sessions/{session_id}/device/challenge"
+        ))
+        .header("authorization", HTTP_TOKEN)
+        .json(&json!({
+            "device_id": device_id,
+            "device_fingerprint": device_fingerprint,
+            "purpose": purpose
+        }))
+        .send()
+        .await
+        .expect("device challenge must reach router")
+        .error_for_status()
+        .expect("active enrolled device must receive a challenge")
+        .json()
+        .await
+        .expect("device challenge response must be JSON");
+    let challenge_id = response["challenge_id"]
+        .as_str()
+        .expect("challenge_id")
+        .to_string();
+    let challenge = response["challenge"].as_str().expect("challenge");
+    let proof = device_challenge_proof(
+        device_key,
+        purpose,
+        user_id,
+        session_id,
+        device_id,
+        device_fingerprint,
+        &challenge_id,
+        challenge,
+    );
+    (challenge_id, proof)
 }
 
 async fn insert_session(pool: &SharedPool, user_id: &str, session_id: &str) {
@@ -253,6 +365,68 @@ impl AuthService for JointAuth {
         _request: AuthRefreshRequestData,
     ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
         unimplemented!("joint E2E does not exercise auth logout")
+    }
+}
+
+#[derive(Clone)]
+struct TwoOwnerAuth {
+    owner_a_user_id: String,
+    owner_b_user_id: String,
+}
+
+#[async_trait]
+impl AuthService for TwoOwnerAuth {
+    async fn current_user(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let (user_id, username) = match authorization {
+            Some(OWNER_A_HTTP_TOKEN) => (&self.owner_a_user_id, "e2e-owner-a"),
+            Some(OWNER_B_HTTP_TOKEN) => (&self.owner_b_user_id, "e2e-owner-b"),
+            _ => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse::new("joint E2E owner token is invalid")),
+                ));
+            }
+        };
+        Ok(AuthUserRecord {
+            user_id: user_id.clone(),
+            username: username.to_string(),
+            email: format!("{username}@example.test"),
+            display_name: None,
+        })
+    }
+
+    async fn register(
+        &self,
+        _request: AuthRegisterRequestData,
+    ) -> Result<AuthUserRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!("two-owner joint E2E does not exercise auth register")
+    }
+
+    async fn login(
+        &self,
+        _request: AuthLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!("two-owner joint E2E does not exercise auth login")
+    }
+
+    async fn refresh(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!("two-owner joint E2E does not exercise auth refresh")
+    }
+
+    async fn logout(
+        &self,
+        _request: AuthRefreshRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        unimplemented!("two-owner joint E2E does not exercise auth logout")
     }
 }
 
@@ -554,6 +728,23 @@ fn build_joint_app(
     build_app(state)
 }
 
+fn build_two_owner_session_app(
+    pool: SharedPool,
+    owner_a_user_id: String,
+    owner_b_user_id: String,
+) -> Router {
+    let session_service =
+        DatabaseSessionService::new(pool.settings().clone()).with_pool(pool.clone());
+    let state = AppState::new(ServiceInfo::default(), Arc::new(JointHealth))
+        .with_shared_pool(pool)
+        .with_auth_service(Arc::new(TwoOwnerAuth {
+            owner_a_user_id,
+            owner_b_user_id,
+        }))
+        .with_session_service(Arc::new(session_service));
+    build_app(state)
+}
+
 async fn spawn_tcp_router(app: Router) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -657,6 +848,135 @@ async fn post_json(
     let payload = serde_json::from_str(&text)
         .unwrap_or_else(|error| panic!("joint E2E response must be JSON: {error}; body={text}"));
     (status, payload)
+}
+
+async fn revoke_device_as(
+    client: &Client,
+    addr: SocketAddr,
+    authorization: &str,
+    session_id: &str,
+    device_id: &str,
+    reason: &str,
+) -> Value {
+    let response = client
+        .post(format!("http://{addr}/sessions/{session_id}/device/revoke"))
+        .header("authorization", authorization)
+        .json(&json!({
+            "device_id": device_id,
+            "reason": reason,
+        }))
+        .send()
+        .await
+        .expect("owner-scoped device revoke must reach the joint E2E router");
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("owner-scoped device revoke response body must be readable");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "owner-scoped device revoke must succeed; body={body}"
+    );
+    serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("device revoke response must be JSON: {error}; body={body}"))
+}
+
+async fn open_device_event_stream(
+    client: &Client,
+    addr: SocketAddr,
+    authorization: &str,
+    session_id: &str,
+) -> reqwest::Response {
+    let response = client
+        .get(format!("http://{addr}/sessions/{session_id}/device/events"))
+        .header("authorization", authorization)
+        .send()
+        .await
+        .expect("owner-scoped device event stream must reach the joint E2E router");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::OK,
+        "owner-scoped device event stream must authenticate"
+    );
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "device event route must return SSE, got {content_type:?}"
+    );
+    response
+}
+
+async fn read_device_events_until_barrier(
+    response: reqwest::Response,
+    barrier_id: String,
+) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut stream = response.bytes_stream();
+    let mut pending = Vec::<u8>::new();
+    let mut events = Vec::new();
+
+    loop {
+        while let Some(frame_end) = pending.windows(2).position(|window| window == b"\n\n") {
+            let frame = pending.drain(..frame_end + 2).collect::<Vec<_>>();
+            let frame = std::str::from_utf8(&frame[..frame_end])
+                .expect("device event SSE frame must be UTF-8");
+            let Some(data) = frame.lines().find_map(|line| line.strip_prefix("data: ")) else {
+                continue;
+            };
+            let event: Value = serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("device event SSE data must be JSON: {error}"));
+            if event.get("barrier_id").and_then(Value::as_str) == Some(barrier_id.as_str()) {
+                return events;
+            }
+            events.push(event);
+        }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out before owner barrier {barrier_id}; events={events:?}"
+        );
+        let chunk = tokio::time::timeout(remaining, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out before owner barrier {barrier_id}; events={events:?}")
+            })
+            .unwrap_or_else(|| panic!("device event SSE closed before owner barrier {barrier_id}"))
+            .expect("device event SSE body chunk must be readable");
+        pending.extend_from_slice(&chunk);
+    }
+}
+
+async fn cleanup_device_owner_fixture(pool: &SharedPool, user_id: &str, session_id: &str) {
+    sqlx::query("DELETE FROM session_device_challenges WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean owner-scoped device challenges");
+    sqlx::query("DELETE FROM session_device_lease_events WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean owner-scoped device lease events");
+    sqlx::query("DELETE FROM session_device_leases WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean owner-scoped device leases");
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(user_id)
+        .bind(session_id)
+        .execute(pool.get())
+        .await
+        .expect("clean owner-scoped joint E2E session");
 }
 
 async fn cleanup_joint_run(pool: &SharedPool, user_id: &str, run_id: &str) {
@@ -2191,12 +2511,34 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     let (addr, handle) = spawn_tcp_router(app).await;
     let client = local_client();
 
+    let mut device_keys = Vec::new();
     for device_idx in 1..=4 {
+        let device_id = format!("device-{device_idx}");
+        let device_fingerprint = format!("fp-{device_idx}");
+        let device_key =
+            enroll_device(&client, addr, &session_id, &device_id, &device_fingerprint).await;
+        let (challenge_id, device_proof) = issue_device_challenge_proof(
+            &client,
+            addr,
+            DeviceChallengeIdentity {
+                user_id: &user_id,
+                session_id: &session_id,
+                device_id: &device_id,
+                device_fingerprint: &device_fingerprint,
+                device_key: &device_key,
+            },
+            DeviceProofPurpose::Hydrate,
+        )
+        .await;
         let state: Value = client
             .get(format!(
-                "http://{addr}/sessions/{session_id}/state?known_state_revision=0&client_cache_empty=true&device_id=device-{device_idx}&device_fingerprint=fp-{device_idx}"
+                "http://{addr}/sessions/{session_id}/state?known_state_revision=0&client_cache_empty=true"
             ))
             .header("authorization", HTTP_TOKEN)
+            .header(ASTRA_DEVICE_ID_HEADER, &device_id)
+            .header(ASTRA_DEVICE_FINGERPRINT_HEADER, &device_fingerprint)
+            .header(ASTRA_DEVICE_CHALLENGE_ID_HEADER, &challenge_id)
+            .header(ASTRA_DEVICE_PROOF_HEADER, &device_proof)
             .send()
             .await
             .expect("S14 cold-start state request must reach router")
@@ -2287,7 +2629,123 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
                 >= 2,
             "S14 active run replay from last_index=0 must include durable events; replay={replay:?}"
         );
+        if device_idx == 1 {
+            let replayed_proof = client
+                .get(format!(
+                    "http://{addr}/sessions/{session_id}/state?known_state_revision=0&client_cache_empty=true"
+                ))
+                .header("authorization", HTTP_TOKEN)
+                .header(ASTRA_DEVICE_ID_HEADER, &device_id)
+                .header(ASTRA_DEVICE_FINGERPRINT_HEADER, &device_fingerprint)
+                .header(ASTRA_DEVICE_CHALLENGE_ID_HEADER, &challenge_id)
+                .header(ASTRA_DEVICE_PROOF_HEADER, &device_proof)
+                .send()
+                .await
+                .expect("replayed proof request must reach router");
+            assert_eq!(
+                replayed_proof.status(),
+                reqwest::StatusCode::FORBIDDEN,
+                "S14 consumed hydration challenge must be one-time"
+            );
+        }
+        device_keys.push(device_key);
     }
+
+    let (revoked_challenge_id, revoked_device_proof) = issue_device_challenge_proof(
+        &client,
+        addr,
+        DeviceChallengeIdentity {
+            user_id: &user_id,
+            session_id: &session_id,
+            device_id: "device-4",
+            device_fingerprint: "fp-4",
+            device_key: device_keys.last().expect("device-4 key"),
+        },
+        DeviceProofPurpose::Hydrate,
+    )
+    .await;
+    let revoked = client
+        .post(format!("http://{addr}/sessions/{session_id}/device/revoke"))
+        .header("authorization", HTTP_TOKEN)
+        .json(&json!({
+            "device_id": "device-4",
+            "reason": "phase0_hydration_fence"
+        }))
+        .send()
+        .await
+        .expect("S14 device revoke request must reach router");
+    assert_eq!(
+        revoked.status(),
+        reqwest::StatusCode::OK,
+        "S14 device revoke must succeed: {}",
+        revoked.text().await.unwrap_or_default()
+    );
+    for fingerprint in ["fp-4", "caller-replaced-fingerprint"] {
+        let unverified_reenrollment = client
+            .post(format!("http://{addr}/sessions/{session_id}/device/enroll"))
+            .header("authorization", HTTP_TOKEN)
+            .json(&json!({
+                "device_id": "device-4",
+                "device_fingerprint": fingerprint
+            }))
+            .send()
+            .await
+            .expect("unverified re-enrollment request must reach router");
+        assert_eq!(
+            unverified_reenrollment.status(),
+            reqwest::StatusCode::FORBIDDEN,
+            "S14 revoked identity must require verified reauthentication regardless of caller fingerprint"
+        );
+    }
+
+    let stale_hydration = client
+        .get(format!(
+            "http://{addr}/sessions/{session_id}/state?known_state_revision=0&client_cache_empty=true"
+        ))
+        .header("authorization", HTTP_TOKEN)
+        .header(ASTRA_DEVICE_ID_HEADER, "device-4")
+        .header(ASTRA_DEVICE_FINGERPRINT_HEADER, "fp-4")
+        .header(ASTRA_DEVICE_CHALLENGE_ID_HEADER, revoked_challenge_id)
+        .header(ASTRA_DEVICE_PROOF_HEADER, revoked_device_proof)
+        .send()
+        .await
+        .expect("S14 revoked-device hydration request must reach router");
+    assert_eq!(
+        stale_hydration.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "S14 ordinary hydration must not reactivate a revoked lease"
+    );
+    let revoked_row = sqlx::query(
+        "SELECT status, device_fingerprint, revoked_at
+         FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND device_id = 'device-4'",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("S14 revoked device lease must remain queryable");
+    assert_eq!(
+        revoked_row
+            .try_get::<String, _>("status")
+            .unwrap_or_default(),
+        "revoked",
+        "S14 rejected hydration must leave the durable lease revoked"
+    );
+    assert_eq!(
+        revoked_row
+            .try_get::<String, _>("device_fingerprint")
+            .unwrap_or_default(),
+        "fp-4",
+        "S14 ordinary hydration must not replace the enrolled device fingerprint"
+    );
+    assert!(
+        revoked_row
+            .try_get::<Option<chrono::NaiveDateTime>, _>("revoked_at")
+            .expect("S14 revoked_at must decode")
+            .is_some(),
+        "S14 rejected hydration must not erase revocation evidence"
+    );
 
     let budget = astra_services::budget_for_turn_intent(Some("benchmark_comparison"));
     let zone_total = budget.budget.input_context_cap();
@@ -2354,8 +2812,8 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
                 .await
                 .expect("S14 device lease SSE parity event must be published")
                 .expect("S14 device lease event receiver must be open");
-            if ev.get("session_id").and_then(Value::as_str) == Some(session_id.as_str())
-                && ev.get("device_id").and_then(Value::as_str) == Some("device-2")
+            if ev.belongs_to(&user_id, &session_id)
+                && ev.payload.get("device_id").and_then(Value::as_str) == Some("device-2")
             {
                 break ev;
             }
@@ -2363,9 +2821,9 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         }
     };
     assert!(
-        event.get("type").and_then(Value::as_str) == Some("device_lease_expired")
-            && event.get("device_id").and_then(Value::as_str) == Some("device-2"),
-        "S14 passive expiry event must have symmetric device_lease_expired payload, got {event}"
+        event.payload.get("type").and_then(Value::as_str) == Some("device_lease_expired")
+            && event.payload.get("device_id").and_then(Value::as_str) == Some("device-2"),
+        "S14 passive expiry event must have symmetric device_lease_expired payload, got {event:?}"
     );
     let reason = sqlx::query(
         "SELECT reason FROM session_device_lease_events
@@ -2382,5 +2840,369 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
         reason == "auto_expire",
         "S14 passive expiry DB event reason must match SSE reason, got {reason}"
     );
+    let expired_challenge = client
+        .post(format!(
+            "http://{addr}/sessions/{session_id}/device/challenge"
+        ))
+        .header("authorization", HTTP_TOKEN)
+        .json(&json!({
+            "device_id": "device-2",
+            "device_fingerprint": "fp-2",
+            "purpose": "hydrate"
+        }))
+        .send()
+        .await
+        .expect("expired-device challenge request must reach router");
+    assert_eq!(
+        expired_challenge.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "S14 expired device cannot obtain a fresh hydration challenge"
+    );
+    let expired_reenrollment = client
+        .post(format!("http://{addr}/sessions/{session_id}/device/enroll"))
+        .header("authorization", HTTP_TOKEN)
+        .json(&json!({
+            "device_id": "device-2",
+            "device_fingerprint": "fp-2"
+        }))
+        .send()
+        .await
+        .expect("expired-device re-enrollment request must reach router");
+    assert_eq!(
+        expired_reenrollment.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "S14 expired device cannot reactivate without verified reauthentication"
+    );
     handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(unused_attributes)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+#[ignore = "e2e_joint"]
+async fn device_event_sse_isolates_two_owners_with_the_same_session_id() {
+    let pool = setup_pool().await;
+    let owner_a = id("owner-a");
+    let owner_b = id("owner-b");
+    let session_id = id("shared-session");
+    let device_a1 = id("device-a1");
+    let device_b1 = id("device-b1");
+    let device_a2 = id("device-a2");
+    insert_session(&pool, &owner_a, &session_id).await;
+    insert_session(&pool, &owner_b, &session_id).await;
+
+    let app = build_two_owner_session_app(pool.clone(), owner_a.clone(), owner_b.clone());
+    let (addr, handle) = spawn_tcp_router(app).await;
+    let client = local_client();
+
+    enroll_device_as(
+        &client,
+        addr,
+        OWNER_A_HTTP_TOKEN,
+        &session_id,
+        &device_a1,
+        &id("fingerprint-a1"),
+    )
+    .await;
+    enroll_device_as(
+        &client,
+        addr,
+        OWNER_B_HTTP_TOKEN,
+        &session_id,
+        &device_b1,
+        &id("fingerprint-b1"),
+    )
+    .await;
+    enroll_device_as(
+        &client,
+        addr,
+        OWNER_A_HTTP_TOKEN,
+        &session_id,
+        &device_a2,
+        &id("fingerprint-a2"),
+    )
+    .await;
+
+    let response_a = open_device_event_stream(&client, addr, OWNER_A_HTTP_TOKEN, &session_id).await;
+    let response_b = open_device_event_stream(&client, addr, OWNER_B_HTTP_TOKEN, &session_id).await;
+    let barrier_a = id("barrier-a");
+    let barrier_b = id("barrier-b");
+    let reader_a = tokio::spawn(read_device_events_until_barrier(
+        response_a,
+        barrier_a.clone(),
+    ));
+    let reader_b = tokio::spawn(read_device_events_until_barrier(
+        response_b,
+        barrier_b.clone(),
+    ));
+
+    let revoke_a1 = revoke_device_as(
+        &client,
+        addr,
+        OWNER_A_HTTP_TOKEN,
+        &session_id,
+        &device_a1,
+        "owner_isolation_a1",
+    )
+    .await;
+    let revoke_b1 = revoke_device_as(
+        &client,
+        addr,
+        OWNER_B_HTTP_TOKEN,
+        &session_id,
+        &device_b1,
+        "owner_isolation_b1",
+    )
+    .await;
+    let revoke_a2 = revoke_device_as(
+        &client,
+        addr,
+        OWNER_A_HTTP_TOKEN,
+        &session_id,
+        &device_a2,
+        "owner_isolation_a2",
+    )
+    .await;
+
+    for (response, expected_device_id, expected_reason) in [
+        (&revoke_a1, device_a1.as_str(), "owner_isolation_a1"),
+        (&revoke_b1, device_b1.as_str(), "owner_isolation_b1"),
+        (&revoke_a2, device_a2.as_str(), "owner_isolation_a2"),
+    ] {
+        assert_eq!(
+            response.pointer("/event/type").and_then(Value::as_str),
+            Some("device_revoked")
+        );
+        assert_eq!(
+            response
+                .pointer("/event/session_id")
+                .and_then(Value::as_str),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            response.pointer("/event/device_id").and_then(Value::as_str),
+            Some(expected_device_id)
+        );
+        assert_eq!(
+            response.pointer("/event/reason").and_then(Value::as_str),
+            Some(expected_reason)
+        );
+        assert_eq!(
+            response.get("idempotent").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    // The barriers close each owner's observation window with a positive
+    // protocol event. They avoid inferring isolation from a timing-based
+    // "nothing arrived" assertion while leaving all product events on the
+    // real HTTP revoke -> broadcast -> SSE route.
+    astra_runtime::server::device_lease_sweeper::publish_device_lease_event(
+        &owner_a,
+        &session_id,
+        json!({
+            "type": "owner_isolation_barrier",
+            "barrier_id": barrier_a,
+            "session_id": session_id,
+        }),
+    );
+    astra_runtime::server::device_lease_sweeper::publish_device_lease_event(
+        &owner_b,
+        &session_id,
+        json!({
+            "type": "owner_isolation_barrier",
+            "barrier_id": barrier_b,
+            "session_id": session_id,
+        }),
+    );
+
+    let events_a = reader_a
+        .await
+        .expect("owner A SSE reader must finish at its structured barrier");
+    let events_b = reader_b
+        .await
+        .expect("owner B SSE reader must finish at its structured barrier");
+    for event in events_a.iter().chain(events_b.iter()) {
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("device_revoked"),
+            "only durable revoke events may precede the owner barrier: {event}"
+        );
+        assert_eq!(
+            event.get("session_id").and_then(Value::as_str),
+            Some(session_id.as_str()),
+            "SSE event must preserve the shared session identity: {event}"
+        );
+        assert!(
+            event.get("lease_id").and_then(Value::as_str).is_some(),
+            "SSE event must retain its durable lease identity: {event}"
+        );
+    }
+    assert_eq!(
+        events_a
+            .iter()
+            .filter_map(|event| event.get("device_id").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        [device_a1.as_str(), device_a2.as_str()],
+        "owner A must observe A1 then A2, never B1"
+    );
+    assert_eq!(
+        events_b
+            .iter()
+            .filter_map(|event| event.get("device_id").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        [device_b1.as_str()],
+        "owner B must observe B1 only, never A1 or A2"
+    );
+
+    handle.abort();
+    cleanup_device_owner_fixture(&pool, &owner_a, &session_id).await;
+    cleanup_device_owner_fixture(&pool, &owner_b, &session_id).await;
+}
+
+#[tokio::test]
+#[allow(unused_attributes)]
+#[ignore = "requires ASTRA_TEST_DB_IT=1"]
+#[ignore = "e2e_joint"]
+async fn device_lease_sweeper_cas_keeps_same_lease_id_owner_scoped() {
+    let pool = setup_pool().await;
+    let owner_a = id("sweeper-owner-a");
+    let owner_b = id("sweeper-owner-b");
+    let session_id = id("sweeper-shared-session");
+    let lease_id = id("shared-lease");
+    let device_id = id("shared-device");
+    let fingerprint_a = id("sweeper-fingerprint-a");
+    let fingerprint_b = id("sweeper-fingerprint-b");
+    insert_session(&pool, &owner_a, &session_id).await;
+    insert_session(&pool, &owner_b, &session_id).await;
+
+    let expires_a = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .expect("valid owner A expiry date")
+        .and_hms_opt(0, 0, 0)
+        .expect("valid owner A expiry time");
+    let expires_b = chrono::NaiveDate::from_ymd_opt(2000, 1, 2)
+        .expect("valid owner B expiry date")
+        .and_hms_opt(0, 0, 0)
+        .expect("valid owner B expiry time");
+    for (owner, fingerprint, expires_at) in [
+        (&owner_a, &fingerprint_a, expires_a),
+        (&owner_b, &fingerprint_b, expires_b),
+    ] {
+        sqlx::query(
+            "INSERT INTO session_device_leases
+             (lease_id, user_id, session_id, device_id, device_fingerprint, device_key_hash,
+              trust_level, status, last_monotonic_id, expires_at, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'new_device', 'active', 0, ?, NOW(6), NOW(6))",
+        )
+        .bind(&lease_id)
+        .bind(owner)
+        .bind(&session_id)
+        .bind(&device_id)
+        .bind(fingerprint)
+        .bind("0".repeat(64))
+        .bind(expires_at)
+        .execute(pool.get())
+        .await
+        .expect("insert same lease identity under an independent owner");
+    }
+
+    let mut events = astra_runtime::server::device_lease_sweeper::subscribe_device_lease_events();
+    let expired =
+        astra_runtime::server::device_lease_sweeper::expire_due_device_leases_once(pool.clone(), 1)
+            .await
+            .expect("owner-scoped lease sweeper pass must succeed");
+    assert_eq!(
+        expired, 1,
+        "limit=1 must commit exactly one selected owner lease"
+    );
+
+    let status_a = sqlx::query(
+        "SELECT status FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND lease_id = ?",
+    )
+    .bind(&owner_a)
+    .bind(&session_id)
+    .bind(&lease_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("owner A lease must remain queryable")
+    .try_get::<String, _>("status")
+    .expect("owner A status must decode");
+    let status_b = sqlx::query(
+        "SELECT status FROM session_device_leases
+         WHERE user_id = ? AND session_id = ? AND lease_id = ?",
+    )
+    .bind(&owner_b)
+    .bind(&session_id)
+    .bind(&lease_id)
+    .fetch_one(pool.get())
+    .await
+    .expect("owner B lease must remain queryable")
+    .try_get::<String, _>("status")
+    .expect("owner B status must decode");
+    assert_eq!(status_a, "expired", "earliest owner A lease must expire");
+    assert_eq!(
+        status_b, "active",
+        "same lease_id under owner B must not be mutated by owner A's CAS"
+    );
+
+    let event = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let event = tokio::time::timeout(remaining, events.recv())
+                .await
+                .expect("selected owner expiry must publish an event")
+                .expect("device lease event channel must remain open");
+            if event.belongs_to(&owner_a, &session_id)
+                && event.payload.get("lease_id").and_then(Value::as_str) == Some(lease_id.as_str())
+            {
+                break event;
+            }
+        }
+    };
+    assert_eq!(
+        event.payload.get("type").and_then(Value::as_str),
+        Some("device_lease_expired")
+    );
+    assert_eq!(
+        event
+            .payload
+            .get("device_fingerprint")
+            .and_then(Value::as_str),
+        Some(fingerprint_a.as_str()),
+        "published event must come from the selected owner A row"
+    );
+
+    let owner_event_counts = sqlx::query(
+        "SELECT user_id, COUNT(*) AS event_count
+         FROM session_device_lease_events
+         WHERE lease_id = ? AND session_id = ?
+         GROUP BY user_id",
+    )
+    .bind(&lease_id)
+    .bind(&session_id)
+    .fetch_all(pool.get())
+    .await
+    .expect("owner-scoped expiry event counts must be queryable");
+    assert_eq!(
+        owner_event_counts.len(),
+        1,
+        "only the selected owner may receive a durable expiry event"
+    );
+    assert_eq!(
+        owner_event_counts[0]
+            .try_get::<String, _>("user_id")
+            .expect("event owner must decode"),
+        owner_a
+    );
+    assert_eq!(
+        owner_event_counts[0]
+            .try_get::<i64, _>("event_count")
+            .expect("event count must decode"),
+        1
+    );
+
+    cleanup_device_owner_fixture(&pool, &owner_a, &session_id).await;
+    cleanup_device_owner_fixture(&pool, &owner_b, &session_id).await;
 }

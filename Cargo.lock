@@ -225,6 +225,7 @@ name = "astra-config"
 version = "0.1.0"
 dependencies = [
  "astra-core",
+ "astra-runtime-env",
  "astra-turn-types",
  "chrono",
  "dirs",
@@ -245,10 +246,12 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "dirs",
  "dotenvy",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "temp-env",
  "tempfile",
@@ -274,6 +277,7 @@ dependencies = [
 name = "astra-edge"
 version = "0.1.0"
 dependencies = [
+ "astra-core",
  "astra-credentials",
  "astra-logging",
  "astra-runtime-env",
@@ -464,7 +468,9 @@ dependencies = [
  "flate2",
  "fs2",
  "futures-util",
+ "hmac",
  "http-body-util",
+ "nix 0.31.2",
  "notify",
  "percent-encoding",
  "proptest",
@@ -533,7 +539,6 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap",
- "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -592,6 +597,7 @@ version = "0.1.0"
 dependencies = [
  "astra-core",
  "astra-pipeline",
+ "astra-runtime-env",
  "astra-services",
  "async-trait",
  "axum",
@@ -628,6 +634,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astra-services",
+ "astra-turn-types",
  "async-trait",
  "axum",
  "chrono",
@@ -665,8 +672,10 @@ dependencies = [
  "astra-sync-protocol",
  "astra-turn-types",
  "async-stream",
+ "base64",
  "futures-util",
  "hex",
+ "hmac",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

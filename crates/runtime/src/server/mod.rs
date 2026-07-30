@@ -130,7 +130,6 @@ mod ws_handler;
 
 use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
 use astra_server_types::*;
-use astra_server_types::{ChatRouteResponse, classify_chat_route};
 mod completions;
 
 pub use request_trace::RequestTrace;

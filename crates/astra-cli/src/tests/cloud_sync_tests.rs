@@ -1,3 +1,7 @@
+use crate::cli::cli_config::cli_utils::{
+    CredentialsFile, Profile, TestCliProfileIdentityGuard, install_cli_profile_identity_for_test,
+    save_credentials,
+};
 use crate::cli::cloud_sync::{
     self, CloudPullResult, append_cloud_pull_sync_journal,
     append_cloud_pull_sync_journal_for_immediate_drain, cloud_pull_warrants_sync_marker,
@@ -47,6 +51,47 @@ impl Drop for EnvVarGuard {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+}
+
+fn session_state_with_journal(session_id: String) -> SessionState {
+    let journal =
+        session_journal::JournalWriter::new(&session_id).expect("create owner-scoped journal");
+    SessionState {
+        session_id: Some(session_id),
+        journal: Some(journal),
+        ..Default::default()
+    }
+}
+
+struct TestCloudAuth {
+    _identity: TestCliProfileIdentityGuard,
+    _credentials: crate::test_utils::CredentialsGuard,
+}
+
+fn install_test_cloud_auth(access_token: Option<&str>) -> TestCloudAuth {
+    const PROFILE: &str = "cloud-sync-test";
+    const ACCOUNT: &str = "cloud-sync-test-account";
+
+    let credentials = isolate_credentials();
+    let mut data = CredentialsFile {
+        current_profile: Some(PROFILE.to_string()),
+        ..Default::default()
+    };
+    data.profiles.insert(
+        PROFILE.to_string(),
+        Profile {
+            account_id: Some(ACCOUNT.to_string()),
+            access_token: access_token.map(str::to_string),
+            ..Default::default()
+        },
+    );
+    save_credentials(&data).expect("persist test profile credentials");
+    let identity = install_cli_profile_identity_for_test(PROFILE, Some(ACCOUNT))
+        .expect("install matching test profile identity");
+    TestCloudAuth {
+        _identity: identity,
+        _credentials: credentials,
     }
 }
 
@@ -242,16 +287,20 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = JournalDirGuard::new(temp.path());
     let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
-    let state = SessionState {
-        session_id: Some(sid.clone()),
-        ..Default::default()
-    };
+    let state = session_state_with_journal(sid.clone());
+    let owner_scope = state
+        .journal
+        .as_ref()
+        .expect("live session journal")
+        .owner_scope()
+        .clone();
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
     let prefs = vec!["explain_mode".to_string()];
     append_cloud_pull_sync_journal(&state, "work", "session_startup", &pull, &prefs);
-    let events = session_journal::read_journal(&sid).expect("read journal");
+    let events = session_journal::read_journal_for_owner(&owner_scope, &sid)
+        .expect("read owner-scoped journal");
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[0].event_type,
@@ -279,7 +328,6 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
     assert_eq!(outbox.pending, 1);
     assert_eq!(outbox.ready, 1);
     assert_eq!(outbox.poisoned, 0);
-    std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
 }
 
 #[test]
@@ -287,15 +335,19 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = JournalDirGuard::new(temp.path());
     let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
-    let state = SessionState {
-        session_id: Some(sid.clone()),
-        ..Default::default()
-    };
+    let state = session_state_with_journal(sid.clone());
+    let owner_scope = state
+        .journal
+        .as_ref()
+        .expect("live session journal")
+        .owner_scope()
+        .clone();
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
     append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
-    let events = session_journal::read_journal(&sid).expect("read journal");
+    let events = session_journal::read_journal_for_owner(&owner_scope, &sid)
+        .expect("read owner-scoped journal");
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[0].event_type,
@@ -318,7 +370,6 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
     assert_eq!(outbox.pending, 1);
     assert_eq!(outbox.ready, 1);
     assert_eq!(outbox.poisoned, 0);
-    std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
 }
 
 #[test]
@@ -352,13 +403,10 @@ async fn drain_sync_outbox_acks_server_confirmed_payload_hash() {
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+    let _auth = install_test_cloud_auth(Some("token"));
 
     let sid = format!("test-cloud-drain-ok-{}", uuid::Uuid::new_v4());
-    let state = SessionState {
-        session_id: Some(sid.clone()),
-        ..Default::default()
-    };
+    let state = session_state_with_journal(sid.clone());
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
@@ -426,13 +474,10 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+    let _auth = install_test_cloud_auth(Some("token"));
 
     let sid = format!("test-cloud-drain-reconcile-{}", uuid::Uuid::new_v4());
-    let state = SessionState {
-        session_id: Some(sid.clone()),
-        ..Default::default()
-    };
+    let state = session_state_with_journal(sid.clone());
     append_cloud_pull_sync_journal_for_immediate_drain(
         &state,
         "default",
@@ -522,19 +567,15 @@ async fn drain_sync_outbox_reconciles_delivered_event_after_unparseable_success_
 #[serial_test::serial]
 #[tokio::test]
 async fn post_auth_sync_foreground_drain_reports_its_own_marker_delivery() {
-    let _creds = isolate_credentials();
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
-    let mut state = SessionState {
-        session_id: Some(format!(
-            "test-post-auth-foreground-drain-{}",
-            uuid::Uuid::new_v4()
-        )),
-        ..Default::default()
-    };
+    let _auth = install_test_cloud_auth(Some("token"));
+    let mut state = session_state_with_journal(format!(
+        "test-post-auth-foreground-drain-{}",
+        uuid::Uuid::new_v4()
+    ));
 
     Mock::given(method("GET"))
         .and(path("/preferences"))
@@ -582,13 +623,10 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "token");
+    let _auth = install_test_cloud_auth(Some("token"));
 
     let sid = format!("test-cloud-drain-fail-{}", uuid::Uuid::new_v4());
-    let state = SessionState {
-        session_id: Some(sid),
-        ..Default::default()
-    };
+    let state = session_state_with_journal(sid);
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
@@ -618,20 +656,16 @@ async fn drain_sync_outbox_http_failure_keeps_record_for_retry() {
 #[serial_test::serial]
 #[tokio::test]
 async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
-    let _creds = isolate_credentials();
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+    let _auth = install_test_cloud_auth(None);
 
-    let mut state = SessionState {
-        session_id: Some(format!(
-            "test-cloud-drain-no-token-{}",
-            uuid::Uuid::new_v4()
-        )),
-        ..Default::default()
-    };
+    let mut state = session_state_with_journal(format!(
+        "test-cloud-drain-no-token-{}",
+        uuid::Uuid::new_v4()
+    ));
     let pull = CloudPullResult {
         cloud_reachable: true,
     };
@@ -660,12 +694,11 @@ async fn post_auth_sync_reports_missing_token_and_preserves_ready_records() {
 #[serial_test::serial]
 #[tokio::test]
 async fn drain_empty_sync_outbox_does_not_require_cloud_credentials() {
-    let _creds = isolate_credentials();
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
     let server = MockServer::start().await;
     let _api = EnvVarGuard::set("ASTRA_API_URL", &server.uri());
-    let _token = EnvVarGuard::remove("ASTRA_ACCESS_TOKEN");
+    let _auth = install_test_cloud_auth(None);
 
     let report = cloud_sync::try_drain_sync_outbox(10).await;
     assert!(report.cloud_configured);

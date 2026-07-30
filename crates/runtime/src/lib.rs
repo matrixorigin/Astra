@@ -145,8 +145,10 @@ pub use astra_services::{
         DatabaseAdminAuditReader, DatabaseAdminAuthorizer, DatabaseAdminFeedbackStatsReader,
         DatabaseAdminInitializer, DatabaseAdminTokenReader, DatabaseAdminTokenWriter,
         DatabaseAdminUserRoleManager, DatabaseAuthService, DatabaseSessionService,
-        FernetTokenEncryptor, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
-        SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+        FernetTokenEncryptor, ReauthenticationProofRecord, ReauthenticationPurpose,
+        ReauthenticationRequestData, SessionActivityRecord, SessionCreateRequestData,
+        SessionListFilter, SessionListRecord, SessionRecord, SessionService,
+        SessionUpdateRequestData,
     },
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{
@@ -311,9 +313,6 @@ pub use astra_turn_core::{
         build_tool_call_event_payload, build_tool_result_event_payload,
     },
     response_guard::{is_prompt_leaked, is_repetition_loop},
-    retrieval::{
-        RETRIEVAL_BUDGET_CHARS, enhanced_extraction, format_retrieved_events, rule_based_extraction,
-    },
     routing::build_skipped_routing_metadata,
     stall::{
         DIVERGENCE_CORRECTION, DivergenceStatus, SERVER_STALL_WINDOW, canonical_tool_args,

@@ -115,8 +115,14 @@ impl CompactionTier {
 pub enum CompactionKind {
     /// Pre-turn pressure advisory (before compaction triggers).
     PressureWarning,
+    /// Host-provided LLM summary applied before the next provider turn.
+    PreTurnSummary,
     /// Tool-result clearing microcompact.
     Microcompact,
+    /// Memoria compaction applied while assembling the initial provider wire.
+    WireAssembly,
+    /// Memoria compaction applied while rebuilding a context-window retry.
+    WireContextRetry,
     /// Default-tier proactive compression pipeline.
     ProactiveDefault,
     /// Aggressive-tier proactive compression pipeline.
@@ -137,7 +143,10 @@ impl std::fmt::Display for CompactionKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Self::PressureWarning => "pressure_warning",
+            Self::PreTurnSummary => "pre_turn_summary",
             Self::Microcompact => "microcompact",
+            Self::WireAssembly => "wire_assembly",
+            Self::WireContextRetry => "wire_context_retry",
             Self::ProactiveDefault => "proactive_default",
             Self::ProactiveAggressive => "proactive_aggressive",
             Self::Resume => "resume",

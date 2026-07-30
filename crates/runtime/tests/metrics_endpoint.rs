@@ -85,4 +85,12 @@ async fn get_metrics_returns_prometheus_text() {
         text.contains(r#"astra_test_requests_total{route="/ping"} 3"#),
         "missing counter value in:\n{text}"
     );
+    assert!(
+        text.contains("astra_history_work_instrumentation_enabled 0"),
+        "disabled history instrumentation must remain explicit"
+    );
+    assert!(
+        !text.contains("astra_history_work_site_info"),
+        "disabled history instrumentation must not emit the 159-site detail matrix"
+    );
 }

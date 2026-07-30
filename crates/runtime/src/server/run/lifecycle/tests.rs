@@ -6537,6 +6537,24 @@ fn agent_communication_is_a_durable_replay_boundary() {
 }
 
 #[test]
+fn compaction_is_a_durable_live_replay_boundary() {
+    let event = json!({
+        "type": "compaction",
+        "data": {
+            "kind": "wire_assembly",
+            "pressure": 0.78,
+            "tokens_before": 12_000,
+            "tokens_after": 7_000,
+            "tokens_freed": 5_000
+        }
+    });
+
+    assert!(live_delta_event_for_persistence(&event));
+    assert!(streaming_event_for_persistence(&event));
+    assert!(durable_replay_boundary_event(&event));
+}
+
+#[test]
 fn active_run_live_event_projection_is_bounded() {
     let mut run = RunState {
         run_id: "run-live-bound".to_string(),
@@ -9082,6 +9100,31 @@ fn build_initial_state_sets_user_message() {
     assert_eq!(state.agentic_turn_budget, expected_budget);
     assert_eq!(state.message, "write a test");
     assert!(state.cancellation.token.is_none());
+}
+
+#[test]
+fn admitted_context_window_determines_loop_input_budget() {
+    let mut execution = test_admitted_model_execution();
+    execution.context_window = Some(1_000_000);
+    let limits = astra_core::RuntimeLimits::default();
+
+    assert_eq!(
+        effective_max_turn_input_tokens(&limits, Some("unrelated-fallback"), Some(&execution)),
+        800_000
+    );
+
+    let svc = test_service();
+    let mut request = test_request("use the admitted model");
+    request.admitted_model_execution = Some(execution);
+    let state = svc.build_initial_state("test-user", &request, "sess-1", "run-1", None, None, None);
+    assert_eq!(
+        state.max_turn_input_tokens,
+        effective_max_turn_input_tokens(
+            astra_core::RuntimeLimits::global(),
+            request.model.as_deref(),
+            request.admitted_model_execution.as_ref(),
+        )
+    );
 }
 
 #[test]
@@ -13767,6 +13810,14 @@ async fn run_admission_metrics_record_acquired_and_timeout() {
     );
     assert!(
         rendered.contains("astra_run_admission_wait_ms_total{outcome=\"timeout\"}"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("astra_run_admission_weight_units_total{outcome=\"timeout\"} 1"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("astra_run_admission_weight_units_total{outcome=\"acquired\"} 1"),
         "{rendered}"
     );
 }

@@ -447,7 +447,6 @@ mod tests {
             memory_context: Some(astra_pipeline::step_protocol::MemoryContext {
                 retrieved_memory_ids: vec!["m-1".to_string()],
                 domain_hints: vec!["rust".to_string()],
-                boost_terms: vec!["resume".to_string()],
                 provenance: vec!["memoria".to_string()],
                 governance_actions: Vec::new(),
                 cluster_insights: Vec::new(),
@@ -485,7 +484,6 @@ mod tests {
         let memory_context = heavy.memory_context.expect("memory context");
         assert_eq!(memory_context.retrieved_memory_ids, vec!["m-1".to_string()]);
         assert_eq!(memory_context.domain_hints, vec!["rust".to_string()]);
-        assert_eq!(memory_context.boost_terms, vec!["resume".to_string()]);
         assert_eq!(memory_context.provenance, vec!["memoria".to_string()]);
         assert_eq!(memory_context.snapshot_id.as_deref(), Some("snapshot-1"));
         assert!(heavy.interruption.is_none());

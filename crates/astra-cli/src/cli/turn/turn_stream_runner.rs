@@ -143,6 +143,7 @@ fn build_turn_stream_params<'a>(
         incremental_state: Some(prepared.incremental_state.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: state.tui_stream_event_tx.clone(),
+        stream_json_emitter: None,
         agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
         approval_request_tx: state.tui_approval_request_tx.clone(),
         ask_user_request_tx: state.tui_ask_user_request_tx.clone(),

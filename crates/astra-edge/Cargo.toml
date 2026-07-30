@@ -13,6 +13,7 @@ name = "astra-edge"
 path = "src/main.rs"
 
 [dependencies]
+astra-core.workspace = true
 astra-logging.workspace = true
 clap = { workspace = true }
 futures-util = { workspace = true }

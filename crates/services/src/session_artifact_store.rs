@@ -6,7 +6,10 @@
 //!   LLM captures and request dumps) without assuming the caller can access server-local
 //!   files.
 
-use std::path::{Component, Path, PathBuf};
+use std::{
+    path::{Component, Path, PathBuf},
+    sync::{LazyLock, RwLock},
+};
 
 use crate::db_row::RowExt as SessionArtifactDbRow;
 use astra_core::{MatrixOneSettings, SharedPool};
@@ -192,7 +195,7 @@ impl OwnerScope {
     }
 
     pub fn local_user() -> Self {
-        Self::user(local_owner_user_id()).expect("local owner user id is non-empty")
+        local_owner_scope()
     }
 
     pub fn kind(&self) -> OwnerScopeKind {
@@ -212,16 +215,47 @@ impl OwnerScope {
     }
 }
 
+static PROCESS_LOCAL_OWNER_SCOPE: LazyLock<RwLock<OwnerScope>> = LazyLock::new(|| {
+    RwLock::new(OwnerScope::user("local").expect("default local owner id is non-empty"))
+});
+
+/// Install the owner identity for ownerless local-session APIs in this process.
+///
+/// The CLI resolves this once from its selected profile plus the server-issued
+/// account id before opening journals, caches, or the sync outbox. Server paths
+/// should continue to pass an explicit [`OwnerScope`] instead.
+pub fn configure_local_owner_scope(owner_scope: OwnerScope) {
+    match PROCESS_LOCAL_OWNER_SCOPE.write() {
+        Ok(mut current) => *current = owner_scope,
+        Err(poisoned) => {
+            tracing::warn!(
+                "process local owner scope lock was poisoned; replacing the stored identity"
+            );
+            *poisoned.into_inner() = owner_scope;
+        }
+    }
+}
+
+#[must_use]
+pub fn local_owner_scope() -> OwnerScope {
+    match PROCESS_LOCAL_OWNER_SCOPE.read() {
+        Ok(current) => current.clone(),
+        Err(poisoned) => {
+            tracing::warn!(
+                "process local owner scope lock was poisoned; recovering the stored identity"
+            );
+            poisoned.into_inner().clone()
+        }
+    }
+}
+
 pub fn local_owner_user_id() -> String {
-    std::env::var("ASTRA_CLI_USER_ID")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "local".to_string())
+    local_owner_scope().id().to_string()
 }
 
 pub trait SessionArtifactStore {
     fn sessions_root(&self) -> PathBuf;
+    fn owner_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String>;
     fn owner_sessions_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String>;
     fn session_dir_for_owner(
         &self,
@@ -1316,13 +1350,16 @@ impl SessionArtifactStore for LocalSessionArtifactStore {
         crate::session_journal::local_sessions_dir()
     }
 
-    fn owner_sessions_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String> {
+    fn owner_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String> {
         Ok(self
             .sessions_root()
             .join(LOCAL_SESSION_LAYOUT_VERSION)
             .join(owner_scope.directory_segment())
-            .join(owner_scope.storage_key())
-            .join("sessions"))
+            .join(owner_scope.storage_key()))
+    }
+
+    fn owner_sessions_root(&self, owner_scope: &OwnerScope) -> Result<PathBuf, String> {
+        Ok(self.owner_root(owner_scope)?.join("sessions"))
     }
 
     fn session_dir_for_owner(

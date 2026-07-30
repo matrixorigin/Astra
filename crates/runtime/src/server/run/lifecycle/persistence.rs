@@ -147,9 +147,7 @@ fn lifecycle_token_usage_json(
         return None;
     }
 
-    let billable_input = input_tokens
-        .saturating_add(cached_input_tokens)
-        .saturating_add(cache_creation_tokens);
+    let billable_input = usage.normalized_prompt_cache_usage().total_input_tokens();
     let total_tokens = usage.total_tokens();
     let cache_hit_ratio = if billable_input == 0 {
         0.0
@@ -937,6 +935,15 @@ pub(crate) fn format_task_board_resume_hint(tasks: &[SessionTask]) -> Option<Str
 
 pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
     let mut messages = state.messages.clone();
+    if astra_core::history_work::instrumentation_enabled() {
+        let (bytes, rows) = json_history_payload_work(&messages);
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ServerCslPersistClone,
+            bytes,
+            rows,
+            0,
+        );
+    }
     let final_text = state.final_text.trim();
     if !final_text.is_empty() {
         let already_has_final = messages
@@ -955,6 +962,84 @@ pub(crate) fn messages_for_csl_persist(state: &AgenticLoopState) -> Vec<Value> {
         }
     }
     messages
+}
+
+/// Count cloned heap payload without allocating a second serialized history.
+fn json_value_payload_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(_) => {
+            u64::try_from(std::mem::size_of::<serde_json::Number>()).unwrap_or(u64::MAX)
+        }
+        Value::String(value) => value.len().try_into().unwrap_or(u64::MAX),
+        Value::Array(values) => values.iter().fold(0_u64, |bytes, value| {
+            bytes.saturating_add(json_value_payload_bytes(value))
+        }),
+        Value::Object(values) => json_map_payload_bytes(values),
+    }
+}
+
+fn json_map_payload_bytes(values: &Map<String, Value>) -> u64 {
+    values.iter().fold(0_u64, |bytes, (key, value)| {
+        bytes
+            .saturating_add(key.len().try_into().unwrap_or(u64::MAX))
+            .saturating_add(json_value_payload_bytes(value))
+    })
+}
+
+fn json_history_payload_work(messages: &[Value]) -> (u64, u64) {
+    (
+        messages.iter().fold(0_u64, |bytes, message| {
+            bytes.saturating_add(json_value_payload_bytes(message))
+        }),
+        messages.len().try_into().unwrap_or(u64::MAX),
+    )
+}
+
+fn server_observer_request_retained_bytes(request: &TurnObserverRequest) -> u64 {
+    request
+        .messages
+        .iter()
+        .fold(
+            request
+                .user_id
+                .len()
+                .saturating_add(request.session_id.len())
+                .try_into()
+                .unwrap_or(u64::MAX),
+            |bytes, message| bytes.saturating_add(json_map_payload_bytes(message)),
+        )
+        .saturating_add(
+            request
+                .session_start
+                .as_ref()
+                .map_or(0, json_value_payload_bytes),
+        )
+        .saturating_add(
+            u64::try_from(std::mem::size_of_val(&request.turn_count)).unwrap_or(u64::MAX),
+        )
+}
+
+fn reserve_server_observer_request(
+    request: &TurnObserverRequest,
+) -> Option<astra_core::history_work::QueueBytesReservation> {
+    reserve_server_observer_request_when(
+        request,
+        astra_core::history_work::instrumentation_enabled(),
+    )
+}
+
+fn reserve_server_observer_request_when(
+    request: &TurnObserverRequest,
+    instrumentation_enabled: bool,
+) -> Option<astra_core::history_work::QueueBytesReservation> {
+    instrumentation_enabled.then(|| {
+        astra_core::history_work::QueueBytesReservation::for_site(
+            astra_core::history_work::HistoryWorkSite::ServerObserverQueue,
+            server_observer_request_retained_bytes(request),
+        )
+    })
 }
 
 pub(crate) fn server_loop_causal_chain_id(kind: &str) -> String {
@@ -2612,8 +2697,10 @@ async fn fire_server_loop_observer_with_async_limit(
         ));
     };
     record_turn_observer_dispatch_metrics(metrics_registry.as_ref(), "async", "scheduled");
+    let queue_reservation = reserve_server_observer_request(&request);
     let session_id = session_id.to_string();
     tokio::spawn(async move {
+        let _queue_reservation = queue_reservation;
         let _permit = permit;
         run_server_loop_observer_request(
             observer_worker.as_ref(),
@@ -2895,7 +2982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_async)]
+    #[serial_test::serial(history_work)]
     async fn server_loop_observer_async_does_not_block_caller() {
         let observer = Arc::new(CaptureObserverWorker::new(true));
         let started = observer.started.notified();
@@ -2925,7 +3012,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_async)]
+    #[serial_test::serial(history_work)]
     async fn server_loop_observer_async_limit_reports_saturation_without_blocking() {
         let first = Arc::new(CaptureObserverWorker::new(true));
         let second = Arc::new(CaptureObserverWorker::new(false));
@@ -2973,7 +3060,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(turn_observer_async)]
+    #[serial_test::serial(history_work)]
     async fn server_loop_observer_metrics_stay_low_cardinality() {
         let registry = Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new());
         let observer = Arc::new(CaptureObserverWorker::new(false));
@@ -3021,6 +3108,47 @@ mod tests {
         assert_eq!(request.session_id, "session-1");
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.turn_count, 3);
+    }
+
+    #[test]
+    fn history_payload_work_counts_nested_payload_without_json_serialization() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": ["hi", {"text": "nested"}],
+        })];
+
+        assert_eq!(json_history_payload_work(&messages), (27, 1));
+    }
+
+    #[test]
+    #[serial_test::serial(history_work)]
+    fn server_observer_queue_reservation_releases_bytes_on_drop() {
+        let state = observer_test_state();
+        let request = build_server_loop_observer_request("user-1", "session-1", &state)
+            .expect("observer request");
+        assert!(
+            reserve_server_observer_request_when(&request, false).is_none(),
+            "disabled instrumentation must not retain or inspect queue payload"
+        );
+        let expected_bytes = server_observer_request_retained_bytes(&request);
+        let scenario =
+            astra_core::history_work::HistoryWorkScenario::begin("server-observer-queue-drop")
+                .expect("exclusive history-work scenario");
+
+        {
+            let reservation = reserve_server_observer_request_when(&request, true)
+                .expect("explicitly enabled instrumentation");
+            assert_eq!(reservation.bytes(), expected_bytes);
+        }
+
+        let report = scenario.finish().expect("history-work report");
+        let measurement = report
+            .scoped
+            .measurement(astra_core::history_work::HistoryWorkSite::ServerObserverQueue);
+        assert_eq!(measurement.events, 1);
+        assert_eq!(measurement.bytes, expected_bytes);
+        assert_eq!(measurement.queue_peak_bytes, expected_bytes);
+        assert_eq!(measurement.queue_current_bytes, 0);
     }
 
     #[test]

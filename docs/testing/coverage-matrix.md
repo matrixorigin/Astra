@@ -37,8 +37,7 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | Marketplace probe | `journey_full` | `marketplace_contract` |
 | Data versioning lineage | `journey_full` | `data_versioning_contract` |
 | Replay compare | `journey_full` | `replay_contract` |
-| `POST /chat/route` (shape + auth path) | `journey_full` + `e2e_matrix_chat_route_models` | `chat_route_contract` |
-| `GET /models` (authenticated list) | `journey_full` + `e2e_matrix_chat_route_models` | — |
+| `GET /models` (authenticated list) | `journey_full` + `e2e_matrix_models` | — |
 | Models admin CRUD + `infra_llm_models` | `journey_extended::run_models_admin_crud_with_db` (`provider: mock`, `grant_astra_admin_role`) | `model_crud_contract` |
 | `POST /branches/cost-estimate` (JWT + estimate fields; 401 without auth) | `e2e_matrix_branches_cost_estimate_http` | `branches_contract` (stub; different surface) |
 | `GET /admin/tokens` (403 → grant `astra_admin` → 200 array) | `e2e_matrix_admin_tokens_smoke` | — |

@@ -395,7 +395,8 @@ async fn empty_message_history_does_not_panic() {
 // Drives three consecutive mock rounds through execute_mock_turn that
 // interleave text-only, tool_call-only, and mixed text+tool_call shapes,
 // verifying:
-//   * SSE event order: text_delta before tool_call before usage per round
+//   * HostTurnResult preserves typed tool calls while host-local progress keeps
+//     text_delta before usage; admitted tool_call SSE belongs to the outer loop
 //   * History messages grow monotonically between rounds (no loss or reorder)
 //   * Cacheable prefix stays stable across all three rounds (system + tools
 //     unchanged — only message list grows)
@@ -447,7 +448,7 @@ fn event_types_in_order(events: &[Value]) -> Vec<String> {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
+async fn interleaved_tool_and_text_rounds_preserve_typed_results_and_history() {
     let capture = Arc::new(Mutex::new(Vec::new()));
     let rounds = vec![
         scripted_round("greeting"),
@@ -465,7 +466,8 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
         .push(json!({ "role": "user", "content": "please help" }));
 
     // Round 1 — text only.
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let result_r1 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    assert!(result_r1.accum.tool_calls.is_empty());
     let events_r1 = host.take_emitted_events();
     let types_r1 = event_types_in_order(&events_r1);
     assert!(
@@ -492,26 +494,20 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
         .push(json!({"role": "user", "content": "now run some tools"}));
 
     // Round 2 — tool_calls only, no text.
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let result_r2 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    assert_eq!(
+        result_r2.accum.tool_calls.len(),
+        2,
+        "round 2 typed result must preserve both tool calls"
+    );
+    assert!(result_r2.accum.full_text.is_empty());
     let events_r2 = host.take_emitted_events();
     let types_r2 = event_types_in_order(&events_r2);
-    let tool_positions: Vec<usize> = types_r2
-        .iter()
-        .enumerate()
-        .filter_map(|(i, t)| if t == "tool_call" { Some(i) } else { None })
-        .collect();
-    assert_eq!(
-        tool_positions.len(),
-        2,
-        "round 2 must emit two tool_call events, got {types_r2:?}"
+    assert!(
+        !types_r2.iter().any(|event_type| event_type == "tool_call"),
+        "host-only helper must not fabricate the outer loop's admitted tool lifecycle"
     );
-    let usage_pos_r2 = types_r2.iter().position(|t| t == "usage").unwrap();
-    for p in &tool_positions {
-        assert!(
-            *p < usage_pos_r2,
-            "every tool_call must come before usage, got {types_r2:?}"
-        );
-    }
+    assert!(types_r2.iter().any(|event_type| event_type == "usage"));
 
     // Append synthetic tool_result messages and a follow-up to simulate
     // the agentic loop feeding tool outputs back to the LLM.
@@ -531,15 +527,24 @@ async fn interleaved_tool_and_text_rounds_preserve_event_order_and_history() {
         .push(json!({"role": "tool", "tool_call_id": "tc_read_file_1", "content": "hello"}));
 
     // Round 3 — mixed text + tool_call.
-    host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    let result_r3 = host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+    assert_eq!(
+        result_r3.accum.tool_calls.len(),
+        1,
+        "round 3 typed result must preserve its tool call"
+    );
+    assert_eq!(result_r3.accum.full_text, "here is the answer");
     let events_r3 = host.take_emitted_events();
     let types_r3 = event_types_in_order(&events_r3);
     let text_pos_r3 = types_r3.iter().position(|t| t == "text_delta").unwrap();
-    let tool_pos_r3 = types_r3.iter().position(|t| t == "tool_call").unwrap();
     let usage_pos_r3 = types_r3.iter().position(|t| t == "usage").unwrap();
     assert!(
-        text_pos_r3 < tool_pos_r3 && tool_pos_r3 < usage_pos_r3,
-        "mixed round must emit text then tool_call then usage, got {types_r3:?}"
+        text_pos_r3 < usage_pos_r3,
+        "mixed round must emit text before usage, got {types_r3:?}"
+    );
+    assert!(
+        !types_r3.iter().any(|event_type| event_type == "tool_call"),
+        "outer-loop tool admission remains outside the host-only helper"
     );
 
     // Cacheable prefix stable across all 3 rounds (tools + system unchanged).

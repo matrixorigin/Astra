@@ -1,6 +1,5 @@
-use crate::cli::cli_config::cli_utils::{
-    credential_store, load_credentials, normalize_model_override, profile_name,
-};
+use crate::cli::auth_flow::{parse_auth_tokens, save_refreshed_profile_tokens};
+use crate::cli::cli_config::cli_utils::{load_credentials, normalize_model_override, profile_name};
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::session::session_state::SessionState;
 use crate::cli::theme;
@@ -35,10 +34,7 @@ pub(crate) fn create_tui_pipeline_modules(
 }
 
 pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
-    let tasks_dir = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("tasks");
+    let tasks_dir = astra_runtime_env::local_state_root().join("tasks");
     std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
 }
 
@@ -689,7 +685,7 @@ pub(crate) async fn ensure_state_default_model(
 enum SilentRefreshError {
     Thin(astra_thin_client::ThinClientError),
     /// HTTP 200 body was not usable; keep existing tokens.
-    BadResponse(&'static str),
+    BadResponse(String),
     /// New tokens could not be written; do not clear the file.
     SaveFailed(String),
 }
@@ -812,24 +808,9 @@ async fn try_refresh_token(
         .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
         .await
         .map_err(SilentRefreshError::Thin)?;
-    let value: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| SilentRefreshError::Thin(e.into()))?;
-    let new_access = value.get("access_token").and_then(|v| v.as_str()).ok_or(
-        SilentRefreshError::BadResponse("refresh response: missing access_token"),
-    )?;
-    let new_refresh = value.get("refresh_token").and_then(|v| v.as_str()).ok_or(
-        SilentRefreshError::BadResponse("refresh response: missing refresh_token"),
-    )?;
-    let new_access = new_access.to_string();
-    let new_refresh = new_refresh.to_string();
-    credential_store()
-        .mutate(|creds| {
-            let name = profile_name(profile, creds);
-            let entry = creds.profiles.entry(name).or_default();
-            entry.access_token = Some(new_access.clone());
-            entry.refresh_token = Some(new_refresh.clone());
-        })
-        .map_err(|e| SilentRefreshError::SaveFailed(e.to_string()))?;
+    let tokens = parse_auth_tokens(&body)
+        .map_err(|error| SilentRefreshError::BadResponse(format!("refresh response: {error}")))?;
+    save_refreshed_profile_tokens(profile, &tokens).map_err(SilentRefreshError::SaveFailed)?;
     Ok(())
 }
 
@@ -996,10 +977,7 @@ pub(crate) fn initialize_session_state(
 
     // Initialize observability hub for M1-M6 integration
     // Use persistent storage under ~/.astra/observability for user profiles
-    let obs_path = dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".astra")
-        .join("observability");
+    let obs_path = astra_runtime_env::local_state_root().join("observability");
     state.observability_hub = Some(std::sync::Arc::new(
         astra_runtime::observability::ObservabilityHub::with_storage(obs_path),
     ));
@@ -1193,6 +1171,10 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
             restored.recent_tools = tools_used;
         }
     }
+    crate::cli::history_work::record_pair_history(
+        astra_core::history_work::HistoryWorkSite::CliJournalHistoryHydration,
+        &restored.history,
+    );
 
     Ok(RestoredJournalState {
         exists: journal_exists,
@@ -3131,6 +3113,7 @@ mod tests {
         creds.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some(
                     "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0.eyJleHAiOjF9.sig".to_string(),
                 ),
@@ -3144,6 +3127,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "fresh-access",
                 "refresh_token": "fresh-refresh"
             })))
@@ -3270,6 +3254,7 @@ mod tests {
         creds.profiles.insert(
             "default".into(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some(jwt_with_exp(1)),
                 refresh_token: Some("refresh-old".to_string()),
                 ..Default::default()
@@ -3281,6 +3266,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/auth/refresh"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "fresh-access",
                 "refresh_token": "fresh-refresh"
             })))

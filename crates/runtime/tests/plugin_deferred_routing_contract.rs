@@ -106,7 +106,7 @@ fn default_surface_does_not_include_plugin_in_production_path() {
     let plugins = make_plugins();
     registry.register_plugins(&plugins);
 
-    let (schemas, _report) = registry.build_routed_surface(4000);
+    let (schemas, _report) = registry.build_turn_surface_with_report(None, 4000);
     let names = names(&schemas);
     assert!(
         !names.contains(&"mcp__weather".to_string()),

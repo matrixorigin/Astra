@@ -15,6 +15,7 @@ pub const MAX_COMPLETION_OUTPUT_TOKENS: u32 = 8_192;
 pub enum CompletionOperation {
     MemoryExtraction,
     MemoryRetrievalRerank,
+    TurnIntent,
     SkillAutoRoute,
     VerificationJudge,
 }
@@ -27,6 +28,7 @@ impl CompletionOperation {
             Self::MemoryRetrievalRerank => {
                 astra_turn_types::InferencePurpose::MemoryRetrievalRerank
             }
+            Self::TurnIntent => astra_turn_types::InferencePurpose::Introspection,
             Self::SkillAutoRoute => astra_turn_types::InferencePurpose::Introspection,
             Self::VerificationJudge => astra_turn_types::InferencePurpose::VerificationJudge,
         }
@@ -37,6 +39,7 @@ impl CompletionOperation {
         match self {
             Self::MemoryExtraction => "completion_proxy:memory_extraction",
             Self::MemoryRetrievalRerank => "completion_proxy:memory_retrieval_rerank",
+            Self::TurnIntent => "completion_proxy:turn_intent",
             Self::SkillAutoRoute => "completion_proxy:skill_auto_route",
             Self::VerificationJudge => "completion_proxy:verification_judge",
         }
@@ -268,6 +271,31 @@ mod tests {
         ] {
             assert!(serde_json::from_value::<CompletionRequest>(forbidden).is_err());
         }
+    }
+
+    #[test]
+    fn turn_intent_operation_has_distinct_durable_identity() {
+        let request = CompletionRequest::new(
+            CompletionOperation::TurnIntent,
+            "session-1",
+            3,
+            0,
+            0,
+            vec![serde_json::json!({"role": "user", "content": "classify"})],
+        );
+
+        assert_eq!(
+            request.purpose(),
+            astra_turn_types::InferencePurpose::Introspection
+        );
+        assert_eq!(
+            request.invocation_scope().operation_id(),
+            "completion_proxy:turn_intent"
+        );
+        assert_eq!(
+            serde_json::to_value(request).unwrap()["operation"],
+            "turn_intent"
+        );
     }
 
     #[test]

@@ -13,9 +13,51 @@ use astra_config::runtime_config::RuntimeConfig;
 use astra_config::user_profile::{Scenario, UserProfile, UserProfileManager, UserProfileStore};
 use astra_core::feedback::FeedbackSignal;
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
-use astra_turn_core::decision_explainer::{DecisionExplanation, DriftDetector, FocusDriftAnalysis};
+use astra_turn_core::decision_explainer::DecisionExplanation;
 
 use super::types::*;
+
+fn record_observability_rollback_history(
+    site: astra_core::history_work::HistoryWorkSite,
+    original_query: &Option<String>,
+    recent_queries: &[String],
+    compressed_turns: &[u32],
+    user_corrections: &[u32],
+    context_traces: &[ContextAssemblyTrace],
+) {
+    astra_core::history_work::record_serialized_value(
+        site,
+        &(
+            original_query,
+            recent_queries,
+            compressed_turns,
+            user_corrections,
+            context_traces,
+        ),
+    );
+}
+
+impl Clone for ObservabilitySessionRollbackSnapshot {
+    fn clone(&self) -> Self {
+        record_observability_rollback_history(
+            astra_core::history_work::HistoryWorkSite::ObservabilityRollbackSnapshotClone,
+            &self.original_query,
+            &self.recent_queries,
+            &self.compressed_turns,
+            &self.user_corrections,
+            &self.context_traces,
+        );
+        Self {
+            config: self.config.clone(),
+            original_query: self.original_query.clone(),
+            recent_queries: self.recent_queries.clone(),
+            compressed_turns: self.compressed_turns.clone(),
+            user_corrections: self.user_corrections.clone(),
+            context_traces: self.context_traces.clone(),
+            last_query_at: self.last_query_at,
+        }
+    }
+}
 
 impl ObservabilitySession {
     /// Create a new session with loaded user profile.
@@ -53,7 +95,6 @@ impl ObservabilitySession {
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
-            previous_turn_user_cancelled: false,
             last_strategy_application: None,
             last_guardrail_view: None,
             last_denial_pressure: None,
@@ -96,7 +137,6 @@ impl ObservabilitySession {
             last_scenario_change_turn: None,
             last_token_budget_direction: 0,
             last_token_budget_change_turn: None,
-            previous_turn_user_cancelled: false,
             last_strategy_application: None,
             last_guardrail_view: None,
             last_denial_pressure: None,
@@ -490,16 +530,19 @@ impl ObservabilitySession {
         self.started_at.elapsed()
     }
 
-    /// Check for focus drift using all available signals.
-    ///
-    /// Uses the original query (from session start), recent queries,
-    /// compression events, and direct user corrections to detect drift.
-
     /// Record a tool result (no-op; previously fed the goal tracker).
     pub fn record_tool_result(&mut self, _tool_name: &str, _output: &str, _exit_code: Option<i32>) {
     }
 
     pub fn rollback_snapshot(&self) -> ObservabilitySessionRollbackSnapshot {
+        record_observability_rollback_history(
+            astra_core::history_work::HistoryWorkSite::ObservabilityRollbackSnapshotClone,
+            &self.original_query,
+            &self.recent_queries,
+            &self.compressed_turns,
+            &self.user_corrections,
+            &self.context_traces,
+        );
         ObservabilitySessionRollbackSnapshot {
             config: self.config.clone(),
             original_query: self.original_query.clone(),
@@ -512,6 +555,14 @@ impl ObservabilitySession {
     }
 
     pub fn restore_rollback_snapshot(&mut self, snapshot: &ObservabilitySessionRollbackSnapshot) {
+        record_observability_rollback_history(
+            astra_core::history_work::HistoryWorkSite::ObservabilityRollbackRestoreClone,
+            &snapshot.original_query,
+            &snapshot.recent_queries,
+            &snapshot.compressed_turns,
+            &snapshot.user_corrections,
+            &snapshot.context_traces,
+        );
         self.config = snapshot.config.clone();
         self.original_query = snapshot.original_query.clone();
         self.recent_queries = snapshot.recent_queries.clone();
@@ -533,5 +584,25 @@ mod tests {
 
         assert_eq!(behavior.delay_since_last_query_ms, None);
         assert!(session.user_corrections.is_empty());
+    }
+
+    #[test]
+    fn rollback_snapshot_clone_and_restore_preserve_structured_history() {
+        let mut session = ObservabilitySession::new_simple("s-rollback");
+        session.original_query = Some("原始问题".to_string());
+        session.recent_queries = vec!["first".to_string(), "第二个".to_string()];
+        session.compressed_turns = vec![2, 7];
+        session.user_corrections = vec![3];
+
+        let snapshot = session.rollback_snapshot();
+        let retained = snapshot.clone();
+        session.original_query = Some("changed".to_string());
+        session.recent_queries.clear();
+        session.restore_rollback_snapshot(&retained);
+
+        assert_eq!(session.original_query.as_deref(), Some("原始问题"));
+        assert_eq!(session.recent_queries, ["first", "第二个"]);
+        assert_eq!(session.compressed_turns, [2, 7]);
+        assert_eq!(session.user_corrections, [3]);
     }
 }
