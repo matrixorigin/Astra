@@ -463,6 +463,7 @@ mod tests {
                 run_id: "test-run".into(),
                 model_id: "test-model".into(),
                 provider_name: "anthropic".into(),
+                pre_reserved_output_tokens: 0,
                 model_limit: 100_000,
                 provider_policy: ProviderCachePolicy::default(),
                 provider_strategy: ProviderCacheStrategy::default(),
@@ -615,6 +616,7 @@ mod tests {
         let plan_input = crate::context_planner::PlanInput {
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &sources.turn.recovery,
             latches: sources.latches,
             stats: sources.stats,
@@ -1011,6 +1013,7 @@ mod tests {
         let plan_input = crate::context_planner::PlanInput {
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &sources.turn.recovery,
             latches: sources.latches,
             stats: sources.stats,

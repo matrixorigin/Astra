@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v18";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v19";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3961,6 +3961,10 @@ async fn ensure_core_schema_while_leased(
             chunk_id VARCHAR(80) NULL,
             chunk_hash VARCHAR(64) NULL,
             previous_chunk_hash VARCHAR(64) NULL,
+            chunk_tokens BIGINT NULL,
+            chunk_bytes BIGINT NULL,
+            previous_chunk_tokens BIGINT NULL,
+            previous_chunk_bytes BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, request_id, delta_seq),
             INDEX idx_prompt_deltas_owner_request_position (user_id, session_id, request_id, position, delta_seq)
@@ -3968,6 +3972,26 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    for (column, ddl) in [
+        (
+            "chunk_tokens",
+            "ALTER TABLE prompt_deltas ADD COLUMN chunk_tokens BIGINT NULL",
+        ),
+        (
+            "chunk_bytes",
+            "ALTER TABLE prompt_deltas ADD COLUMN chunk_bytes BIGINT NULL",
+        ),
+        (
+            "previous_chunk_tokens",
+            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_tokens BIGINT NULL",
+        ),
+        (
+            "previous_chunk_bytes",
+            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_bytes BIGINT NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "prompt_deltas", column, ddl).await?;
+    }
     core_schema_create!(
         pool,
         "session_state_revisions",

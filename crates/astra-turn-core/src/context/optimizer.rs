@@ -603,6 +603,7 @@ mod tests {
             run_id: "r1".into(),
             model_id: "m1".into(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::default(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -648,6 +649,7 @@ mod tests {
         let plan_input = PlanInput {
             tokens: &turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &turn.recovery,
             latches: &latches,
             stats: &stats,

@@ -70,6 +70,15 @@ pub struct ConversationCommitV1 {
 /// JSON object keys are sorted recursively so equivalent wire objects have
 /// one placement-independent root.
 pub fn canonical_conversation_root(messages: &[Value]) -> String {
+    canonical_conversation_identity(messages).0
+}
+
+/// Compute the canonical root and serialized byte count together.
+///
+/// Root construction already needs one counting pass before hashing because
+/// the byte length is domain-separated ahead of the payload. Returning that
+/// count avoids a third full-history traversal in segmented storage.
+pub fn canonical_conversation_identity(messages: &[Value]) -> (String, u64) {
     let mut counter = CountingWriter::default();
     write_canonical_messages(messages, &mut counter)
         .expect("counting canonical JSON bytes cannot fail");
@@ -79,7 +88,7 @@ pub fn canonical_conversation_root(messages: &[Value]) -> String {
     digest.update(counter.bytes.to_be_bytes());
     write_canonical_messages(messages, &mut DigestWriter(&mut digest))
         .expect("hashing canonical JSON bytes cannot fail");
-    format!("{:x}", digest.finalize())
+    (format!("{:x}", digest.finalize()), counter.bytes)
 }
 
 /// Number of bytes in the canonical JSON representation used by
@@ -191,7 +200,10 @@ fn write_json(value: &impl Serialize, out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use serde_json::json;
 
-    use super::{canonical_conversation_root, json_serialized_len};
+    use super::{
+        canonical_conversation_identity, canonical_conversation_root,
+        canonical_conversation_serialized_len, json_serialized_len,
+    };
 
     #[test]
     fn streaming_root_preserves_the_v1_wire_hash() {
@@ -208,6 +220,9 @@ mod tests {
             canonical_conversation_root(&messages),
             "18fd5901a9aa39a4802a649a8f13a2f79a5266ff76f514645d33d5cd1bd6891b"
         );
+        let (root, bytes) = canonical_conversation_identity(&messages);
+        assert_eq!(root, canonical_conversation_root(&messages));
+        assert_eq!(bytes, canonical_conversation_serialized_len(&messages));
     }
 
     #[test]

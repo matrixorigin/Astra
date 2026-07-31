@@ -189,6 +189,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub provider: &'a str,
     pub model_name: &'a str,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
@@ -325,6 +326,7 @@ pub(crate) struct LlmContextManifestTrace {
     pub provider: String,
     pub model_name: String,
     pub model_context_window_tokens: u32,
+    pub context_window_policy: crate::prompts::ContextWindowPolicy,
     pub compaction_tier: String,
     pub system_prompt_tokens: u32,
     pub stable_system_message_count: usize,
@@ -340,6 +342,7 @@ impl LlmContextManifestTrace {
             "provider": self.provider.clone(),
             "model_name": self.model_name.clone(),
             "model_context_window_tokens": self.model_context_window_tokens,
+            "context_window_policy": self.context_window_policy,
             "compaction_tier": self.compaction_tier.clone(),
             "system_prompt_tokens": self.system_prompt_tokens,
             "stable_system_message_count": self.stable_system_message_count,
@@ -662,6 +665,7 @@ pub(crate) struct BridgeSessionContextInput<'a> {
     pub session_id: &'a str,
     pub model_id: &'a str,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub provider: &'a str,
     pub edge_profile_cwd: Option<&'a str>,
     pub edge_profile_git_branch: Option<&'a str>,
@@ -689,6 +693,7 @@ impl<'a> BridgeSessionContextInput<'a> {
             session_id,
             model_id,
             context_window: None,
+            max_completion_tokens: None,
             provider,
             edge_profile_cwd,
             edge_profile_git_branch,
@@ -705,6 +710,11 @@ impl<'a> BridgeSessionContextInput<'a> {
 
     pub(crate) fn with_context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
+        self
+    }
+
+    pub(crate) fn with_max_completion_tokens(mut self, max_completion_tokens: Option<u32>) -> Self {
+        self.max_completion_tokens = max_completion_tokens;
         self
     }
 }
@@ -1110,6 +1120,12 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
     );
+    let window_policy = crate::prompts::budget_for_model_with_metadata(
+        Some(input.session.model_id),
+        input.session.context_window,
+        input.session.max_completion_tokens,
+    )
+    .window_policy();
     let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome_with_messages(
         &effective_tool_names,
         &effective_tool_schemas,
@@ -1122,7 +1138,8 @@ pub(crate) fn assemble_bridge_context(
         input.session.cache_capability,
         input.session.session_id,
         input.session.model_id,
-        input.session.context_window,
+        u32::try_from(window_policy.usable_input_limit_tokens).ok(),
+        u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX),
         input.session.provider,
         input.session.edge_profile_cwd,
         input.session.edge_profile_git_branch,
@@ -1143,14 +1160,8 @@ pub(crate) fn assemble_bridge_context(
     let volatile_preamble_count = usize::from(outcome.dynamic_system.is_some());
     let tool_schema_count = outcome.tool_schemas.len();
     let compaction_tier = format!("{:?}", outcome.tier);
-    let model_context_window_tokens = u32::try_from(
-        crate::prompts::budget_for_model_with_override(
-            Some(input.session.model_id),
-            input.session.context_window,
-        )
-        .model_limit,
-    )
-    .unwrap_or(u32::MAX);
+    let model_context_window_tokens =
+        u32::try_from(window_policy.raw_context_window_tokens).unwrap_or(u32::MAX);
     BridgeContextAssemblyOutput {
         primary_system: outcome.primary_system,
         dynamic_system: outcome.dynamic_system,
@@ -1163,6 +1174,7 @@ pub(crate) fn assemble_bridge_context(
             provider: input.session.provider.to_string(),
             model_name: input.session.model_id.to_string(),
             model_context_window_tokens,
+            context_window_policy: window_policy,
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
@@ -1287,14 +1299,14 @@ pub(crate) fn assemble_context_pipeline(
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
     // `SessionContext::model_limit` is different: it must be the concrete
     // model context window used for section budgeting and pressure planning.
-    let model_context_limit = u64::try_from(
-        crate::prompts::budget_for_model_with_override(
-            Some(input.model_name),
-            input.context_window,
-        )
-        .model_limit,
+    let window_policy = crate::prompts::budget_for_model_with_metadata(
+        Some(input.model_name),
+        input.context_window,
+        input.max_completion_tokens,
     )
-    .unwrap_or(u64::MAX);
+    .window_policy();
+    let model_context_limit =
+        u64::try_from(window_policy.usable_input_limit_tokens).unwrap_or(u64::MAX);
     let session_current_date = resolve_pipeline_session_current_date(
         state.pipeline_session.as_ref(),
         state.context_manifest_user_id.as_deref(),
@@ -1312,6 +1324,8 @@ pub(crate) fn assemble_context_pipeline(
         &session_current_date,
         state.context_manifest_user_id.as_deref(),
     );
+    session_ctx.pre_reserved_output_tokens =
+        u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX);
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
@@ -1465,7 +1479,8 @@ pub(crate) fn assemble_context_pipeline(
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
     let tier = pipeline_output.plan.compact_tier;
     let compaction_tier = format!("{:?}", tier);
-    let model_context_window_tokens = u32::try_from(model_context_limit).unwrap_or(u32::MAX);
+    let model_context_window_tokens =
+        u32::try_from(window_policy.raw_context_window_tokens).unwrap_or(u32::MAX);
 
     Ok(LlmContextAssemblyOutput {
         system_messages,
@@ -1480,6 +1495,7 @@ pub(crate) fn assemble_context_pipeline(
             provider: input.provider.to_string(),
             model_name: input.model_name.to_string(),
             model_context_window_tokens,
+            context_window_policy: window_policy,
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
@@ -2367,6 +2383,7 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
             context_window: Some(1_000_000),
+            max_completion_tokens: Some(64_000),
             cache_capability: Some(strict_history),
             user_content: "which model are you?",
             query_source: "test",
@@ -2484,6 +2501,7 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "gpt-4",
             context_window: Some(200_000),
+            max_completion_tokens: Some(16_384),
             cache_capability: None,
             user_content: "hello",
             query_source: "test",
@@ -2831,6 +2849,8 @@ mod context_cache_contract_tests {
                 tokens_before: 12_000,
                 tokens_after: 7_000,
                 tokens_saved: 5_000,
+                post_compaction_target_tokens: Some(7_000),
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient,
             },
         ];
 

@@ -42,6 +42,7 @@ pub(crate) fn observe_context_compaction(
     result: &CompactResult,
     fixed_context: &[Value],
     visible_tools: &[Value],
+    window_policy: Option<crate::prompts::ContextWindowPolicy>,
 ) -> Option<astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation> {
     result.boundary.as_ref()?;
     if result.messages == history_before {
@@ -63,6 +64,17 @@ pub(crate) fn observe_context_compaction(
         return None;
     }
 
+    let post_compaction_target_tokens = window_policy
+        .map(|policy| u64::try_from(policy.post_compaction_target_tokens()).unwrap_or(u64::MAX));
+    let effectiveness = match post_compaction_target_tokens {
+        Some(target) if tokens_after <= target => {
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient
+        }
+        Some(_) => {
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
+        }
+        None => astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
+    };
     Some(
         astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
             id: id.into(),
@@ -73,6 +85,8 @@ pub(crate) fn observe_context_compaction(
             tokens_before,
             tokens_after,
             tokens_saved: tokens_before - tokens_after,
+            post_compaction_target_tokens,
+            effectiveness,
         },
     )
 }
@@ -86,6 +100,7 @@ pub(crate) fn observe_context_compaction(
 pub(crate) struct WireBudgetStatus {
     pub estimated_input_tokens: usize,
     pub requested_output_tokens: usize,
+    pub reserved_protocol_tokens: usize,
     pub effective_input_limit: usize,
     pub model_limit: usize,
 }
@@ -100,6 +115,7 @@ impl WireBudgetStatus {
     pub fn hard_limit_exceeded(self) -> bool {
         self.estimated_input_tokens
             .saturating_add(self.requested_output_tokens)
+            .saturating_add(self.reserved_protocol_tokens)
             > self.model_limit
     }
 
@@ -108,6 +124,7 @@ impl WireBudgetStatus {
         serde_json::json!({
             "estimated_input_tokens": self.estimated_input_tokens,
             "requested_output_tokens": self.requested_output_tokens,
+            "reserved_protocol_tokens": self.reserved_protocol_tokens,
             "effective_input_limit": self.effective_input_limit,
             "model_limit": self.model_limit,
             "soft_target_exceeded": self.soft_target_exceeded(),
@@ -117,44 +134,50 @@ impl WireBudgetStatus {
     }
 }
 
-pub(crate) fn wire_budget_status(
+pub(crate) fn wire_budget_status_with_metadata(
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
     context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
     requested_output_tokens: usize,
 ) -> WireBudgetStatus {
-    const PROVIDER_FRAMING_TOKENS: usize = 300;
     let tool_tokens = tools
         .iter()
         .map(crate::prompts::estimate_json_value_tokens)
         .sum();
     let estimated_input_tokens =
-        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens)
-            .total_tokens
-            .saturating_add(PROVIDER_FRAMING_TOKENS);
-    let budget = crate::prompts::budget_for_model_with_override(Some(model_name), context_window);
+        crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens).total_tokens;
+    let budget = crate::prompts::budget_for_model_with_metadata(
+        Some(model_name),
+        context_window,
+        max_completion_tokens,
+    );
+    let policy = budget.window_policy();
     WireBudgetStatus {
         estimated_input_tokens,
         requested_output_tokens,
+        reserved_protocol_tokens: policy.reserved_protocol_tokens,
         effective_input_limit: budget.effective_input_limit(),
         model_limit: budget.model_limit,
     }
 }
 
-pub(crate) fn augment_manifest_trace_with_wire_budget(
+pub(crate) fn augment_manifest_trace_with_wire_budget_and_metadata(
     trace: &mut Value,
     messages: &[Value],
     tools: &[Value],
     model_name: &str,
     context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
     requested_output_tokens: usize,
 ) -> WireBudgetStatus {
-    let status = wire_budget_status(
+    let status = wire_budget_status_with_metadata(
         messages,
         tools,
         model_name,
         context_window,
+        max_completion_tokens,
         requested_output_tokens,
     );
     if !trace.is_object() {
@@ -934,6 +957,14 @@ mod tests {
             &result,
             &[json!({"role": "system", "content": "fixed"})],
             &[json!({"type": "function", "function": {"name": "lookup"}})],
+            Some(
+                crate::prompts::budget_for_model_with_metadata(
+                    Some("model"),
+                    Some(10_000),
+                    Some(1_000),
+                )
+                .window_policy(),
+            ),
         )
         .expect("a shrinking boundary is observable");
 
@@ -945,6 +976,11 @@ mod tests {
         assert_eq!(
             observation.tokens_saved,
             observation.tokens_before - observation.tokens_after
+        );
+        assert!(observation.post_compaction_target_tokens.is_some());
+        assert_eq!(
+            observation.effectiveness,
+            astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient
         );
         assert!(observation.is_consistent());
     }
@@ -970,7 +1006,8 @@ mod tests {
                 &messages,
                 &no_boundary,
                 &[],
-                &[]
+                &[],
+                None
             )
             .is_none()
         );
@@ -990,7 +1027,8 @@ mod tests {
                 &messages,
                 &unchanged,
                 &[],
-                &[]
+                &[],
+                None
             )
             .is_none()
         );
@@ -1098,17 +1136,19 @@ mod tests {
             "content": [{"type": "text", "text": "你好世界".repeat(400)}]
         })];
         let mut trace = json!({"wire": {"message_count": 1}});
-        let status = augment_manifest_trace_with_wire_budget(
+        let status = augment_manifest_trace_with_wire_budget_and_metadata(
             &mut trace,
             &messages,
             &[],
             "model",
             Some(1_000),
+            None,
             100,
         );
 
         assert!(status.soft_target_exceeded());
         assert!(status.hard_limit_exceeded());
+        assert_eq!(status.reserved_protocol_tokens, 300);
         assert_eq!(trace["wire"]["message_count"], 1);
         assert_eq!(
             trace["wire"]["budget"]["enforcement"],

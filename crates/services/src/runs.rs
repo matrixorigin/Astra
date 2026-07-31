@@ -11188,6 +11188,7 @@ mod tests {
                 cache_capability: None,
                 request_body_overrides: None,
                 context_window: Some(128_000),
+                max_completion_tokens: Some(16_384),
                 header_overrides: HashMap::new(),
                 completions_url_override: None,
                 request_timeout_ms: None,

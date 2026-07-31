@@ -83,6 +83,7 @@ impl ModelService for StaticTestModelService {
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(128_000),
+                max_completion_tokens: Some(16_384),
                 request_headers: None,
             },
         })

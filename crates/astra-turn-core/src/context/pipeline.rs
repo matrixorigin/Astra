@@ -149,6 +149,7 @@ impl ContextPipeline {
         let preliminary_plan_input = PlanInput {
             tokens: input.tokens,
             model_limit: input.model_limit,
+            pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,
             recovery: input.recovery,
             latches: input.latches,
             stats: input.sources.stats,
@@ -180,6 +181,7 @@ impl ContextPipeline {
         let final_plan_input = PlanInput {
             tokens: &measured,
             model_limit: input.model_limit,
+            pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,
             recovery: input.recovery,
             latches: input.latches,
             stats: input.sources.stats,

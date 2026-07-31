@@ -257,6 +257,13 @@ pub struct SessionContext {
     pub run_id: String,
     pub model_id: String,
     pub provider_name: String,
+    /// Output capacity already excluded from `model_limit` by the runtime's
+    /// resolved context-window policy. The planner applies only predicted
+    /// output growth beyond this guarantee.
+    pub pre_reserved_output_tokens: u32,
+    /// Prompt-side capacity presented to the planner. Runtime paths resolve
+    /// this after static output/summary/protocol reserves; legacy callers
+    /// with no pre-reserve retain the shared-window behavior.
     pub model_limit: u32,
     pub provider_policy: ProviderCachePolicy,
     pub provider_strategy: ProviderCacheStrategy,

@@ -98,7 +98,16 @@ async fn schema_rationalization_runtime_contract() {
     }
 
     let prompt_deltas = column_names(&pool, &schema, "prompt_deltas").await;
-    for expected in ["user_id", "session_id", "request_id", "delta_seq"] {
+    for expected in [
+        "user_id",
+        "session_id",
+        "request_id",
+        "delta_seq",
+        "chunk_tokens",
+        "chunk_bytes",
+        "previous_chunk_tokens",
+        "previous_chunk_bytes",
+    ] {
         assert!(
             prompt_deltas.iter().any(|column| column == expected),
             "prompt_deltas missing explicit owner-bound key column {expected}"

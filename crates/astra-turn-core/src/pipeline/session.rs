@@ -742,6 +742,7 @@ mod tests {
             run_id: "run-1".into(),
             model_id: "claude-sonnet-4-6".into(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: 200_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),

@@ -2633,7 +2633,14 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     .await
     .expect("seed owner session");
 
-    let first_messages = [serde_json::json!({"role": "user", "content": "stable"})];
+    let first_messages = (0..260)
+        .map(|index| {
+            serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("stable-{index}"),
+            })
+        })
+        .collect::<Vec<_>>();
     let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
@@ -2663,7 +2670,16 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     )
     .await
     .expect("persist first prompt");
-    assert_eq!(first.delta_counts.append, 1);
+    assert_eq!(first.delta_counts.append, 260);
+    assert!(
+        first.delta_counts.token_weights.append > 0,
+        "new prompt chunks must carry token-weighted delta evidence"
+    );
+    assert_eq!(
+        first.delta_counts.token_weights.tokenizer_revision,
+        astra_turn_types::token_estimate::CANONICAL_JSON_TOKENIZER_REVISION
+    );
+    assert!(first.delta_counts.token_weights.complete);
 
     sqlx::query(
         "INSERT INTO prompt_deltas
@@ -2713,10 +2729,50 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         second.previous_request_id.as_deref(),
         Some(first.request_id.as_str())
     );
-    assert_eq!(second.delta_counts.reuse, 1);
+    assert_eq!(second.delta_counts.reuse, 260);
+    assert_eq!(
+        second.delta_counts.token_weights.reuse, first.delta_counts.token_weights.append,
+        "the same retained chunk must preserve its tokenizer-independent weight"
+    );
     assert_eq!(
         second.delta_counts.drop, 0,
         "foreign prompt_deltas rows with the same request_id must not affect owner diffing"
+    );
+    assert!(second.delta_counts.token_weights.complete);
+
+    let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+        user_id: &owner_user_id,
+        session_id: &session_id,
+        turn: 3,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &first_messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("third prompt plan");
+    let third = astra_services::persist_prompt_request(
+        &shared,
+        &astra_services::PromptRequestPersistInput {
+            session_id: session_id.clone(),
+            user_id: owner_user_id.clone(),
+            run_id: None,
+            turn: 3,
+            round: 0,
+            attempt: 0,
+            source: "turn".into(),
+            model: "test-model".into(),
+            provider: "other-provider".into(),
+        },
+        &third_plan,
+    )
+    .await
+    .expect("persist provider-change prompt");
+    assert_eq!(third.delta_counts.reuse, 260);
+    assert!(
+        !third.delta_counts.token_weights.complete,
+        "provider changes must not claim cache evidence from another namespace"
     );
 
     cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])

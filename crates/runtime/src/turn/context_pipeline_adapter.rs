@@ -730,6 +730,7 @@ pub(crate) fn build_session_context(
         run_id: run_id.unwrap_or_default().to_string(),
         model_id: model_name.to_string(),
         provider_name: provider.to_string(),
+        pre_reserved_output_tokens: 0,
         model_limit: u32::try_from(max_input_tokens).unwrap_or(u32::MAX),
         provider_policy,
         provider_strategy,

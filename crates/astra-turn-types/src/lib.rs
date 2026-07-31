@@ -22,6 +22,7 @@ mod session_cursor;
 pub mod session_facts;
 mod session_fork;
 mod session_handoff;
+pub mod token_estimate;
 mod tool_idempotency;
 mod tool_invocation;
 mod user_intent;
@@ -100,8 +101,8 @@ pub use session_cursor::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
-    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
-    canonical_conversation_serialized_len, json_serialized_len,
+    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_identity,
+    canonical_conversation_root, canonical_conversation_serialized_len, json_serialized_len,
 };
 pub use session_fork::{
     ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,

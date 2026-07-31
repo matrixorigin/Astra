@@ -46,6 +46,18 @@ pub struct BridgeInjectionFingerprints {
 /// The bridge may emit `context_meta` more than once for one HTTP turn, so
 /// `id` is stable within that turn and lets consumers de-duplicate repeated
 /// snapshots without conflating distinct retry compactions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCompactionEffectiveness {
+    /// Older producers did not carry the resolved window policy.
+    #[default]
+    Unmeasured,
+    /// Occupancy landed at least ten percentage points below the trigger.
+    Sufficient,
+    /// Tokens were removed, but occupancy did not reach the policy target.
+    Insufficient,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ContextCompactionObservation {
     pub id: String,
@@ -56,6 +68,10 @@ pub struct ContextCompactionObservation {
     pub tokens_before: u64,
     pub tokens_after: u64,
     pub tokens_saved: u64,
+    #[serde(default)]
+    pub post_compaction_target_tokens: Option<u64>,
+    #[serde(default)]
+    pub effectiveness: ContextCompactionEffectiveness,
 }
 
 impl ContextCompactionObservation {
@@ -65,10 +81,22 @@ impl ContextCompactionObservation {
     /// provider text or human-facing labels.
     #[must_use]
     pub fn is_consistent(&self) -> bool {
+        let effectiveness_consistent =
+            match (self.post_compaction_target_tokens, self.effectiveness) {
+                (None, ContextCompactionEffectiveness::Unmeasured) => true,
+                (Some(target), ContextCompactionEffectiveness::Sufficient) => {
+                    self.tokens_after <= target
+                }
+                (Some(target), ContextCompactionEffectiveness::Insufficient) => {
+                    self.tokens_after > target
+                }
+                _ => false,
+            };
         !self.id.trim().is_empty()
             && self.messages_before >= self.messages_after
             && self.tokens_before >= self.tokens_after
             && self.tokens_saved == self.tokens_before - self.tokens_after
+            && effectiveness_consistent
     }
 }
 

@@ -386,6 +386,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         session_id,
         model_id,
         context_window,
+        0,
         provider,
         edge_profile_cwd,
         edge_profile_git_branch,
@@ -415,6 +416,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     session_id: &str,
     model_id: &str,
     context_window: Option<u32>,
+    pre_reserved_output_tokens: u32,
     provider: &str,
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
@@ -540,6 +542,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         run_id: String::new(),
         model_id: model_id.to_string(),
         provider_name: provider.to_string(),
+        pre_reserved_output_tokens,
         model_limit: saturating_usize_to_u32(
             crate::prompts::budget_for_model_with_override(Some(model_id), context_window)
                 .model_limit,
@@ -1223,6 +1226,7 @@ mod tests {
             "sid-long-running-bridge",
             "model-with-explicit-window",
             Some(8_000),
+            0,
             "openai",
             None,
             None,

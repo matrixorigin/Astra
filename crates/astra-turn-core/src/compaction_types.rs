@@ -56,50 +56,27 @@ impl CompactionTier {
         self.max(min_tier)
     }
 
-    // ── Adaptive thresholds (context-window aware) ─────────────────
+    // ── Resolved-policy thresholds ──────────────────────────────────
 
-    /// Pre-turn compaction trigger pressure, scaled to model context window.
-    ///
-    /// Smaller context windows need earlier compaction because the same
-    /// pressure ratio leaves less absolute token headroom. For example,
-    /// a 32 K model at 80% has only 6.4 K free — barely enough for one
-    /// tool output — while a 200 K model at 80% still has 40 K free.
+    /// Pre-turn trigger measured against the already-resolved usable-input
+    /// limit. The limit, rather than this ratio, carries catalog and reserve
+    /// differences; branching on raw window size here would apply a second,
+    /// unmeasured heuristic.
     #[must_use]
-    pub fn pre_turn_trigger(max_tokens: u64) -> f64 {
-        match max_tokens {
-            ..=32_767 => 0.70,        // ≤32 K: compact at 70%
-            32_768..=65_535 => 0.75,  // 32 K–65 K: compact at 75%
-            65_536..=131_071 => 0.80, // 65 K–128 K: compact at 80%
-            _ => 0.85,                // ≥128 K: compact at 85%
-        }
+    pub fn pre_turn_trigger(_usable_input_tokens: u64) -> f64 {
+        crate::context_budget::PRESSURE_COMPACT_HISTORY
     }
 
-    /// Pre-turn pressure-warning threshold, scaled to model context window.
-    ///
-    /// Always 10 points below the trigger so the user gets a heads-up
-    /// before compaction fires.
+    /// Warn ten percentage points before the resolved trigger.
     #[must_use]
-    pub fn pre_turn_warning(max_tokens: u64) -> f64 {
-        match max_tokens {
-            ..=32_767 => 0.60,
-            32_768..=65_535 => 0.65,
-            65_536..=131_071 => 0.70,
-            _ => 0.75,
-        }
+    pub fn pre_turn_warning(_usable_input_tokens: u64) -> f64 {
+        crate::context_budget::PRESSURE_COMPACT_HISTORY - 0.10
     }
 
-    /// Aggressive-compaction trigger pressure, scaled to model context window.
-    ///
-    /// When pressure exceeds this threshold, the aggressive pipeline
-    /// (summarising entire history) fires instead of the default pipeline.
-    /// Always above `pre_turn_trigger` by ~15 points, capped at 0.95.
+    /// Aggressive trigger shared with the pipeline budget selector.
     #[must_use]
-    pub fn aggressive_trigger(max_tokens: u64) -> f64 {
-        match max_tokens {
-            ..=32_767 => 0.85,
-            32_768..=65_535 => 0.90,
-            _ => 0.95,
-        }
+    pub fn aggressive_trigger(_usable_input_tokens: u64) -> f64 {
+        crate::context_budget::PRESSURE_AGGRESSIVE_PRUNE
     }
 }
 
@@ -356,104 +333,21 @@ mod tests {
         assert_eq!(ev.tokens_after, 82_000);
     }
 
-    // ── Adaptive thresholds ────────────────────────────────────────
-
     #[test]
-    fn pre_turn_trigger_decreases_for_small_windows() {
-        // 16 K window = tiny → compact at 70%
-        assert!((CompactionTier::pre_turn_trigger(16_000) - 0.70).abs() < 0.01);
-        // 32 K window = small → compact at 70%
-        assert!((CompactionTier::pre_turn_trigger(32_000) - 0.70).abs() < 0.01);
-        // 48 K window = medium → compact at 75%
-        assert!((CompactionTier::pre_turn_trigger(48_000) - 0.75).abs() < 0.01);
-        // 65 K window = standard → compact at 80%
-        assert!((CompactionTier::pre_turn_trigger(65_536) - 0.80).abs() < 0.01);
-        // 132 K window = large (128 K model) → compact at 85%
-        assert!((CompactionTier::pre_turn_trigger(131_072) - 0.85).abs() < 0.01);
-        // 200 K window = huge → compact at 85%
-        assert!((CompactionTier::pre_turn_trigger(200_000) - 0.85).abs() < 0.01);
-    }
-
-    #[test]
-    fn pre_turn_warning_is_below_trigger() {
-        for max_tokens in [16_000u64, 32_000, 48_000, 65_536, 128_000, 200_000] {
-            let trigger = CompactionTier::pre_turn_trigger(max_tokens);
-            let warning = CompactionTier::pre_turn_warning(max_tokens);
-            assert!(
-                warning < trigger,
-                "warning={warning} must be below trigger={trigger} for {max_tokens}-token window"
+    fn resolved_policy_thresholds_do_not_reclassify_raw_window_sizes() {
+        for usable_input_tokens in [16_000_u64, 32_000, 65_536, 200_000, 1_000_000] {
+            assert_eq!(
+                CompactionTier::pre_turn_trigger(usable_input_tokens),
+                crate::context_budget::PRESSURE_COMPACT_HISTORY
+            );
+            assert_eq!(
+                CompactionTier::aggressive_trigger(usable_input_tokens),
+                crate::context_budget::PRESSURE_AGGRESSIVE_PRUNE
+            );
+            assert_eq!(
+                CompactionTier::pre_turn_warning(usable_input_tokens),
+                crate::context_budget::PRESSURE_COMPACT_HISTORY - 0.10
             );
         }
-    }
-
-    #[test]
-    fn pre_turn_thresholds_are_stable_at_boundaries() {
-        // Just below and just above each boundary should produce similar triggers.
-        // f64 representation of 0.05 may overshoot due to binary rounding —
-        // using 0.055 epsilon accounts for this.
-        assert!(
-            (CompactionTier::pre_turn_trigger(32_767) - CompactionTier::pre_turn_trigger(32_768))
-                .abs()
-                <= 0.055
-        );
-        assert!(
-            (CompactionTier::pre_turn_trigger(65_535) - CompactionTier::pre_turn_trigger(65_536))
-                .abs()
-                <= 0.055
-        );
-    }
-
-    #[test]
-    fn aggressive_trigger_above_pre_turn_trigger() {
-        for max_tokens in [16_000u64, 32_000, 48_000, 65_536, 131_072, 200_000] {
-            let trigger = CompactionTier::pre_turn_trigger(max_tokens);
-            let aggressive = CompactionTier::aggressive_trigger(max_tokens);
-            assert!(
-                aggressive > trigger,
-                "aggressive={aggressive} must be above trigger={trigger} for {max_tokens}-token window"
-            );
-        }
-    }
-
-    #[test]
-    fn pre_turn_trigger_at_128k_boundary_is_correct() {
-        // 131071 (just below 128K) → 0.80 (standard window)
-        // 131072 (128K exactly) → 0.85 (large window)
-        let below = CompactionTier::pre_turn_trigger(131_071);
-        let at = CompactionTier::pre_turn_trigger(131_072);
-        let above = CompactionTier::pre_turn_trigger(131_073);
-
-        assert!(
-            (below - 0.80).abs() < 0.01,
-            "131071 should be ~0.80 (standard), got {below}"
-        );
-        assert!(
-            (at - 0.85).abs() < 0.01,
-            "131072 should be ~0.85 (large), got {at}"
-        );
-        assert!(
-            at > below,
-            "trigger must step up at 128K boundary: {below} → {at}"
-        );
-        assert!(
-            (above - 0.85).abs() < 0.01,
-            "131073 should stay at ~0.85 (large), got {above}"
-        );
-    }
-
-    #[test]
-    fn aggressive_trigger_at_128k_boundary() {
-        let below = CompactionTier::aggressive_trigger(131_071);
-        let at = CompactionTier::aggressive_trigger(131_072);
-
-        assert!(
-            at >= below,
-            "aggressive must not decrease at 128K: {below} → {at}"
-        );
-        // aggressive_trigger should be ≥ 0.90 for large windows.
-        assert!(
-            at >= 0.90,
-            "aggressive trigger at 128K must be at least 0.90, got {at}"
-        );
     }
 }

@@ -347,6 +347,7 @@ mod tests {
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(32_000),
+                    max_completion_tokens: Some(4_096),
                     request_headers: Some(serde_json::Map::from_iter([(
                         "x-offering-route".into(),
                         serde_json::Value::String("admitted".into()),

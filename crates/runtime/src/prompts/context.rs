@@ -266,20 +266,110 @@ pub struct ContextBudget {
     pub keep_recent_turns: usize,
     /// Max chars for memory retrieval injection.
     pub memory_budget_chars: usize,
-    /// Fraction of model_limit reserved for output generation.
-    /// `effective_input_limit = model_limit * (1.0 - output_reserve_ratio)`.
+    /// Compatibility ratio for direct construction. Production constructors
+    /// resolve exact token reserves in [`ContextWindowPolicy`].
     pub output_reserve_ratio: f64,
     /// LLM-based compaction summary configuration.
     pub compact_config: CompactConfig,
+    /// Exact resolved policy for production paths. `None` is retained only
+    /// for direct construction in compatibility tests and embedded callers.
+    pub(crate) resolved_policy: Option<ContextWindowPolicy>,
 }
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+pub const DEFAULT_OUTPUT_RESERVE_TOKENS: usize = 16_384;
+pub const DEFAULT_PROTOCOL_RESERVE_TOKENS: usize = 300;
+
+/// Provenance for a resolved context-window policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextWindowPolicySource {
+    /// Both the raw window and completion limit came from the model catalog.
+    ModelCatalog,
+    /// The catalog supplied only part of the limit metadata.
+    PartialModelCatalog,
+    /// No catalog window was available, so the documented generic fallback
+    /// was used. No model-name matching is performed.
+    GenericFallback,
+}
+
+/// One exact token policy shared by assembly, wire preflight, trace, and
+/// compaction-effectiveness checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ContextWindowPolicy {
+    pub raw_context_window_tokens: usize,
+    pub usable_input_limit_tokens: usize,
+    pub reserved_output_tokens: usize,
+    pub reserved_summary_tokens: usize,
+    pub reserved_protocol_tokens: usize,
+    pub auto_compact_trigger_tokens: usize,
+    pub hard_input_limit_tokens: usize,
+    pub source: ContextWindowPolicySource,
+}
+
+impl ContextWindowPolicy {
+    #[must_use]
+    pub fn resolve(
+        context_window_tokens: Option<u32>,
+        max_completion_tokens: Option<u32>,
+        summary_reserve_tokens: usize,
+        compact_threshold: f64,
+    ) -> Self {
+        let catalog_context_window = context_window_tokens.filter(|tokens| *tokens > 0);
+        let catalog_max_completion = max_completion_tokens.filter(|tokens| *tokens > 0);
+        let raw = catalog_context_window
+            .map(|tokens| tokens as usize)
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
+        // Catalog metadata is authoritative. The fallback is one fixed
+        // documented reserve, clamped only to keep malformed/tiny windows
+        // arithmetically valid; it never branches on provider/model text.
+        let output = catalog_max_completion
+            .map(|tokens| tokens as usize)
+            .unwrap_or_else(|| DEFAULT_OUTPUT_RESERVE_TOKENS.min((raw / 4).max(1)))
+            .min(raw.saturating_sub(1));
+        let protocol = DEFAULT_PROTOCOL_RESERVE_TOKENS.min(raw.saturating_sub(output));
+        let hard_input = raw.saturating_sub(output).saturating_sub(protocol);
+        let summary = summary_reserve_tokens.min(hard_input / 4);
+        let usable_input = hard_input.saturating_sub(summary);
+        let threshold = if compact_threshold.is_finite() {
+            compact_threshold.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let auto_compact_trigger = (usable_input as f64 * threshold)
+            .floor()
+            .min(usize::MAX as f64) as usize;
+        let source = match (catalog_context_window, catalog_max_completion) {
+            (Some(_), Some(_)) => ContextWindowPolicySource::ModelCatalog,
+            (Some(_), None) | (None, Some(_)) => ContextWindowPolicySource::PartialModelCatalog,
+            (None, None) => ContextWindowPolicySource::GenericFallback,
+        };
+        Self {
+            raw_context_window_tokens: raw,
+            usable_input_limit_tokens: usable_input,
+            reserved_output_tokens: output,
+            reserved_summary_tokens: summary,
+            reserved_protocol_tokens: protocol,
+            auto_compact_trigger_tokens: auto_compact_trigger,
+            hard_input_limit_tokens: hard_input,
+            source,
+        }
+    }
+
+    /// Exit-gate target: a successful compaction must land at least ten
+    /// percentage points below the trigger, measured against usable input.
+    #[must_use]
+    pub fn post_compaction_target_tokens(self) -> usize {
+        self.auto_compact_trigger_tokens
+            .saturating_sub(self.usable_input_limit_tokens / 10)
+    }
+}
 
 impl ContextBudget {
-    /// Create a ContextBudget from RuntimeConfig, applying model-specific limits.
+    /// Create a ContextBudget from RuntimeConfig and explicit catalog limits.
     ///
     /// This bridges RuntimeConfig's strategy parameters with model-aware defaults.
-    /// - Model limit and output reserve come from the model name
+    /// - Model limit comes from metadata or the generic fallback
     /// - compact_threshold, keep_recent_turns come from RuntimeConfig.compression
     /// - memory_budget_chars comes from RuntimeConfig.memory.max_memory_tokens
     pub fn from_runtime_config(
@@ -298,6 +388,13 @@ impl ContextBudget {
     ) -> Self {
         // Get model-specific limits
         let base = budget_for_model_with_override(model, context_window_tokens);
+        let compact_config = CompactConfig::from_env();
+        let resolved_policy = ContextWindowPolicy::resolve(
+            context_window_tokens,
+            None,
+            compact_config.summary_token_budget,
+            config.compression.compression_threshold,
+        );
 
         // Apply RuntimeConfig overrides
         Self {
@@ -309,19 +406,40 @@ impl ContextBudget {
             keep_recent_turns: config.compression.preserve_recent_turns as usize,
             // Convert max_memory_tokens to chars (rough: 4 chars/token avg)
             memory_budget_chars: (config.memory.max_memory_tokens as usize) * 4,
-            compact_config: CompactConfig::from_env(),
+            compact_config,
+            resolved_policy: Some(resolved_policy),
         }
     }
 
     /// Usable input token budget after reserving headroom for output.
     pub fn effective_input_limit(&self) -> usize {
-        (self.model_limit as f64 * (1.0 - self.output_reserve_ratio)) as usize
+        self.resolved_policy.map_or_else(
+            || (self.model_limit as f64 * (1.0 - self.output_reserve_ratio)) as usize,
+            |policy| policy.usable_input_limit_tokens,
+        )
     }
 
     /// Returns the token count at which auto-compact should trigger.
     /// Now based on `effective_input_limit` rather than raw `model_limit`.
     pub fn compact_trigger(&self) -> usize {
-        (self.effective_input_limit() as f64 * self.compact_threshold) as usize
+        self.resolved_policy.map_or_else(
+            || (self.effective_input_limit() as f64 * self.compact_threshold) as usize,
+            |policy| policy.auto_compact_trigger_tokens,
+        )
+    }
+
+    #[must_use]
+    pub fn window_policy(&self) -> ContextWindowPolicy {
+        self.resolved_policy.unwrap_or_else(|| {
+            let reserved_output =
+                (self.model_limit as f64 * self.output_reserve_ratio.clamp(0.0, 1.0)) as usize;
+            ContextWindowPolicy::resolve(
+                u32::try_from(self.model_limit).ok(),
+                u32::try_from(reserved_output).ok(),
+                0,
+                self.compact_threshold,
+            )
+        })
     }
 
     /// Whether the given token count exceeds the compact trigger.
@@ -368,6 +486,7 @@ impl Default for ContextBudget {
             memory_budget_chars: 8_000,
             output_reserve_ratio: 0.10,
             compact_config: CompactConfig::default(),
+            resolved_policy: None,
         }
     }
 }
@@ -389,41 +508,54 @@ pub fn budget_for_model(model: Option<&str>) -> ContextBudget {
 /// it is authoritative. When it is absent, use the generic 200K default rather
 /// than inferring from the model name.
 pub fn budget_for_model_with_override(
-    _model: Option<&str>,
+    model: Option<&str>,
     config_context_window: Option<u32>,
 ) -> ContextBudget {
-    let limit = config_context_window
-        .map(|cw| cw as usize)
-        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS);
-    let reserve = if limit >= 128_000 { 0.10 } else { 0.15 };
+    budget_for_model_with_metadata(model, config_context_window, None)
+}
 
+/// Resolve an exact context policy from trusted catalog metadata.
+///
+/// `model` is accepted for call-site compatibility and trace correlation but
+/// is deliberately not interpreted. Unknown/missing metadata follows one
+/// generic fallback rather than model-name or provider-name matching.
+pub fn budget_for_model_with_metadata(
+    _model: Option<&str>,
+    config_context_window: Option<u32>,
+    max_completion_tokens: Option<u32>,
+) -> ContextBudget {
+    let default = ContextBudget::default();
+    let policy = ContextWindowPolicy::resolve(
+        config_context_window,
+        max_completion_tokens,
+        default.compact_config.summary_token_budget,
+        default.compact_threshold,
+    );
     ContextBudget {
-        model_limit: limit,
-        output_reserve_ratio: reserve,
-        ..Default::default()
+        model_limit: policy.raw_context_window_tokens,
+        output_reserve_ratio: if policy.raw_context_window_tokens == 0 {
+            1.0
+        } else {
+            (policy.raw_context_window_tokens - policy.usable_input_limit_tokens) as f64
+                / policy.raw_context_window_tokens as f64
+        },
+        resolved_policy: Some(policy),
+        ..default
     }
 }
 
-/// Conservative default output token cap (8K) with escalation on `finish_reason: "length"`.
-///
-/// Default cap on output tokens — used for models with large context windows
-/// (≥128K). Smaller models keep 8K to preserve context headroom.
+/// Compatibility cap for directly constructed legacy budgets.
 const DEFAULT_OUTPUT_TOKEN_CAP: usize = 16_384;
 
-/// Fallback cap for models with smaller context windows (<128K).
-const SMALL_MODEL_OUTPUT_TOKEN_CAP: usize = 8192;
-
-/// Cap on output tokens that balances quality (longer code generation) with
-/// context headroom. Large-context models (≥128K) get 16K; smaller models
-/// get 8K. The existing escalation logic retries at 2× then 4× if truncated.
+/// Resolve the outbound cap. Production policies return the exact catalog
+/// completion limit. Direct legacy construction uses one documented fallback
+/// cap rather than inferring a model class from window size.
 pub fn capped_output_tokens(budget: &ContextBudget) -> usize {
-    let cap = if budget.model_limit >= 128_000 {
-        DEFAULT_OUTPUT_TOKEN_CAP
-    } else {
-        SMALL_MODEL_OUTPUT_TOKEN_CAP
-    };
+    if let Some(policy) = budget.resolved_policy {
+        return policy.reserved_output_tokens;
+    }
     let full_reserve = (budget.model_limit as f64 * budget.output_reserve_ratio) as usize;
-    full_reserve.min(cap)
+    full_reserve.min(DEFAULT_OUTPUT_TOKEN_CAP)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,36 +600,66 @@ mod tests {
         ] {
             let b = budget_for_model(model);
             assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
-            assert_eq!(b.output_reserve_ratio, 0.10);
+            assert_eq!(
+                b.window_policy().source,
+                ContextWindowPolicySource::GenericFallback
+            );
+            assert_eq!(
+                b.window_policy().reserved_output_tokens,
+                DEFAULT_OUTPUT_RESERVE_TOKENS
+            );
         }
     }
 
     #[test]
     fn test_budget_for_model_with_override() {
-        // override wins
+        // Explicit window metadata wins; model names remain inert.
         let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), Some(50_000));
         assert_eq!(b.model_limit, 50_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
+        assert_eq!(
+            b.window_policy().source,
+            ContextWindowPolicySource::PartialModelCatalog
+        );
 
-        // override for unknown model
         let b = budget_for_model_with_override(Some("unknown"), Some(100_000));
         assert_eq!(b.model_limit, 100_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
 
-        // small window gets 0.15 reserve
+        // A tiny catalog window is clamped arithmetically, not classified by
+        // provider/model family.
         let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), Some(10_000));
         assert_eq!(b.model_limit, 10_000);
-        assert_eq!(b.output_reserve_ratio, 0.15);
+        assert_eq!(b.window_policy().reserved_output_tokens, 2_500);
 
-        // no override uses the generic default; model names are not metadata
         let b = budget_for_model_with_override(Some("claude-sonnet-4-20250514"), None);
         assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
-        assert_eq!(b.output_reserve_ratio, 0.10);
 
-        // no override for unknown falls back to default
         let b = budget_for_model_with_override(Some("unknown-model"), None);
         assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
-        assert_eq!(b.output_reserve_ratio, 0.10);
+
+        let b = budget_for_model_with_metadata(Some("unknown-model"), Some(0), Some(0));
+        assert_eq!(b.model_limit, DEFAULT_CONTEXT_WINDOW_TOKENS);
+        assert_eq!(
+            b.window_policy().source,
+            ContextWindowPolicySource::GenericFallback
+        );
+    }
+
+    #[test]
+    fn catalog_completion_limit_drives_exact_one_million_token_policy() {
+        let budget =
+            budget_for_model_with_metadata(Some("opaque-model-id"), Some(1_000_000), Some(65_536));
+        let policy = budget.window_policy();
+
+        assert_eq!(policy.source, ContextWindowPolicySource::ModelCatalog);
+        assert_eq!(policy.raw_context_window_tokens, 1_000_000);
+        assert_eq!(policy.reserved_output_tokens, 65_536);
+        assert_eq!(policy.reserved_summary_tokens, 20_000);
+        assert_eq!(policy.reserved_protocol_tokens, 300);
+        assert_eq!(policy.hard_input_limit_tokens, 934_164);
+        assert_eq!(policy.usable_input_limit_tokens, 914_164);
+        assert_eq!(policy.auto_compact_trigger_tokens, 685_623);
+        assert_eq!(policy.post_compaction_target_tokens(), 594_207);
+        assert_eq!(capped_output_tokens(&budget), 65_536);
     }
 
     // === effective_input_limit (8→1) ===
@@ -508,13 +670,13 @@ mod tests {
         let b = ContextBudget::default();
         assert_eq!(b.effective_input_limit(), 180_000);
 
-        // model names do not change the default without registry metadata
+        // Resolution reserves exact output, summary, and protocol budgets.
         let b = budget_for_model(Some("claude-sonnet-4-20250514"));
-        assert_eq!(b.effective_input_limit(), 180_000);
+        assert_eq!(b.effective_input_limit(), 163_316);
 
-        // gpt-4o also uses the default without registry metadata
+        // Model names do not change the result.
         let b = budget_for_model(Some("gpt-4o-2024-08-06"));
-        assert_eq!(b.effective_input_limit(), 180_000);
+        assert_eq!(b.effective_input_limit(), 163_316);
 
         // less than model_limit
         let b = ContextBudget::default();
@@ -904,23 +1066,6 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(capped_output_tokens(&b), 0);
-
-        // exactly 128k boundary (large model cap)
-        let b = ContextBudget {
-            model_limit: 128_000,
-            output_reserve_ratio: 0.1,
-            ..Default::default()
-        };
-        assert_eq!(capped_output_tokens(&b), 12_800); // 128k*0.1=12800, min(12800,16384)=12800
-
-        // just below 128k (small model cap)
-        let b = ContextBudget {
-            model_limit: 127_999,
-            output_reserve_ratio: 0.15,
-            ..Default::default()
-        };
-        // full_reserve = 19199, min(19199, 8192) = 8192
-        assert_eq!(capped_output_tokens(&b), 8_192);
 
         // tiny 4k model
         let b = ContextBudget {

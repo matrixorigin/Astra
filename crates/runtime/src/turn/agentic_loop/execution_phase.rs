@@ -838,6 +838,11 @@ pub(crate) fn record_context_compactions<H: AgenticLoopHost>(
         state
             .compaction_effectiveness
             .record_compaction(tokens_freed);
+        if observation.effectiveness
+            == astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
+        {
+            state.compaction_effectiveness.mark_insufficient();
+        }
         state.step_recorder.record_compaction_with_kind(
             &observation.kind.to_string(),
             compacted_messages,
@@ -3258,6 +3263,8 @@ mod tests {
                 tokens_before: 15_000,
                 tokens_after: 9_000,
                 tokens_saved: 6_000,
+                post_compaction_target_tokens: None,
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
             },
             astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
                 id: "context_window_retry:1:1".to_string(),
@@ -3268,6 +3275,8 @@ mod tests {
                 tokens_before: 10_000,
                 tokens_after: 5_000,
                 tokens_saved: 5_000,
+                post_compaction_target_tokens: None,
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
             },
         ];
 

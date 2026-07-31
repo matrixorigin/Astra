@@ -2007,13 +2007,14 @@ impl InProcessChatTurnBridge {
             // Every production route reaches the adapter as the same admitted,
             // non-serializable execution material. The E2E hook only replaces
             // the physical provider call; it does not define another route.
-            let (model_name, wire_model_name, api_key, base_url, provider, request_body_overrides, cache_capability, model_context_window) = if use_e2e_llm {
+            let (model_name, wire_model_name, api_key, base_url, provider, request_body_overrides, cache_capability, model_context_window, model_max_completion_tokens) = if use_e2e_llm {
                 (
                     "bridge-e2e-mock".to_string(),
                     None::<String>,
                     "unused".to_string(),
                     "http://127.0.0.1:1".to_string(),
                     "openai".to_string(),
+                    None,
                     None,
                     None,
                     None,
@@ -2030,6 +2031,7 @@ impl InProcessChatTurnBridge {
                         admitted_model_execution.cache_capability,
                     ),
                     admitted_model_execution.context_window,
+                    admitted_model_execution.max_completion_tokens,
                 )
             };
             let (llm_header_overrides, completions_url_override, request_timeout) = if use_e2e_llm
@@ -2517,6 +2519,7 @@ impl InProcessChatTurnBridge {
                         &bridge_session_current_date,
                     )
                     .with_context_window(model_context_window)
+                    .with_max_completion_tokens(model_max_completion_tokens)
                     .with_skill_listing_block(skill_listing_hint_text.as_deref().unwrap_or("")),
                 },
             );
@@ -2631,6 +2634,14 @@ impl InProcessChatTurnBridge {
                     &compact_result,
                     &compaction_fixed_context,
                     &edge_tools,
+                    Some(
+                        crate::prompts::budget_for_model_with_metadata(
+                            Some(&model_name),
+                            model_context_window,
+                            model_max_completion_tokens,
+                        )
+                        .window_policy(),
+                    ),
                 )
                 {
                     context_compactions.push(observation);
@@ -2676,6 +2687,7 @@ impl InProcessChatTurnBridge {
                                             &bridge_session_current_date,
                                         )
                                         .with_context_window(model_context_window)
+                                        .with_max_completion_tokens(model_max_completion_tokens)
                                         .with_skill_listing_block(
                                             skill_listing_hint_text.as_deref().unwrap_or(""),
                                         ),
@@ -2753,9 +2765,10 @@ impl InProcessChatTurnBridge {
             let mut llm_steps: Vec<Value> = Vec::new();
 
             let llm_started = Instant::now();
-            let budget = crate::prompts::budget_for_model_with_override(
+            let budget = crate::prompts::budget_for_model_with_metadata(
                 Some(&model_name),
                 model_context_window,
+                model_max_completion_tokens,
             );
             let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
@@ -2940,12 +2953,13 @@ impl InProcessChatTurnBridge {
                         &llm_messages,
                         &pruned_tools,
                     );
-                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
                         &model_name,
                         model_context_window,
+                        model_max_completion_tokens,
                         max_output_tokens,
                     );
                     capture_request(&mut turn_event_buffer, &llm_messages, attempt_in_round);
@@ -3046,12 +3060,13 @@ impl InProcessChatTurnBridge {
                         &llm_messages,
                         &pruned_tools,
                     );
-                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                    crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
                         &model_name,
                         model_context_window,
+                        model_max_completion_tokens,
                         max_output_tokens,
                     );
 
@@ -3499,6 +3514,7 @@ impl InProcessChatTurnBridge {
                                 &compact_result,
                                 system_prefix,
                                 &round_edge_tools,
+                                Some(budget.window_policy()),
                             )
                             {
                                 context_compactions.push(observation);
@@ -3539,12 +3555,13 @@ impl InProcessChatTurnBridge {
                                 &llm_messages,
                                 &pruned_tools,
                             );
-                            crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                            crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                                 &mut bridge_manifest_trace_json,
                                 &llm_messages,
                                 &pruned_tools,
                                 &model_name,
                                 model_context_window,
+                                model_max_completion_tokens,
                                 max_output_tokens / 2,
                             );
                             attempt_in_round = attempt_in_round.saturating_add(1);
@@ -6437,6 +6454,7 @@ mod tests {
             &result,
             &[json!({"role": "system", "content": "stable"})],
             &[json!({"type": "function", "function": {"name": "read_file"}})],
+            None,
         )
         .expect("boundary must produce one observation");
 
@@ -6482,7 +6500,8 @@ mod tests {
                 &messages,
                 &result,
                 &[],
-                &[]
+                &[],
+                None
             )
             .is_none()
         );

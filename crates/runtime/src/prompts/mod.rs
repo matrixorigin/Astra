@@ -14,11 +14,11 @@ pub use astra_prompts::skills::{
     builtin_system_skills,
 };
 pub use context::{
-    CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget,
-    DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_SYSTEM_PROMPT_TOKENS, budget_for_model,
-    budget_for_model_with_override, capped_output_tokens, estimate_json_value_tokens,
-    estimate_str_tokens, estimate_tokens, estimate_tokens_cache_aware,
-    estimate_tokens_cache_aware_split,
+    CacheAwareEstimate, CompactConfig, CompactionTier, ContextBudget, ContextWindowPolicy,
+    ContextWindowPolicySource, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_SYSTEM_PROMPT_TOKENS,
+    budget_for_model, budget_for_model_with_metadata, budget_for_model_with_override,
+    capped_output_tokens, estimate_json_value_tokens, estimate_str_tokens, estimate_tokens,
+    estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
 };
 pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
 pub use system::{

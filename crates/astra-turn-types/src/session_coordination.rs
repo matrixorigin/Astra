@@ -4,8 +4,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
-    canonical_conversation_serialized_len,
+    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SessionCursorV1,
+    canonical_conversation_identity,
 };
 
 pub const SESSION_COORDINATION_SCHEMA_VERSION: u32 = 1;
@@ -249,8 +249,7 @@ fn segment_identity(
     }
     let message_count = u32::try_from(messages.len())
         .map_err(|_| SessionCoordinationValidationError::CountOverflow)?;
-    let canonical_root_hash = canonical_conversation_root(messages);
-    let canonical_bytes = canonical_conversation_serialized_len(messages);
+    let (canonical_root_hash, canonical_bytes) = canonical_conversation_identity(messages);
     let segment_hash = segment_hash(
         &key.isolation_domain,
         &key.owner_user_id,

@@ -7281,6 +7281,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
+            max_completion_tokens: None,
             request_headers: None,
         };
         let config = CloudLlmConfig::from_resolved(resolved);

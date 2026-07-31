@@ -27,6 +27,85 @@ pub const DEFAULT_SOURCE: &str = "main";
 /// At cap=10 that's negligible; raising this above ~64 should switch
 /// `source_order` to `VecDeque` or an indexed linked structure.
 const MAX_TRACKED_SOURCES: usize = 10;
+pub const MAX_WARM_CACHE_READ_SHARE_DROP: f64 = 0.05;
+
+/// Rollout gate derived from provider-reported warm-cache read share.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WarmCacheRolloutEvidence {
+    pub baseline_read_share: f64,
+    pub observed_read_share: f64,
+    pub percentage_point_drop: f64,
+    pub intentional_policy_change: bool,
+    pub decision: WarmCacheRolloutDecision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WarmCacheRolloutDecision {
+    Pass,
+    Blocked,
+    ExplainedPolicyChange,
+}
+
+/// Evaluate the Phase-6 warm-cache rollout gate.
+///
+/// Shares are fractions in `[0, 1]`. A drop strictly greater than five
+/// percentage points blocks rollout unless the caller supplies typed evidence
+/// that the cache loss is an intentional policy change.
+pub fn evaluate_warm_cache_rollout(
+    baseline_read_share: f64,
+    observed_read_share: f64,
+    intentional_policy_change: bool,
+) -> Result<WarmCacheRolloutEvidence, &'static str> {
+    if !baseline_read_share.is_finite()
+        || !observed_read_share.is_finite()
+        || !(0.0..=1.0).contains(&baseline_read_share)
+        || !(0.0..=1.0).contains(&observed_read_share)
+    {
+        return Err("warm-cache read shares must be finite fractions in [0, 1]");
+    }
+    let percentage_point_drop = (baseline_read_share - observed_read_share).max(0.0);
+    let decision = if percentage_point_drop <= MAX_WARM_CACHE_READ_SHARE_DROP + f64::EPSILON * 8.0 {
+        WarmCacheRolloutDecision::Pass
+    } else if intentional_policy_change {
+        WarmCacheRolloutDecision::ExplainedPolicyChange
+    } else {
+        WarmCacheRolloutDecision::Blocked
+    };
+    Ok(WarmCacheRolloutEvidence {
+        baseline_read_share,
+        observed_read_share,
+        percentage_point_drop,
+        intentional_policy_change,
+        decision,
+    })
+}
+
+#[cfg(test)]
+mod warm_cache_rollout_tests {
+    use super::*;
+
+    #[test]
+    fn five_point_drop_passes_but_larger_unexplained_drop_blocks() {
+        let boundary = evaluate_warm_cache_rollout(0.80, 0.75, false).expect("valid evidence");
+        assert_eq!(boundary.decision, WarmCacheRolloutDecision::Pass);
+
+        let blocked = evaluate_warm_cache_rollout(0.80, 0.749, false).expect("valid evidence");
+        assert_eq!(blocked.decision, WarmCacheRolloutDecision::Blocked);
+
+        let explained = evaluate_warm_cache_rollout(0.80, 0.70, true).expect("valid evidence");
+        assert_eq!(
+            explained.decision,
+            WarmCacheRolloutDecision::ExplainedPolicyChange
+        );
+    }
+
+    #[test]
+    fn invalid_share_is_rejected_instead_of_clamped() {
+        assert!(evaluate_warm_cache_rollout(1.1, 0.8, false).is_err());
+        assert!(evaluate_warm_cache_rollout(f64::NAN, 0.8, false).is_err());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Cache break classification
