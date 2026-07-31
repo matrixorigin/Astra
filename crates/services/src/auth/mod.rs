@@ -485,6 +485,7 @@ pub struct AuthRefreshRequestData {
 pub enum ReauthenticationPurpose {
     DeviceTrust,
     DeviceReenroll,
+    SessionForcedTakeover,
 }
 
 impl ReauthenticationPurpose {
@@ -492,6 +493,7 @@ impl ReauthenticationPurpose {
         match self {
             Self::DeviceTrust => "device_trust",
             Self::DeviceReenroll => "device_reenroll",
+            Self::SessionForcedTakeover => "session_forced_takeover",
         }
     }
 }

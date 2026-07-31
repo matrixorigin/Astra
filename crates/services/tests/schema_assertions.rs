@@ -1213,6 +1213,72 @@ async fn phase1_run_durability_schema_contract() {
         "authority audit identity must remain inside the owner isolation domain"
     );
     assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoff_slots").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "one active handoff slot must be serialized by the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_attachment_quarantines").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "quarantine_id"
+        ],
+        "divergent local roots must be quarantined inside the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_publish_receipts").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "local_event_id"
+        ],
+        "publish receipts must map local and Server roots inside the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_attachments").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "attachment_id"
+        ],
+        "attachments must never cross owner or branch boundaries"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoffs").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "handoff_id"
+        ],
+        "handoff records must carry the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoff_events").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "handoff_id",
+            "transition_seq"
+        ],
+        "handoff transitions require an owner-scoped monotonic identity"
+    );
+    assert_eq!(
         index_columns(
             &pool,
             &schema,

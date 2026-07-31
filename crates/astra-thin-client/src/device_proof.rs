@@ -12,6 +12,7 @@ pub const ASTRA_DEVICE_PROOF_HEADER: &str = "x-astra-device-proof";
 #[serde(rename_all = "snake_case")]
 pub enum DeviceProofPurpose {
     Hydrate,
+    Publish,
     Trust,
 }
 
@@ -19,6 +20,7 @@ impl DeviceProofPurpose {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Hydrate => "hydrate",
+            Self::Publish => "publish",
             Self::Trust => "trust",
         }
     }

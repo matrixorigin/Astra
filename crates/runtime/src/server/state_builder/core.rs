@@ -32,6 +32,18 @@ pub(super) fn build_core_state(
         astra_services::ExecutionGrantSigner::new(execution_grant_key.finalize().as_slice())
             .expect("SHA-256 derived execution grant key has the required length");
 
+    let session_context_coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
+        astra_services::DatabaseSessionContextCoordinator::new(shared_pool.clone()),
+    );
+    let session_handoff_service = Arc::new(astra_services::DatabaseSessionHandoffService::new(
+        shared_pool.clone(),
+        Arc::clone(&session_context_coordinator),
+    ));
+    let session_publish_service = Arc::new(astra_services::DatabaseSessionPublishService::new(
+        shared_pool.clone(),
+        Arc::clone(&session_context_coordinator),
+    ));
+
     AppState::new(
         ServiceInfo::default(),
         Arc::new(
@@ -41,11 +53,11 @@ pub(super) fn build_core_state(
     .with_cors_origins(settings.api.cors_origins.clone())
     .with_shared_pool(shared_pool.clone())
     .with_session_context_authority(
-        Arc::new(astra_services::DatabaseSessionContextCoordinator::new(
-            shared_pool.clone(),
-        )),
+        session_context_coordinator,
         Arc::new(execution_grant_signer),
     )
+    .with_session_handoff_service(session_handoff_service)
+    .with_session_publish_service(session_publish_service)
     .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
         shared_pool.get().clone(),
     )))

@@ -51,9 +51,11 @@ pub mod session_audit;
 pub mod session_checkpoint;
 pub mod session_context_coordinator;
 pub mod session_fork;
+pub mod session_handoff;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
 pub mod session_memory_inventory;
+pub mod session_publish;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
@@ -318,10 +320,20 @@ pub use session_context_coordinator::{
     AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
     FileSessionContextCoordinator, MaterializedConversationV1, ReserveTurnOutcome,
     SessionContextCoordinator, SessionContextCoordinatorError, SystemCoordinatorClock,
+    TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
 };
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
     ForkSessionResult, SessionForkBasisEvidenceV1, fork_local_session, verify_local_fork_basis,
+};
+pub use session_handoff::{
+    AttachSessionOutcomeV1, AttachSessionRequestV1, DatabaseSessionHandoffService,
+    FenceSessionWriterOutcomeV1, HandoffTransitionPatchV1, RequestSessionHandoffV1,
+    SessionHandoffError, TransitionSessionHandoffV1,
+};
+pub use session_publish::{
+    DatabaseSessionPublishService, PublishJournalItemV1, PublishSessionOutcomeV1,
+    PublishSessionRequestV1, SessionPublishError,
 };
 pub use skill_auto_route_judge::{
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,

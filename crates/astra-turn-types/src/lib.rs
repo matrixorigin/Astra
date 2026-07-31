@@ -6,6 +6,7 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
+mod canonical_tool_pairing;
 mod context_identity;
 mod context_window;
 mod inference;
@@ -19,6 +20,7 @@ mod semantic_read_cache;
 mod session_coordination;
 mod session_cursor;
 pub mod session_facts;
+mod session_handoff;
 mod tool_idempotency;
 mod tool_invocation;
 mod user_intent;
@@ -29,6 +31,7 @@ pub use agent_communication::{
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
+pub use canonical_tool_pairing::{CanonicalToolPairingError, validate_canonical_tool_pairing};
 pub use context_identity::{
     ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,
     LLM_ARTIFACT_EVIDENCE_MAX_ENTRIES, LlmArtifactEvidenceEntryV1, LlmArtifactEvidenceManifestV1,
@@ -98,6 +101,14 @@ pub use session_cursor::{
     DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
     SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
     canonical_conversation_serialized_len, json_serialized_len,
+};
+pub use session_handoff::{
+    HandoffOperationWatermarksV1, HandoffRiskEvidenceV1, MANIFEST_DELTA_SCHEMA_VERSION,
+    MAX_HANDOFF_EFFECT_IDENTITIES, ManifestDeltaV1, SESSION_ATTACHMENT_SCHEMA_VERSION,
+    SESSION_HANDOFF_SCHEMA_VERSION, SessionAttachmentModeV1, SessionAttachmentV1,
+    SessionHandoffModeV1, SessionHandoffRecordV1, SessionHandoffStateV1,
+    SessionHandoffValidationError, SessionPlacementV1, WorkspaceHandoffEvidenceV1,
+    valid_transition,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

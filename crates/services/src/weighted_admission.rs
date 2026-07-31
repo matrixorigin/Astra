@@ -427,12 +427,14 @@ async fn lock_distributed_admission_gate(
 async fn distributed_database_now(
     tx: &mut Transaction<'_, MySql>,
 ) -> Result<chrono::NaiveDateTime, DistributedAdmissionError> {
-    sqlx::query("SELECT NOW(6) AS admission_now")
-        .fetch_one(&mut **tx)
+    let unix_ms = crate::db_row::database_now_unix_ms(tx)
         .await
-        .map_err(|source| distributed_database_error("load_database_time", source))?
-        .try_get("admission_now")
-        .map_err(|source| distributed_database_error("decode_database_time", source))
+        .map_err(|source| distributed_database_error("load_database_time", source))?;
+    chrono::DateTime::from_timestamp_millis(unix_ms)
+        .map(|timestamp| timestamp.naive_utc())
+        .ok_or_else(|| {
+            DistributedAdmissionError::Invalid("database time is outside chrono range".into())
+        })
 }
 
 async fn load_distributed_reservation(

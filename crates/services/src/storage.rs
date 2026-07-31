@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v14";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v17";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2830,6 +2830,164 @@ async fn ensure_core_schema_while_leased(
                 (isolation_domain, owner_user_id, session_id, branch_id, created_at),
             INDEX idx_context_authority_outcome_created
                 (operation_kind, outcome, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_attachment_quarantines",
+        "CREATE TABLE IF NOT EXISTS session_attachment_quarantines (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            quarantine_id CHAR(36) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            observed_manifest_root CHAR(64) NOT NULL,
+            current_manifest_root CHAR(64) NULL,
+            reason VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, quarantine_id),
+            UNIQUE KEY uq_session_attachment_quarantine_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_attachment_quarantine_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_publish_receipts",
+        "CREATE TABLE IF NOT EXISTS session_publish_receipts (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            local_event_id VARCHAR(128) NOT NULL,
+            payload_hash VARCHAR(80) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            local_base_root CHAR(64) NOT NULL,
+            local_cursor_root CHAR(64) NOT NULL,
+            local_cursor_json LONGTEXT NOT NULL,
+            server_base_manifest_root CHAR(64) NULL,
+            server_manifest_root CHAR(64) NOT NULL,
+            server_cursor_json LONGTEXT NOT NULL,
+            segment_hashes_json LONGTEXT NOT NULL,
+            publish_state VARCHAR(16) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (
+                isolation_domain, owner_user_id, session_id, branch_id, local_event_id
+            ),
+            INDEX idx_session_publish_local_root (
+                isolation_domain, owner_user_id, session_id, branch_id, local_cursor_root
+            ),
+            INDEX idx_session_publish_server_root (
+                isolation_domain, owner_user_id, session_id, branch_id, server_manifest_root
+            )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoff_slots",
+        "CREATE TABLE IF NOT EXISTS session_handoff_slots (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            active_handoff_id CHAR(36) NULL,
+            next_attachment_epoch BIGINT NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_attachments",
+        "CREATE TABLE IF NOT EXISTS session_attachments (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            attachment_id CHAR(36) NOT NULL,
+            attachment_epoch BIGINT NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            actor_id VARCHAR(512) NOT NULL,
+            mode VARCHAR(32) NOT NULL,
+            placement VARCHAR(32) NOT NULL,
+            observed_manifest_root CHAR(64) NULL,
+            attachment_json LONGTEXT NOT NULL,
+            expires_at_ms BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, attachment_id),
+            UNIQUE KEY uq_session_attachment_epoch
+                (isolation_domain, owner_user_id, session_id, branch_id, attachment_epoch),
+            UNIQUE KEY uq_session_attachment_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_attachments_expiry (expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoffs",
+        "CREATE TABLE IF NOT EXISTS session_handoffs (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            handoff_id CHAR(36) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            mode VARCHAR(32) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            deadline_ms BIGINT NOT NULL,
+            record_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, handoff_id),
+            UNIQUE KEY uq_session_handoff_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_handoffs_state_deadline (state, deadline_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoff_events",
+        "CREATE TABLE IF NOT EXISTS session_handoff_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            handoff_id CHAR(36) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            from_state VARCHAR(32) NULL,
+            to_state VARCHAR(32) NOT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, handoff_id, transition_seq),
+            INDEX idx_session_handoff_events_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at)
         )",
     )
     .execute(&pool)

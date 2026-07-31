@@ -1643,50 +1643,673 @@ pub(crate) async fn close_session_handler(
     Ok(Json(SessionResponse::from(session)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionAttachRequest {
+    pub idempotency_key: String,
+    pub placement: astra_turn_types::SessionPlacementV1,
+    #[serde(default)]
+    pub after_manifest_root: Option<String>,
+    #[serde(default = "default_attachment_ttl_seconds")]
+    pub ttl_seconds: u64,
+}
+
+fn default_attachment_ttl_seconds() -> u64 {
+    15 * 60
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionHandoffRequest {
+    pub idempotency_key: String,
+    pub mode: astra_turn_types::SessionHandoffModeV1,
+    #[serde(default)]
+    pub from_attachment_id: Option<String>,
+    pub to_attachment_id: String,
+    #[serde(default)]
+    pub from_placement: Option<astra_turn_types::SessionPlacementV1>,
+    #[serde(default)]
+    pub expected_cursor: Option<astra_turn_types::SessionCursorV1>,
+    #[serde(default)]
+    pub watermarks: astra_turn_types::HandoffOperationWatermarksV1,
+    #[serde(default)]
+    pub unsynced_suffix_root: Option<String>,
+    #[serde(default)]
+    pub unknown_effect_invocation_ids: Vec<String>,
+    #[serde(default)]
+    pub reauthentication_proof: Option<String>,
+    pub reason: String,
+    #[serde(default = "default_handoff_deadline_seconds")]
+    pub deadline_seconds: u64,
+}
+
+fn default_handoff_deadline_seconds() -> u64 {
+    5 * 60
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionHandoffTransitionRequest {
+    pub idempotency_key: String,
+    pub expected_state: astra_turn_types::SessionHandoffStateV1,
+    pub expected_transition_seq: u64,
+    pub next_state: astra_turn_types::SessionHandoffStateV1,
+    #[serde(default)]
+    pub patch: astra_services::HandoffTransitionPatchV1,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionHandoffFenceRequest {
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub source_lease: Option<astra_turn_types::ConversationWriterLeaseV1>,
+    #[serde(default = "default_writer_ttl_seconds")]
+    pub writer_ttl_seconds: u64,
+}
+
+fn default_writer_ttl_seconds() -> u64 {
+    5 * 60
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionHandoffActivateRequest {
+    pub idempotency_key: String,
+    pub expected_transition_seq: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionSegmentBatchRequest {
+    pub segment_hashes: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionSegmentBatchResponse {
+    pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionSegmentUploadRequest {
+    pub segments: Vec<astra_turn_types::ConversationSegmentV1>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct SessionSegmentUploadResponse {
+    pub stored_segment_hashes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionPublishRequest {
+    pub idempotency_key: String,
+    pub items: Vec<astra_services::PublishJournalItemV1>,
+    #[serde(default = "default_writer_ttl_seconds")]
+    pub writer_ttl_seconds: u64,
+}
+
 pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
-{
-    let user = state.auth_service.current_user(&headers).await?;
-    let user_id = user.user_id.clone();
+) -> Result<Json<astra_services::AttachSessionOutcomeV1>, (StatusCode, Json<ErrorResponse>)> {
+    attach_session(
+        &state,
+        &session_id,
+        &headers,
+        SessionAttachRequest {
+            idempotency_key: format!("resume-server:{}", state.session_actor_id),
+            placement: astra_turn_types::SessionPlacementV1::Server,
+            after_manifest_root: None,
+            ttl_seconds: default_attachment_ttl_seconds(),
+        },
+    )
+    .await
+    .map(Json)
+}
+
+pub(crate) async fn attach_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionAttachRequest>,
+) -> Result<Json<astra_services::AttachSessionOutcomeV1>, (StatusCode, Json<ErrorResponse>)> {
+    attach_session(&state, &session_id, &headers, request)
+        .await
+        .map(Json)
+}
+
+async fn attach_session(
+    state: &AppState,
+    session_id: &str,
+    headers: &HeaderMap,
+    request: SessionAttachRequest,
+) -> Result<astra_services::AttachSessionOutcomeV1, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(headers).await?;
     let session = state
         .session_service
-        .get_session(session_id.clone(), user_id.clone())
+        .get_session(session_id.to_owned(), user.user_id.clone())
         .await?;
-    let Some(shared_pool) = state.shared_pool.as_ref() else {
-        return Err(internal_error("shared MatrixOne pool is not configured"));
-    };
-    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-    let mut restored = svc
-        .restore_session(&user_id, &session.session_id)
+    let key = server_session_key(&user.user_id, &session.session_id);
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let epochs = coordinator
+        .load_authority_epochs(&key)
         .await
-        .map_err(internal_error)?
+        .map_err(session_context_http_error)?
+        .unwrap_or_default();
+    let (actor_kind, surface, actor_id, device_id) = match request.placement {
+        astra_turn_types::SessionPlacementV1::Server => (
+            astra_turn_types::ActorKindV1::Server,
+            astra_turn_types::SessionSurfaceV1::Server,
+            state.session_actor_id.clone(),
+            None,
+        ),
+        astra_turn_types::SessionPlacementV1::Cli | astra_turn_types::SessionPlacementV1::Edge => {
+            let pool = state
+                .shared_pool
+                .as_ref()
+                .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+            let device = verify_device_proof_from_headers(
+                pool,
+                &user.user_id,
+                &session.session_id,
+                headers,
+                DeviceProofPurpose::Hydrate,
+            )
+            .await?;
+            let (kind, surface) = if request.placement == astra_turn_types::SessionPlacementV1::Cli
+            {
+                (
+                    astra_turn_types::ActorKindV1::Cli,
+                    astra_turn_types::SessionSurfaceV1::Cli,
+                )
+            } else {
+                (
+                    astra_turn_types::ActorKindV1::Edge,
+                    astra_turn_types::SessionSurfaceV1::Edge,
+                )
+            };
+            (
+                kind,
+                surface,
+                format!("device:{}", device.device_id),
+                Some(device.device_id),
+            )
+        }
+    };
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &user.user_id,
+        actor_id,
+        actor_kind,
+        surface,
+        device_id,
+        epochs,
+    );
+    let service = handoff_service(state)?;
+    service
+        .attach_read_only(
+            &astra_services::AttachSessionRequestV1 {
+                idempotency_key: request.idempotency_key,
+                key,
+                actor,
+                placement: request.placement,
+                after_manifest_root: request.after_manifest_root,
+                // Workspace authority is never accepted as an unsigned HTTP
+                // body claim. A later capability-bound attach supplies it
+                // through the trusted internal service boundary.
+                workspace: None,
+            },
+            std::time::Duration::from_secs(request.ttl_seconds),
+        )
+        .await
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn request_session_handoff_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionHandoffRequest>,
+) -> Result<Json<astra_turn_types::SessionHandoffRecordV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let key = server_session_key(&user.user_id, &session.session_id);
+    let service = handoff_service(&state)?;
+    let target = service
+        .load_attachment(&key, &request.to_attachment_id)
+        .await
+        .map_err(session_handoff_http_error)?;
+    let source = match request.from_attachment_id.as_deref() {
+        Some(id) => Some(
+            service
+                .load_attachment(&key, id)
+                .await
+                .map_err(session_handoff_http_error)?,
+        ),
+        None => None,
+    };
+    let from_placement = source
+        .as_ref()
+        .map(|attachment| attachment.placement)
+        .or(request.from_placement)
         .ok_or_else(|| {
             error_response(
-                StatusCode::NOT_FOUND,
-                format!("session {} has no resumable state", session.session_id),
+                StatusCode::BAD_REQUEST,
+                "from_placement is required when no source attachment is available",
             )
         })?;
-    // Activation is committed only after ownership and resumable state have
-    // both been validated. A malformed/missing snapshot must not leave the
-    // session falsely marked active.
-    state
-        .session_service
-        .update_session(
-            session_id,
-            user_id,
-            SessionUpdateRequestData {
-                title: None,
-                metadata: None,
-                metadata_patch: None,
-                status: Some("active".to_string()),
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(session_context_http_error)?;
+    if request.expected_cursor.as_ref() != head.as_ref().map(|head| &head.cursor) {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "expected cursor is not the current Server head",
+        ));
+    }
+    let authority_epochs = coordinator
+        .load_authority_epochs(&key)
+        .await
+        .map_err(session_context_http_error)?
+        .unwrap_or_default();
+    if target.actor.authority_epochs != authority_epochs {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "target attachment authority is stale; attach again",
+        ));
+    }
+    let risk = match request.mode {
+        astra_turn_types::SessionHandoffModeV1::Graceful => {
+            astra_turn_types::HandoffRiskEvidenceV1::default()
+        }
+        astra_turn_types::SessionHandoffModeV1::Forced => {
+            let proof = request.reauthentication_proof.as_deref().ok_or_else(|| {
+                error_response(
+                    StatusCode::FORBIDDEN,
+                    "forced takeover requires verified reauthentication",
+                )
+            })?;
+            state
+                .auth_service
+                .consume_reauthentication_proof(
+                    &user.user_id,
+                    astra_services::ReauthenticationPurpose::SessionForcedTakeover,
+                    proof,
+                )
+                .await?;
+            astra_turn_types::HandoffRiskEvidenceV1 {
+                unsynced_suffix_root: request.unsynced_suffix_root,
+                unknown_effect_invocation_ids: request.unknown_effect_invocation_ids,
+                forced_authorization_id: Some(format!(
+                    "consumed-reauth:{}",
+                    sha256_hex(proof.as_bytes())
+                )),
+            }
+        }
+    };
+    service
+        .request_handoff(
+            &astra_services::RequestSessionHandoffV1 {
+                idempotency_key: request.idempotency_key,
+                key,
+                mode: request.mode,
+                from_attachment_id: request.from_attachment_id,
+                to_attachment_id: request.to_attachment_id,
+                from_placement,
+                to_placement: target.placement,
+                target_actor: target.actor,
+                base_cursor: head.map(|head| head.cursor),
+                authority_epochs,
+                workspace: target.workspace,
+                watermarks: request.watermarks,
+                risk,
+                reason: request.reason,
             },
+            std::time::Duration::from_secs(request.deadline_seconds),
         )
+        .await
+        .map(Json)
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn get_session_handoff_handler(
+    State(state): State<AppState>,
+    Path((session_id, handoff_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<astra_turn_types::SessionHandoffRecordV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
         .await?;
-    restored.last_status = "active".to_string();
-    Ok(Json(restored))
+    handoff_service(&state)?
+        .load_handoff(
+            &server_session_key(&user.user_id, &session.session_id),
+            &handoff_id,
+        )
+        .await
+        .map(Json)
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn transition_session_handoff_handler(
+    State(state): State<AppState>,
+    Path((session_id, handoff_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SessionHandoffTransitionRequest>,
+) -> Result<Json<astra_turn_types::SessionHandoffRecordV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    handoff_service(&state)?
+        .transition_handoff(&astra_services::TransitionSessionHandoffV1 {
+            idempotency_key: request.idempotency_key,
+            key: server_session_key(&user.user_id, &session.session_id),
+            handoff_id,
+            expected_state: request.expected_state,
+            expected_transition_seq: request.expected_transition_seq,
+            next_state: request.next_state,
+            patch: request.patch,
+        })
+        .await
+        .map(Json)
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn fence_session_handoff_handler(
+    State(state): State<AppState>,
+    Path((session_id, handoff_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SessionHandoffFenceRequest>,
+) -> Result<Json<astra_services::FenceSessionWriterOutcomeV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    handoff_service(&state)?
+        .fence_writer(
+            &server_session_key(&user.user_id, &session.session_id),
+            &handoff_id,
+            request.source_lease,
+            std::time::Duration::from_secs(request.writer_ttl_seconds),
+            &request.idempotency_key,
+        )
+        .await
+        .map(Json)
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn activate_session_handoff_handler(
+    State(state): State<AppState>,
+    Path((session_id, handoff_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SessionHandoffActivateRequest>,
+) -> Result<Json<astra_turn_types::SessionHandoffRecordV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    handoff_service(&state)?
+        .activate_handoff(
+            &server_session_key(&user.user_id, &session.session_id),
+            &handoff_id,
+            request.expected_transition_seq,
+            &request.idempotency_key,
+        )
+        .await
+        .map(Json)
+        .map_err(session_handoff_http_error)
+}
+
+pub(crate) async fn get_session_segments_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionSegmentBatchRequest>,
+) -> Result<Json<SessionSegmentBatchResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let segments = coordinator
+        .load_segments(
+            &server_session_key(&user.user_id, &session.session_id),
+            &request.segment_hashes,
+        )
+        .await
+        .map_err(session_context_http_error)?;
+    Ok(Json(SessionSegmentBatchResponse { segments }))
+}
+
+pub(crate) async fn upload_session_segments_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionSegmentUploadRequest>,
+) -> Result<Json<SessionSegmentUploadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let _device = verify_device_proof_from_headers(
+        pool,
+        &user.user_id,
+        &session.session_id,
+        &headers,
+        DeviceProofPurpose::Publish,
+    )
+    .await?;
+    let key = server_session_key(&user.user_id, &session.session_id);
+    publish_service(&state)?
+        .store_segments(&key, &request.segments)
+        .await
+        .map_err(session_publish_http_error)?;
+    Ok(Json(SessionSegmentUploadResponse {
+        stored_segment_hashes: request
+            .segments
+            .into_iter()
+            .map(|segment| segment.segment_hash)
+            .collect(),
+    }))
+}
+
+pub(crate) async fn publish_session_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionPublishRequest>,
+) -> Result<Json<astra_services::PublishSessionOutcomeV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let device = verify_device_proof_from_headers(
+        pool,
+        &user.user_id,
+        &session.session_id,
+        &headers,
+        DeviceProofPurpose::Publish,
+    )
+    .await?;
+    let key = server_session_key(&user.user_id, &session.session_id);
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let epochs = coordinator
+        .load_authority_epochs(&key)
+        .await
+        .map_err(session_context_http_error)?
+        .unwrap_or_default();
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &user.user_id,
+        format!("device:{}", device.device_id),
+        astra_turn_types::ActorKindV1::Cli,
+        astra_turn_types::SessionSurfaceV1::Cli,
+        Some(device.device_id),
+        epochs,
+    );
+    publish_service(&state)?
+        .publish(
+            &astra_services::PublishSessionRequestV1 {
+                idempotency_key: request.idempotency_key,
+                key,
+                actor,
+                items: request.items,
+            },
+            std::time::Duration::from_secs(request.writer_ttl_seconds),
+        )
+        .await
+        .map(Json)
+        .map_err(session_publish_http_error)
+}
+
+fn server_session_key(user_id: &str, session_id: &str) -> astra_turn_types::SessionKeyV1 {
+    astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        user_id,
+        session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    )
+}
+
+fn publish_service(
+    state: &AppState,
+) -> Result<&astra_services::DatabaseSessionPublishService, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .session_publish_service
+        .as_deref()
+        .ok_or_else(|| internal_error("session publish service is not configured"))
+}
+
+fn handoff_service(
+    state: &AppState,
+) -> Result<&astra_services::DatabaseSessionHandoffService, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .session_handoff_service
+        .as_deref()
+        .ok_or_else(|| internal_error("session handoff service is not configured"))
+}
+
+fn session_context_http_error(
+    error: astra_services::SessionContextCoordinatorError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        astra_services::SessionContextCoordinatorError::DivergentManifest => error_response(
+            StatusCode::CONFLICT,
+            "observed manifest is not an ancestor of the current Server head; fork is required",
+        ),
+        astra_services::SessionContextCoordinatorError::Invalid(message) => {
+            error_response(StatusCode::BAD_REQUEST, message)
+        }
+        astra_services::SessionContextCoordinatorError::SegmentNotFound => {
+            error_response(StatusCode::NOT_FOUND, error.to_string())
+        }
+        astra_services::SessionContextCoordinatorError::Fenced
+        | astra_services::SessionContextCoordinatorError::Expired => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
+        _ => internal_error(error),
+    }
+}
+
+fn session_handoff_http_error(
+    error: astra_services::SessionHandoffError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        astra_services::SessionHandoffError::Invalid(message) => {
+            error_response(StatusCode::BAD_REQUEST, message)
+        }
+        astra_services::SessionHandoffError::NotFound => {
+            error_response(StatusCode::NOT_FOUND, error.to_string())
+        }
+        astra_services::SessionHandoffError::ForkRequired { .. } => {
+            error_response_coded(StatusCode::CONFLICT, error.to_string(), "fork_required")
+        }
+        astra_services::SessionHandoffError::ActiveHandoffConflict { .. }
+        | astra_services::SessionHandoffError::StateConflict { .. }
+        | astra_services::SessionHandoffError::IdempotencyMismatch
+        | astra_services::SessionHandoffError::DeadlineExpired
+        | astra_services::SessionHandoffError::AttachmentExpired => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
+        astra_services::SessionHandoffError::Coordinator(source) => {
+            session_context_http_error(source)
+        }
+        _ => internal_error(error),
+    }
+}
+
+fn session_publish_http_error(
+    error: astra_services::SessionPublishError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        astra_services::SessionPublishError::Invalid(message) => {
+            error_response_coded(StatusCode::BAD_REQUEST, message, "session_publish_invalid")
+        }
+        astra_services::SessionPublishError::MissingSegment => error_response_coded(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "session_publish_incomplete",
+        ),
+        astra_services::SessionPublishError::UnacknowledgedJournal => error_response_coded(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "session_publish_journal_unacknowledged",
+        ),
+        astra_services::SessionPublishError::ForkRequired { .. } => {
+            error_response_coded(StatusCode::CONFLICT, error.to_string(), "fork_required")
+        }
+        astra_services::SessionPublishError::Conflict => error_response_coded(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "session_publish_conflict",
+        ),
+        astra_services::SessionPublishError::Coordinator(
+            astra_services::SessionContextCoordinatorError::Invalid(message),
+        ) => error_response_coded(StatusCode::BAD_REQUEST, message, "session_publish_invalid"),
+        astra_services::SessionPublishError::Coordinator(
+            astra_services::SessionContextCoordinatorError::Fenced
+            | astra_services::SessionContextCoordinatorError::Expired,
+        ) => error_response_coded(
+            StatusCode::CONFLICT,
+            error.to_string(),
+            "session_publish_fenced",
+        ),
+        _ => internal_error(error),
+    }
 }
 
 pub(crate) async fn cancel_session_handler(

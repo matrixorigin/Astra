@@ -1,5 +1,18 @@
 use sqlx::Row;
 
+/// Read the database authority clock without depending on whether a backend
+/// reports `NOW(6)` as DATETIME or TIMESTAMP. MatrixOne and MySQL expose
+/// different wire types for that expression, while the explicit signed epoch
+/// value has one stable SQLx representation.
+pub(crate) async fn database_now_unix_ms(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query("SELECT CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED) AS database_now_unix_ms")
+        .fetch_one(&mut **tx)
+        .await?
+        .try_get("database_now_unix_ms")
+}
+
 pub trait RowExt {
     fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
         Err(sqlx::Error::ColumnNotFound(column.to_string()))

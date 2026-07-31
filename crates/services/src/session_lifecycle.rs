@@ -148,6 +148,30 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "session_publish_receipts",
+        sql: "DELETE FROM session_publish_receipts WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_attachment_quarantines",
+        sql: "DELETE FROM session_attachment_quarantines WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoff_events",
+        sql: "DELETE FROM session_handoff_events WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoffs",
+        sql: "DELETE FROM session_handoffs WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_attachments",
+        sql: "DELETE FROM session_attachments WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoff_slots",
+        sql: "DELETE FROM session_handoff_slots WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "session_context_authority_events",
         sql: "DELETE FROM session_context_authority_events WHERE session_id = ? AND owner_user_id = ?",
     },
@@ -419,6 +443,12 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("conversation_manifest_nodes", "owner_user_id"),
     ("session_context_operation_receipts", "owner_user_id"),
     ("session_context_authority_events", "owner_user_id"),
+    ("session_handoff_events", "owner_user_id"),
+    ("session_handoffs", "owner_user_id"),
+    ("session_attachments", "owner_user_id"),
+    ("session_handoff_slots", "owner_user_id"),
+    ("session_attachment_quarantines", "owner_user_id"),
+    ("session_publish_receipts", "owner_user_id"),
     ("session_weighted_admission_reservations", "owner_user_id"),
     ("agent_events", "user_id"),
     ("agent_event_edges", "user_id"),

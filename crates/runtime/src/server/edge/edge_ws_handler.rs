@@ -653,87 +653,108 @@ async fn handle_edge_connection(
     let dispatch_sink = ws_sink.clone();
     let dispatch_inflight = inflight_dispatches.clone();
     let (dispatch_cancel_tx, mut dispatch_cancel_rx) = tokio::sync::watch::channel(());
+    let mut dispatch_wakeup = dispatch_svc
+        .subscribe_pending_wakeup(&dispatch_user_id, &dispatch_agent_id)
+        .await;
 
     let mut dispatch_task = tokio::spawn(async move {
-        // 2000ms interval keeps per-connection DB QPS at 0.5
-        // (vs 5 at 200ms). Cross-pod dispatch targets ~2s end-to-end.
+        // Same-pod admission wakes immediately; one batched DB observer per
+        // pod fans out cross-pod wakeups. The 2-second per-connection poll is
+        // retained only for missed notifications and process-restart recovery.
         let mut interval = tokio::time::interval(Duration::from_millis(2000));
         loop {
-            tokio::select! {
-                _ = dispatch_cancel_rx.changed() => break,
-                _ = interval.tick() => {
-                    match dispatch_svc.poll_pending(&dispatch_user_id, &dispatch_agent_id).await {
-                        Ok(rows) if !rows.is_empty() => {
-                            let mut stop_dispatch = false;
-                            for (idx, row) in rows.iter().enumerate() {
-                                let msg = match serde_json::from_str::<EdgeServerMessage>(&row.payload_json) {
-                                    Ok(msg) => msg,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            target: "astra_runtime::edge_ws",
-                                            user_id = %row.user_id,
-                                            edge_agent_id = %row.edge_agent_id,
-                                            request_id = %row.request_id,
-                                            error = %error,
-                                            "Edge dispatch relay failed to decode claimed payload; marking dispatch failed"
-                                        );
-                                        fail_claimed_edge_dispatch(
-                                            dispatch_svc.as_ref(),
-                                            row,
-                                            "edge_dispatch_payload_decode_failed",
-                                        )
-                                        .await;
-                                        continue;
-                                    }
-                                };
-                                let inflight = InflightEdgeDispatch {
-                                    identity: row.identity(),
-                                    edge_agent_id: row.edge_agent_id.clone(),
-                                };
-                                if let Err(inflight) = dispatch_inflight.track(inflight).await {
-                                    tracing::warn!(
-                                        target: "astra_runtime::edge_ws",
-                                        user_id = %inflight.identity.user_id,
-                                        edge_agent_id = %inflight.edge_agent_id,
-                                        request_id = %inflight.identity.request_id,
-                                        "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
-                                    );
-                                    fail_inflight_edge_dispatches(
-                                        dispatch_svc.as_ref(),
-                                        std::slice::from_ref(&inflight),
-                                        "edge_ws_disconnected",
-                                    )
-                                    .await;
-                                    stop_dispatch = true;
-                                    break;
-                                }
-                                if send_edge_msg(&dispatch_sink, msg).await.is_err() {
-                                    dispatch_inflight.remove(&row.request_id).await;
-                                    tracing::warn!(
-                                        target: "astra_runtime::edge_ws",
-                                        user_id = %row.user_id,
-                                        edge_agent_id = %row.edge_agent_id,
-                                        request_id = %row.request_id,
-                                        remaining_claimed = rows.len().saturating_sub(idx),
-                                        "Edge dispatch relay failed to write to websocket; marking claimed dispatches failed"
-                                    );
-                                    fail_claimed_edge_dispatches(
-                                        dispatch_svc.as_ref(),
-                                        &rows[idx..],
-                                        "edge_ws_send_failed",
-                                    )
-                                    .await;
-                                    stop_dispatch = true;
-                                    break;
-                                }
+            let triggered = tokio::select! {
+                _ = dispatch_cancel_rx.changed() => false,
+                _ = interval.tick() => true,
+                wakeup_open = async {
+                    match dispatch_wakeup.as_mut() {
+                        Some(receiver) => receiver.changed().await.is_ok(),
+                        None => std::future::pending::<bool>().await,
+                    }
+                } => {
+                    if !wakeup_open {
+                        dispatch_wakeup = None;
+                    }
+                    true
+                }
+            };
+            if !triggered {
+                break;
+            }
+            match dispatch_svc
+                .poll_pending(&dispatch_user_id, &dispatch_agent_id)
+                .await
+            {
+                Ok(rows) if !rows.is_empty() => {
+                    let mut stop_dispatch = false;
+                    for (idx, row) in rows.iter().enumerate() {
+                        let msg = match serde_json::from_str::<EdgeServerMessage>(&row.payload_json)
+                        {
+                            Ok(msg) => msg,
+                            Err(error) => {
+                                tracing::warn!(
+                                    target: "astra_runtime::edge_ws",
+                                    user_id = %row.user_id,
+                                    edge_agent_id = %row.edge_agent_id,
+                                    request_id = %row.request_id,
+                                    error = %error,
+                                    "Edge dispatch relay failed to decode claimed payload; marking dispatch failed"
+                                );
+                                fail_claimed_edge_dispatch(
+                                    dispatch_svc.as_ref(),
+                                    row,
+                                    "edge_dispatch_payload_decode_failed",
+                                )
+                                .await;
+                                continue;
                             }
-                            if stop_dispatch {
-                                break;
-                            }
+                        };
+                        let inflight = InflightEdgeDispatch {
+                            identity: row.identity(),
+                            edge_agent_id: row.edge_agent_id.clone(),
+                        };
+                        if let Err(inflight) = dispatch_inflight.track(inflight).await {
+                            tracing::warn!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %inflight.identity.user_id,
+                                edge_agent_id = %inflight.edge_agent_id,
+                                request_id = %inflight.identity.request_id,
+                                "Edge dispatch relay rejected claimed dispatch because websocket cleanup is closing"
+                            );
+                            fail_inflight_edge_dispatches(
+                                dispatch_svc.as_ref(),
+                                std::slice::from_ref(&inflight),
+                                "edge_ws_disconnected",
+                            )
+                            .await;
+                            stop_dispatch = true;
+                            break;
                         }
-                        _ => {} // no pending dispatches or error
+                        if send_edge_msg(&dispatch_sink, msg).await.is_err() {
+                            dispatch_inflight.remove(&row.request_id).await;
+                            tracing::warn!(
+                                target: "astra_runtime::edge_ws",
+                                user_id = %row.user_id,
+                                edge_agent_id = %row.edge_agent_id,
+                                request_id = %row.request_id,
+                                remaining_claimed = rows.len().saturating_sub(idx),
+                                "Edge dispatch relay failed to write to websocket; marking claimed dispatches failed"
+                            );
+                            fail_claimed_edge_dispatches(
+                                dispatch_svc.as_ref(),
+                                &rows[idx..],
+                                "edge_ws_send_failed",
+                            )
+                            .await;
+                            stop_dispatch = true;
+                            break;
+                        }
+                    }
+                    if stop_dispatch {
+                        break;
                     }
                 }
+                _ => {} // no pending dispatches or error
             }
         }
     });
