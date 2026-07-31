@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-30-v11";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v14";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2703,6 +2703,177 @@ async fn ensure_core_schema_while_leased(
         &["updated_at"],
         "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_updated (updated_at)",
     )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_heads",
+        "CREATE TABLE IF NOT EXISTS session_context_heads (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            head_json LONGTEXT NULL,
+            canonical_root_hash CHAR(64) NULL,
+            latest_manifest_root CHAR(64) NULL,
+            total_canonical_bytes BIGINT NOT NULL DEFAULT 0,
+            total_message_count BIGINT NOT NULL DEFAULT 0,
+            completed_turn BIGINT NOT NULL DEFAULT 0,
+            journal_event_seq BIGINT NOT NULL DEFAULT 0,
+            conversation_seq BIGINT NOT NULL DEFAULT 0,
+            projection_schema INT NOT NULL DEFAULT 0,
+            compaction_generation BIGINT NOT NULL DEFAULT 0,
+            writer_epoch BIGINT NOT NULL DEFAULT 0,
+            authorization_epoch BIGINT NOT NULL DEFAULT 0,
+            device_trust_epoch BIGINT NOT NULL DEFAULT 0,
+            permission_epoch BIGINT NOT NULL DEFAULT 0,
+            active_writer_json LONGTEXT NULL,
+            active_writer_expires_at_ms BIGINT NULL,
+            active_reservation_json LONGTEXT NULL,
+            active_reservation_expires_at_ms BIGINT NULL,
+            last_commit_json LONGTEXT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
+            INDEX idx_session_context_heads_owner_session (owner_user_id, session_id, branch_id),
+            INDEX idx_session_context_heads_writer_expiry (active_writer_expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_segments",
+        "CREATE TABLE IF NOT EXISTS conversation_segments (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            segment_hash CHAR(64) NOT NULL,
+            canonical_root_hash CHAR(64) NOT NULL,
+            canonical_bytes BIGINT NOT NULL,
+            message_count BIGINT NOT NULL,
+            segment_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, segment_hash),
+            INDEX idx_conversation_segments_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_manifest_nodes",
+        "CREATE TABLE IF NOT EXISTS conversation_manifest_nodes (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            manifest_root CHAR(64) NOT NULL,
+            parent_manifest_root CHAR(64) NULL,
+            completed_turn BIGINT NOT NULL,
+            conversation_seq BIGINT NOT NULL,
+            canonical_segment_bytes BIGINT NOT NULL,
+            manifest_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
+            INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
+            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_operation_receipts",
+        "CREATE TABLE IF NOT EXISTS session_context_operation_receipts (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            operation_kind VARCHAR(32) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            receipt_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, operation_kind, idempotency_hash),
+            INDEX idx_session_context_receipts_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_authority_events",
+        "CREATE TABLE IF NOT EXISTS session_context_authority_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            event_id CHAR(36) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            operation_kind VARCHAR(32) NOT NULL,
+            outcome VARCHAR(32) NOT NULL,
+            writer_epoch BIGINT NOT NULL,
+            actor_id VARCHAR(512) NULL,
+            device_id VARCHAR(512) NULL,
+            lease_id CHAR(36) NULL,
+            reservation_id CHAR(36) NULL,
+            expected_root CHAR(64) NULL,
+            observed_root CHAR(64) NULL,
+            authorization_epoch BIGINT NOT NULL,
+            device_trust_epoch BIGINT NOT NULL,
+            permission_epoch BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, event_id),
+            INDEX idx_context_authority_session_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at),
+            INDEX idx_context_authority_outcome_created
+                (operation_kind, outcome, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_weighted_admission_gates",
+        "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
+            scope_name VARCHAR(64) NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (scope_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_weighted_admission_reservations",
+        "CREATE TABLE IF NOT EXISTS session_weighted_admission_reservations (
+            scope_name VARCHAR(64) NOT NULL,
+            reservation_id CHAR(36) NOT NULL,
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            resident_bytes BIGINT NOT NULL,
+            context_tokens BIGINT NOT NULL,
+            provider_slots BIGINT NOT NULL,
+            cpu_units BIGINT NOT NULL,
+            io_bytes BIGINT NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (scope_name, reservation_id),
+            UNIQUE KEY uq_weighted_admission_idempotency
+                (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            INDEX idx_weighted_admission_expiry (scope_name, expires_at),
+            INDEX idx_weighted_admission_owner_expiry
+                (scope_name, isolation_domain, owner_user_id, expires_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     core_schema_create!(pool, "agent_run_events",

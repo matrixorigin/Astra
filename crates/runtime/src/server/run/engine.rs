@@ -3392,6 +3392,7 @@ mod tests {
         let engine = test_engine();
         let request = astra_services::runs::ChatRequestData {
             message: "hello".to_string(),
+            conversation_authority: None,
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),

@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 pub const SESSION_CURSOR_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_COMMIT_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION: u32 = 2;
 pub const DEFAULT_CONVERSATION_BRANCH_ID: &str = "main";
 const ROOT_HASH_DOMAIN: &[u8] = b"astra.canonical-conversation.v1\0";
 
@@ -79,6 +80,30 @@ pub fn canonical_conversation_root(messages: &[Value]) -> String {
     write_canonical_messages(messages, &mut DigestWriter(&mut digest))
         .expect("hashing canonical JSON bytes cannot fail");
     format!("{:x}", digest.finalize())
+}
+
+/// Number of bytes in the canonical JSON representation used by
+/// [`canonical_conversation_root`].
+///
+/// This deliberately counts through a writer instead of allocating a second
+/// full-history buffer. Segment stores use it for byte-weighted admission and
+/// cache accounting.
+pub fn canonical_conversation_serialized_len(messages: &[Value]) -> u64 {
+    let mut counter = CountingWriter::default();
+    write_canonical_messages(messages, &mut counter)
+        .expect("counting canonical JSON bytes cannot fail");
+    counter.bytes
+}
+
+/// Count a JSON payload without allocating its serialized representation.
+///
+/// Admission paths use this for fresh request components that are not yet
+/// canonical conversation messages (attachments, typed parts, and runtime
+/// context). JSON object ordering does not affect the byte count.
+pub fn json_serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, serde_json::Error> {
+    let mut counter = CountingWriter::default();
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.bytes)
 }
 
 #[derive(Default)]
@@ -166,7 +191,7 @@ fn write_json(value: &impl Serialize, out: &mut impl Write) -> io::Result<()> {
 mod tests {
     use serde_json::json;
 
-    use super::canonical_conversation_root;
+    use super::{canonical_conversation_root, json_serialized_len};
 
     #[test]
     fn streaming_root_preserves_the_v1_wire_hash() {
@@ -182,6 +207,18 @@ mod tests {
         assert_eq!(
             canonical_conversation_root(&messages),
             "18fd5901a9aa39a4802a649a8f13a2f79a5266ff76f514645d33d5cd1bd6891b"
+        );
+    }
+
+    #[test]
+    fn streaming_json_length_matches_wire_serialization() {
+        let payload = json!({
+            "parts": [{"type": "text", "text": "hello 世界"}],
+            "attachments": [{"name": "a.txt", "bytes": 1234}],
+        });
+        assert_eq!(
+            json_serialized_len(&payload).unwrap(),
+            serde_json::to_vec(&payload).unwrap().len() as u64
         );
     }
 }

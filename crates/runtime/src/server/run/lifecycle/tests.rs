@@ -25,6 +25,70 @@ use uuid::Uuid;
 static LIFECYCLE_RUN_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
 const DURABLE_EVENT_PRESSURE_OPT_IN: &str = "ASTRA_DURABLE_EVENT_PRESSURE_PROBE";
 
+#[test]
+fn canonical_segment_packing_keeps_structured_tool_exchange_atomic() {
+    let payload = "x".repeat(300 * 1024);
+    let messages = vec![
+        json!({
+            "role": "assistant",
+            "content": payload,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read", "arguments": "{}"}
+            }]
+        }),
+        json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "y".repeat(300 * 1024)
+        }),
+        json!({"role": "user", "content": "continue"}),
+    ];
+
+    let packs = pack_canonical_turn_segments(messages.clone());
+
+    assert_eq!(packs.len(), 2, "an oversized atomic group stays whole");
+    assert_eq!(packs[0], messages[..2]);
+    assert_eq!(packs[1], messages[2..]);
+}
+
+#[test]
+fn canonical_segment_packing_bounds_ordinary_groups_without_reordering() {
+    let messages = vec![
+        json!({"role": "user", "content": "a".repeat(300 * 1024)}),
+        json!({"role": "assistant", "content": "b".repeat(300 * 1024)}),
+        json!({"role": "user", "content": "tail"}),
+    ];
+
+    let packs = pack_canonical_turn_segments(messages.clone());
+
+    assert_eq!(packs.len(), 2);
+    assert_eq!(packs.concat(), messages);
+    assert!(
+        packs.iter().all(|pack| {
+            astra_turn_types::canonical_conversation_serialized_len(pack) <= 512 * 1024
+        }),
+        "non-atomic groups must respect the physical pack target"
+    );
+}
+
+#[test]
+fn fresh_request_admission_accounts_for_large_non_message_payloads() {
+    let mut request = test_request("small");
+    let baseline = fresh_request_admission_bytes(&request).unwrap();
+    request.attachments.push(json!({
+        "kind": "inline",
+        "data": "x".repeat(1024 * 1024),
+    }));
+    let with_attachment = fresh_request_admission_bytes(&request).unwrap();
+
+    assert!(
+        with_attachment >= baseline + 1024 * 1024,
+        "large attachment bytes must be admitted before canonical history is materialized"
+    );
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,
@@ -3807,6 +3871,7 @@ async fn seed_lifecycle_run_for_pause_resume_it(
 fn test_request(message: &str) -> ChatRequestData {
     ChatRequestData {
         message: message.to_string(),
+        conversation_authority: None,
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -8959,6 +9024,7 @@ fn extract_edge_tools_from_context() {
     );
     let req = ChatRequestData {
         message: "hi".into(),
+        conversation_authority: None,
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
@@ -9038,6 +9104,7 @@ fn extract_edge_profile_from_context() {
     );
     let req = ChatRequestData {
         message: "hi".into(),
+        conversation_authority: None,
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),

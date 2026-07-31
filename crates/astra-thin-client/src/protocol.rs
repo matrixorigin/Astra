@@ -42,6 +42,8 @@ pub struct ChatStreamRequest {
     /// Tool names this edge instance can run (bash, fs, git, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +83,7 @@ impl ChatStreamRequest {
             is_plan_subtask: None,
             edge_executor_id: None,
             capabilities: Vec::new(),
+            conversation_authority: None,
         }
     }
 }
@@ -1022,6 +1025,7 @@ mod tests {
     fn chat_stream_request_serde_roundtrip() {
         let r = ChatStreamRequest {
             message: "hi".into(),
+            conversation_authority: None,
             parts: vec![json!({"type": "text", "text": "hi"})],
             attachments: vec![json!({"id": "att-1", "kind": "file"})],
             session_id: Some("s-1".into()),

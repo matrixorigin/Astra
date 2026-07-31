@@ -1145,6 +1145,106 @@ async fn phase1_run_durability_schema_contract() {
         ["updated_at"],
         "stale slot cleanup must not require scanning the slot table"
     );
+    let context_heads = column_names(&pool, &schema, "session_context_heads").await;
+    for expected in [
+        "head_json",
+        "canonical_root_hash",
+        "latest_manifest_root",
+        "total_canonical_bytes",
+        "total_message_count",
+        "writer_epoch",
+        "authorization_epoch",
+        "device_trust_epoch",
+        "permission_epoch",
+        "active_writer_json",
+        "active_reservation_json",
+    ] {
+        assert!(
+            context_heads.iter().any(|column| column == expected),
+            "session_context_heads missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_heads").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "canonical head serialization must be scoped by the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_segments").await,
+        ["isolation_domain", "owner_user_id", "segment_hash"],
+        "immutable segment deduplication must stop at the owner boundary"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_manifest_nodes").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "manifest_root"
+        ],
+        "manifest lookup must carry complete owner/session/branch identity"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_operation_receipts").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "operation_kind",
+            "idempotency_hash"
+        ],
+        "idempotent coordinator replay must never cross a SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_weighted_admission_reservations").await,
+        ["scope_name", "reservation_id"],
+        "distributed admission reservations need one cross-pod physical identity"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_authority_events").await,
+        ["isolation_domain", "owner_user_id", "event_id"],
+        "authority audit identity must remain inside the owner isolation domain"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_context_authority_events",
+            "idx_context_authority_session_created"
+        )
+        .await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "created_at"
+        ],
+        "authority history queries must carry the complete SessionKey prefix"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_weighted_admission_reservations",
+            "idx_weighted_admission_owner_expiry"
+        )
+        .await,
+        [
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "expires_at"
+        ],
+        "per-owner distributed admission must not require a global table scan"
+    );
     assert!(
         index_columns(
             &pool,

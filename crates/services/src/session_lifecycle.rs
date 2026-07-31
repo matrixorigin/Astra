@@ -148,6 +148,26 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "session_context_authority_events",
+        sql: "DELETE FROM session_context_authority_events WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_weighted_admission_reservations",
+        sql: "DELETE FROM session_weighted_admission_reservations WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_context_operation_receipts",
+        sql: "DELETE FROM session_context_operation_receipts WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "conversation_manifest_nodes",
+        sql: "DELETE FROM conversation_manifest_nodes WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_context_heads",
+        sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "agent_session_execution_slots",
         sql: "DELETE FROM agent_session_execution_slots WHERE session_id = ? AND user_id = ?",
     },
@@ -392,15 +412,20 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[&str] = &[
-    "agent_sessions",
-    "agent_session_execution_slots",
-    "agent_events",
-    "agent_event_edges",
-    "agent_runs",
-    "agent_tasks",
-    "inference_invocation_settlement_debts",
-    "task_contracts",
+const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
+    ("agent_sessions", "user_id"),
+    ("agent_session_execution_slots", "user_id"),
+    ("session_context_heads", "owner_user_id"),
+    ("conversation_manifest_nodes", "owner_user_id"),
+    ("session_context_operation_receipts", "owner_user_id"),
+    ("session_context_authority_events", "owner_user_id"),
+    ("session_weighted_admission_reservations", "owner_user_id"),
+    ("agent_events", "user_id"),
+    ("agent_event_edges", "user_id"),
+    ("agent_runs", "user_id"),
+    ("agent_tasks", "user_id"),
+    ("inference_invocation_settlement_debts", "user_id"),
+    ("task_contracts", "user_id"),
 ];
 
 async fn delete_session_rows_session_user(
@@ -506,10 +531,11 @@ async fn verify_core_session_tables_deleted(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    for table in SESSION_DELETE_CORE_RESIDUAL_TABLES {
+    for (table, owner_column) in SESSION_DELETE_CORE_RESIDUAL_TABLES {
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE session_id = ? AND user_id = ?",
-            crate::snapshot_sql::quote_mysql_identifier(table)
+            "SELECT COUNT(*) FROM {} WHERE session_id = ? AND {} = ?",
+            crate::snapshot_sql::quote_mysql_identifier(table),
+            crate::snapshot_sql::quote_mysql_identifier(owner_column),
         );
         let remaining: i64 = sqlx::query_scalar(&sql)
             .bind(session_id)
@@ -1287,7 +1313,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
-                    || normalized.contains("session_id = ? AND owner_id = ?");
+                    || normalized.contains("session_id = ? AND owner_id = ?")
+                    || normalized.contains("session_id = ? AND owner_user_id = ?");
                 let session_quality_scoped = statement.label == "eval_quality_assessments"
                     && normalized.contains("target_id = ? AND user_id = ?")
                     && normalized.contains("level = 'session'");

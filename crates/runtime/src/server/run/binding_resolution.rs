@@ -560,6 +560,7 @@ mod tests {
     fn test_request(message: &str) -> astra_services::runs::ChatRequestData {
         astra_services::runs::ChatRequestData {
             message: message.to_string(),
+            conversation_authority: None,
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),

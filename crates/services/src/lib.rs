@@ -20,6 +20,7 @@ pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
+pub mod execution_grant;
 pub mod harness;
 pub mod inference_execution;
 pub mod interaction_contract;
@@ -48,6 +49,7 @@ pub mod session_analytics;
 pub mod session_artifact_store;
 pub mod session_audit;
 pub mod session_checkpoint;
+pub mod session_context_coordinator;
 pub mod session_fork;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
@@ -70,6 +72,7 @@ pub mod tool_invocation_ledger;
 pub mod triggers;
 pub mod turn_intent_judge;
 pub mod verification;
+pub mod weighted_admission;
 pub mod workflows;
 pub mod workspace_records;
 
@@ -195,6 +198,7 @@ pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
     EventListRecord, EventRecord, EventService, UnconfiguredEventService,
 };
+pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use harness::{
     DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
     HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
@@ -310,6 +314,11 @@ pub use session_artifact_store::{
     SessionArtifactStoreError, StoredSessionArtifact, configure_local_owner_scope,
     local_owner_scope, local_owner_user_id, local_session_artifact_store,
 };
+pub use session_context_coordinator::{
+    AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
+    FileSessionContextCoordinator, MaterializedConversationV1, ReserveTurnOutcome,
+    SessionContextCoordinator, SessionContextCoordinatorError, SystemCoordinatorClock,
+};
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
     ForkSessionResult, SessionForkBasisEvidenceV1, fork_local_session, verify_local_fork_basis,
@@ -371,6 +380,11 @@ pub use turn_intent_judge::{
 };
 pub use verification::{
     SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
+};
+pub use weighted_admission::{
+    AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
+    DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
+    WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,

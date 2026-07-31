@@ -22,6 +22,114 @@ fn parse_chat_request_body(body: &Bytes) -> Result<ChatRequest, (StatusCode, Jso
     })
 }
 
+pub(super) async fn validate_conversation_authority(
+    state: &AppState,
+    authenticated_user_id: &str,
+    session_id: Option<&str>,
+    authority: Option<&astra_turn_types::ConversationAuthorityEnvelopeV1>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(authority) = authority else {
+        // `/chat` and `/chat/stream` are Server-owned loops. They may start
+        // without a client grant; the run lifecycle acquires authority
+        // internally. A supplied grant, however, always fails closed.
+        return Ok(());
+    };
+    authority.validate_shape().map_err(|error| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("invalid conversation authority envelope: {error}"),
+            "conversation_authority_invalid",
+        )
+    })?;
+    if authority.key.owner_user_id != authenticated_user_id
+        || session_id != Some(authority.key.session_id.as_str())
+    {
+        return Err(error_response_coded(
+            StatusCode::FORBIDDEN,
+            "conversation authority does not match the authenticated owner and session",
+            "conversation_authority_owner_mismatch",
+        ));
+    }
+    let coordinator = state.session_context_coordinator.as_ref().ok_or_else(|| {
+        error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "canonical session coordinator is unavailable",
+            "session_coordinator_unavailable",
+        )
+    })?;
+    let signer = state.execution_grant_signer.as_ref().ok_or_else(|| {
+        error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "execution grant verifier is unavailable",
+            "execution_grant_verifier_unavailable",
+        )
+    })?;
+    let current_epochs = coordinator
+        .load_authority_epochs(&authority.key)
+        .await
+        .map_err(|error| {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to load current session authority: {error}"),
+                "session_authority_unavailable",
+            )
+        })?
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::CONFLICT,
+                "conversation authority references an uninitialized branch",
+                "conversation_authority_missing",
+            )
+        })?;
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let claims = signer
+        .verify(
+            &authority.execution_grant,
+            &authority.key,
+            current_epochs,
+            &authority.run_id,
+            authority.run_generation,
+            authority.provider_binding_id.as_deref(),
+            authority.provider_generation,
+            now_unix_ms,
+        )
+        .map_err(|error| {
+            error_response_coded(
+                StatusCode::CONFLICT,
+                format!("conversation execution grant was rejected: {error}"),
+                "conversation_authority_fenced",
+            )
+        })?;
+    if claims.writer_epoch != authority.writer_epoch || claims.actor_id != authority.actor_id {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "conversation authority generations do not match the signed grant",
+            "conversation_authority_fenced",
+        ));
+    }
+    let head = coordinator
+        .load_head(&authority.key)
+        .await
+        .map_err(|error| {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to load canonical conversation head: {error}"),
+                "session_head_unavailable",
+            )
+        })?;
+    if head.as_ref().map(|head| &head.cursor) != authority.expected_cursor.as_ref()
+        || authority.prompt_manifest_root.as_deref()
+            != head.as_ref().map(|head| head.latest_manifest_root.as_str())
+    {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "conversation cursor or prompt manifest is stale",
+            "conversation_cursor_conflict",
+        ));
+    }
+    Ok(())
+}
+
 /// Safely convert a string to a HeaderValue, returning an SSE error response on failure.
 #[allow(clippy::result_large_err)]
 fn safe_header_value(value: &str) -> Result<HeaderValue, Response> {
@@ -166,6 +274,13 @@ pub(super) async fn chat_handler(
     .await?;
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    validate_conversation_authority(
+        &state,
+        &user.user_id,
+        chat_data.session_id.as_deref(),
+        chat_data.conversation_authority.as_ref(),
+    )
+    .await?;
     inject_effective_runtime_context(&state, &principal, &mut chat_data).await?;
     let run = state
         .execution
@@ -224,6 +339,16 @@ pub(super) async fn chat_stream_handler(
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
+    if let Err((status, error)) = validate_conversation_authority(
+        &state,
+        &user.user_id,
+        chat_data.session_id.as_deref(),
+        chat_data.conversation_authority.as_ref(),
+    )
+    .await
+    {
+        return sse_error_response_from_error(status, error.0);
+    }
     if let Err((status, error)) =
         inject_effective_runtime_context(&state, &principal, &mut chat_data).await
     {

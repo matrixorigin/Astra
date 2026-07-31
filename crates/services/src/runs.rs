@@ -572,6 +572,7 @@ pub struct ChatRequestData {
     pub explain: bool,
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: bool,
+    pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
 
 fn redacted_forward_header_names(headers: &std::collections::HashMap<String, String>) -> Vec<&str> {
@@ -633,6 +634,18 @@ impl std::fmt::Debug for ChatRequestData {
             .field("context", &self.context)
             .field("edge_executor_id", &self.edge_executor_id)
             .field("capabilities", &self.capabilities)
+            .field(
+                "conversation_authority",
+                &self.conversation_authority.as_ref().map(|authority| {
+                    (
+                        &authority.key,
+                        authority.writer_epoch,
+                        &authority.run_id,
+                        authority.run_generation,
+                        authority.provider_generation,
+                    )
+                }),
+            )
             .field(
                 "forward_headers",
                 &RedactedForwardHeadersDebug(&self.forward_headers),
@@ -11208,6 +11221,7 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
             provider_workspace_id: None,
+            conversation_authority: None,
         };
 
         let rendered = format!("{request:?}");
@@ -11280,6 +11294,7 @@ mod tests {
             interaction_mode: None,
             interactive_client: false,
             provider_workspace_id: None,
+            conversation_authority: None,
         };
 
         let rendered = format!("{request:?}");
@@ -11368,6 +11383,7 @@ mod tests {
                     interaction_mode: None,
                     interactive_client: false,
                     provider_workspace_id: None,
+                    conversation_authority: None,
                 },
             )
             .await

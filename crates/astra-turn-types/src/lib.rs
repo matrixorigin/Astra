@@ -16,6 +16,7 @@ mod result_quality;
 mod resume;
 mod runtime_scaffolding;
 mod semantic_read_cache;
+mod session_coordination;
 mod session_cursor;
 pub mod session_facts;
 mod tool_idempotency;
@@ -81,11 +82,22 @@ pub use semantic_read_cache::{
     SemanticReadFreshnessContext, SemanticReadFreshnessResolution,
     SemanticReadFreshnessUnavailableReason, SemanticReadObservation,
 };
+pub use session_coordination::{
+    ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+    CONTEXT_MANIFEST_NODE_SCHEMA_VERSION, CONVERSATION_AUTHORITY_ENVELOPE_SCHEMA_VERSION,
+    CONVERSATION_SEGMENT_SCHEMA_VERSION, CanonicalTurnDeltaV1, ContextManifestNodeV1,
+    ConversationAuthorityEnvelopeV1, ConversationSegmentRefV1, ConversationSegmentV1,
+    ConversationWriterLeaseV1, CoordinatorConflictOptionV1, CoordinatorMutationV1,
+    EXECUTION_GRANT_SCHEMA_VERSION, ExecutionGrantClaimsV1, SESSION_COORDINATION_SCHEMA_VERSION,
+    SessionContextHeadV1, SessionCoordinationValidationError, SessionKeyV1, SessionSurfaceV1,
+    SignedExecutionGrantV1, TurnReservationV1,
+};
 pub use session_cursor::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
-    DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
-    canonical_conversation_root,
+    DEFAULT_CONVERSATION_BRANCH_ID, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
+    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
+    canonical_conversation_serialized_len, json_serialized_len,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

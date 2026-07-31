@@ -44,6 +44,8 @@ pub(super) struct ChatTurnRequestBody {
     turn_chain_id: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_query_event_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_authority: Option<serde_json::Value>,
     /// Forward-compatible: preserves unknown fields through round-trip.
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
@@ -127,6 +129,15 @@ impl ChatTurnRequestBody {
 
     fn user_query(&self) -> String {
         extract_latest_user_query(self.messages_slice())
+    }
+
+    fn conversation_authority(
+        &self,
+    ) -> Result<Option<astra_turn_types::ConversationAuthorityEnvelopeV1>, serde_json::Error> {
+        self.conversation_authority
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
     }
 }
 
@@ -315,6 +326,16 @@ fn validate_bridge_payload_fields(
             "bridge payload field `edge_profile` must be an object",
         ));
     }
+    if payload
+        .get("conversation_authority")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "bridge payload field `conversation_authority` must be an object",
+            "conversation_authority_invalid",
+        ));
+    }
 
     Ok(())
 }
@@ -460,6 +481,29 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         trusted_session_created_at.as_deref(),
     ) {
         seed_bridge_session_created_at(state, &user.user_id, session_id, created_at).await;
+    }
+    let conversation_authority = request.conversation_authority().map_err(|error| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("invalid conversation authority envelope: {error}"),
+            "conversation_authority_invalid",
+        )
+    })?;
+    super::chat_handlers::validate_conversation_authority(
+        state,
+        &user.user_id,
+        trusted_session_id.as_deref(),
+        conversation_authority.as_ref(),
+    )
+    .await?;
+    if let Some(authority) = &conversation_authority
+        && request.round_index != Some(authority.round)
+    {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "conversation authority round does not match the bridge request",
+            "conversation_authority_round_mismatch",
+        ));
     }
     // ── Turn identifiers ────────────────────────────────────────────────
     let (turn_chain_id, user_query_event_id, session_turn) =

@@ -1273,6 +1273,7 @@ fn build_ws_chat_request(
         forward_headers: std::collections::HashMap::new(),
         provider_workspace_id: None,
         execution_budget,
+        conversation_authority: None,
         execution_policy: Default::default(),
         explain,
         interaction_mode,

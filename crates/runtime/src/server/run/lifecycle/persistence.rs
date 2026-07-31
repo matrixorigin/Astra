@@ -208,24 +208,20 @@ pub(crate) struct PostLoopPersistContext {
 }
 
 impl PostLoopPersistContext {
-    /// Run all best-effort post-loop persistence side effects.
+    /// Persist projections and observers after the canonical core transaction.
     ///
-    /// The `loop_success` flag comes from `outcome.is_ok()` (before consuming
-    /// the outcome in `finalize_run_events`).
-    pub(crate) async fn run(
+    /// Callers must pass the exact result of
+    /// [`Self::persist_core_and_trace_in_transaction`]. This keeps the order
+    /// `canonical journal -> context-head CAS -> CSL/projections` explicit.
+    pub(crate) async fn run_after_core(
         &self,
         state: &AgenticLoopState,
         loop_success: bool,
+        core_trace_result: Result<(), String>,
+        canonical_context_persisted: bool,
     ) -> Result<(), String> {
         let mut errors = Vec::new();
-
-        // 0. Persist core events + trace detail events in a single MatrixOne
-        // transaction FIRST, so that a crash between writes leaves a consistent
-        // state. If core+trace fails, CSL is never written — preserving the
-        // invariant that CSL never advances beyond the canonical core events.
-        // If core+trace succeeds and CSL later fails, the next restore falls
-        // back to transcript messages, which is a recoverable degradation.
-        let core_trace_persisted = match self.persist_core_and_trace_in_transaction(state).await {
+        let core_trace_persisted = match core_trace_result {
             Ok(()) => true,
             Err(e) => {
                 errors.push(format!("core+trace transaction failed: {}", e));
@@ -237,8 +233,12 @@ impl PostLoopPersistContext {
         // succeeds. If CSL fails later, restore can fall back to transcript
         // messages; if core+trace failed, advancing CSL would create history
         // without canonical durable events behind it.
-        self.persist_csl_if_core_trace_persisted(state, core_trace_persisted, &mut errors)
-            .await;
+        self.persist_csl_if_canonical_ready(
+            state,
+            core_trace_persisted && canonical_context_persisted,
+            &mut errors,
+        )
+        .await;
 
         // 2. Persist decision audit + skill selection to hook DB. Canonical
         // per-call tool lifecycle events were already written atomically with
@@ -333,20 +333,20 @@ impl PostLoopPersistContext {
         }
     }
 
-    async fn persist_csl_if_core_trace_persisted(
+    async fn persist_csl_if_canonical_ready(
         &self,
         state: &AgenticLoopState,
-        core_trace_persisted: bool,
+        canonical_ready: bool,
         errors: &mut Vec<String>,
     ) {
         let Some(ref mgr) = self.csl_manager else {
             return;
         };
-        if !core_trace_persisted {
+        if !canonical_ready {
             tracing::warn!(
                 session_id = %self.session_id,
                 run_id = %self.run_id,
-                "skipping CSL persist because core+trace persistence failed"
+                "skipping CSL persist because canonical journal or context-head persistence failed"
             );
             return;
         }
@@ -371,7 +371,7 @@ impl PostLoopPersistContext {
     /// Persist core events and trace detail events in a single MatrixOne
     /// transaction. If the transaction fails, all writes are rolled back
     /// atomically — preventing partial state on crash.
-    async fn persist_core_and_trace_in_transaction(
+    pub(crate) async fn persist_core_and_trace_in_transaction(
         &self,
         state: &AgenticLoopState,
     ) -> Result<(), String> {
@@ -3212,7 +3212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csl_persist_is_skipped_when_core_trace_persistence_fails() {
+    async fn csl_persist_is_skipped_when_canonical_backbone_is_incomplete() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
         let session_id = "post-loop-csl-gated-on-core";
@@ -3229,7 +3229,7 @@ mod tests {
         state.final_text = "answer".to_string();
         let mut errors = Vec::new();
 
-        ctx.persist_csl_if_core_trace_persisted(&state, false, &mut errors)
+        ctx.persist_csl_if_canonical_ready(&state, false, &mut errors)
             .await;
 
         assert!(errors.is_empty());
@@ -3241,7 +3241,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn csl_persist_runs_after_core_trace_persistence_succeeds() {
+    async fn csl_persist_runs_after_canonical_backbone_is_ready() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store: Arc<dyn CslStore> = Arc::new(FileCslStore::new(dir.path()));
         let session_id = "post-loop-csl-after-core";
@@ -3258,7 +3258,7 @@ mod tests {
         state.final_text = "answer".to_string();
         let mut errors = Vec::new();
 
-        ctx.persist_csl_if_core_trace_persisted(&state, true, &mut errors)
+        ctx.persist_csl_if_canonical_ready(&state, true, &mut errors)
             .await;
 
         assert!(errors.is_empty());
