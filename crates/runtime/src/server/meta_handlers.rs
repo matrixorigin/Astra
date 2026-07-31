@@ -258,6 +258,117 @@ fn scrape_history_work_metrics(state: &AppState) {
     }
 }
 
+pub(super) fn publish_model_request_metrics(
+    registry: &astra_turn_core::pipeline_metrics::MetricsRegistry,
+    rows: &[astra_services::ModelRequestMetricsRow],
+) {
+    const REQUESTS: &str = "astra_model_requests_total";
+    const INPUT: &str = "astra_llm_input_tokens_total";
+    const OUTPUT: &str = "astra_llm_output_tokens_total";
+    const CACHE_SHARE: &str = "astra_prompt_cache_read_share";
+    registry.register_counter(
+        REQUESTS,
+        "Database-global durable physical model request terminals by low-cardinality execution dimensions.",
+    );
+    registry.register_counter(
+        INPUT,
+        "Database-global provider-normalized model input tokens by mutually exclusive input lane.",
+    );
+    registry.register_counter(
+        OUTPUT,
+        "Database-global provider-normalized model output tokens.",
+    );
+    registry.register_gauge(
+        CACHE_SHARE,
+        "Database-global provider-normalized cache-read tokens divided by total request input tokens.",
+    );
+
+    let mut token_totals =
+        std::collections::BTreeMap::<(String, String, String, String), [u64; 4]>::new();
+    for row in rows {
+        registry.set_counter_absolute(
+            REQUESTS,
+            &[
+                ("topology", row.topology.as_str()),
+                ("purpose", row.purpose.as_str()),
+                ("provider", row.provider.as_str()),
+                ("model_family", row.model_family.as_str()),
+                ("outcome", row.terminal_status.as_str()),
+            ],
+            row.requests,
+        );
+        let totals = token_totals
+            .entry((
+                row.topology.clone(),
+                row.purpose.clone(),
+                row.provider.clone(),
+                row.model_family.clone(),
+            ))
+            .or_default();
+        totals[0] = totals[0].saturating_add(row.input_tokens);
+        totals[1] = totals[1].saturating_add(row.output_tokens);
+        totals[2] = totals[2].saturating_add(row.cache_read_tokens);
+        totals[3] = totals[3].saturating_add(row.cache_creation_tokens);
+    }
+    for ((topology, purpose, provider, model_family), totals) in token_totals {
+        let input_tokens = totals[0];
+        let output_tokens = totals[1];
+        let cache_read_tokens = totals[2];
+        let cache_creation_tokens = totals[3];
+        let identity_labels = [
+            ("topology", topology.as_str()),
+            ("purpose", purpose.as_str()),
+            ("provider", provider.as_str()),
+            ("model_family", model_family.as_str()),
+        ];
+        registry.set_counter_absolute(
+            INPUT,
+            &[
+                ("bucket", "fresh"),
+                identity_labels[0],
+                identity_labels[1],
+                identity_labels[2],
+                identity_labels[3],
+            ],
+            input_tokens
+                .saturating_sub(cache_read_tokens)
+                .saturating_sub(cache_creation_tokens),
+        );
+        registry.set_counter_absolute(
+            INPUT,
+            &[
+                ("bucket", "cache_read"),
+                identity_labels[0],
+                identity_labels[1],
+                identity_labels[2],
+                identity_labels[3],
+            ],
+            cache_read_tokens,
+        );
+        registry.set_counter_absolute(
+            INPUT,
+            &[
+                ("bucket", "cache_creation"),
+                identity_labels[0],
+                identity_labels[1],
+                identity_labels[2],
+                identity_labels[3],
+            ],
+            cache_creation_tokens,
+        );
+        registry.set_counter_absolute(OUTPUT, &identity_labels, output_tokens);
+        registry.set_gauge(
+            CACHE_SHARE,
+            &identity_labels,
+            if input_tokens == 0 {
+                0.0
+            } else {
+                cache_read_tokens as f64 / input_tokens as f64
+            },
+        );
+    }
+}
+
 pub(super) async fn root_handler(State(state): State<AppState>) -> Json<RootResponse> {
     Json(RootResponse {
         name: state.service_info.name,
@@ -561,6 +672,77 @@ mod tests {
         assert!(
             text.contains(
                 "# TYPE astra_event_ingestion_events_dropped_before_acceptance_by_priority_total counter"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn model_request_metrics_sum_status_rows_without_label_overwrite() {
+        let registry = astra_turn_core::pipeline_metrics::MetricsRegistry::new();
+        let rows = [
+            astra_services::ModelRequestMetricsRow {
+                topology: "server_only".to_string(),
+                provider: "deepseek".to_string(),
+                model_family: "flash".to_string(),
+                purpose: "primary_agent".to_string(),
+                terminal_status: "succeeded".to_string(),
+                requests: 3,
+                input_tokens: 1_000,
+                output_tokens: 100,
+                cache_read_tokens: 600,
+                cache_creation_tokens: 100,
+            },
+            astra_services::ModelRequestMetricsRow {
+                topology: "server_only".to_string(),
+                provider: "deepseek".to_string(),
+                model_family: "flash".to_string(),
+                purpose: "primary_agent".to_string(),
+                terminal_status: "failed".to_string(),
+                requests: 1,
+                input_tokens: 200,
+                output_tokens: 20,
+                cache_read_tokens: 50,
+                cache_creation_tokens: 0,
+            },
+            astra_services::ModelRequestMetricsRow {
+                topology: "server_only".to_string(),
+                provider: "deepseek".to_string(),
+                model_family: "reasoning".to_string(),
+                purpose: "primary_agent".to_string(),
+                terminal_status: "succeeded".to_string(),
+                requests: 2,
+                input_tokens: 900,
+                output_tokens: 200,
+                cache_read_tokens: 100,
+                cache_creation_tokens: 0,
+            },
+        ];
+
+        publish_model_request_metrics(&registry, &rows);
+        let text = registry.render_prometheus();
+
+        assert!(
+            text.contains(
+                "astra_llm_input_tokens_total{bucket=\"fresh\",model_family=\"flash\",provider=\"deepseek\",purpose=\"primary_agent\",topology=\"server_only\"} 450"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "astra_llm_output_tokens_total{model_family=\"flash\",provider=\"deepseek\",purpose=\"primary_agent\",topology=\"server_only\"} 120"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "astra_model_requests_total{model_family=\"flash\",outcome=\"succeeded\",provider=\"deepseek\",purpose=\"primary_agent\",topology=\"server_only\"} 3"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "astra_llm_input_tokens_total{bucket=\"fresh\",model_family=\"reasoning\",provider=\"deepseek\",purpose=\"primary_agent\",topology=\"server_only\"} 800"
             ),
             "{text}"
         );

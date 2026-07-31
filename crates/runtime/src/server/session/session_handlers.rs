@@ -152,6 +152,25 @@ pub(crate) struct PromptRequestObservabilityResponse {
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
+pub(crate) struct CanonicalHeadObservabilityResponse {
+    pub isolation_domain: String,
+    pub branch_id: String,
+    pub completed_turn: u32,
+    pub journal_event_seq: u64,
+    pub conversation_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_root_hash: Option<String>,
+    pub projection_schema: u32,
+    pub compaction_generation: u64,
+    pub writer_epoch: u64,
+    pub authorization_epoch: u64,
+    pub device_trust_epoch: u64,
+    pub permission_epoch: u64,
+    pub total_message_count: u64,
+    pub total_canonical_bytes: u64,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
 pub(crate) struct SessionProjectionObservabilityResponse {
     pub observability_available: bool,
     pub transcript_page_count: u32,
@@ -161,6 +180,20 @@ pub(crate) struct SessionProjectionObservabilityResponse {
     pub prompt_request_count: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_prompt_request: Option<PromptRequestObservabilityResponse>,
+    pub canonical_heads: Vec<CanonicalHeadObservabilityResponse>,
+    pub model_request_trace_coverage: astra_services::ModelRequestTraceCoverage,
+    pub cursor_conflict_count: u64,
+    pub stale_epoch_rejection_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_handoff_state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_model_request_lineage: Option<astra_services::ModelRequestLineage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_resume_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_fork_parent_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_compaction: Option<astra_services::ModelRequestCompaction>,
 }
 
 fn user_anchor_memory_response(item: UserAnchorMemoryItem) -> UserAnchorMemoryResponse {
@@ -886,6 +919,27 @@ fn decode_context_manifest_summary(
     })
 }
 
+fn decode_canonical_head_observability(
+    row: &impl RowExt,
+) -> Result<CanonicalHeadObservabilityResponse, String> {
+    Ok(CanonicalHeadObservabilityResponse {
+        isolation_domain: session_row_string(row, "isolation_domain")?,
+        branch_id: session_row_string(row, "branch_id")?,
+        completed_turn: session_row_u32(row, "completed_turn")?,
+        journal_event_seq: session_row_non_negative_i64(row, "journal_event_seq")? as u64,
+        conversation_seq: session_row_non_negative_i64(row, "conversation_seq")? as u64,
+        canonical_root_hash: session_row_optional_string(row, "canonical_root_hash")?,
+        projection_schema: session_row_u32(row, "projection_schema")?,
+        compaction_generation: session_row_non_negative_i64(row, "compaction_generation")? as u64,
+        writer_epoch: session_row_non_negative_i64(row, "writer_epoch")? as u64,
+        authorization_epoch: session_row_non_negative_i64(row, "authorization_epoch")? as u64,
+        device_trust_epoch: session_row_non_negative_i64(row, "device_trust_epoch")? as u64,
+        permission_epoch: session_row_non_negative_i64(row, "permission_epoch")? as u64,
+        total_message_count: session_row_non_negative_i64(row, "total_message_count")? as u64,
+        total_canonical_bytes: session_row_non_negative_i64(row, "total_canonical_bytes")? as u64,
+    })
+}
+
 fn decode_active_run_projection(row: &impl RowExt) -> Result<ActiveRunProjection, String> {
     let last_event_idx = session_row_i64(row, "last_event_idx")?;
     if last_event_idx < -1 {
@@ -955,6 +1009,88 @@ async fn load_session_projection_observability(
                 tool_count: request.tool_count,
                 delta_counts: request.delta_counts,
             });
+    let canonical_heads = sqlx::query(
+        "SELECT isolation_domain, branch_id, completed_turn, journal_event_seq, conversation_seq,
+                canonical_root_hash, projection_schema, compaction_generation,
+                writer_epoch, authorization_epoch, device_trust_epoch,
+                permission_epoch, total_message_count, total_canonical_bytes
+         FROM session_context_heads
+         WHERE owner_user_id = ? AND session_id = ?
+         ORDER BY isolation_domain, branch_id",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_all(pool.get())
+    .await
+    .map_err(internal_error)?
+    .into_iter()
+    .map(|row| decode_canonical_head_observability(&row))
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(internal_error)?;
+    let model_request_trace_coverage =
+        astra_services::model_request_trace_coverage(pool, user_id, session_id)
+            .await
+            .map_err(internal_error)?;
+    let recent_model_requests =
+        astra_services::list_model_request_context_events(pool, user_id, session_id, 8)
+            .await
+            .map_err(internal_error)?;
+    let latest_model_request_lineage = recent_model_requests
+        .first()
+        .map(|record| record.event.lineage.clone());
+    let latest_model_request = recent_model_requests
+        .into_iter()
+        .find(|record| record.stage == astra_services::ModelRequestEventStage::Terminal);
+    let authority_status = sqlx::query(
+        "SELECT
+            COALESCE(SUM(CASE WHEN outcome = 'cursor_conflict' THEN 1 ELSE 0 END), 0)
+                AS cursor_conflicts,
+            COALESCE(SUM(CASE WHEN outcome = 'stale_fenced' THEN 1 ELSE 0 END), 0)
+                AS stale_epoch_rejections
+         FROM session_context_authority_events
+         WHERE owner_user_id = ? AND session_id = ?",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(pool.get())
+    .await
+    .map_err(internal_error)?;
+    let cursor_conflict_count = session_row_non_negative_i64(&authority_status, "cursor_conflicts")
+        .map_err(internal_error)? as u64;
+    let stale_epoch_rejection_count =
+        session_row_non_negative_i64(&authority_status, "stale_epoch_rejections")
+            .map_err(internal_error)? as u64;
+    let latest_handoff_state = sqlx::query(
+        "SELECT state
+         FROM session_handoffs
+         WHERE owner_user_id = ? AND session_id = ?
+         ORDER BY updated_at DESC, handoff_id DESC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(pool.get())
+    .await
+    .map_err(internal_error)?
+    .map(|row| session_row_string(&row, "state"))
+    .transpose()
+    .map_err(internal_error)?;
+    let latest_resume_source = latest_model_request
+        .as_ref()
+        .and_then(|record| record.event.lineage.resume_source.clone());
+    let latest_fork_parent_session_id = latest_model_request
+        .as_ref()
+        .and_then(|record| record.event.lineage.fork_parent_session_id.clone());
+    let latest_compaction = latest_model_request
+        .filter(|record| {
+            let compaction = &record.event.compaction;
+            compaction.compaction_id.is_some()
+                || compaction.tier.is_some()
+                || compaction.insufficient
+                || compaction.futile
+                || compaction.circuit_open
+        })
+        .map(|record| record.event.compaction);
     Ok(SessionProjectionObservabilityResponse {
         observability_available: true,
         transcript_page_count,
@@ -964,6 +1100,15 @@ async fn load_session_projection_observability(
         active_run_projection_lag_events,
         prompt_request_count,
         latest_prompt_request,
+        canonical_heads,
+        model_request_trace_coverage,
+        cursor_conflict_count,
+        stale_epoch_rejection_count,
+        latest_handoff_state,
+        latest_model_request_lineage,
+        latest_resume_source,
+        latest_fork_parent_session_id,
+        latest_compaction,
     })
 }
 
@@ -1798,20 +1943,47 @@ pub(crate) async fn resume_session_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
     headers: HeaderMap,
-) -> Result<Json<astra_services::AttachSessionOutcomeV1>, (StatusCode, Json<ErrorResponse>)> {
-    attach_session(
-        &state,
-        &session_id,
-        &headers,
-        SessionAttachRequest {
-            idempotency_key: format!("resume-server:{}", state.session_actor_id),
-            placement: astra_turn_types::SessionPlacementV1::Server,
-            after_manifest_root: None,
-            ttl_seconds: default_attachment_ttl_seconds(),
-        },
-    )
-    .await
-    .map(Json)
+) -> Result<Json<astra_services::session_restore::RestoredSession>, (StatusCode, Json<ErrorResponse>)>
+{
+    let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id.clone();
+    let session = state
+        .session_service
+        .get_session(session_id.clone(), user_id.clone())
+        .await?;
+    let Some(shared_pool) = state.shared_pool.as_ref() else {
+        return Err(internal_error("shared MatrixOne pool is not configured"));
+    };
+    let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
+    let mut restored = svc
+        .restore_session(&user_id, &session.session_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                format!("session {} has no resumable state", session.session_id),
+            )
+        })?;
+    // Resume is the hydration API consumed by CLI clients. Cross-placement
+    // observation and control remain explicit operations on `/attachments`
+    // and `/handoffs`; inferring a Server attachment here would assign the
+    // wrong actor and placement to a CLI restore.
+    state
+        .session_service
+        .update_session(
+            session_id,
+            user_id,
+            SessionUpdateRequestData {
+                title: None,
+                metadata: None,
+                metadata_patch: None,
+                status: Some("active".to_string()),
+            },
+        )
+        .await?;
+    restored.last_status = "active".to_string();
+    Ok(Json(restored))
 }
 
 pub(crate) async fn attach_session_handler(
@@ -3503,6 +3675,8 @@ mod tests {
                 "ended_at_server" => "2026-06-26T13:00:00",
                 "page_hash" => "hash-1",
                 "run_id" => "run-1",
+                "branch_id" => "main",
+                "isolation_domain" => "owner-session-v1",
                 _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
             .to_string())
@@ -3513,6 +3687,7 @@ mod tests {
             Ok(match column {
                 "run_id" => Some("run-1".to_string()),
                 "budget_template_id" => Some("budget-1".to_string()),
+                "canonical_root_hash" => Some("a".repeat(64)),
                 "source_event_id" => None,
                 "payload_json" => Some(
                     r#"{"reasoning":"thinking","reasoning_status":"complete","tool_calls":[{"tool_use_id":"call-1","name":"read_file","arguments":"{\"path\":\"src/lib.rs\"}"}]}"#
@@ -3545,6 +3720,17 @@ mod tests {
                 "total_estimated_tokens" => Ok(123),
                 "high_watermark" => Ok(11),
                 "last_event_idx" => Ok(10),
+                "completed_turn" => Ok(5),
+                "journal_event_seq" => Ok(17),
+                "conversation_seq" => Ok(13),
+                "projection_schema" => Ok(2),
+                "compaction_generation" => Ok(3),
+                "writer_epoch" => Ok(7),
+                "authorization_epoch" => Ok(11),
+                "device_trust_epoch" => Ok(12),
+                "permission_epoch" => Ok(14),
+                "total_message_count" => Ok(40),
+                "total_canonical_bytes" => Ok(8_192),
                 _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
             }
         }
@@ -4224,6 +4410,70 @@ mod tests {
             assert!(
                 err.contains("total_estimated_tokens"),
                 "error should identify token column: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_head_observability_decode_is_exact_and_fails_loudly() {
+        let head = decode_canonical_head_observability(&FakeSessionRow::complete())
+            .expect("canonical head decodes");
+        assert_eq!(head.branch_id, "main");
+        assert_eq!(head.isolation_domain, "owner-session-v1");
+        assert_eq!(head.completed_turn, 5);
+        assert_eq!(head.journal_event_seq, 17);
+        assert_eq!(head.conversation_seq, 13);
+        assert_eq!(head.canonical_root_hash, Some("a".repeat(64)));
+        assert_eq!(head.projection_schema, 2);
+        assert_eq!(head.compaction_generation, 3);
+        assert_eq!(head.writer_epoch, 7);
+        assert_eq!(head.authorization_epoch, 11);
+        assert_eq!(head.device_trust_epoch, 12);
+        assert_eq!(head.permission_epoch, 14);
+        assert_eq!(head.total_message_count, 40);
+        assert_eq!(head.total_canonical_bytes, 8_192);
+
+        for column in [
+            "isolation_domain",
+            "branch_id",
+            "completed_turn",
+            "journal_event_seq",
+            "conversation_seq",
+            "canonical_root_hash",
+            "projection_schema",
+            "compaction_generation",
+            "writer_epoch",
+            "authorization_epoch",
+            "device_trust_epoch",
+            "permission_epoch",
+            "total_message_count",
+            "total_canonical_bytes",
+        ] {
+            let error = decode_canonical_head_observability(&FakeSessionRow::fail_on(column))
+                .expect_err("missing canonical head fact must fail");
+            assert!(
+                error.contains(column),
+                "error must identify missing canonical head column {column}: {error}"
+            );
+        }
+        for column in [
+            "completed_turn",
+            "journal_event_seq",
+            "conversation_seq",
+            "projection_schema",
+            "compaction_generation",
+            "writer_epoch",
+            "authorization_epoch",
+            "device_trust_epoch",
+            "permission_epoch",
+            "total_message_count",
+            "total_canonical_bytes",
+        ] {
+            let error = decode_canonical_head_observability(&FakeSessionRow::with_i64(column, -1))
+                .expect_err("negative canonical head coordinate must fail");
+            assert!(
+                error.contains(column),
+                "error must identify invalid canonical head column {column}: {error}"
             );
         }
     }

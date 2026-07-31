@@ -417,6 +417,26 @@ pub(crate) fn load_session_continuation_for_recovery(
     }
 }
 
+/// Recover the durable canonical conversation for a live turn boundary.
+///
+/// A journal with no conversation commits is not the same as unavailable
+/// canonical state: it is an explicitly empty canonical conversation. This
+/// occurs after a first-turn failure or a foreground-to-background handoff.
+/// Materializing that empty state lets the next turn proceed without ever
+/// promoting display-oriented pair history into a prompt source.
+pub(crate) fn recover_or_initialize_active_conversation(
+    session_id: &str,
+) -> Result<astra_turn_core::active_conversation::ActiveConversation, String> {
+    match load_journal_canonical_conversation(session_id)? {
+        Some(active) => Ok(active),
+        None => astra_turn_core::active_conversation::ActiveConversation::empty(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id,
+        )
+        .map_err(|error| error.to_string()),
+    }
+}
+
 fn projection_active_conversation(
     session_id: &str,
     messages: Vec<Value>,

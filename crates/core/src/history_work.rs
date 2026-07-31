@@ -22,9 +22,6 @@ pub enum HistoryWorkSite {
     CliSettlementRollbackSnapshot,
     CliPrimaryCommitWorkerHistoryQueue,
     CliPrimaryCommitWorkerFinalMessagesQueue,
-    CliContinuationShadowFullClone,
-    CliContinuationShadowCanonicalHash,
-    CliContinuationShadowToolGroupSlice,
     CliDebugCheckpointRead,
     CliDebugCheckpointDeserialization,
     CliDebugCheckpointHistoryClone,
@@ -179,7 +176,7 @@ pub enum HistoryWorkSite {
 }
 
 impl HistoryWorkSite {
-    const COUNT: usize = 159;
+    const COUNT: usize = 156;
 
     pub const ALL: [Self; Self::COUNT] = [
         Self::AgenticRequestSnapshot,
@@ -187,9 +184,6 @@ impl HistoryWorkSite {
         Self::CliSettlementRollbackSnapshot,
         Self::CliPrimaryCommitWorkerHistoryQueue,
         Self::CliPrimaryCommitWorkerFinalMessagesQueue,
-        Self::CliContinuationShadowFullClone,
-        Self::CliContinuationShadowCanonicalHash,
-        Self::CliContinuationShadowToolGroupSlice,
         Self::CliDebugCheckpointRead,
         Self::CliDebugCheckpointDeserialization,
         Self::CliDebugCheckpointHistoryClone,
@@ -352,9 +346,6 @@ impl HistoryWorkSite {
             Self::CliPrimaryCommitWorkerFinalMessagesQueue => {
                 "cli_primary_commit_worker_final_messages_queue"
             }
-            Self::CliContinuationShadowFullClone => "cli_continuation_shadow_full_clone",
-            Self::CliContinuationShadowCanonicalHash => "cli_continuation_shadow_canonical_hash",
-            Self::CliContinuationShadowToolGroupSlice => "cli_continuation_shadow_tool_group_slice",
             Self::CliDebugCheckpointRead => "cli_debug_checkpoint_read",
             Self::CliDebugCheckpointDeserialization => "cli_debug_checkpoint_deserialization",
             Self::CliDebugCheckpointHistoryClone => "cli_debug_checkpoint_history_clone",
@@ -537,9 +528,6 @@ impl HistoryWorkSite {
             | Self::CliPrimaryCommitWorkerHistoryQueue
             | Self::CliPrimaryCommitWorkerFinalMessagesQueue
             | Self::CliPostCommitQueue => "cli.turn_settlement",
-            Self::CliContinuationShadowFullClone
-            | Self::CliContinuationShadowCanonicalHash
-            | Self::CliContinuationShadowToolGroupSlice => "cli.turn.continuation_shadow",
             Self::CliDebugCheckpointRead
             | Self::CliDebugCheckpointDeserialization
             | Self::CliDebugCheckpointHistoryClone
@@ -795,9 +783,6 @@ impl HistoryWorkSite {
             | Self::BridgeRequestCaptureClone
             | Self::BridgeDisconnectCaptureClone
             | Self::ServerToolAdmissionSnapshotClone
-            | Self::CliContinuationShadowFullClone
-            | Self::CliContinuationShadowCanonicalHash
-            | Self::CliContinuationShadowToolGroupSlice
             | Self::CliDebugCheckpointRead
             | Self::CliDebugCheckpointDeserialization
             | Self::CliDebugCheckpointHistoryClone

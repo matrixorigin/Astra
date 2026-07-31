@@ -4,6 +4,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
+use crate::model_request_context::{
+    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextSeed,
+    ModelRequestEventStage, ModelRequestIdentity, ModelRequestTopology, ModelRequestUsage,
+    ModelRequestWireComposition,
+};
 use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_offering_id};
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
@@ -33,7 +38,7 @@ pub struct InferenceInvocationPlan {
     input: InferenceInvocationInput,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InferenceProviderAttemptPlan {
     attempt_id: String,
     invocation_id: String,
@@ -42,6 +47,8 @@ pub struct InferenceProviderAttemptPlan {
     provider: String,
     admission_token: String,
     wire: InferenceProviderWireIdentity,
+    invocation_input: InferenceInvocationInput,
+    request_context: ModelRequestContextSeed,
 }
 
 /// Immutable identity of the exact serialized provider request body.
@@ -54,6 +61,7 @@ pub struct InferenceProviderWireIdentity {
     protocol: String,
     provider_wire_hash: String,
     provider_wire_bytes: u64,
+    composition: ModelRequestWireComposition,
 }
 
 impl InferenceInvocationPlan {
@@ -94,6 +102,11 @@ impl InferenceProviderAttemptPlan {
     pub fn wire(&self) -> &InferenceProviderWireIdentity {
         &self.wire
     }
+
+    #[must_use]
+    pub fn request_context(&self) -> &ModelRequestContextSeed {
+        &self.request_context
+    }
 }
 
 impl InferenceProviderWireIdentity {
@@ -130,7 +143,14 @@ impl InferenceProviderWireIdentity {
             protocol,
             provider_wire_hash,
             provider_wire_bytes,
+            composition: ModelRequestWireComposition::default(),
         })
+    }
+
+    #[must_use]
+    pub fn with_composition(mut self, composition: ModelRequestWireComposition) -> Self {
+        self.composition = composition;
+        self
     }
 
     #[must_use]
@@ -146,6 +166,11 @@ impl InferenceProviderWireIdentity {
     #[must_use]
     pub fn provider_wire_bytes(&self) -> u64 {
         self.provider_wire_bytes
+    }
+
+    #[must_use]
+    pub fn composition(&self) -> &ModelRequestWireComposition {
+        &self.composition
     }
 }
 
@@ -289,6 +314,21 @@ pub fn plan_inference_provider_attempt(
     attempt_index: u32,
     wire: InferenceProviderWireIdentity,
 ) -> InferenceProviderAttemptPlan {
+    let mut request_context = ModelRequestContextSeed::server_default();
+    if invocation.input.execution_placement == ModelExecutionPlacement::Edge {
+        request_context.topology = ModelRequestTopology::EdgeServer;
+        request_context.execution_binding = "edge".to_string();
+    }
+    plan_inference_provider_attempt_with_context(invocation, attempt_index, wire, request_context)
+}
+
+#[must_use]
+pub fn plan_inference_provider_attempt_with_context(
+    invocation: &InferenceInvocationPlan,
+    attempt_index: u32,
+    wire: InferenceProviderWireIdentity,
+    request_context: ModelRequestContextSeed,
+) -> InferenceProviderAttemptPlan {
     let attempt_index_text = attempt_index.to_string();
     InferenceProviderAttemptPlan {
         attempt_id: hash_identity(
@@ -304,6 +344,8 @@ pub fn plan_inference_provider_attempt(
         provider: invocation.input.provider.clone(),
         admission_token: new_admission_token(),
         wire,
+        invocation_input: invocation.input.clone(),
+        request_context,
     }
 }
 
@@ -328,6 +370,225 @@ fn terminal_fingerprint(terminal: &InferenceInvocationTerminal) -> ServiceResult
         )
     })?;
     Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+fn checked_optional_i64(value: Option<u64>, label: &str) -> ServiceResult<Option<i64>> {
+    value.map(|value| checked_i64(value, label)).transpose()
+}
+
+fn model_request_metric_shard(attempt_id: &str) -> i16 {
+    i16::from(Sha256::digest(attempt_id.as_bytes())[0] % 64)
+}
+
+fn model_request_event(
+    attempt: &InferenceProviderAttemptPlan,
+    stage: ModelRequestEventStage,
+    terminal: Option<&InferenceInvocationTerminal>,
+) -> ServiceResult<(String, String, ModelRequestContextEvent)> {
+    if matches!(
+        (stage, terminal),
+        (ModelRequestEventStage::Accepted, Some(_)) | (ModelRequestEventStage::Terminal, None)
+    ) {
+        return Err(ServiceError::internal(
+            "model request accepted events cannot carry terminals and terminal events require one",
+        ));
+    }
+    let mut budget = attempt.request_context.budget.clone();
+    let usage = terminal.map(|terminal| {
+        let measured = terminal.usage.input_tokens;
+        budget.measured_input_tokens = Some(measured);
+        budget.usage_source = Some("provider_terminal".to_string());
+        if let Some(estimated) = budget.estimated_input_tokens {
+            let error = i128::from(measured) - i128::from(estimated);
+            budget.estimate_error_tokens =
+                Some(i64::try_from(error).unwrap_or(if error.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }));
+            budget.estimate_error_ratio =
+                (estimated > 0).then_some(error as f64 / estimated as f64);
+        }
+        ModelRequestUsage {
+            fresh_input_tokens: measured
+                .saturating_sub(terminal.usage.cache_read_tokens)
+                .saturating_sub(terminal.usage.cache_creation_tokens),
+            cache_read_tokens: terminal.usage.cache_read_tokens,
+            cache_creation_tokens: terminal.usage.cache_creation_tokens,
+            request_input_tokens: measured,
+            output_tokens: terminal.usage.output_tokens,
+        }
+    });
+    let mut cache = attempt.request_context.cache.clone();
+    if let Some(usage) = usage.as_ref() {
+        cache.cache_read_share = (usage.request_input_tokens > 0)
+            .then_some(usage.cache_read_tokens as f64 / usage.request_input_tokens as f64);
+    }
+    let input = &attempt.invocation_input;
+    let event = ModelRequestContextEvent {
+        schema: MODEL_REQUEST_CONTEXT_SCHEMA.to_string(),
+        stage,
+        identity: ModelRequestIdentity {
+            request_id: attempt.request_id().to_string(),
+            provider_response_id: terminal
+                .and_then(|terminal| terminal.provider_response_id.clone()),
+            owner_scope: input.user_id.clone(),
+            session_id: input.scope.session_id().map(str::to_string),
+            run_id: input.scope.run_id().map(str::to_string),
+            harness_run_id: input.scope.harness_run_id().map(str::to_string),
+            turn: input.scope.turn(),
+            round: input.scope.round(),
+            logical_attempt: input.scope.logical_attempt(),
+            physical_attempt: attempt.attempt_index,
+            actor_id: attempt.request_context.actor_id.clone(),
+            execution_principal: attempt.request_context.execution_principal.clone(),
+            billing_scope: attempt.request_context.billing_scope.clone(),
+            auth_session_id: attempt.request_context.auth_session_id.clone(),
+            device_instance_id: attempt.request_context.device_instance_id.clone(),
+            agent_id: attempt.request_context.agent_id.clone(),
+            parent_run_id: attempt.request_context.parent_run_id.clone(),
+            topology: attempt.request_context.topology,
+            interaction_owner: attempt.request_context.interaction_owner.clone(),
+            loop_owner: attempt.request_context.loop_owner.clone(),
+            execution_binding: attempt.request_context.execution_binding.clone(),
+            provider: input.provider.clone(),
+            model: input.resolved_model_name.clone(),
+            offering_id: input.offering_id.clone(),
+            inference_purpose: input.purpose.as_str().to_string(),
+            provider_protocol: attempt.wire.protocol.clone(),
+            provider_wire_hash: attempt.wire.provider_wire_hash.clone(),
+            provider_wire_bytes: attempt.wire.provider_wire_bytes,
+        },
+        lineage: attempt.request_context.lineage.clone(),
+        budget,
+        usage,
+        composition: attempt.request_context.composition.clone(),
+        wire_composition: attempt.wire.composition.clone(),
+        cache,
+        compaction: attempt.request_context.compaction.clone(),
+        terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
+        error_kind: terminal.and_then(|terminal| terminal.error_kind.clone()),
+    };
+    let event_json = serde_json::to_string(&event).map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Internal,
+            "serialize model request context event",
+            error,
+        )
+    })?;
+    let event_id = hash_identity("mrctx", &[attempt.attempt_id.as_str(), stage.as_str()]);
+    Ok((event_id, event_json, event))
+}
+
+async fn insert_model_request_context_event(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+    stage: ModelRequestEventStage,
+    terminal: Option<&InferenceInvocationTerminal>,
+) -> ServiceResult<()> {
+    let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
+    let usage = event.usage.as_ref();
+    let model_family = attempt
+        .request_context
+        .model_family
+        .as_deref()
+        .unwrap_or("unspecified");
+    sqlx::query(
+        "INSERT INTO model_request_context_events
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+          event_stage, terminal_status, topology, provider, model_family, purpose,
+          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+          event_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(event_id)
+    .bind(&attempt.user_id)
+    .bind(&attempt.attempt_id)
+    .bind(&attempt.invocation_id)
+    .bind(attempt.invocation_input.scope.session_id())
+    .bind(attempt.invocation_input.scope.run_id())
+    .bind(attempt.invocation_input.scope.harness_run_id())
+    .bind(stage.as_str())
+    .bind(event.terminal_status.as_deref())
+    .bind(event.identity.topology.as_str())
+    .bind(&event.identity.provider)
+    .bind(model_family)
+    .bind(&event.identity.inference_purpose)
+    .bind(checked_optional_i64(
+        usage.map(|usage| usage.request_input_tokens),
+        "model request input_tokens",
+    )?)
+    .bind(checked_optional_i64(
+        usage.map(|usage| usage.output_tokens),
+        "model request output_tokens",
+    )?)
+    .bind(checked_optional_i64(
+        usage.map(|usage| usage.cache_read_tokens),
+        "model request cache_read_tokens",
+    )?)
+    .bind(checked_optional_i64(
+        usage.map(|usage| usage.cache_creation_tokens),
+        "model request cache_creation_tokens",
+    )?)
+    .bind(event_json)
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "insert model request context event",
+            error,
+        )
+    })?;
+    if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
+        sqlx::query(
+            "INSERT INTO model_request_metric_shards
+             (metric_shard, topology, provider, model_family, purpose, terminal_status,
+              requests, input_tokens, output_tokens, cache_read_tokens,
+              cache_creation_tokens, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NOW(6))
+             ON DUPLICATE KEY UPDATE
+              requests = requests + 1,
+              input_tokens = input_tokens + VALUES(input_tokens),
+              output_tokens = output_tokens + VALUES(output_tokens),
+              cache_read_tokens = cache_read_tokens + VALUES(cache_read_tokens),
+              cache_creation_tokens =
+                  cache_creation_tokens + VALUES(cache_creation_tokens),
+              updated_at = NOW(6)",
+        )
+        .bind(model_request_metric_shard(&attempt.attempt_id))
+        .bind(event.identity.topology.as_str())
+        .bind(&event.identity.provider)
+        .bind(model_family)
+        .bind(&event.identity.inference_purpose)
+        .bind(status)
+        .bind(checked_i64(
+            usage.request_input_tokens,
+            "model request metric input_tokens",
+        )?)
+        .bind(checked_i64(
+            usage.output_tokens,
+            "model request metric output_tokens",
+        )?)
+        .bind(checked_i64(
+            usage.cache_read_tokens,
+            "model request metric cache_read_tokens",
+        )?)
+        .bind(checked_i64(
+            usage.cache_creation_tokens,
+            "model request metric cache_creation_tokens",
+        )?)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "accumulate model request metrics",
+                error,
+            )
+        })?;
+    }
+    Ok(())
 }
 
 async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation: &'static str) {
@@ -920,6 +1181,17 @@ pub async fn begin_inference_provider_attempt(
     .await;
     match result {
         Ok(result) if result.rows_affected() == 1 => {
+            if let Err(error) = insert_model_request_context_event(
+                &mut tx,
+                attempt,
+                ModelRequestEventStage::Accepted,
+                None,
+            )
+            .await
+            {
+                rollback_inference_tx(tx, "record accepted model request context").await;
+                return Err(error);
+            }
             let Err(error) = tx.commit().await else {
                 return Ok(());
             };
@@ -1132,6 +1404,18 @@ pub async fn finish_inference_provider_attempt(
             rollback_inference_tx(tx, "record successful inference settlement debt").await;
             return Err(error);
         }
+        if result.rows_affected() == 1
+            && let Err(error) = insert_model_request_context_event(
+                &mut tx,
+                attempt,
+                ModelRequestEventStage::Terminal,
+                Some(terminal),
+            )
+            .await
+        {
+            rollback_inference_tx(tx, "record successful model request context").await;
+            return Err(error);
+        }
         if let Err(error) = tx.commit().await {
             let commit_error = ServiceError::with_source(
                 ServiceErrorKind::Persistence,
@@ -1151,14 +1435,53 @@ pub async fn finish_inference_provider_attempt(
         }
         result
     } else {
-        match update.execute(db).await {
-            Ok(result) => result,
+        let mut tx = db.begin().await.map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "begin inference provider terminal",
+                error,
+            )
+        })?;
+        match update.execute(&mut *tx).await {
+            Ok(result) => {
+                if result.rows_affected() == 1
+                    && let Err(error) = insert_model_request_context_event(
+                        &mut tx,
+                        attempt,
+                        ModelRequestEventStage::Terminal,
+                        Some(terminal),
+                    )
+                    .await
+                {
+                    rollback_inference_tx(tx, "record terminal model request context").await;
+                    return Err(error);
+                }
+                if let Err(error) = tx.commit().await {
+                    let commit_error = ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "commit inference provider terminal",
+                        error,
+                    );
+                    return recover_provider_terminal_after_unknown_write(
+                        db,
+                        attempt,
+                        provider_wire_bytes,
+                        terminal,
+                        &terminal_state,
+                        &fingerprint,
+                        commit_error,
+                    )
+                    .await;
+                }
+                result
+            }
             Err(error) => {
                 let write_error = ServiceError::with_source(
                     ServiceErrorKind::Persistence,
                     "finish inference provider attempt",
                     error,
                 );
+                rollback_inference_tx(tx, "finish inference provider attempt").await;
                 return recover_provider_terminal_after_unknown_write(
                     db,
                     attempt,
@@ -2423,5 +2746,88 @@ mod tests {
             ))
             .expect("original fingerprint")
         );
+    }
+
+    #[test]
+    fn model_request_event_uses_exact_causal_facts_and_partitions_usage() {
+        let invocation = plan_inference_invocation(input()).expect("invocation");
+        let mut seed = ModelRequestContextSeed::server_default();
+        seed.topology = ModelRequestTopology::CliServer;
+        seed.interaction_owner = "cli".to_string();
+        seed.budget.estimated_input_tokens = Some(900);
+        seed.cache.current_identity = Some("sha256:stable-prefix".to_string());
+        let wire = InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            4_096,
+        )
+        .expect("wire")
+        .with_composition(ModelRequestWireComposition {
+            system_bytes: 100,
+            conversation_bytes: 3_000,
+            tool_schema_bytes: 500,
+            provider_envelope_bytes: 496,
+            system_items: 1,
+            conversation_items: 40,
+            tool_schema_items: 8,
+        });
+        let attempt = plan_inference_provider_attempt_with_context(&invocation, 2, wire, seed);
+        let terminal = InferenceInvocationTerminal::succeeded(
+            InferenceUsage {
+                input_tokens: 1_000,
+                output_tokens: 80,
+                cache_read_tokens: 600,
+                cache_creation_tokens: 100,
+            },
+            Some("provider-response".to_string()),
+        );
+
+        let (accepted_id, accepted_json, accepted) =
+            model_request_event(&attempt, ModelRequestEventStage::Accepted, None)
+                .expect("accepted event");
+        let (terminal_id, terminal_json, terminal_event) =
+            model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&terminal))
+                .expect("terminal event");
+
+        assert_ne!(accepted_id, terminal_id);
+        assert!(accepted.usage.is_none());
+        assert_eq!(terminal_event.identity.physical_attempt, 2);
+        assert_eq!(
+            terminal_event.identity.provider_wire_hash,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            terminal_event.usage,
+            Some(ModelRequestUsage {
+                fresh_input_tokens: 300,
+                cache_read_tokens: 600,
+                cache_creation_tokens: 100,
+                request_input_tokens: 1_000,
+                output_tokens: 80,
+            })
+        );
+        assert_eq!(terminal_event.budget.estimate_error_tokens, Some(100));
+        assert_eq!(terminal_event.cache.cache_read_share, Some(0.6));
+        assert_eq!(terminal_event.wire_composition.system_bytes, 100);
+        assert!(!accepted_json.contains("provider-response"));
+        assert!(terminal_json.contains(MODEL_REQUEST_CONTEXT_SCHEMA));
+
+        for status in [
+            InferenceTerminalStatus::Succeeded,
+            InferenceTerminalStatus::Failed,
+            InferenceTerminalStatus::Cancelled,
+            InferenceTerminalStatus::DeliveryUnknown,
+        ] {
+            let mut outcome = terminal.clone();
+            outcome.status = status;
+            let (_, _, event) =
+                model_request_event(&attempt, ModelRequestEventStage::Terminal, Some(&outcome))
+                    .expect("every durable provider terminal has one context event");
+            assert_eq!(event.terminal_status.as_deref(), Some(status.as_str()));
+            assert_eq!(
+                event.usage.as_ref().map(|usage| usage.request_input_tokens),
+                Some(1_000)
+            );
+        }
     }
 }

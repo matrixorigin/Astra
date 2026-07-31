@@ -15,9 +15,6 @@ fn prepare_canonical_conversation_commit(
     state: &SessionState,
     result: &StreamResult,
 ) -> Result<Option<astra_turn_core::active_conversation::PreparedConversationCommit>, String> {
-    if !cfg!(feature = "active-conversation") {
-        return Ok(None);
-    }
     let Some(session_id) = state.session_id.as_deref() else {
         return Ok(None);
     };

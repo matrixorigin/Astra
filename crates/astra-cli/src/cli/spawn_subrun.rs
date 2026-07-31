@@ -414,9 +414,11 @@ fn stream_event_to_agent_live_kind(
                 bytes,
             }))
         }
-        StreamEvent::ContextWindowEstimated(_)
+        StreamEvent::ContextWindowPolicy { .. }
+        | StreamEvent::ContextWindowEstimated(_)
         | StreamEvent::ContextSystemPromptTokens(_)
         | StreamEvent::ContextWindowMeasured(_)
+        | StreamEvent::RequestTokenUsage(_)
         | StreamEvent::Thinking(_)
         | StreamEvent::AgentLive(_)
         | StreamEvent::AgentLiveGap(_)

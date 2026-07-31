@@ -3250,10 +3250,15 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
         );
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire(
+            crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                 trace,
                 &wire_messages,
                 &annotated_tools,
+                if self.full_llm_capture {
+                    crate::turn::llm::context::WireTraceDetail::Debug
+                } else {
+                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                },
             );
         }
         self.emit_context_meta(
@@ -5712,10 +5717,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&final_tools);
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                crate::turn::llm::context::augment_manifest_trace_with_wire(
+                crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                     trace,
                     &llm_messages,
                     &final_tools,
+                    if self.full_llm_capture {
+                        crate::turn::llm::context::WireTraceDetail::Debug
+                    } else {
+                        crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                    },
                 );
                 crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                     trace,
@@ -5791,6 +5801,14 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
             }
             let prompt_round = next_provider_request_round(state);
+            let attempt_wire_budget_status =
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::wire_assembly::set_manifest_wire_budget(
+                    trace,
+                    attempt_wire_budget_status,
+                );
+            }
             let prompt_request_plan =
                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
@@ -5853,8 +5871,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "durable inference admission failed: Server execution has no durable run identity",
                 )
             })?;
+            let request_context =
+                crate::turn::llm::context::model_request_context_seed_from_manifest(
+                    astra_services::ModelRequestTopology::ServerOnly,
+                    state.last_llm_context_manifest_trace.as_ref(),
+                );
             let durable_invocation = durable_ledger
-                .admit(
+                .admit_with_request_context(
                     astra_turn_types::InferenceInvocationScope::Run {
                         session_id: self.session_id.clone(),
                         run_id,
@@ -5870,6 +5893,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         .as_deref()
                         .unwrap_or(&llm_cfg.model_name),
                     &llm_cfg.provider,
+                    request_context,
                 )
                 .await?;
             state

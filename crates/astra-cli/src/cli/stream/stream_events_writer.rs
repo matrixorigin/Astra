@@ -17,6 +17,14 @@ pub(crate) fn spawn_stderr_writer(mut rx: StreamEventRx) -> tokio::task::JoinHan
 
 fn event_to_json(event: &StreamEvent) -> String {
     let value = match event {
+        StreamEvent::ContextWindowPolicy {
+            raw_window_tokens,
+            usable_input_tokens,
+        } => serde_json::json!({
+            "type": "context_window_policy",
+            "raw_window_tokens": raw_window_tokens,
+            "usable_input_tokens": usable_input_tokens,
+        }),
         StreamEvent::ContextWindowEstimated(usage) => {
             serde_json::json!({
                 "type": "context_window_estimated",
@@ -31,6 +39,13 @@ fn event_to_json(event: &StreamEvent) -> String {
         StreamEvent::ContextWindowMeasured(tokens) => {
             serde_json::json!({"type": "context_window_measured", "used_tokens": tokens})
         }
+        StreamEvent::RequestTokenUsage(usage) => serde_json::json!({
+            "type": "request_token_usage",
+            "fresh_input_tokens": usage.fresh_input_tokens,
+            "cache_read_tokens": usage.cache_read_tokens,
+            "cache_creation_tokens": usage.cache_creation_tokens,
+            "output_tokens": usage.output_tokens,
+        }),
         StreamEvent::Token(text) => {
             serde_json::json!({"type": "token", "text": text})
         }
@@ -250,6 +265,21 @@ mod tests {
         let measured: serde_json::Value = serde_json::from_str(&measured).unwrap();
         assert_eq!(measured["type"], "context_window_measured");
         assert_eq!(measured["used_tokens"], 18_000);
+
+        let lanes = event_to_json(&StreamEvent::RequestTokenUsage(
+            astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 200,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+                output_tokens: 50,
+            },
+        ));
+        let lanes: serde_json::Value = serde_json::from_str(&lanes).unwrap();
+        assert_eq!(lanes["type"], "request_token_usage");
+        assert_eq!(lanes["fresh_input_tokens"], 200);
+        assert_eq!(lanes["cache_read_tokens"], 800);
+        assert_eq!(lanes["cache_creation_tokens"], 100);
+        assert_eq!(lanes["output_tokens"], 50);
     }
 
     #[test]

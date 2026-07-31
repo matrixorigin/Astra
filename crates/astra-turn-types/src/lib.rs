@@ -40,7 +40,7 @@ pub use context_identity::{
     NormalizedPromptCacheUsage, PROMPT_CACHE_IDENTITY_CONTRACT_VERSION, PromptCacheIdentityV1,
     PromptCacheInvalidationReason,
 };
-pub use context_window::{ContextWindowUsage, ContextWindowUsageSource};
+pub use context_window::{ContextWindowUsage, ContextWindowUsageSource, RequestTokenUsage};
 pub use inference::{
     CLIENT_DIRECT_EXECUTION_FIELDS, InferenceInvocationScope, InferencePurpose, ModelSelection,
     client_direct_execution_field,

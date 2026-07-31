@@ -628,6 +628,7 @@ fn session_summary_flows_through_snapshot() {
         completion_tokens: 3_000,
         cache_read_tokens: 8_000,
         cache_creation_tokens: 500,
+        canonical_conversation: None,
         request_context: None,
         continuation_anchor: Some(
             crate::cli::session::session_state::ContinuationAnchor::rendered_for_test(

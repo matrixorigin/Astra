@@ -388,6 +388,33 @@ impl DurableInferenceLedger {
         upstream_model_name: &str,
         provider: &str,
     ) -> Result<DurableInferenceInvocation, astra_core::ClassifiedError> {
+        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
+        if self.admitted_execution.execution_placement
+            == astra_services::ModelExecutionPlacement::Edge
+        {
+            request_context.topology = astra_services::ModelRequestTopology::EdgeServer;
+            request_context.execution_binding = "edge".to_string();
+        }
+        self.admit_with_request_context(
+            scope,
+            purpose,
+            resolved_model_name,
+            upstream_model_name,
+            provider,
+            request_context,
+        )
+        .await
+    }
+
+    pub(crate) async fn admit_with_request_context(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        purpose: astra_turn_types::InferencePurpose,
+        resolved_model_name: &str,
+        upstream_model_name: &str,
+        provider: &str,
+        request_context: astra_services::ModelRequestContextSeed,
+    ) -> Result<DurableInferenceInvocation, astra_core::ClassifiedError> {
         if self.admitted_execution.model_name != resolved_model_name
             || self.admitted_execution.provider != provider
             || self
@@ -402,6 +429,10 @@ impl DurableInferenceLedger {
                 "resolved provider route drifted from the admitted Offering",
             ));
         }
+        let request_context = normalize_request_context_for_execution(
+            request_context,
+            self.admitted_execution.execution_placement,
+        );
         let plan =
             astra_services::plan_inference_invocation(astra_services::InferenceInvocationInput {
                 user_id: self.user_id.clone(),
@@ -423,6 +454,7 @@ impl DurableInferenceLedger {
             observer: Arc::new(DurableProviderAttemptObserver::new_with_persistence(
                 self.persistence.clone(),
                 plan.clone(),
+                request_context,
             )),
             persistence: self.persistence.clone(),
             plan,
@@ -492,6 +524,25 @@ impl DurableInferenceLedger {
             }
         }
     }
+}
+
+fn normalize_request_context_for_execution(
+    mut context: astra_services::ModelRequestContextSeed,
+    placement: astra_services::ModelExecutionPlacement,
+) -> astra_services::ModelRequestContextSeed {
+    context.execution_binding = match placement {
+        astra_services::ModelExecutionPlacement::Server => "server",
+        astra_services::ModelExecutionPlacement::Edge => "edge",
+    }
+    .to_string();
+    if placement == astra_services::ModelExecutionPlacement::Edge
+        && context.topology == astra_services::ModelRequestTopology::ServerOnly
+    {
+        context.topology = astra_services::ModelRequestTopology::EdgeServer;
+        context.interaction_owner = "edge".to_string();
+        context.loop_owner = "server".to_string();
+    }
+    context
 }
 
 #[async_trait]
@@ -741,6 +792,7 @@ impl NonstreamInvocationSettlement for DurableInferenceInvocation {
 struct DurableProviderAttemptObserver {
     persistence: Arc<dyn InferenceLedgerPersistence>,
     invocation: astra_services::InferenceInvocationPlan,
+    request_context: astra_services::ModelRequestContextSeed,
     next_attempt: AtomicU32,
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
@@ -884,10 +936,12 @@ impl DurableProviderAttemptObserver {
     fn new_with_persistence(
         persistence: Arc<dyn InferenceLedgerPersistence>,
         invocation: astra_services::InferenceInvocationPlan,
+        request_context: astra_services::ModelRequestContextSeed,
     ) -> Self {
         Self {
             persistence,
             invocation,
+            request_context,
             next_attempt: AtomicU32::new(0),
             state: Arc::new(tokio::sync::Mutex::new(ProviderAttemptState::default())),
             operations: ProviderOperationGate::default(),
@@ -989,11 +1043,21 @@ impl ProviderAttemptObserver for DurableProviderAttemptObserver {
             wire.provider_wire_hash.clone(),
             wire.provider_wire_bytes,
         )
-        .map_err(|error| service_error("provider wire identity", error))?;
-        let attempt = astra_services::plan_inference_provider_attempt(
+        .map_err(|error| service_error("provider wire identity", error))?
+        .with_composition(astra_services::ModelRequestWireComposition {
+            system_bytes: wire.composition.system_bytes,
+            conversation_bytes: wire.composition.conversation_bytes,
+            tool_schema_bytes: wire.composition.tool_schema_bytes,
+            provider_envelope_bytes: wire.composition.provider_envelope_bytes,
+            system_items: wire.composition.system_items,
+            conversation_items: wire.composition.conversation_items,
+            tool_schema_items: wire.composition.tool_schema_items,
+        });
+        let attempt = astra_services::plan_inference_provider_attempt_with_context(
             &self.invocation,
             attempt_index,
             service_wire,
+            self.request_context.clone(),
         );
         let request = DurableProviderRequestIdentity {
             request_id: attempt.request_id().to_string(),
@@ -1174,6 +1238,48 @@ fn terminal_from_result(result: &LlmCallResult) -> astra_services::InferenceInvo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_placement_is_normalized_independently_from_surface_topology() {
+        let cli_edge = normalize_request_context_for_execution(
+            astra_services::ModelRequestContextSeed {
+                topology: astra_services::ModelRequestTopology::CliServer,
+                interaction_owner: "cli".to_string(),
+                loop_owner: "server".to_string(),
+                ..astra_services::ModelRequestContextSeed::server_default()
+            },
+            astra_services::ModelExecutionPlacement::Edge,
+        );
+        assert_eq!(
+            cli_edge.topology,
+            astra_services::ModelRequestTopology::CliServer
+        );
+        assert_eq!(cli_edge.interaction_owner, "cli");
+        assert_eq!(cli_edge.loop_owner, "server");
+        assert_eq!(cli_edge.execution_binding, "edge");
+
+        let server_edge = normalize_request_context_for_execution(
+            astra_services::ModelRequestContextSeed::server_default(),
+            astra_services::ModelExecutionPlacement::Edge,
+        );
+        assert_eq!(
+            server_edge.topology,
+            astra_services::ModelRequestTopology::EdgeServer
+        );
+        assert_eq!(server_edge.interaction_owner, "edge");
+        assert_eq!(server_edge.loop_owner, "server");
+        assert_eq!(server_edge.execution_binding, "edge");
+
+        let edge_server = normalize_request_context_for_execution(
+            server_edge,
+            astra_services::ModelExecutionPlacement::Server,
+        );
+        assert_eq!(
+            edge_server.topology,
+            astra_services::ModelRequestTopology::EdgeServer
+        );
+        assert_eq!(edge_server.execution_binding, "server");
+    }
 
     #[test]
     fn required_ledger_fails_closed_without_a_database() {

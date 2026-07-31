@@ -8718,6 +8718,14 @@ fn handle_app_event(
         status_indicator.mark_dispatched();
     }
     match ev {
+        TuiAppEvent::ContextWindowPolicy {
+            raw_window_tokens,
+            usable_input_tokens,
+        } => {
+            bottom_pane
+                .footer
+                .set_context_window_policy(*raw_window_tokens, *usable_input_tokens);
+        }
         TuiAppEvent::ContextWindowEstimated(usage) => {
             bottom_pane.footer.begin_context_window_estimate(*usage);
         }
@@ -8726,6 +8734,9 @@ fn handle_app_event(
         }
         TuiAppEvent::ContextWindowMeasured(tokens) => {
             bottom_pane.footer.set_context_window_measured(*tokens);
+        }
+        TuiAppEvent::RequestTokenUsage(usage) => {
+            bottom_pane.footer.set_request_token_usage(*usage);
         }
         TuiAppEvent::Token(text) => {
             // Bump the per-turn token approximation so the

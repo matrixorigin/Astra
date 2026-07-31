@@ -2948,10 +2948,11 @@ impl InProcessChatTurnBridge {
                         &cache_cfg,
                         &session_id,
                     );
-                    crate::turn::llm::context::augment_manifest_trace_with_wire(
+                    crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
+                        crate::turn::llm::context::WireTraceDetail::Debug,
                     );
                     crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                         &mut bridge_manifest_trace_json,
@@ -3055,10 +3056,15 @@ impl InProcessChatTurnBridge {
                         &cache_cfg,
                         &session_id,
                     );
-                    crate::turn::llm::context::augment_manifest_trace_with_wire(
+                    crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                         &mut bridge_manifest_trace_json,
                         &llm_messages,
                         &pruned_tools,
+                        if full_llm_capture {
+                            crate::turn::llm::context::WireTraceDetail::Debug
+                        } else {
+                            crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                        },
                     );
                     crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                         &mut bridge_manifest_trace_json,
@@ -3263,6 +3269,11 @@ impl InProcessChatTurnBridge {
                             .clone()
                             .unwrap_or_else(|| model_name.clone());
                         let provider_for_admission = provider.clone();
+                        let request_context =
+                            crate::turn::llm::context::model_request_context_seed_from_manifest(
+                                astra_services::ModelRequestTopology::CliServer,
+                                Some(&bridge_manifest_trace_json),
+                            );
                         let admission_active = active_inference.clone();
                         let admission_cancel = cc.clone();
                         // Admission is detached from response-body polling. If
@@ -3271,12 +3282,13 @@ impl InProcessChatTurnBridge {
                         // and closes it before any provider request can start.
                         let admission = tokio::spawn(async move {
                             let invocation = match ledger
-                                .admit(
+                                .admit_with_request_context(
                                     scope,
                                     inference_purpose,
                                     &resolved_model_for_admission,
                                     &upstream_model_for_admission,
                                     &provider_for_admission,
+                                    request_context,
                                 )
                                 .await
                             {
@@ -3550,10 +3562,15 @@ impl InProcessChatTurnBridge {
                             crate::turn::llm::context::clear_manifest_provider_request(
                                 &mut bridge_manifest_trace_json,
                             );
-                            crate::turn::llm::context::augment_manifest_trace_with_wire(
+                            crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                                 &mut bridge_manifest_trace_json,
                                 &llm_messages,
                                 &pruned_tools,
+                                if full_llm_capture {
+                                    crate::turn::llm::context::WireTraceDetail::Debug
+                                } else {
+                                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                                },
                             );
                             crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                                 &mut bridge_manifest_trace_json,

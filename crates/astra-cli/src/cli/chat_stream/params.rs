@@ -59,6 +59,12 @@ impl ToolProgressSink {
 /// without plan-specific context (subtask IDs, etc.).
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// Catalog-backed raw window and the exact usable input ceiling after
+    /// deterministic output/summary/protocol reserves.
+    ContextWindowPolicy {
+        raw_window_tokens: u64,
+        usable_input_tokens: u64,
+    },
     /// Context occupancy estimated from the request before the runtime has
     /// assembled its system prompt. This is a per-request value, never a
     /// session aggregate.
@@ -70,6 +76,9 @@ pub enum StreamEvent {
     /// The number includes the canonical fresh/cache-read/cache-write input
     /// buckets exactly once.
     ContextWindowMeasured(u64),
+    /// Provider-normalized lanes for the same physical request as
+    /// `ContextWindowMeasured`.
+    RequestTokenUsage(astra_turn_types::RequestTokenUsage),
     /// LLM token chunk.
     Token(String),
     /// Model thinking/reasoning started or stopped.

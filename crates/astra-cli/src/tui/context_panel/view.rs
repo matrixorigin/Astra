@@ -1395,6 +1395,19 @@ fn append_memory_focus_collapsed(out: &mut Vec<Line<'static>>, focus: &super::mo
     }
 }
 
+fn canonical_source_label(
+    source: astra_turn_core::active_conversation::ActiveConversationSource,
+) -> &'static str {
+    use astra_turn_core::active_conversation::ActiveConversationSource;
+    match source {
+        ActiveConversationSource::Live => "live",
+        ActiveConversationSource::Journal => "journal",
+        ActiveConversationSource::CslProjection => "csl projection",
+        ActiveConversationSource::Checkpoint => "checkpoint",
+        ActiveConversationSource::LegacyDisplayProjection => "legacy display projection",
+    }
+}
+
 fn append_session_section(
     out: &mut Vec<Line<'static>>,
     s: &super::model::SessionSummary,
@@ -1450,6 +1463,38 @@ fn append_session_section(
         ),
     ]));
 
+    if let Some(canonical) = &s.canonical_conversation {
+        let cursor = &canonical.cursor;
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled(
+                format!(
+                    "canonical cursor · turn {} · journal/conversation {}/{} · compaction gen {} · {}",
+                    cursor.completed_turn,
+                    cursor.journal_event_seq,
+                    cursor.conversation_seq,
+                    cursor.compaction_generation,
+                    canonical_source_label(canonical.source),
+                ),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
+        if expanded {
+            out.push(Line::from(vec![
+                Span::raw("        "),
+                Span::styled(
+                    format!(
+                        "branch {} · projection v{} · root {}",
+                        cursor.branch_id,
+                        cursor.projection_schema,
+                        truncate_preview(&cursor.canonical_root_hash, 24),
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+
     if let Some(request) = s.request_context {
         let usage = request.usage;
         let pct = if usage.limit_tokens == 0 {
@@ -1465,15 +1510,35 @@ fn append_session_section(
             Span::raw("    └ "),
             Span::styled(
                 format!(
-                    "{} context · {:.0}% · {}/{} · {provenance}",
+                    "{} context · {:.0}% · {} used / {} usable{} · {provenance}",
                     request.scope.label(),
                     pct,
                     fmt_tokens_u64(usage.used_tokens),
                     fmt_tokens_u64(usage.limit_tokens),
+                    request
+                        .raw_window_tokens
+                        .filter(|raw| *raw != usage.limit_tokens)
+                        .map(|raw| format!(" / {} raw", fmt_tokens_u64(raw)))
+                        .unwrap_or_default(),
                 ),
                 Style::default().fg(crate::tui::theme::current().accent),
             ),
         ]));
+        if let Some(tokens) = request.token_usage {
+            out.push(Line::from(vec![
+                Span::raw("    └ "),
+                Span::styled(
+                    format!(
+                        "request lanes · fresh {} · cache-read {} · cache-create {} · output {}",
+                        fmt_tokens_u64(tokens.fresh_input_tokens),
+                        fmt_tokens_u64(tokens.cache_read_tokens),
+                        fmt_tokens_u64(tokens.cache_creation_tokens),
+                        fmt_tokens_u64(tokens.output_tokens),
+                    ),
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
     }
 
     append_read_activity(out, &s.read_activity, expanded);
@@ -2811,9 +2876,32 @@ mod tests {
             completion_tokens: 300,
             cache_read_tokens: 800,
             cache_creation_tokens: 0,
+            canonical_conversation: Some(super::super::model::CanonicalConversationEvidence {
+                cursor: astra_turn_types::SessionCursorV1 {
+                    schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+                    owner_id: "owner".to_string(),
+                    session_id: "abcdef12-full".to_string(),
+                    branch_id: "main".to_string(),
+                    completed_turn: 5,
+                    journal_event_seq: 17,
+                    conversation_seq: 13,
+                    canonical_root_hash: "a".repeat(64),
+                    projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                    compaction_generation: 3,
+                    config_version_id: None,
+                },
+                source: astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+            }),
             request_context: Some(RequestContextEvidence {
                 usage: astra_turn_types::ContextWindowUsage::provider_reported(25_000, 100_000),
                 scope: RequestContextScope::LastCompletedRequest,
+                raw_window_tokens: Some(128_000),
+                token_usage: Some(astra_turn_types::RequestTokenUsage {
+                    fresh_input_tokens: 5_000,
+                    cache_read_tokens: 20_000,
+                    cache_creation_tokens: 0,
+                    output_tokens: 1_200,
+                }),
             }),
             continuation_anchor: Some(
                 crate::cli::session::session_state::ContinuationAnchor::rendered_for_test(
@@ -2843,9 +2931,25 @@ mod tests {
         assert!(text.contains("/ $1.00"));
         assert!(
             text.contains(
-                "last completed request context · 25% · 25.0k/100.0k · provider measured"
+                "canonical cursor · turn 5 · journal/conversation 17/13 · compaction gen 3 · journal"
+            ),
+            "typed cursor is visible without history-length inference: {text}"
+        );
+        assert!(
+            text.contains("branch main · projection v1 · root aaaaaaaaaaaaaaaaaaaaaaaa"),
+            "expanded cursor keeps its exact namespace and root: {text}"
+        );
+        assert!(
+            text.contains(
+                "last completed request context · 25% · 25.0k used / 100.0k usable / 128.0k raw · provider measured"
             ),
             "request context is distinct from session totals: {text}"
+        );
+        assert!(
+            text.contains(
+                "request lanes · fresh 5.0k · cache-read 20.0k · cache-create 0 · output 1.2k"
+            ),
+            "request token lanes are separate from cumulative session totals: {text}"
         );
         assert!(text.contains("refactoring auth"));
     }
@@ -2864,6 +2968,7 @@ mod tests {
             completion_tokens: 200,
             cache_read_tokens: 300,
             cache_creation_tokens: 0,
+            canonical_conversation: None,
             request_context: None,
             continuation_anchor: None,
             queued_message: None,
@@ -3171,6 +3276,7 @@ mod tests {
             completion_tokens: 800,
             cache_read_tokens: 300,
             cache_creation_tokens: 0,
+            canonical_conversation: None,
             request_context: None,
             continuation_anchor: None,
             queued_message: None,

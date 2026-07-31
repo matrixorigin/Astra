@@ -353,6 +353,91 @@ impl LlmContextManifestTrace {
     }
 }
 
+fn manifest_u64(trace: &Value, pointer: &str) -> Option<u64> {
+    trace.pointer(pointer).and_then(Value::as_u64)
+}
+
+fn manifest_string(trace: &Value, pointer: &str) -> Option<String> {
+    trace
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn model_request_rollout_stage() -> astra_services::ModelRequestRolloutStage {
+    use std::sync::OnceLock;
+    static STAGE: OnceLock<astra_services::ModelRequestRolloutStage> = OnceLock::new();
+    *STAGE.get_or_init(|| {
+        match std::env::var("ASTRA_MODEL_REQUEST_CONTEXT_ROLLOUT")
+            .ok()
+            .as_deref()
+        {
+            Some("opt_in") => astra_services::ModelRequestRolloutStage::OptIn,
+            Some("topology_canary") => astra_services::ModelRequestRolloutStage::TopologyCanary,
+            Some("default") => astra_services::ModelRequestRolloutStage::Default,
+            // Missing and invalid configuration both fail closed to shadow.
+            Some("shadow") | None | Some(_) => astra_services::ModelRequestRolloutStage::Shadow,
+        }
+    })
+}
+
+/// Convert the shared assembly manifest into the content-free seed persisted
+/// at the physical provider boundary.
+///
+/// Every lookup is an exact schema path. Unknown facts stay absent; provider
+/// or model names are never interpreted to manufacture lineage or budgets.
+pub(crate) fn model_request_context_seed_from_manifest(
+    topology: astra_services::ModelRequestTopology,
+    trace: Option<&Value>,
+) -> astra_services::ModelRequestContextSeed {
+    let (interaction_owner, loop_owner, execution_binding) = match topology {
+        astra_services::ModelRequestTopology::CliServer => ("cli", "server", "server"),
+        astra_services::ModelRequestTopology::EdgeServer => ("edge", "server", "edge"),
+        astra_services::ModelRequestTopology::ServerOnly => ("server", "server", "server"),
+    };
+    let mut seed = astra_services::ModelRequestContextSeed::server_default();
+    seed.topology = topology;
+    seed.rollout_stage = model_request_rollout_stage();
+    seed.interaction_owner = interaction_owner.to_string();
+    seed.loop_owner = loop_owner.to_string();
+    seed.execution_binding = execution_binding.to_string();
+    let Some(trace) = trace else {
+        return seed;
+    };
+
+    seed.budget.raw_context_window_tokens =
+        manifest_u64(trace, "/context_window_policy/raw_context_window_tokens")
+            .or_else(|| manifest_u64(trace, "/model_context_window_tokens"));
+    seed.budget.usable_input_limit_tokens =
+        manifest_u64(trace, "/context_window_policy/usable_input_limit_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/effective_input_limit"));
+    seed.budget.reserved_output_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_output_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/requested_output_tokens"));
+    seed.budget.reserved_summary_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_summary_tokens");
+    seed.budget.reserved_protocol_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_protocol_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/reserved_protocol_tokens"));
+    seed.budget.compact_trigger_tokens =
+        manifest_u64(trace, "/context_window_policy/auto_compact_trigger_tokens");
+    seed.budget.hard_limit_tokens =
+        manifest_u64(trace, "/context_window_policy/hard_input_limit_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/model_limit"));
+    seed.budget.estimated_input_tokens = manifest_u64(trace, "/wire/budget/estimated_input_tokens");
+    seed.budget.usage_source = Some("pre_provider_estimate".to_string());
+
+    seed.composition.stable_system_tokens = manifest_u64(trace, "/system_prompt_tokens");
+    seed.cache.layout = manifest_string(
+        trace,
+        "/wire/fingerprint/prompt_cache_identity/cache_layout",
+    );
+    seed.cache.current_identity =
+        manifest_string(trace, "/wire/fingerprint/prompt_cache_identity/content_id");
+    seed.compaction.tier = manifest_string(trace, "/compaction_tier");
+    seed
+}
+
 /// Attach every durably admitted physical request, its exact serialized
 /// provider-body composition, and its complete durable terminal when present.
 ///
@@ -543,14 +628,6 @@ fn message_role(message: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn role_counts_json(roles: &[String]) -> Value {
-    let mut counts = BTreeMap::<String, usize>::new();
-    for role in roles {
-        *counts.entry(role.clone()).or_default() += 1;
-    }
-    json!(counts)
 }
 
 /// Bridge-facing context assembly input.
@@ -1947,29 +2024,47 @@ pub(crate) fn finalize_bridge_wire_messages(
     synthetic_tail_prefix_end
 }
 
-pub(crate) fn augment_manifest_trace_with_wire(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WireTraceDetail {
+    MetricsOnly,
+    Debug,
+}
+
+#[cfg(test)]
+fn augment_manifest_trace_with_wire(trace: &mut Value, messages: &[Value], tool_schemas: &[Value]) {
+    augment_manifest_trace_with_wire_detail(trace, messages, tool_schemas, WireTraceDetail::Debug);
+}
+
+/// Add final pre-provider request facts without making production
+/// observability another history-sized payload.
+///
+/// The metrics path walks the already-materialized message slice once for
+/// low-cardinality counts and hashes only the stable system/tool prefix.
+/// Per-message hashes and whole-request canonical clones are debug capture:
+/// they are useful diagnostically, but scale with the complete session and
+/// must not be paid on every request in a long-running production session.
+pub(crate) fn augment_manifest_trace_with_wire_detail(
     trace: &mut Value,
     messages: &[Value],
     tool_schemas: &[Value],
+    detail: WireTraceDetail,
 ) {
     let message_cache_control_count = messages.iter().map(cache_control_count).sum::<usize>();
     let tool_cache_control_count = tool_schemas.iter().map(cache_control_count).sum::<usize>();
-    let message_roles: Vec<String> = messages.iter().map(message_role).collect();
-    let conversation_messages: Vec<Value> = messages
-        .iter()
-        .filter(|message| message_role(message) != "system")
-        .cloned()
-        .collect();
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
-        &conversation_messages,
-    );
-    let conversation_roles: Vec<String> = conversation_messages.iter().map(message_role).collect();
-    let system_messages: Vec<Value> = messages
-        .iter()
-        .filter(|message| message_role(message) == "system")
-        .cloned()
-        .collect();
+    let mut message_role_counts = BTreeMap::<String, usize>::new();
+    let mut conversation_role_counts = BTreeMap::<String, usize>::new();
+    let mut conversation_message_count = 0_usize;
+    let mut system_messages = Vec::new();
+    for message in messages {
+        let role = message_role(message);
+        *message_role_counts.entry(role.clone()).or_default() += 1;
+        if role == "system" {
+            system_messages.push(message.clone());
+        } else {
+            conversation_message_count = conversation_message_count.saturating_add(1);
+            *conversation_role_counts.entry(role).or_default() += 1;
+        }
+    }
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
         &system_messages,
@@ -1987,73 +2082,91 @@ pub(crate) fn augment_manifest_trace_with_wire(
         cache_layout,
     )
     .expect("wire prompt cache identity inputs are bounded constants and JSON");
-    let message_hashes: Vec<Value> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            json!({
-                "index": index,
-                "role": message_role(message),
-                "sha256": canonical_wire_sha256(message),
-            })
-        })
-        .collect();
-    let estimated_message_tokens: u64 = messages
-        .iter()
-        .map(estimate_json_tokens)
-        .map(u64::from)
-        .sum();
-    let estimated_conversation_tokens: u64 = conversation_messages
-        .iter()
-        .map(estimate_json_tokens)
-        .map(u64::from)
-        .sum();
 
     if let Some(trace_obj) = trace.as_object_mut() {
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
-            messages,
-        );
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
-            &system_messages,
-        );
-        astra_core::history_work::record_serialized_value(
-            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
-            tool_schemas,
-        );
-        trace_obj.insert(
-            "wire".to_string(),
-            serde_json::json!({
-                "projection_authority": "pre_provider_messages_and_tools_v1",
-                "message_count": messages.len(),
-                "tool_schema_count": tool_schemas.len(),
-                "message_roles": message_roles.clone(),
-                "message_role_counts": role_counts_json(&message_roles),
-                "estimated_message_tokens": estimated_message_tokens,
-                "message_cache_control_count": message_cache_control_count,
-                "tool_cache_control_count": tool_cache_control_count,
-                "total_cache_control_count": message_cache_control_count + tool_cache_control_count,
-                "conversation_projection": {
-                    "message_count": conversation_messages.len(),
-                    "message_roles": conversation_roles.clone(),
-                    "role_counts": role_counts_json(&conversation_roles),
-                    "estimated_tokens": estimated_conversation_tokens,
-                },
-                "fingerprint": {
-                    "message_sequence_sha256": canonical_wire_sha256(&Value::Array(messages.to_vec())),
-                    "system_message_sequence_sha256": canonical_wire_sha256(&Value::Array(system_messages.clone())),
-                    "conversation_message_sequence_sha256": canonical_wire_sha256(&Value::Array(conversation_messages)),
-                    "tool_schema_sequence_sha256": canonical_wire_sha256(&Value::Array(tool_schemas.to_vec())),
-                    "system_and_tools_sha256": canonical_wire_sha256(&json!({
-                        "system_messages": system_messages,
-                        "tool_schemas": tool_schemas,
-                    })),
-                    "prompt_cache_identity": prompt_cache_identity,
-                    "message_hashes": message_hashes,
-                },
-            }),
-        );
+        let mut wire = serde_json::json!({
+            "projection_authority": "pre_provider_messages_and_tools_v1",
+            "trace_detail": match detail {
+                WireTraceDetail::MetricsOnly => "metrics_only",
+                WireTraceDetail::Debug => "debug",
+            },
+            "message_count": messages.len(),
+            "tool_schema_count": tool_schemas.len(),
+            "message_role_counts": message_role_counts,
+            "message_cache_control_count": message_cache_control_count,
+            "tool_cache_control_count": tool_cache_control_count,
+            "total_cache_control_count": message_cache_control_count + tool_cache_control_count,
+            "conversation_projection": {
+                "message_count": conversation_message_count,
+                "role_counts": conversation_role_counts,
+            },
+            "fingerprint": {
+                "prompt_cache_identity": prompt_cache_identity,
+            },
+        });
+        if detail == WireTraceDetail::Debug {
+            let message_roles: Vec<String> = messages.iter().map(message_role).collect();
+            let conversation_messages: Vec<Value> = messages
+                .iter()
+                .filter(|message| message_role(message) != "system")
+                .cloned()
+                .collect();
+            let conversation_roles: Vec<String> =
+                conversation_messages.iter().map(message_role).collect();
+            let message_hashes: Vec<Value> = messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    json!({
+                        "index": index,
+                        "role": message_role(message),
+                        "sha256": canonical_wire_sha256(message),
+                    })
+                })
+                .collect();
+            let estimated_message_tokens: u64 = messages
+                .iter()
+                .map(estimate_json_tokens)
+                .map(u64::from)
+                .sum();
+            let estimated_conversation_tokens: u64 = conversation_messages
+                .iter()
+                .map(estimate_json_tokens)
+                .map(u64::from)
+                .sum();
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                &conversation_messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                tool_schemas,
+            );
+            wire["message_roles"] = json!(message_roles);
+            wire["estimated_message_tokens"] = json!(estimated_message_tokens);
+            wire["conversation_projection"]["message_roles"] = json!(conversation_roles);
+            wire["conversation_projection"]["estimated_tokens"] =
+                json!(estimated_conversation_tokens);
+            wire["fingerprint"]["message_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(messages.to_vec())));
+            wire["fingerprint"]["system_message_sequence_sha256"] = json!(canonical_wire_sha256(
+                &Value::Array(system_messages.clone())
+            ));
+            wire["fingerprint"]["conversation_message_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(conversation_messages)));
+            wire["fingerprint"]["tool_schema_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(tool_schemas.to_vec())));
+            wire["fingerprint"]["system_and_tools_sha256"] = json!(canonical_wire_sha256(&json!({
+                "system_messages": system_messages,
+                "tool_schemas": tool_schemas,
+            })));
+            wire["fingerprint"]["message_hashes"] = json!(message_hashes);
+        }
+        trace_obj.insert("wire".to_string(), wire);
     }
 }
 
@@ -3321,6 +3434,95 @@ mod context_cache_contract_tests {
                 .as_str()
                 .unwrap()
                 .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn metrics_wire_trace_is_bounded_and_keeps_only_low_cardinality_facts() {
+        let secret = "message-content-must-not-enter-metrics-trace";
+        let messages = (0..2_048)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("{secret}-{index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut trace = json!({"source": "llm_context"});
+
+        augment_manifest_trace_with_wire_detail(
+            &mut trace,
+            &messages,
+            &[],
+            WireTraceDetail::MetricsOnly,
+        );
+
+        assert_eq!(trace["wire"]["trace_detail"], "metrics_only");
+        assert_eq!(trace["wire"]["message_count"], 2_048);
+        assert_eq!(
+            trace["wire"]["message_role_counts"],
+            json!({"assistant": 1024, "user": 1024})
+        );
+        assert!(trace["wire"].get("message_roles").is_none());
+        assert!(trace["wire"].get("estimated_message_tokens").is_none());
+        assert!(
+            trace["wire"]["fingerprint"]
+                .get("message_sequence_sha256")
+                .is_none()
+        );
+        assert!(trace["wire"]["fingerprint"].get("message_hashes").is_none());
+        assert!(!trace.to_string().contains(secret));
+        assert!(
+            trace.to_string().len() < 2_048,
+            "metrics trace size must not grow with message count"
+        );
+    }
+
+    #[test]
+    fn model_request_seed_reads_only_exact_manifest_contract_fields() {
+        let trace = json!({
+            "model_context_window_tokens": 1_000_000,
+            "context_window_policy": {
+                "raw_context_window_tokens": 1_000_000,
+                "usable_input_limit_tokens": 910_000,
+                "reserved_output_tokens": 64_000,
+                "reserved_summary_tokens": 24_000,
+                "reserved_protocol_tokens": 2_000,
+                "auto_compact_trigger_tokens": 728_000,
+                "hard_input_limit_tokens": 934_000
+            },
+            "system_prompt_tokens": 12_000,
+            "compaction_tier": "normal",
+            "wire": {
+                "budget": {
+                    "estimated_input_tokens": 700_000
+                },
+                "fingerprint": {
+                    "prompt_cache_identity": {
+                        "cache_layout": "provider-prefix-v1",
+                        "content_id": "sha256:stable"
+                    }
+                }
+            }
+        });
+
+        let seed = model_request_context_seed_from_manifest(
+            astra_services::ModelRequestTopology::CliServer,
+            Some(&trace),
+        );
+        assert_eq!(
+            seed.topology,
+            astra_services::ModelRequestTopology::CliServer
+        );
+        assert_eq!(seed.interaction_owner, "cli");
+        assert_eq!(seed.loop_owner, "server");
+        assert_eq!(seed.budget.raw_context_window_tokens, Some(1_000_000));
+        assert_eq!(seed.budget.usable_input_limit_tokens, Some(910_000));
+        assert_eq!(seed.budget.estimated_input_tokens, Some(700_000));
+        assert_eq!(seed.composition.stable_system_tokens, Some(12_000));
+        assert_eq!(
+            seed.cache.current_identity.as_deref(),
+            Some("sha256:stable")
         );
     }
 

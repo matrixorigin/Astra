@@ -677,6 +677,14 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                 completion_tokens: ctx.state.total_completion_tokens,
                 cache_read_tokens: ctx.state.total_cache_read_tokens,
                 cache_creation_tokens: ctx.state.total_cache_creation_tokens,
+                canonical_conversation: ctx.state.active_conversation.as_ref().map(
+                    |conversation| {
+                        crate::tui::context_panel::model::CanonicalConversationEvidence {
+                            cursor: conversation.cursor().clone(),
+                            source: conversation.source(),
+                        }
+                    },
+                ),
                 request_context: ctx.bottom_pane.footer.context_window.map(|usage| {
                     let scope = if ctx.bottom_pane.footer.context_window_is_previous() {
                         RequestContextScope::PreviousRequestWhileAssembling
@@ -685,7 +693,12 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
                     } else {
                         RequestContextScope::LastCompletedRequest
                     };
-                    RequestContextEvidence { usage, scope }
+                    RequestContextEvidence {
+                        usage,
+                        scope,
+                        raw_window_tokens: ctx.bottom_pane.footer.raw_context_window_tokens,
+                        token_usage: ctx.bottom_pane.footer.request_token_usage,
+                    }
                 }),
                 continuation_anchor: ctx.state.continuation_anchor.clone(),
                 queued_message: ctx.state.queued_message.clone(),
@@ -3506,6 +3519,7 @@ mod routing_tests {
             completion_tokens: 600,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            canonical_conversation: None,
             request_context: None,
             continuation_anchor: None,
             queued_message: None,

@@ -191,6 +191,8 @@ pub(crate) struct SessionSummary {
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// Exact local canonical projection cursor, when the session has one.
+    pub canonical_conversation: Option<CanonicalConversationEvidence>,
     /// One request's actual context-window occupancy. This is deliberately
     /// separate from cumulative session/billing totals above.
     pub request_context: Option<RequestContextEvidence>,
@@ -203,10 +205,18 @@ pub(crate) struct SessionSummary {
     pub read_activity: ReadActivity,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CanonicalConversationEvidence {
+    pub cursor: astra_turn_types::SessionCursorV1,
+    pub source: astra_turn_core::active_conversation::ActiveConversationSource,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestContextEvidence {
     pub usage: astra_turn_types::ContextWindowUsage,
     pub scope: RequestContextScope,
+    pub raw_window_tokens: Option<u64>,
+    pub token_usage: Option<astra_turn_types::RequestTokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

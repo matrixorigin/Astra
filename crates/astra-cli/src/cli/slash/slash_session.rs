@@ -5622,7 +5622,17 @@ async fn apply_restored_session(
             .as_ref()
             .map(|resume| resume.cursor.clone())
     };
-    let use_restored_projection = use_typed_continuation || prepared_history.resume.is_none();
+    // Local-only legacy metadata did not carry a cursor envelope. It remains
+    // admissible only when the local canonical journal proves that it was
+    // persisted at the exact same completed-turn boundary. A remote,
+    // checkpoint, or differently versioned projection must still lose all
+    // turn-sensitive controls when the local canonical generation wins.
+    let exact_local_legacy_projection = !restored.restored_from_cloud
+        && typed_continuation.is_none()
+        && prepared_history.journal_state.turn == restored.turn_count;
+    let use_restored_projection = use_typed_continuation
+        || prepared_history.resume.is_none()
+        || exact_local_legacy_projection;
     if !use_restored_projection {
         // The local canonical generation won causal selection. Do not retain
         // independently persisted cloud/checkpoint controls from a different

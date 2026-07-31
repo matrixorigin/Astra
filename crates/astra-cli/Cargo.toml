@@ -16,8 +16,7 @@ name = "astra_cli"
 path = "src/lib.rs"
 
 [features]
-default = ["harness", "active-conversation"]
-active-conversation = []
+default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]
 release-vendored-openssl = ["astra-services/openssl-vendored"]
 

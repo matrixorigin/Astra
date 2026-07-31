@@ -363,6 +363,10 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
         (
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
+        (
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND session_id = ?",
             session_id,
         ),
@@ -582,6 +586,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     let user_id = format!("inf-user-{suffix}");
     let session_id = format!("inf-session-{suffix}");
     let run_id = format!("inf-run-{suffix}");
+    let provider = format!("test-provider-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
     let input = InferenceInvocationInput {
@@ -597,7 +602,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         offering_id: "offer-online".to_string(),
         resolved_model_name: "wire-model".to_string(),
         upstream_model_name: "provider-wire-model".to_string(),
-        provider: "openai".to_string(),
+        provider: provider.clone(),
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
@@ -799,6 +804,71 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     assert_eq!(attempts[1].get::<i64, _>("output_tokens"), 24);
     assert_eq!(attempts[1].get::<i64, _>("cache_read_tokens"), 80);
     assert_eq!(attempts[1].get::<i64, _>("cache_creation_tokens"), 10);
+
+    let context_events =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 10)
+            .await
+            .expect("list model request context events");
+    assert_eq!(
+        context_events.len(),
+        4,
+        "two accepted physical requests must each have accepted and terminal facts"
+    );
+    let accepted = context_events
+        .iter()
+        .filter(|event| event.stage == astra_services::ModelRequestEventStage::Accepted)
+        .count();
+    let terminal = context_events
+        .iter()
+        .filter(|event| event.stage == astra_services::ModelRequestEventStage::Terminal)
+        .count();
+    assert_eq!((accepted, terminal), (2, 2));
+    let successful_context = context_events
+        .iter()
+        .find(|event| event.terminal_status.as_deref() == Some("succeeded"))
+        .expect("successful request context");
+    assert_eq!(
+        successful_context
+            .event
+            .usage
+            .as_ref()
+            .expect("terminal usage")
+            .fresh_input_tokens,
+        30
+    );
+    assert_eq!(
+        astra_services::model_request_trace_coverage(&shared_pool, &user_id, &session_id,)
+            .await
+            .expect("request trace coverage"),
+        astra_services::ModelRequestTraceCoverage {
+            accepted_requests: 2,
+            terminal_requests: 2,
+            open_requests: 0,
+        }
+    );
+    let metric_rows = astra_services::aggregate_model_request_metrics(&shared_pool)
+        .await
+        .expect("aggregate durable model request metrics");
+    let metric_totals = metric_rows
+        .iter()
+        .filter(|row| {
+            row.topology == "server_only"
+                && row.provider == provider
+                && row.purpose == "primary_agent"
+        })
+        .fold([0_u64; 5], |mut totals, row| {
+            totals[0] += row.requests;
+            totals[1] += row.input_tokens;
+            totals[2] += row.output_tokens;
+            totals[3] += row.cache_read_tokens;
+            totals[4] += row.cache_creation_tokens;
+            totals
+        });
+    assert_eq!(
+        metric_totals,
+        [2, 120, 24, 80, 10],
+        "aggregate metrics must decode MatrixOne count/sum values and reconcile all outcomes: {metric_rows:?}"
+    );
 
     let invocation = sqlx::query(
         "SELECT admission_token, status, input_tokens, output_tokens, cache_read_tokens,
@@ -1286,6 +1356,7 @@ async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
     );
 
     for table in [
+        "model_request_context_events",
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",

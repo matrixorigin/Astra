@@ -250,11 +250,60 @@ fn bench_high_pressure_compaction(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_wire_trace_overhead(c: &mut Criterion) {
+    let fixtures = WINDOWS
+        .into_iter()
+        .map(|(label, window)| (label, context_fixture(window)))
+        .collect::<Vec<_>>();
+    let mut group = c.benchmark_group("context_history_wire_trace");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(5));
+    for (label, fixture) in &fixtures {
+        group.throughput(Throughput::Bytes(fixture.serialized_bytes));
+        group.bench_with_input(
+            BenchmarkId::new("metrics_only", label),
+            fixture,
+            |b, fixture| {
+                b.iter(|| {
+                    let mut trace = json!({
+                        "source": "criterion",
+                        "context_window_policy": {
+                            "raw_context_window_tokens": fixture.raw_context_tokens,
+                            "usable_input_limit_tokens": fixture.usable_input_tokens,
+                        }
+                    });
+                    astra_runtime::context_observability_bench::augment_wire_trace(
+                        &mut trace,
+                        black_box(&fixture.messages),
+                        &[],
+                        false,
+                    );
+                    black_box(trace)
+                });
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("debug", label), fixture, |b, fixture| {
+            b.iter(|| {
+                let mut trace = json!({"source": "criterion"});
+                astra_runtime::context_observability_bench::augment_wire_trace(
+                    &mut trace,
+                    black_box(&fixture.messages),
+                    &[],
+                    true,
+                );
+                black_box(trace)
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     context_history_benches,
     bench_history_clone,
     bench_history_serialization,
     bench_prompt_delta_plan,
     bench_high_pressure_compaction,
+    bench_wire_trace_overhead,
 );
 criterion_main!(context_history_benches);

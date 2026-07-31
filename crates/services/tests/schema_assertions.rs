@@ -103,6 +103,7 @@ async fn schema_rationalization_runtime_contract() {
         "session_id",
         "request_id",
         "delta_seq",
+        "reuse_count",
         "chunk_tokens",
         "chunk_bytes",
         "previous_chunk_tokens",
@@ -125,6 +126,63 @@ async fn schema_rationalization_runtime_contract() {
         primary_key_columns(&pool, &schema, "prompt_deltas").await,
         ["user_id", "session_id", "request_id", "delta_seq"],
         "prompt_deltas primary key must carry the owner/session boundary"
+    );
+
+    let request_context = column_names(&pool, &schema, "model_request_context_events").await;
+    for expected in [
+        "event_id",
+        "user_id",
+        "attempt_id",
+        "invocation_id",
+        "event_stage",
+        "topology",
+        "provider",
+        "model_family",
+        "purpose",
+        "event_json",
+    ] {
+        assert!(
+            request_context.iter().any(|column| column == expected),
+            "model_request_context_events missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "model_request_context_events").await,
+        ["user_id", "event_id"],
+        "model request context events must remain owner scoped"
+    );
+    let request_metric_totals = column_names(&pool, &schema, "model_request_metric_shards").await;
+    for expected in [
+        "metric_shard",
+        "topology",
+        "provider",
+        "model_family",
+        "purpose",
+        "terminal_status",
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+    ] {
+        assert!(
+            request_metric_totals
+                .iter()
+                .any(|column| column == expected),
+            "model_request_metric_shards missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "model_request_metric_shards").await,
+        [
+            "metric_shard",
+            "topology",
+            "provider",
+            "model_family",
+            "purpose",
+            "terminal_status"
+        ],
+        "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "eval_calibration_assessments").await,

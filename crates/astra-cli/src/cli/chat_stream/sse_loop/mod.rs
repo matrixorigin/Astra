@@ -26,7 +26,6 @@ use astra_runtime::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
         StallTrackingState, StopHookState, TelemetryState, runtime_manifest_for_model,
     },
-    turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
@@ -281,6 +280,12 @@ pub(crate) async fn stream_chat_sse(
     }
     let effective_max_turn_input_tokens = RuntimeLimits::global()
         .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
+    if let Some(ref tx) = p.stream_event_tx {
+        let _ = tx.try_send(crate::cli::chat_stream::StreamEvent::ContextWindowPolicy {
+            raw_window_tokens: u64::from(context_window_tokens),
+            usable_input_tokens: effective_max_turn_input_tokens,
+        });
+    }
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -495,7 +500,15 @@ pub(crate) async fn stream_chat_sse(
             }
         }
     }
-    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message).map_err(
+        |error| crate::TurnFailure {
+            error: error.to_string(),
+            partial: crate::PartialTurnData {
+                session_id: p.session_id.map(str::to_string),
+                ..Default::default()
+            },
+        },
+    )?;
     // Only the fresh user suffix starts this root execution transcript. The
     // preceding prompt history is inherited context, not a new conversation
     // item for this run.
@@ -1371,11 +1384,19 @@ fn missing_model_selection_turn_failure(session_id: Option<&str>) -> crate::Turn
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum TurnMessageLoadError {
+    #[error(
+        "canonical prompt history is unavailable for a non-empty session; repair or resume from the canonical journal instead of using lossy display pairs"
+    )]
+    CanonicalHistoryRequired,
+}
+
 fn load_turn_messages(
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
     history: &[(String, String)],
     current_message: &str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, TurnMessageLoadError> {
     if let Some(msgs) = pre_loaded_messages {
         crate::cli::history_work::record_json_history(
             astra_core::history_work::HistoryWorkSite::CliPromptContinuationSanitization,
@@ -1390,21 +1411,21 @@ fn load_turn_messages(
             );
         }
         msgs.push(json!({"role": "user", "content": current_message}));
-        return msgs;
+        return Ok(msgs);
     }
-    crate::cli::history_work::record_pair_history(
-        astra_core::history_work::HistoryWorkSite::CliPromptHistoryMaterialization,
-        history,
-    );
-    openai_messages_from_repl_history(history, current_message)
+    if !history.is_empty() {
+        return Err(TurnMessageLoadError::CanonicalHistoryRequired);
+    }
+    Ok(vec![json!({"role": "user", "content": current_message})])
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        circuit_breaker_config_from_tool_policy, detect_turn_hook_sets, load_turn_messages,
-        missing_model_selection_journal_event, missing_model_selection_turn_failure,
-        normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
+        TurnMessageLoadError, circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
+        load_turn_messages, missing_model_selection_journal_event,
+        missing_model_selection_turn_failure, normalize_turn_model,
+        refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
         step_recorder_for_cli_turn,
     };
@@ -1448,7 +1469,8 @@ mod tests {
             json!({"role": "assistant", "content": "明白，不做 review。"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "修复刚才发现的问题");
+        let messages = load_turn_messages(Some(preloaded), &[], "修复刚才发现的问题")
+            .expect("canonical messages");
 
         assert_eq!(messages.last().unwrap()["content"], "修复刚才发现的问题");
         assert!(
@@ -1486,7 +1508,8 @@ mod tests {
             json!({"role": "assistant", "content": "current answer"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "continue safely");
+        let messages = load_turn_messages(Some(preloaded), &[], "continue safely")
+            .expect("canonical messages");
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["content"], "current objective");
@@ -1515,13 +1538,31 @@ mod tests {
             json!({"role": "assistant", "content": "done"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "what did you find?");
+        let messages = load_turn_messages(Some(preloaded), &[], "what did you find?")
+            .expect("canonical messages");
 
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
         assert_eq!(messages[2]["tool_call_id"], "call-1");
         assert_eq!(messages[2]["content"], "canonical evidence");
         assert_eq!(messages[4]["content"], "what did you find?");
+    }
+
+    #[test]
+    fn display_pair_history_cannot_become_a_healthy_prompt_source() {
+        let error = load_turn_messages(
+            None,
+            &[("old user".to_string(), "old assistant".to_string())],
+            "continue",
+        )
+        .expect_err("lossy display pairs must not enter the model prompt");
+        assert_eq!(error, TurnMessageLoadError::CanonicalHistoryRequired);
+
+        let fresh = load_turn_messages(None, &[], "new session").expect("fresh prompt");
+        assert_eq!(
+            fresh,
+            vec![json!({"role": "user", "content": "new session"})]
+        );
     }
 
     #[test]

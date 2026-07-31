@@ -166,6 +166,44 @@ impl DatabaseSessionHandoffService {
         Self { pool, coordinator }
     }
 
+    pub async fn list_handoff_events(
+        &self,
+        key: &SessionKeyV1,
+        limit: u32,
+    ) -> Result<Vec<SessionHandoffEventV1>, SessionHandoffError> {
+        key.validate()
+            .map_err(|error| SessionHandoffError::Invalid(error.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT event_json, created_at
+             FROM session_handoff_events
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+             ORDER BY created_at DESC, handoff_id DESC, transition_seq DESC
+             LIMIT ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(i64::from(limit.clamp(1, 500)))
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| database_error("list_handoff_events", source))?;
+        rows.into_iter()
+            .map(|row| {
+                let transition: HandoffTransitionEventV1 =
+                    decode_json_row(&row, "event_json", "handoff event")?;
+                Ok(SessionHandoffEventV1 {
+                    from_state: transition.from_state,
+                    record: transition.record,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|source| database_error("decode_handoff_event_time", source))?,
+                })
+            })
+            .collect()
+    }
+
     pub async fn attach_read_only(
         &self,
         request: &AttachSessionRequestV1,
@@ -852,6 +890,13 @@ struct HandoffTransitionEventV1 {
     record: SessionHandoffRecordV1,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionHandoffEventV1 {
+    pub from_state: Option<SessionHandoffStateV1>,
+    pub record: SessionHandoffRecordV1,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 fn validate_attach_request(request: &AttachSessionRequestV1) -> Result<(), SessionHandoffError> {
     request
         .key
@@ -1508,6 +1553,7 @@ mod tests {
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
+        let _ = dotenvy::dotenv();
         HANDOFF_DB
             .get_or_init(|| async {
                 let settings = astra_core::MatrixOneSettings::from_env();
@@ -1594,8 +1640,8 @@ mod tests {
             "main",
         );
         cleanup(&pool, &key).await;
-        let coordinator: Arc<dyn SessionContextCoordinator> =
-            Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
+        let authority_reader = DatabaseSessionContextCoordinator::new(pool.clone());
+        let coordinator: Arc<dyn SessionContextCoordinator> = Arc::new(authority_reader.clone());
         let service = DatabaseSessionHandoffService::new(pool.clone(), coordinator.clone());
         let source_actor = actor(&key.owner_user_id, "source");
         let target_actor = actor(&key.owner_user_id, "target");
@@ -1847,6 +1893,25 @@ mod tests {
         .await
         .expect("count handoff events");
         assert_eq!(event_count, 8);
+        let handoff_events = service
+            .list_handoff_events(&key, 100)
+            .await
+            .expect("list typed handoff events");
+        assert_eq!(handoff_events.len(), 8);
+        assert_eq!(
+            handoff_events.first().map(|event| event.record.state),
+            Some(SessionHandoffStateV1::Active)
+        );
+        let authority_events = authority_reader
+            .list_authority_events(&key, 100)
+            .await
+            .expect("list typed authority events");
+        assert!(
+            authority_events
+                .iter()
+                .any(|event| event.outcome == "stale_fenced"),
+            "the rejected old-writer reservation must remain causally queryable"
+        );
         cleanup(&pool, &key).await;
     }
 }

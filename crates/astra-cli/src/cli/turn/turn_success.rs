@@ -416,7 +416,6 @@ fn apply_turn_success_primary_sync(
         effective_user_input.clone(),
         build_history_text(&result.full_text, &result.tool_call_records),
     ));
-    super::continuation_shadow::record_continuation_shadow(&mut result, &state.history);
     state.recent_tools = recent_tools;
     state.resume_restricted_tools = result
         .interruption

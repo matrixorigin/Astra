@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v19";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v23";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -3958,6 +3958,7 @@ async fn ensure_core_schema_while_leased(
             chunk_kind VARCHAR(32) NOT NULL,
             position INT NOT NULL,
             op VARCHAR(16) NOT NULL,
+            reuse_count INT NULL,
             chunk_id VARCHAR(80) NULL,
             chunk_hash VARCHAR(64) NULL,
             previous_chunk_hash VARCHAR(64) NULL,
@@ -3973,6 +3974,10 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
     for (column, ddl) in [
+        (
+            "reuse_count",
+            "ALTER TABLE prompt_deltas ADD COLUMN reuse_count INT NULL",
+        ),
         (
             "chunk_tokens",
             "ALTER TABLE prompt_deltas ADD COLUMN chunk_tokens BIGINT NULL",
@@ -5418,6 +5423,83 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "model_request_context_events",
+        "CREATE TABLE IF NOT EXISTS model_request_context_events (
+            event_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            attempt_id VARCHAR(64) NOT NULL,
+            invocation_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            harness_run_id VARCHAR(128) NULL,
+            event_stage VARCHAR(16) NOT NULL,
+            terminal_status VARCHAR(32) NULL,
+            topology VARCHAR(32) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            model_family VARCHAR(128) NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            input_tokens BIGINT NULL,
+            output_tokens BIGINT NULL,
+            cache_read_tokens BIGINT NULL,
+            cache_creation_tokens BIGINT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, event_id),
+            CONSTRAINT chk_model_request_context_stage
+                CHECK (event_stage IN ('accepted', 'terminal')),
+            CONSTRAINT chk_model_request_context_terminal
+                CHECK ((event_stage = 'accepted' AND terminal_status IS NULL)
+                    OR (event_stage = 'terminal' AND terminal_status IN
+                        ('succeeded', 'failed', 'cancelled', 'delivery_unknown'))),
+            UNIQUE KEY uq_model_request_context_attempt_stage
+                (user_id, attempt_id, event_stage),
+            INDEX idx_model_request_context_owner_session_created
+                (user_id, session_id, created_at, event_id),
+            INDEX idx_model_request_context_metrics
+                (topology, provider, model_family, purpose, created_at),
+            INDEX idx_model_request_context_terminal_status
+                (terminal_status, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Terminal request metrics are accumulated transactionally with their
+    // append-only event. Scrapers read this bounded low-cardinality
+    // projection instead of repeatedly scanning every historical request.
+    core_schema_create!(
+        pool,
+        "model_request_metric_shards",
+        "CREATE TABLE IF NOT EXISTS model_request_metric_shards (
+            metric_shard SMALLINT NOT NULL,
+            topology VARCHAR(32) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            model_family VARCHAR(128) NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            terminal_status VARCHAR(32) NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY
+                (metric_shard, topology, provider, model_family, purpose, terminal_status),
+            CONSTRAINT chk_model_request_metric_shard
+                CHECK (metric_shard >= 0 AND metric_shard < 64),
+            CONSTRAINT chk_model_request_metric_terminal
+                CHECK (terminal_status IN
+                    ('succeeded', 'failed', 'cancelled', 'delivery_unknown')),
+            CONSTRAINT chk_model_request_metric_nonnegative
+                CHECK (requests >= 0 AND input_tokens >= 0 AND output_tokens >= 0
+                    AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0)
         )",
     )
     .execute(&pool)

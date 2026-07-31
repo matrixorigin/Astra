@@ -3,9 +3,14 @@
 #[derive(Debug, Clone)]
 pub(crate) enum TuiAppEvent {
     // ── Mapped from StreamEvent (one-layer bridge) ──────────────────────
+    ContextWindowPolicy {
+        raw_window_tokens: u64,
+        usable_input_tokens: u64,
+    },
     ContextWindowEstimated(astra_turn_types::ContextWindowUsage),
     ContextSystemPromptTokens(u32),
     ContextWindowMeasured(u64),
+    RequestTokenUsage(astra_turn_types::RequestTokenUsage),
     Token(String),
     ThinkingStarted,
     ThinkingStopped,

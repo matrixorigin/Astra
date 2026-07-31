@@ -98,6 +98,24 @@ pub mod session_memory;
 pub mod storage;
 pub mod tool_registry;
 pub mod turn;
+
+#[doc(hidden)]
+pub mod context_observability_bench {
+    use serde_json::Value;
+
+    pub fn augment_wire_trace(trace: &mut Value, messages: &[Value], tools: &[Value], debug: bool) {
+        crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
+            trace,
+            messages,
+            tools,
+            if debug {
+                crate::turn::llm::context::WireTraceDetail::Debug
+            } else {
+                crate::turn::llm::context::WireTraceDetail::MetricsOnly
+            },
+        );
+    }
+}
 pub use astra_sandbox as tool_sandbox;
 
 // ── Re-exports: core primitives ──────────────────────────────────────────────

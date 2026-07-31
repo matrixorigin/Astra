@@ -45,12 +45,6 @@ pub struct ContextAssemblyTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_identity: Option<ModelRequestTraceIdentity>,
 
-    /// Phase-0 shadow evidence comparing the current lossy CLI pair-history
-    /// continuation with the complete typed messages produced by the turn.
-    /// This is measurement only and never selects prompt history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub continuation_shadow: Option<ContinuationShadowTrace>,
-
     /// Breakdown of system prompt components.
     pub system_prompt: SystemPromptBreakdown,
 
@@ -92,7 +86,6 @@ impl Default for ContextAssemblyTrace {
             timestamp: SystemTime::now(),
             session_id: String::new(),
             request_identity: None,
-            continuation_shadow: None,
             system_prompt: SystemPromptBreakdown::default(),
             history: HistorySelectionTrace::default(),
             memory: MemoryRetrievalTrace::default(),
@@ -117,24 +110,6 @@ pub struct ModelRequestTraceIdentity {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_response_id: Option<String>,
-}
-
-/// One candidate continuation projection in the Phase-0 shadow comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContinuationProjectionTrace {
-    pub prompt_hash: String,
-    pub estimated_tokens: u64,
-    pub serialized_bytes: u64,
-    pub message_count: u32,
-    pub complete_tool_groups: u32,
-}
-
-/// Side-by-side evidence for the current CLI continuation loss.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContinuationShadowTrace {
-    pub pair_history: ContinuationProjectionTrace,
-    pub complete_final_messages: ContinuationProjectionTrace,
-    pub dropped_tool_groups: u32,
 }
 
 /// Normalize arbitrary memory content into a one-line preview suitable for
@@ -499,11 +474,6 @@ impl ContextAssemblyTraceBuilder {
 
     pub fn with_request_identity(mut self, identity: ModelRequestTraceIdentity) -> Self {
         self.trace.request_identity = Some(identity);
-        self
-    }
-
-    pub fn with_continuation_shadow(mut self, shadow: ContinuationShadowTrace) -> Self {
-        self.trace.continuation_shadow = Some(shadow);
         self
     }
 

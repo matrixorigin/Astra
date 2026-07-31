@@ -103,6 +103,24 @@ fn build_turn_stream_params<'a>(
     input: TurnExecutionInput<'a>,
     prepared: &'a PreparedTurnStreamState,
 ) -> ChatTurnParams<'a> {
+    if state.active_conversation.is_none()
+        && let Some(session_id) = state
+            .session_id
+            .as_deref()
+            .or(input.session_id)
+            .map(str::to_owned)
+    {
+        match crate::cli::session::session_continuation::recover_or_initialize_active_conversation(
+            &session_id,
+        ) {
+            Ok(active) => state.active_conversation = Some(active),
+            Err(error) => tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "canonical conversation could not be recovered at the live turn boundary"
+            ),
+        }
+    }
     ChatTurnParams {
         api: input.api,
         token: input.token,
@@ -176,14 +194,10 @@ fn build_turn_stream_params<'a>(
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
-        pre_loaded_messages: if cfg!(feature = "active-conversation") {
-            state
-                .active_conversation
-                .as_ref()
-                .map(|conversation| conversation.materialize())
-        } else {
-            None
-        },
+        pre_loaded_messages: state
+            .active_conversation
+            .as_ref()
+            .map(|conversation| conversation.materialize()),
         append_system_prompt: prepared.append_system_prompt.clone(),
         session_memory_extractor: state.session_memory_extractor.clone(),
         #[cfg(feature = "harness")]
@@ -334,6 +348,60 @@ mod tests {
         assert!(
             Arc::ptr_eq(&prepared.run_control, &preinstalled),
             "pre-turn queued TUI input must flow into the same provider used by the stream"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_first_turn_recovers_explicit_empty_canonical_state_not_display_pairs() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("failed-first-turn-{}", uuid::Uuid::new_v4());
+        let writer = astra_services::session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&astra_services::session_journal::JournalEvent::turn_error(
+                Some(&session_id),
+                1,
+                Some("mock-model"),
+                "launch work",
+                "foreground ownership moved to the background",
+                0,
+            ))
+            .unwrap();
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            journal: Some(writer),
+            history: vec![(
+                "launch work".into(),
+                "display-only interrupted result".into(),
+            )],
+            ..SessionState::default()
+        };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let prepared = prepare_turn_stream_state(&state).await;
+
+        let params = build_turn_stream_params(
+            &mut state,
+            TurnExecutionInput {
+                api: &api,
+                profile: None,
+                token: "token",
+                message: "what work is running?",
+                user_intent: "what work is running?",
+                input_runtime_required_texts: &[],
+                input_active_system_skills: &[],
+                input_runtime_volatile_texts: &[],
+                session_id: Some(&session_id),
+                semantic_query_override: None,
+            },
+            &prepared,
+        );
+
+        assert_eq!(params.pre_loaded_messages.as_deref(), Some([].as_slice()));
+        assert!(
+            state
+                .active_conversation
+                .as_ref()
+                .is_some_and(|active| active.messages().is_empty())
         );
     }
 

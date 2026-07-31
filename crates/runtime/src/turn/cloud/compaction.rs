@@ -139,6 +139,17 @@ fn tool_text_chars(message: &Value) -> usize {
     }
 }
 
+fn truncate_text_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
+    let suffix_chars = suffix.chars().count();
+    if suffix_chars >= max_chars {
+        return suffix.chars().take(max_chars).collect();
+    }
+    let retained_chars = max_chars - suffix_chars;
+    let mut truncated = text.chars().take(retained_chars).collect::<String>();
+    truncated.push_str(suffix);
+    truncated
+}
+
 fn truncate_tool_text_content(message: &mut Value, keep_chars: usize, suffix: &str) -> bool {
     let Some(content) = message.get_mut("content") else {
         return false;
@@ -556,6 +567,7 @@ pub(crate) fn compact_tiered_impl(
     } else {
         tool_indices.len() - 1
     };
+    const TOOL_COMPACT_SUFFIX: &str = "\n...[compacted for context budget]";
     for &index in tool_indices.iter().take(compact_limit) {
         let meta = resolve_tool_call_meta(&compacted, index);
         let tool_name_s = meta.as_ref().map(|(n, _)| n.as_str());
@@ -594,13 +606,15 @@ pub(crate) fn compact_tiered_impl(
             && line_count > 5
         {
             let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
-            compacted[index]["content"] = Value::String(format!(
-                "{preview}\n...[{line_count} lines compacted — re-run tool if needed]"
-            ));
-        } else {
-            let truncated: String = content.chars().take(eff_limit).collect();
+            let suffix = format!("\n...[{line_count} lines compacted — re-run tool if needed]");
             compacted[index]["content"] =
-                Value::String(truncated + "\n...[compacted for context budget]");
+                Value::String(truncate_text_with_suffix(&preview, eff_limit, &suffix));
+        } else {
+            compacted[index]["content"] = Value::String(truncate_text_with_suffix(
+                content,
+                eff_limit,
+                TOOL_COMPACT_SUFFIX,
+            ));
         }
     }
 
@@ -616,6 +630,7 @@ pub(crate) fn compact_tiered_impl(
             })
             .collect();
         let asst_limit = trunc_limit * 2;
+        const ASSISTANT_COMPACT_SUFFIX: &str = "\n...[earlier response compacted]";
         if assistant_indices.len() > keep_recent_turns {
             let compact_count = assistant_indices.len() - keep_recent_turns;
             for &index in assistant_indices.iter().take(compact_count) {
@@ -624,9 +639,11 @@ pub(crate) fn compact_tiered_impl(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if content.chars().count() > asst_limit {
-                    let truncated: String = content.chars().take(asst_limit).collect();
-                    compacted[index]["content"] =
-                        Value::String(truncated + "\n...[earlier response compacted]");
+                    compacted[index]["content"] = Value::String(truncate_text_with_suffix(
+                        content,
+                        asst_limit,
+                        ASSISTANT_COMPACT_SUFFIX,
+                    ));
                 }
             }
         }

@@ -1,7 +1,6 @@
 //! Turn execution pipeline: auth retry, stream running, settlement, commit,
 //! reporting, and post-commit side effects.
 
-pub mod continuation_shadow;
 pub mod local_run_control;
 pub mod turn_auth_retry;
 pub mod turn_cancellation;

@@ -47,6 +47,43 @@
             "legendFormat": "Active"
           }
         ]
+      },
+      {
+        "title": "Physical Model Request Rate",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "targets": [
+          {
+            "expr": "max by (topology, provider, model_family, purpose, outcome) (rate(astra_model_requests_total[5m]))",
+            "legendFormat": "{{topology}} · {{provider}} · {{model_family}} · {{purpose}} · {{outcome}}"
+          }
+        ]
+      },
+      {
+        "title": "Model Token Lanes",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "targets": [
+          {
+            "expr": "max by (bucket, topology, provider, model_family, purpose) (rate(astra_llm_input_tokens_total[5m]))",
+            "legendFormat": "input {{bucket}} · {{topology}} · {{provider}} · {{model_family}} · {{purpose}}"
+          },
+          {
+            "expr": "max by (topology, provider, model_family, purpose) (rate(astra_llm_output_tokens_total[5m]))",
+            "legendFormat": "output · {{topology}} · {{provider}} · {{model_family}} · {{purpose}}"
+          }
+        ]
+      },
+      {
+        "title": "Prompt Cache Read Share",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "targets": [
+          {
+            "expr": "max by (topology, provider, model_family, purpose) (astra_prompt_cache_read_share)",
+            "legendFormat": "{{topology}} · {{provider}} · {{model_family}} · {{purpose}}"
+          }
+        ]
       }
     ],
     "refresh": "10s",

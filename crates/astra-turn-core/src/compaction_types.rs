@@ -266,10 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn compaction_event_should_warn_at_70_percent() {
+    fn compaction_event_warns_at_the_resolved_warning_threshold() {
+        let warning = CompactionTier::pre_turn_warning(100_000);
         let low = CompactionEvent::new(
             CompactionKind::ProactiveDefault,
-            0.69,
+            warning - 0.01,
             1000,
             50000,
             100000,
@@ -279,7 +280,7 @@ mod tests {
         );
         let high = CompactionEvent::new(
             CompactionKind::ProactiveAggressive,
-            0.70,
+            warning,
             2000,
             70000,
             100000,

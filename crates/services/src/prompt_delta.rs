@@ -177,6 +177,9 @@ struct PreviousPromptRequest {
     tokenizer_revision: Option<String>,
 }
 
+const PROMPT_DELTA_CHECKPOINT_REQUESTS: usize = 64;
+const MAX_PROMPT_DELTA_CHAIN_REQUESTS: usize = 4_096;
+
 fn decode_previous_prompt_request(
     row: &impl PromptDeltaDbRow,
 ) -> Result<PreviousPromptRequest, String> {
@@ -191,6 +194,23 @@ fn decode_previous_prompt_request(
     })
 }
 
+fn common_prefix_len_for_storage(
+    current: &[PromptChunkPlan],
+    previous: &[ExistingPromptChunk],
+    previous_chain_request_count: usize,
+) -> usize {
+    if previous_chain_request_count >= PROMPT_DELTA_CHECKPOINT_REQUESTS {
+        return 0;
+    }
+    current
+        .iter()
+        .zip(previous)
+        .take_while(|(current, previous)| {
+            current.logical_key == previous.logical_key && current.chunk_hash == previous.chunk_hash
+        })
+        .count()
+}
+
 fn decode_existing_prompt_chunk(
     row: &impl PromptDeltaDbRow,
 ) -> Result<ExistingPromptChunk, String> {
@@ -199,6 +219,45 @@ fn decode_existing_prompt_chunk(
         chunk_hash: prompt_delta_row_string(row, "chunk_hash")?,
         estimated_tokens: prompt_delta_row_u64(row, "chunk_tokens")?,
         serialized_bytes: prompt_delta_row_u64(row, "chunk_bytes")?,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StoredPromptDelta {
+    request_id: String,
+    depth: u32,
+    delta_seq: u32,
+    op: String,
+    position: u32,
+    reuse_count: u32,
+    chunk: Option<ExistingPromptChunk>,
+}
+
+fn decode_stored_prompt_delta(
+    row: &impl PromptDeltaDbRow,
+    depth: u32,
+) -> Result<StoredPromptDelta, String> {
+    let op = prompt_delta_row_string(row, "op")?;
+    let chunk_hash = prompt_delta_row_string(row, "chunk_hash")?;
+    let chunk = match op.as_str() {
+        "reuse_prefix" | "drop" => None,
+        _ => {
+            if chunk_hash.is_empty() {
+                return Err(format!(
+                    "prompt delta row op `{op}` requires a non-empty chunk_hash"
+                ));
+            }
+            Some(decode_existing_prompt_chunk(row)?)
+        }
+    };
+    Ok(StoredPromptDelta {
+        request_id: prompt_delta_row_string(row, "request_id")?,
+        depth,
+        delta_seq: prompt_delta_row_u32(row, "delta_seq")?,
+        op,
+        position: prompt_delta_row_u32(row, "position")?,
+        reuse_count: prompt_delta_row_u32(row, "reuse_count")?,
+        chunk,
     })
 }
 
@@ -283,17 +342,27 @@ pub async fn persist_prompt_request(
     }
 
     let previous_request = load_previous_request(db, input).await?;
-    let previous_chunks = if let Some(previous_request) = previous_request.as_ref() {
+    let previous_state = if let Some(previous_request) = previous_request.as_ref() {
         load_request_chunks(db, input, &previous_request.request_id).await?
     } else {
-        Vec::new()
+        LoadedPromptChunks::default()
     };
+    let previous_chunks = previous_state.chunks;
     let previous_request_id = previous_request
         .as_ref()
         .map(|request| request.request_id.clone());
 
+    // Materialize one full request periodically. Individual unchanged chunks
+    // still count as reuse, but the checkpoint no longer depends on its
+    // predecessor for reconstruction.
+    let common_prefix_len = common_prefix_len_for_storage(
+        &plan.chunks,
+        &previous_chunks,
+        previous_state.chain_request_count,
+    );
     let mut previous_map = previous_chunks
         .into_iter()
+        .skip(common_prefix_len)
         .map(|chunk| (chunk.logical_key.clone(), chunk))
         .collect::<std::collections::HashMap<_, _>>();
     let mut delta_counts = PromptDeltaCounts::default();
@@ -305,8 +374,46 @@ pub async fn persist_prompt_request(
                 == Some(astra_turn_types::token_estimate::CANONICAL_JSON_TOKENIZER_REVISION)
     });
     let mut delta_seq: i32 = 0;
-    let mut delta_rows = Vec::with_capacity(plan.chunks.len().saturating_add(previous_map.len()));
-    for chunk in &plan.chunks {
+    let mut delta_rows = Vec::with_capacity(
+        plan.chunks
+            .len()
+            .saturating_sub(common_prefix_len)
+            .saturating_add(previous_map.len())
+            .saturating_add(usize::from(common_prefix_len > 0)),
+    );
+    if common_prefix_len > 0 {
+        let reuse_count = u32::try_from(common_prefix_len)
+            .map_err(|_| "prompt reuse prefix exceeds u32 range".to_string())?;
+        let reused_tokens = plan.chunks[..common_prefix_len]
+            .iter()
+            .fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.estimated_tokens)
+            });
+        let reused_bytes = plan.chunks[..common_prefix_len]
+            .iter()
+            .fold(0_u64, |total, chunk| {
+                total.saturating_add(chunk.serialized_bytes)
+            });
+        delta_counts.reuse = reuse_count;
+        delta_counts.token_weights.reuse = reused_tokens;
+        delta_rows.push(PlannedPromptDelta {
+            delta_seq,
+            logical_key: format!("prefix:{reuse_count}"),
+            chunk_kind: "prefix".to_string(),
+            position: 0,
+            op: "reuse_prefix",
+            reuse_count: Some(reuse_count),
+            chunk_id: None,
+            chunk_hash: None,
+            previous_chunk_hash: None,
+            chunk_tokens: Some(reused_tokens),
+            chunk_bytes: Some(reused_bytes),
+            previous_chunk_tokens: Some(reused_tokens),
+            previous_chunk_bytes: Some(reused_bytes),
+        });
+        delta_seq = delta_seq.saturating_add(1);
+    }
+    for chunk in &plan.chunks[common_prefix_len..] {
         let previous = previous_map.remove(&chunk.logical_key);
         let previous_hash = previous.as_ref().map(|chunk| chunk.chunk_hash.clone());
         let op = if previous_hash.as_deref() == Some(chunk.chunk_hash.as_str()) {
@@ -347,6 +454,7 @@ pub async fn persist_prompt_request(
             chunk_kind: chunk.chunk_kind.clone(),
             position: chunk.position,
             op,
+            reuse_count: None,
             chunk_id: Some(chunk.chunk_id.clone()),
             chunk_hash: Some(chunk.chunk_hash.clone()),
             previous_chunk_hash: previous_hash,
@@ -372,6 +480,7 @@ pub async fn persist_prompt_request(
             chunk_kind: "drop".to_string(),
             position: delta_seq,
             op: "drop",
+            reuse_count: None,
             chunk_id: None,
             chunk_hash: None,
             previous_chunk_hash: Some(previous.chunk_hash),
@@ -615,6 +724,12 @@ struct ExistingPromptChunk {
     serialized_bytes: u64,
 }
 
+#[derive(Default)]
+struct LoadedPromptChunks {
+    chunks: Vec<ExistingPromptChunk>,
+    chain_request_count: usize,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PlannedPromptDelta {
     delta_seq: i32,
@@ -622,6 +737,7 @@ struct PlannedPromptDelta {
     chunk_kind: String,
     position: i32,
     op: &'static str,
+    reuse_count: Option<u32>,
     chunk_id: Option<String>,
     chunk_hash: Option<String>,
     previous_chunk_hash: Option<String>,
@@ -650,8 +766,12 @@ fn planned_prompt_delta_payload_bytes(
         delta.chunk_id.as_deref().map_or(0, string_bytes),
         delta.chunk_hash.as_deref().map_or(0, string_bytes),
         delta.previous_chunk_hash.as_deref().map_or(0, string_bytes),
-        u64::try_from(std::mem::size_of::<i32>() * 2 + std::mem::size_of::<u64>() * 4)
-            .unwrap_or(u64::MAX),
+        u64::try_from(
+            std::mem::size_of::<i32>() * 2
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<u64>() * 4,
+        )
+        .unwrap_or(u64::MAX),
     ]
     .into_iter()
     .fold(0_u64, u64::saturating_add)
@@ -664,7 +784,7 @@ fn unchanged_prefix_work(
 ) -> (u64, u64) {
     delta_rows
         .iter()
-        .take_while(|delta| delta.op == "reuse")
+        .take_while(|delta| matches!(delta.op, "reuse_prefix" | "reuse"))
         .fold((0_u64, 0_u64), |(bytes, rows), delta| {
             (
                 bytes.saturating_add(planned_prompt_delta_payload_bytes(input, request_id, delta)),
@@ -700,26 +820,138 @@ async fn load_request_chunks(
     pool: &sqlx::Pool<sqlx::MySql>,
     input: &PromptRequestPersistInput,
     request_id: &str,
-) -> Result<Vec<ExistingPromptChunk>, String> {
-    let rows = sqlx::query(
-        "SELECT logical_key, chunk_hash,
-                COALESCE(chunk_tokens, 0) AS chunk_tokens,
-                COALESCE(chunk_bytes, 0) AS chunk_bytes
-         FROM prompt_deltas
-         WHERE user_id = ? AND session_id = ? AND request_id = ?
-           AND op != 'drop' AND chunk_hash IS NOT NULL
-         ORDER BY position ASC, delta_seq ASC",
+) -> Result<LoadedPromptChunks, String> {
+    let link_rows = sqlx::query(
+        "SELECT request.request_id,
+                request.previous_request_id,
+                MAX(CASE WHEN delta.op = 'reuse_prefix' THEN 1 ELSE 0 END) AS has_reuse_prefix
+         FROM prompt_request_records AS request
+         LEFT JOIN prompt_deltas AS delta
+           ON delta.user_id = request.user_id
+          AND delta.session_id = request.session_id
+          AND delta.request_id = request.request_id
+          AND delta.op = 'reuse_prefix'
+         WHERE request.user_id = ? AND request.session_id = ? AND request.source = ?
+         GROUP BY request.request_id, request.previous_request_id,
+                  request.created_at, request.turn, request.round, request.attempt
+         ORDER BY request.created_at DESC, request.turn DESC,
+                  request.round DESC, request.attempt DESC
+         LIMIT ?",
     )
     .bind(&input.user_id)
     .bind(&input.session_id)
-    .bind(request_id)
+    .bind(&input.source)
+    .bind(
+        i64::try_from(MAX_PROMPT_DELTA_CHAIN_REQUESTS + 1)
+            .map_err(|_| "prompt delta chain limit exceeds BIGINT range".to_string())?,
+    )
     .fetch_all(pool)
     .await
     .map_err(|error| error.to_string())?;
-    let chunks = rows
-        .into_iter()
-        .map(|row| decode_existing_prompt_chunk(&row))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut links = std::collections::HashMap::with_capacity(link_rows.len());
+    for row in link_rows {
+        let request_id = prompt_delta_row_string(&row, "request_id")?;
+        let previous_request_id =
+            row.optional_string_column("previous_request_id")
+                .map_err(|error| {
+                    format!(
+                        "prompt delta chain decode column `previous_request_id` failed: {error}"
+                    )
+                })?;
+        let has_reuse_prefix = prompt_delta_row_i64(&row, "has_reuse_prefix")? == 1;
+        links.insert(request_id, (previous_request_id, has_reuse_prefix));
+    }
+
+    let mut chain = Vec::new();
+    let mut current_request_id = request_id.to_string();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current_request_id.clone()) {
+            return Err(format!(
+                "prompt delta chain contains a cycle at request_id={current_request_id}"
+            ));
+        }
+        let (previous_request_id, has_reuse_prefix) =
+            links.get(&current_request_id).cloned().ok_or_else(|| {
+                format!("prompt delta chain metadata is missing request_id={current_request_id}")
+            })?;
+        let depth = u32::try_from(chain.len())
+            .map_err(|_| "prompt delta chain depth exceeds u32 range".to_string())?;
+        chain.push((
+            current_request_id.clone(),
+            previous_request_id.clone(),
+            depth,
+        ));
+        if !has_reuse_prefix {
+            break;
+        }
+        if chain.len() >= MAX_PROMPT_DELTA_CHAIN_REQUESTS {
+            return Err(format!(
+                "prompt delta chain for request_id={request_id} exceeds {MAX_PROMPT_DELTA_CHAIN_REQUESTS} requests"
+            ));
+        }
+        current_request_id = previous_request_id.ok_or_else(|| {
+            format!(
+                "prompt request {current_request_id} has a reuse_prefix without a previous request"
+            )
+        })?;
+    }
+
+    let depth_by_request = chain
+        .iter()
+        .map(|(request_id, _, depth)| (request_id.as_str(), *depth))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT delta.request_id,
+                delta.delta_seq,
+                delta.op,
+                delta.position,
+                COALESCE(delta.reuse_count, 0) AS reuse_count,
+                delta.logical_key,
+                COALESCE(delta.chunk_hash, '') AS chunk_hash,
+                COALESCE(delta.chunk_tokens, 0) AS chunk_tokens,
+                COALESCE(delta.chunk_bytes, 0) AS chunk_bytes
+         FROM prompt_deltas AS delta
+         INNER JOIN prompt_request_records AS request
+           ON request.user_id = delta.user_id
+          AND request.session_id = delta.session_id
+          AND request.request_id = delta.request_id
+         WHERE delta.user_id = ",
+    );
+    query
+        .push_bind(&input.user_id)
+        .push(" AND delta.session_id = ")
+        .push_bind(&input.session_id)
+        .push(" AND delta.request_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for (request_id, _, _) in &chain {
+            separated.push_bind(request_id);
+        }
+    }
+    query.push(")");
+    let rows = query
+        .build()
+        .fetch_all(pool)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut deltas =
+        rows.into_iter()
+            .map(|row| {
+                let request_id = prompt_delta_row_string(&row, "request_id")?;
+                let depth = depth_by_request.get(request_id.as_str()).copied().ok_or_else(|| {
+                format!("prompt delta row references request outside selected chain: {request_id}")
+            })?;
+                decode_stored_prompt_delta(&row, depth)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    deltas.sort_by(|left, right| {
+        right
+            .depth
+            .cmp(&left.depth)
+            .then_with(|| left.delta_seq.cmp(&right.delta_seq))
+    });
+    let chunks = reconstruct_prompt_chunks(&deltas)?;
     if astra_core::history_work::instrumentation_enabled() {
         let bytes = chunks.iter().fold(0_u64, |total, chunk| {
             total
@@ -732,6 +964,64 @@ async fn load_request_chunks(
             chunks.len().try_into().unwrap_or(u64::MAX),
             0,
         );
+    }
+    Ok(LoadedPromptChunks {
+        chunks,
+        chain_request_count: chain.len(),
+    })
+}
+
+fn reconstruct_prompt_chunks(
+    deltas: &[StoredPromptDelta],
+) -> Result<Vec<ExistingPromptChunk>, String> {
+    let mut chunks = Vec::new();
+    let mut seen_requests = std::collections::HashSet::new();
+    let mut index = 0;
+    while index < deltas.len() {
+        let request_id = deltas[index].request_id.clone();
+        if !seen_requests.insert(request_id.clone()) {
+            return Err(format!(
+                "prompt delta chain contains a cycle at request_id={request_id}"
+            ));
+        }
+        let group_start = index;
+        while index < deltas.len() && deltas[index].request_id == request_id {
+            index += 1;
+        }
+        let group = &deltas[group_start..index];
+        let mut reuse_prefix = group.iter().filter(|delta| delta.op == "reuse_prefix");
+        if let Some(prefix) = reuse_prefix.next() {
+            if reuse_prefix.next().is_some() {
+                return Err(format!(
+                    "prompt request {request_id} has more than one reuse_prefix row"
+                ));
+            }
+            let prefix_len = usize::try_from(prefix.reuse_count)
+                .map_err(|_| "prompt reuse prefix exceeds usize range".to_string())?;
+            if prefix_len == 0 || prefix_len > chunks.len() {
+                return Err(format!(
+                    "prompt request {request_id} has invalid reuse prefix {prefix_len} over {} inherited chunks",
+                    chunks.len()
+                ));
+            }
+            chunks.truncate(prefix_len);
+        } else {
+            chunks.clear();
+        }
+        for delta in group {
+            let Some(chunk) = delta.chunk.as_ref() else {
+                continue;
+            };
+            let expected_position = u32::try_from(chunks.len())
+                .map_err(|_| "prompt chunk position exceeds u32 range".to_string())?;
+            if delta.position != expected_position {
+                return Err(format!(
+                    "prompt request {request_id} chunk position {} does not follow reconstructed position {expected_position}",
+                    delta.position
+                ));
+            }
+            chunks.push(chunk.clone());
+        }
     }
     Ok(chunks)
 }
@@ -750,7 +1040,7 @@ async fn insert_prompt_delta_batch(
     let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new(
         "INSERT INTO prompt_deltas
          (user_id, session_id, request_id, delta_seq, logical_key, chunk_kind, position,
-          op, chunk_id, chunk_hash, previous_chunk_hash,
+          op, reuse_count, chunk_id, chunk_hash, previous_chunk_hash,
           chunk_tokens, chunk_bytes, previous_chunk_tokens, previous_chunk_bytes) ",
     );
     query.push_values(deltas, |mut row, delta| {
@@ -762,6 +1052,7 @@ async fn insert_prompt_delta_batch(
             .push_bind(&delta.chunk_kind)
             .push_bind(delta.position)
             .push_bind(delta.op)
+            .push_bind(delta.reuse_count.map(i64::from))
             .push_bind(delta.chunk_id.as_deref())
             .push_bind(delta.chunk_hash.as_deref())
             .push_bind(delta.previous_chunk_hash.as_deref())
@@ -1115,6 +1406,107 @@ mod tests {
     }
 
     #[test]
+    fn long_session_delta_chain_materializes_at_a_fixed_interval() {
+        let plan = plan_prompt_request(PromptRequestPlanInput {
+            user_id: "owner",
+            session_id: "session",
+            turn: 1,
+            round: 0,
+            attempt: 0,
+            source: "server",
+            messages: &[json!({"role": "user", "content": "stable"})],
+            tools: &[],
+            max_output_tokens: None,
+        })
+        .expect("plan");
+        let previous = plan
+            .chunks
+            .iter()
+            .map(|chunk| ExistingPromptChunk {
+                logical_key: chunk.logical_key.clone(),
+                chunk_hash: chunk.chunk_hash.clone(),
+                estimated_tokens: chunk.estimated_tokens,
+                serialized_bytes: chunk.serialized_bytes,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            common_prefix_len_for_storage(
+                &plan.chunks,
+                &previous,
+                PROMPT_DELTA_CHECKPOINT_REQUESTS - 1
+            ),
+            1
+        );
+        assert_eq!(
+            common_prefix_len_for_storage(
+                &plan.chunks,
+                &previous,
+                PROMPT_DELTA_CHECKPOINT_REQUESTS
+            ),
+            0,
+            "the checkpoint must break ancestry instead of extending a long-session chain"
+        );
+    }
+
+    #[test]
+    fn reuse_prefix_reconstructs_one_exact_current_chunk_sequence() {
+        let chunk = |request_id: &str, depth, position, hash: &str| StoredPromptDelta {
+            request_id: request_id.to_string(),
+            depth,
+            delta_seq: position,
+            op: "append".to_string(),
+            position,
+            reuse_count: 0,
+            chunk: Some(ExistingPromptChunk {
+                logical_key: format!("message:{position}:user"),
+                chunk_hash: hash.to_string(),
+                estimated_tokens: 10,
+                serialized_bytes: 40,
+            }),
+        };
+        let deltas = vec![
+            chunk("request-1", 1, 0, "old-0"),
+            chunk("request-1", 1, 1, "old-1"),
+            chunk("request-1", 1, 2, "old-2"),
+            StoredPromptDelta {
+                request_id: "request-2".to_string(),
+                depth: 0,
+                delta_seq: 0,
+                op: "reuse_prefix".to_string(),
+                position: 0,
+                reuse_count: 2,
+                chunk: None,
+            },
+            chunk("request-2", 0, 2, "new-2"),
+        ];
+
+        let reconstructed = reconstruct_prompt_chunks(&deltas).expect("reconstruct");
+        assert_eq!(
+            reconstructed
+                .iter()
+                .map(|chunk| chunk.chunk_hash.as_str())
+                .collect::<Vec<_>>(),
+            ["old-0", "old-1", "new-2"]
+        );
+    }
+
+    #[test]
+    fn reuse_prefix_rejects_missing_or_oversized_ancestry() {
+        let prefix = StoredPromptDelta {
+            request_id: "request-2".to_string(),
+            depth: 0,
+            delta_seq: 0,
+            op: "reuse_prefix".to_string(),
+            position: 0,
+            reuse_count: 1,
+            chunk: None,
+        };
+        let error = reconstruct_prompt_chunks(&[prefix]).expect_err("missing ancestry");
+        assert!(error.contains("invalid reuse prefix"), "{error}");
+    }
+
+    #[test]
     fn unchanged_prefix_work_stops_at_first_changed_row() {
         let input = PromptRequestPersistInput {
             session_id: "session-1".to_string(),
@@ -1133,6 +1525,7 @@ mod tests {
             chunk_kind: "message".to_string(),
             position: delta_seq,
             op,
+            reuse_count: None,
             chunk_id: Some(format!("chunk-{delta_seq}")),
             chunk_hash: Some(format!("hash-{delta_seq}")),
             previous_chunk_hash: Some(format!("previous-{delta_seq}")),

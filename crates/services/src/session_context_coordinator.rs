@@ -298,9 +298,104 @@ pub struct DatabaseSessionContextCoordinator {
     pool: SharedPool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionAuthorityEventV1 {
+    pub event_id: String,
+    pub operation_kind: String,
+    pub outcome: String,
+    pub writer_epoch: u64,
+    pub actor_id: Option<String>,
+    pub device_id: Option<String>,
+    pub lease_id: Option<String>,
+    pub reservation_id: Option<String>,
+    pub expected_root: Option<String>,
+    pub observed_root: Option<String>,
+    pub authorization_epoch: u64,
+    pub device_trust_epoch: u64,
+    pub permission_epoch: u64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
 impl DatabaseSessionContextCoordinator {
     pub fn new(pool: SharedPool) -> Self {
         Self { pool }
+    }
+
+    pub async fn list_authority_events(
+        &self,
+        key: &SessionKeyV1,
+        limit: u32,
+    ) -> Result<Vec<SessionAuthorityEventV1>, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let rows = sqlx::query(
+            "SELECT event_id, operation_kind, outcome, writer_epoch, actor_id, device_id,
+                    lease_id, reservation_id, expected_root, observed_root,
+                    authorization_epoch, device_trust_epoch, permission_epoch, created_at
+             FROM session_context_authority_events
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?
+             ORDER BY created_at DESC, event_id DESC
+             LIMIT ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(i64::from(limit.clamp(1, 500)))
+        .fetch_all(self.pool.get())
+        .await
+        .map_err(|source| database_error("list_authority_events", source))?;
+        rows.into_iter()
+            .map(|row| {
+                let nonnegative = |column: &'static str| {
+                    let value: i64 = row
+                        .try_get(column)
+                        .map_err(|source| database_error("decode_authority_event", source))?;
+                    u64::try_from(value).map_err(|_| {
+                        SessionContextCoordinatorError::NeedsRepair(format!(
+                            "authority event column {column} is negative"
+                        ))
+                    })
+                };
+                Ok(SessionAuthorityEventV1 {
+                    event_id: row
+                        .try_get("event_id")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    operation_kind: row
+                        .try_get("operation_kind")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    outcome: row
+                        .try_get("outcome")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    writer_epoch: nonnegative("writer_epoch")?,
+                    actor_id: row
+                        .try_get("actor_id")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    device_id: row
+                        .try_get("device_id")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    lease_id: row
+                        .try_get("lease_id")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    reservation_id: row
+                        .try_get("reservation_id")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    expected_root: row
+                        .try_get("expected_root")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    observed_root: row
+                        .try_get("observed_root")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                    authorization_epoch: nonnegative("authorization_epoch")?,
+                    device_trust_epoch: nonnegative("device_trust_epoch")?,
+                    permission_epoch: nonnegative("permission_epoch")?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|source| database_error("decode_authority_event", source))?,
+                })
+            })
+            .collect()
     }
 }
 

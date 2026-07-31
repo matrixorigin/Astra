@@ -30,6 +30,7 @@ pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
+pub mod model_request_context;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
@@ -215,7 +216,8 @@ pub use inference_execution::{
     InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
     InferenceUsage, admit_inference_invocation, begin_inference_provider_attempt,
     declare_inference_settlement, finish_inference_invocation, finish_inference_provider_attempt,
-    plan_inference_invocation, plan_inference_provider_attempt, reconcile_inference_settlements,
+    plan_inference_invocation, plan_inference_provider_attempt,
+    plan_inference_provider_attempt_with_context, reconcile_inference_settlements,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -245,6 +247,15 @@ pub use mcp_registry::{
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
     McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
     UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
+};
+pub use model_request_context::{
+    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,
+    ModelRequestComposition, ModelRequestContextEvent, ModelRequestContextRecord,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestLineage,
+    ModelRequestMetricsRow, ModelRequestRolloutStage, ModelRequestTopology,
+    ModelRequestTraceCoverage, ModelRequestUsage, ModelRequestWireComposition,
+    aggregate_model_request_metrics, list_model_request_context_events,
+    model_request_trace_coverage,
 };
 pub use models::{
     AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
@@ -320,8 +331,9 @@ pub use session_artifact_store::{
 pub use session_context_coordinator::{
     AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
     FileSessionContextCoordinator, MaterializedConversationV1, ReserveTurnOutcome,
-    SessionContextCoordinator, SessionContextCoordinatorError, SystemCoordinatorClock,
-    TransferWriterOutcome, WriterTransferConflictV1, WriterTransferRequestV1,
+    SessionAuthorityEventV1, SessionContextCoordinator, SessionContextCoordinatorError,
+    SystemCoordinatorClock, TransferWriterOutcome, WriterTransferConflictV1,
+    WriterTransferRequestV1,
 };
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
@@ -333,7 +345,7 @@ pub use session_fork_coordinator::{
 pub use session_handoff::{
     AttachSessionOutcomeV1, AttachSessionRequestV1, DatabaseSessionHandoffService,
     FenceSessionWriterOutcomeV1, HandoffTransitionPatchV1, RequestSessionHandoffV1,
-    SessionHandoffError, TransitionSessionHandoffV1,
+    SessionHandoffError, SessionHandoffEventV1, TransitionSessionHandoffV1,
 };
 pub use session_publish::{
     DatabaseSessionPublishService, PublishJournalItemV1, PublishSessionOutcomeV1,
