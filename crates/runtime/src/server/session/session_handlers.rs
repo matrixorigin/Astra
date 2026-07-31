@@ -1721,6 +1721,50 @@ pub(crate) struct SessionHandoffActivateRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct SessionForkPrepareRequest {
+    pub idempotency_key: String,
+    pub expected_parent_cursor: astra_turn_types::SessionCursorV1,
+    pub reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionForkActivateRequest {
+    #[serde(default = "default_fork_placement")]
+    pub placement: astra_turn_types::SessionPlacementV1,
+    #[serde(default = "default_writer_ttl_seconds")]
+    pub writer_ttl_seconds: u64,
+}
+
+fn default_fork_placement() -> astra_turn_types::SessionPlacementV1 {
+    astra_turn_types::SessionPlacementV1::Server
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionForkAbortRequest {
+    pub detail: String,
+    #[serde(default = "default_fork_grace_seconds")]
+    pub grace_seconds: u64,
+}
+
+fn default_fork_grace_seconds() -> u64 {
+    24 * 60 * 60
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionForkListQuery {
+    #[serde(default = "default_fork_list_limit")]
+    pub limit: u32,
+}
+
+fn default_fork_list_limit() -> u32 {
+    50
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SessionSegmentBatchRequest {
     pub segment_hashes: Vec<String>,
 }
@@ -2078,6 +2122,210 @@ pub(crate) async fn activate_session_handoff_handler(
         .map_err(session_handoff_http_error)
 }
 
+pub(crate) async fn prepare_session_fork_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionForkPrepareRequest>,
+) -> Result<Json<astra_turn_types::SessionForkManifestV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let parent_key = server_session_key(&user.user_id, &session.session_id);
+    let child_session_id =
+        deterministic_fork_session_id(&user.user_id, &session.session_id, &request.idempotency_key);
+    let child_key = server_session_key(&user.user_id, &child_session_id);
+    let dimensions = [
+        astra_turn_types::ForkBasisDimensionV1::Conversation,
+        astra_turn_types::ForkBasisDimensionV1::TaskBoard,
+        astra_turn_types::ForkBasisDimensionV1::Checkpoint,
+        astra_turn_types::ForkBasisDimensionV1::Workspace,
+        astra_turn_types::ForkBasisDimensionV1::Artifacts,
+    ]
+    .into_iter()
+    .map(|dimension| {
+        let is_conversation = dimension == astra_turn_types::ForkBasisDimensionV1::Conversation;
+        astra_turn_types::ForkDimensionEvidenceV1 {
+            dimension,
+            disposition: if is_conversation {
+                astra_turn_types::ForkDimensionDispositionV1::SharedPrefix
+            } else {
+                astra_turn_types::ForkDimensionDispositionV1::Gap
+            },
+            source_cursor: is_conversation.then(|| request.expected_parent_cursor.clone()),
+            evidence_digest: is_conversation
+                .then(|| request.expected_parent_cursor.canonical_root_hash.clone()),
+            detail: (!is_conversation).then(|| {
+                "no canonical Server fork projection is registered for this dimension".into()
+            }),
+        }
+    })
+    .collect();
+    fork_coordinator(&state)?
+        .prepare(&astra_services::PrepareSessionForkV1 {
+            idempotency_key: request.idempotency_key,
+            parent_key,
+            child_key,
+            expected_parent_cursor: request.expected_parent_cursor,
+            dimensions,
+            reason: request.reason,
+        })
+        .await
+        .map(Json)
+        .map_err(session_fork_http_error)
+}
+
+pub(crate) async fn list_session_forks_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SessionForkListQuery>,
+) -> Result<Json<Vec<astra_turn_types::SessionForkManifestV1>>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    fork_coordinator(&state)?
+        .list(
+            &server_session_key(&user.user_id, &session.session_id),
+            query.limit,
+        )
+        .await
+        .map(Json)
+        .map_err(session_fork_http_error)
+}
+
+pub(crate) async fn get_session_fork_handler(
+    State(state): State<AppState>,
+    Path((session_id, fork_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<astra_turn_types::SessionForkManifestV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    fork_coordinator(&state)?
+        .load(
+            &server_session_key(&user.user_id, &session.session_id),
+            &fork_id,
+        )
+        .await
+        .map(Json)
+        .map_err(session_fork_http_error)
+}
+
+pub(crate) async fn activate_session_fork_handler(
+    State(state): State<AppState>,
+    Path((session_id, fork_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SessionForkActivateRequest>,
+) -> Result<Json<astra_turn_types::SessionForkActivationV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let parent_key = server_session_key(&user.user_id, &session.session_id);
+    let manifest = fork_coordinator(&state)?
+        .load(&parent_key, &fork_id)
+        .await
+        .map_err(session_fork_http_error)?;
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let epochs = coordinator
+        .load_authority_epochs(&manifest.child_key)
+        .await
+        .map_err(session_context_http_error)?
+        .unwrap_or_default();
+    let (actor_kind, surface, actor_id, device_id) = match request.placement {
+        astra_turn_types::SessionPlacementV1::Server => (
+            astra_turn_types::ActorKindV1::Server,
+            astra_turn_types::SessionSurfaceV1::Server,
+            state.session_actor_id.clone(),
+            None,
+        ),
+        astra_turn_types::SessionPlacementV1::Cli | astra_turn_types::SessionPlacementV1::Edge => {
+            let pool = state
+                .shared_pool
+                .as_ref()
+                .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+            let device = verify_device_proof_from_headers(
+                pool,
+                &user.user_id,
+                &session.session_id,
+                &headers,
+                DeviceProofPurpose::Publish,
+            )
+            .await?;
+            let (kind, surface) = if request.placement == astra_turn_types::SessionPlacementV1::Cli
+            {
+                (
+                    astra_turn_types::ActorKindV1::Cli,
+                    astra_turn_types::SessionSurfaceV1::Cli,
+                )
+            } else {
+                (
+                    astra_turn_types::ActorKindV1::Edge,
+                    astra_turn_types::SessionSurfaceV1::Edge,
+                )
+            };
+            (
+                kind,
+                surface,
+                format!("device:{}", device.device_id),
+                Some(device.device_id),
+            )
+        }
+    };
+    let actor = astra_turn_types::ActorContextV1::owner_user(
+        &user.user_id,
+        actor_id,
+        actor_kind,
+        surface,
+        device_id,
+        epochs,
+    );
+    fork_coordinator(&state)?
+        .activate(
+            &parent_key,
+            &fork_id,
+            &actor,
+            std::time::Duration::from_secs(request.writer_ttl_seconds),
+        )
+        .await
+        .map(Json)
+        .map_err(session_fork_http_error)
+}
+
+pub(crate) async fn abort_session_fork_handler(
+    State(state): State<AppState>,
+    Path((session_id, fork_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<SessionForkAbortRequest>,
+) -> Result<Json<astra_turn_types::SessionForkManifestV1>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    fork_coordinator(&state)?
+        .abort(
+            &server_session_key(&user.user_id, &session.session_id),
+            &fork_id,
+            std::time::Duration::from_secs(request.grace_seconds),
+            &request.detail,
+        )
+        .await
+        .map(Json)
+        .map_err(session_fork_http_error)
+}
+
 pub(crate) async fn get_session_segments_handler(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -2223,6 +2471,30 @@ fn handoff_service(
         .ok_or_else(|| internal_error("session handoff service is not configured"))
 }
 
+fn fork_coordinator(
+    state: &AppState,
+) -> Result<&astra_services::DatabaseSessionForkCoordinator, (StatusCode, Json<ErrorResponse>)> {
+    state
+        .session_fork_coordinator
+        .as_deref()
+        .ok_or_else(|| internal_error("session fork coordinator is not configured"))
+}
+
+fn deterministic_fork_session_id(
+    owner_user_id: &str,
+    parent_session_id: &str,
+    idempotency_key: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"astra.network-session-fork-child.v1\0");
+    for value in [owner_user_id, parent_session_id, idempotency_key] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let hash = format!("{:x}", digest.finalize());
+    format!("fork-{}", &hash[..32])
+}
+
 fn session_context_http_error(
     error: astra_services::SessionContextCoordinatorError,
 ) -> (StatusCode, Json<ErrorResponse>) {
@@ -2266,6 +2538,28 @@ fn session_handoff_http_error(
             error_response(StatusCode::CONFLICT, error.to_string())
         }
         astra_services::SessionHandoffError::Coordinator(source) => {
+            session_context_http_error(source)
+        }
+        _ => internal_error(error),
+    }
+}
+
+fn session_fork_http_error(
+    error: astra_services::SessionForkCoordinatorError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        astra_services::SessionForkCoordinatorError::Invalid(message) => {
+            error_response(StatusCode::BAD_REQUEST, message)
+        }
+        astra_services::SessionForkCoordinatorError::NotFound => {
+            error_response(StatusCode::NOT_FOUND, error.to_string())
+        }
+        astra_services::SessionForkCoordinatorError::Conflict
+        | astra_services::SessionForkCoordinatorError::IdempotencyMismatch
+        | astra_services::SessionForkCoordinatorError::WriterConflict => {
+            error_response(StatusCode::CONFLICT, error.to_string())
+        }
+        astra_services::SessionForkCoordinatorError::Coordinator(source) => {
             session_context_http_error(source)
         }
         _ => internal_error(error),

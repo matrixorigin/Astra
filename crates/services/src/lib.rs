@@ -51,6 +51,7 @@ pub mod session_audit;
 pub mod session_checkpoint;
 pub mod session_context_coordinator;
 pub mod session_fork;
+pub mod session_fork_coordinator;
 pub mod session_handoff;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
@@ -325,6 +326,9 @@ pub use session_context_coordinator::{
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
     ForkSessionResult, SessionForkBasisEvidenceV1, fork_local_session, verify_local_fork_basis,
+};
+pub use session_fork_coordinator::{
+    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,
 };
 pub use session_handoff::{
     AttachSessionOutcomeV1, AttachSessionRequestV1, DatabaseSessionHandoffService,

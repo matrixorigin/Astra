@@ -237,6 +237,8 @@ pub struct AppState {
     pub(crate) session_context_coordinator:
         Option<Arc<dyn astra_services::SessionContextCoordinator>>,
     pub(crate) session_handoff_service: Option<Arc<astra_services::DatabaseSessionHandoffService>>,
+    pub(crate) session_fork_coordinator:
+        Option<Arc<astra_services::DatabaseSessionForkCoordinator>>,
     pub(crate) session_publish_service: Option<Arc<astra_services::DatabaseSessionPublishService>>,
     pub(crate) execution_grant_signer: Option<Arc<astra_services::ExecutionGrantSigner>>,
     pub(crate) session_actor_id: String,
@@ -350,6 +352,7 @@ impl AppState {
             ),
             session_context_coordinator: None,
             session_handoff_service: None,
+            session_fork_coordinator: None,
             session_publish_service: None,
             execution_grant_signer: None,
             session_actor_id: std::env::var("ASTRA_POD_ID")
@@ -393,6 +396,14 @@ impl AppState {
         service: Arc<astra_services::DatabaseSessionHandoffService>,
     ) -> Self {
         self.session_handoff_service = Some(service);
+        self
+    }
+
+    pub fn with_session_fork_coordinator(
+        mut self,
+        coordinator: Arc<astra_services::DatabaseSessionForkCoordinator>,
+    ) -> Self {
+        self.session_fork_coordinator = Some(coordinator);
         self
     }
 

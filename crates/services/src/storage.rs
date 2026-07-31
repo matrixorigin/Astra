@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v17";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v18";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2732,6 +2732,7 @@ async fn ensure_core_schema_while_leased(
             active_reservation_json LONGTEXT NULL,
             active_reservation_expires_at_ms BIGINT NULL,
             last_commit_json LONGTEXT NULL,
+            fork_base_json LONGTEXT NULL,
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
             INDEX idx_session_context_heads_owner_session (owner_user_id, session_id, branch_id),
@@ -2739,6 +2740,14 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_context_heads",
+        "fork_base_json",
+        "ALTER TABLE session_context_heads ADD COLUMN fork_base_json LONGTEXT NULL",
+    )
     .await?;
 
     core_schema_create!(
@@ -2762,6 +2771,86 @@ async fn ensure_core_schema_while_leased(
 
     core_schema_create!(
         pool,
+        "session_forks",
+        "CREATE TABLE IF NOT EXISTS session_forks (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            fork_id VARCHAR(128) NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            parent_branch_id VARCHAR(128) NOT NULL,
+            child_session_id VARCHAR(128) NOT NULL,
+            child_branch_id VARCHAR(128) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            manifest_json LONGTEXT NOT NULL,
+            activated_at_ms BIGINT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, fork_id),
+            UNIQUE KEY uq_session_forks_child
+                (isolation_domain, owner_user_id, child_session_id, child_branch_id),
+            UNIQUE KEY uq_session_forks_parent_idempotency
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, idempotency_hash),
+            INDEX idx_session_forks_parent_state
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, state),
+            INDEX idx_session_forks_child_state
+                (isolation_domain, owner_user_id, child_session_id, child_branch_id, state)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_fork_events",
+        "CREATE TABLE IF NOT EXISTS session_fork_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            fork_id VARCHAR(128) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            child_session_id VARCHAR(128) NOT NULL,
+            from_state VARCHAR(32) NULL,
+            to_state VARCHAR(32) NOT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, fork_id, transition_seq),
+            INDEX idx_session_fork_events_parent
+                (isolation_domain, owner_user_id, parent_session_id, created_at),
+            INDEX idx_session_fork_events_child
+                (isolation_domain, owner_user_id, child_session_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_manifest_pins",
+        "CREATE TABLE IF NOT EXISTS conversation_manifest_pins (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            pin_id VARCHAR(128) NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            parent_branch_id VARCHAR(128) NOT NULL,
+            manifest_root CHAR(64) NOT NULL,
+            pin_state VARCHAR(32) NOT NULL,
+            grace_expires_at_ms BIGINT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, pin_id),
+            INDEX idx_manifest_pins_parent
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, pin_state),
+            INDEX idx_manifest_pins_grace
+                (pin_state, grace_expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
         "conversation_manifest_nodes",
         "CREATE TABLE IF NOT EXISTS conversation_manifest_nodes (
             isolation_domain VARCHAR(128) NOT NULL,
@@ -2773,12 +2862,51 @@ async fn ensure_core_schema_while_leased(
             completed_turn BIGINT NOT NULL,
             conversation_seq BIGINT NOT NULL,
             canonical_segment_bytes BIGINT NOT NULL,
+            total_canonical_bytes BIGINT NOT NULL,
+            total_message_count BIGINT NOT NULL,
+            reachable TINYINT NOT NULL DEFAULT 0,
             manifest_json LONGTEXT NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
             INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
             INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq)
         )",
+    )
+    .execute(&pool)
+    .await?;
+    for (column, ddl) in [
+        (
+            "total_canonical_bytes",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_canonical_bytes BIGINT NOT NULL DEFAULT 0",
+        ),
+        (
+            "total_message_count",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_message_count BIGINT NOT NULL DEFAULT 0",
+        ),
+        (
+            "reachable",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN reachable TINYINT NOT NULL DEFAULT 0",
+        ),
+    ] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            "conversation_manifest_nodes",
+            column,
+            ddl,
+        )
+        .await?;
+    }
+    query(
+        "UPDATE conversation_manifest_nodes n
+         INNER JOIN session_context_heads h
+           ON h.isolation_domain = n.isolation_domain
+          AND h.owner_user_id = n.owner_user_id
+          AND h.session_id = n.session_id
+          AND h.branch_id = n.branch_id
+          AND h.latest_manifest_root = n.manifest_root
+         SET n.reachable = 1
+         WHERE n.reachable = 0",
     )
     .execute(&pool)
     .await?;

@@ -1032,19 +1032,21 @@ impl HybridRestoreService {
                     conversation_messages,
                     conversation_from_checkpoint,
                     heavy_state.as_ref(),
-                    astra_turn_types::ResumeTaskProjectionV1 {
-                        executing_plan_json: metadata_state.executing_plan_json.clone(),
-                        plan_goal: metadata_state.plan_goal.clone(),
-                        plan_config_json: metadata_state.plan_config_json.clone(),
-                        plan_execution_rounds: metadata_state.plan_execution_rounds,
-                        contract_json: contract_json.clone(),
-                    },
-                    astra_turn_types::ResumeProviderProjectionV1 {
-                        model: model.clone(),
-                        permission_mode: metadata_state.permission_mode.clone(),
-                        config_version_id: heavy_state
-                            .as_ref()
-                            .and_then(|state| state.config_version_id.clone()),
+                    ResumeBundleSupplementalProjections {
+                        task: astra_turn_types::ResumeTaskProjectionV1 {
+                            executing_plan_json: metadata_state.executing_plan_json.clone(),
+                            plan_goal: metadata_state.plan_goal.clone(),
+                            plan_config_json: metadata_state.plan_config_json.clone(),
+                            plan_execution_rounds: metadata_state.plan_execution_rounds,
+                            contract_json: contract_json.clone(),
+                        },
+                        provider: astra_turn_types::ResumeProviderProjectionV1 {
+                            model: model.clone(),
+                            permission_mode: metadata_state.permission_mode.clone(),
+                            config_version_id: heavy_state
+                                .as_ref()
+                                .and_then(|state| state.config_version_id.clone()),
+                        },
                     },
                 )?;
                 let mut restored = RestoredSession {
@@ -1383,6 +1385,11 @@ fn validate_resume_cursor_identity(
     Ok(())
 }
 
+struct ResumeBundleSupplementalProjections {
+    task: astra_turn_types::ResumeTaskProjectionV1,
+    provider: astra_turn_types::ResumeProviderProjectionV1,
+}
+
 fn build_resume_bundle(
     owner_id: &str,
     session_id: &str,
@@ -1390,8 +1397,7 @@ fn build_resume_bundle(
     messages: Vec<serde_json::Value>,
     conversation_from_checkpoint: bool,
     heavy: Option<&CloudHeavyCheckpointState>,
-    task: astra_turn_types::ResumeTaskProjectionV1,
-    provider: astra_turn_types::ResumeProviderProjectionV1,
+    supplemental: ResumeBundleSupplementalProjections,
 ) -> Result<Option<astra_turn_types::ResumeBundleV1>, String> {
     if messages.is_empty() {
         return Ok(None);
@@ -1440,10 +1446,10 @@ fn build_resume_bundle(
             },
         )
     });
-    let task =
-        (!task.is_empty()).then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(task));
-    let provider = (!provider.is_empty())
-        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(provider));
+    let task = (!supplemental.task.is_empty())
+        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.task));
+    let provider = (!supplemental.provider.is_empty())
+        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.provider));
     if (task.is_some() || provider.is_some())
         && !degraded_reasons
             .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
@@ -4236,8 +4242,10 @@ mod tests {
             messages,
             true,
             Some(&heavy),
-            astra_turn_types::ResumeTaskProjectionV1::default(),
-            astra_turn_types::ResumeProviderProjectionV1::default(),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1::default(),
+                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
+            },
         )
         .unwrap_err();
         assert!(error.contains("no valid resume candidate"), "{error}");
@@ -4265,8 +4273,10 @@ mod tests {
             transcript,
             false,
             Some(&heavy),
-            astra_turn_types::ResumeTaskProjectionV1::default(),
-            astra_turn_types::ResumeProviderProjectionV1::default(),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1::default(),
+                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
+            },
         )
         .unwrap()
         .unwrap();

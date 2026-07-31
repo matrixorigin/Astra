@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     ActorContextV1, AuthorityEpochsV1, ContextManifestNodeV1, SessionContextHeadV1,
-    SessionCursorV1, SessionKeyV1,
+    SessionCursorV1, SessionKeyV1, SharedManifestPrefixV1,
 };
 
 pub const SESSION_HANDOFF_SCHEMA_VERSION: u32 = 1;
@@ -93,6 +93,8 @@ pub struct ManifestDeltaV1 {
     pub after_manifest_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<SessionContextHeadV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_prefix: Option<SharedManifestPrefixV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_nodes: Vec<ContextManifestNodeV1>,
     pub missing_canonical_bytes: u64,
@@ -124,6 +126,7 @@ impl ManifestDeltaV1 {
         match &self.head {
             None => {
                 if self.after_manifest_root.is_some()
+                    || self.shared_prefix.is_some()
                     || !self.missing_nodes.is_empty()
                     || self.missing_canonical_bytes != 0
                     || self.missing_message_count != 0
@@ -132,7 +135,19 @@ impl ManifestDeltaV1 {
                 }
             }
             Some(head) => {
-                let mut expected_parent = self.after_manifest_root.as_deref();
+                if let Some(prefix) = &self.shared_prefix {
+                    prefix
+                        .validate_for_child(&self.key)
+                        .map_err(|_| SessionHandoffValidationError::InvalidManifestDelta)?;
+                    if self.after_manifest_root.is_some() {
+                        return Err(SessionHandoffValidationError::InvalidManifestDelta);
+                    }
+                }
+                let mut expected_parent = self.after_manifest_root.as_deref().or_else(|| {
+                    self.shared_prefix
+                        .as_ref()
+                        .map(|prefix| prefix.parent_manifest_root.as_str())
+                });
                 for node in &self.missing_nodes {
                     if node.parent_manifest_root.as_deref() != expected_parent {
                         return Err(SessionHandoffValidationError::InvalidManifestDelta);
@@ -624,6 +639,7 @@ mod tests {
             key,
             after_manifest_root: None,
             head: Some(head),
+            shared_prefix: None,
             missing_nodes: vec![node],
             missing_canonical_bytes: segment.canonical_bytes,
             missing_message_count: u64::from(segment.message_count),

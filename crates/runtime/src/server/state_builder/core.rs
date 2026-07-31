@@ -39,6 +39,10 @@ pub(super) fn build_core_state(
         shared_pool.clone(),
         Arc::clone(&session_context_coordinator),
     ));
+    let session_fork_coordinator = Arc::new(astra_services::DatabaseSessionForkCoordinator::new(
+        shared_pool.clone(),
+        Arc::clone(&session_context_coordinator),
+    ));
     let session_publish_service = Arc::new(astra_services::DatabaseSessionPublishService::new(
         shared_pool.clone(),
         Arc::clone(&session_context_coordinator),
@@ -57,6 +61,7 @@ pub(super) fn build_core_state(
         Arc::new(execution_grant_signer),
     )
     .with_session_handoff_service(session_handoff_service)
+    .with_session_fork_coordinator(session_fork_coordinator)
     .with_session_publish_service(session_publish_service)
     .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
         shared_pool.get().clone(),

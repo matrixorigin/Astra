@@ -19,7 +19,8 @@ use astra_turn_types::{
     ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
     CoordinatorConflictOptionV1, CoordinatorMutationV1, HandoffRiskEvidenceV1,
     MANIFEST_DELTA_SCHEMA_VERSION, ManifestDeltaV1, SESSION_COORDINATION_SCHEMA_VERSION,
-    SessionContextHeadV1, SessionCursorV1, SessionHandoffModeV1, SessionKeyV1, TurnReservationV1,
+    SessionContextHeadV1, SessionCursorV1, SessionForkManifestV1, SessionForkStateV1,
+    SessionHandoffModeV1, SessionKeyV1, SharedManifestPrefixV1, TurnReservationV1,
     canonical_conversation_root, canonical_conversation_serialized_len,
 };
 use async_trait::async_trait;
@@ -197,6 +198,18 @@ pub trait SessionContextCoordinator: Send + Sync {
         &self,
         key: &SessionKeyV1,
     ) -> Result<Option<ConversationWriterLeaseV1>, SessionContextCoordinatorError>;
+
+    async fn load_fork_prefix(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<Option<SharedManifestPrefixV1>, SessionContextCoordinatorError>;
+
+    /// Atomically activate a prepared copy-on-write child head and its durable
+    /// fork record. No writer/run/tool authority is inherited.
+    async fn activate_fork(
+        &self,
+        manifest: &SessionForkManifestV1,
+    ) -> Result<SessionContextHeadV1, SessionContextCoordinatorError>;
 
     async fn acquire_writer(
         &self,
@@ -430,6 +443,78 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
         .await
     }
 
+    async fn load_fork_prefix(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<Option<SharedManifestPrefixV1>, SessionContextCoordinatorError> {
+        let key = key.clone();
+        self.run_blocking(move |coordinator| {
+            let state_path = coordinator.session_dir(&key).join("state.json");
+            if !state_path.exists() {
+                return Ok(None);
+            }
+            coordinator.locked_state(&key, |state, _| Ok(state.fork_base.clone()))
+        })
+        .await
+    }
+
+    async fn activate_fork(
+        &self,
+        manifest: &SessionForkManifestV1,
+    ) -> Result<SessionContextHeadV1, SessionContextCoordinatorError> {
+        validate_prepared_fork(manifest)?;
+        let manifest = manifest.clone();
+        self.run_blocking(move |coordinator| {
+            let parent_node_path = coordinator
+                .owner_objects_dir(&manifest.parent_key)
+                .join("manifests")
+                .join(format!(
+                    "{}.json",
+                    manifest.parent_head.latest_manifest_root
+                ));
+            let parent_node: ContextManifestNodeV1 = read_json(&parent_node_path)?;
+            if parent_node.key != manifest.parent_key
+                || parent_node.cursor() != manifest.parent_head.cursor
+            {
+                return Err(SessionContextCoordinatorError::Invalid(
+                    "fork parent manifest does not match the prepared cursor".into(),
+                ));
+            }
+            coordinator.locked_state(&manifest.child_key, |state, session_dir| {
+                if let Some(stored) = &state.fork_manifest {
+                    if stored.fork_id != manifest.fork_id {
+                        return Err(SessionContextCoordinatorError::Fenced);
+                    }
+                    return state.head.clone().ok_or_else(|| {
+                        SessionContextCoordinatorError::NeedsRepair(
+                            "active file fork has no child head".into(),
+                        )
+                    });
+                }
+                if state.head.is_some()
+                    || state.active_writer.is_some()
+                    || state.active_reservation.is_some()
+                {
+                    return Err(SessionContextCoordinatorError::Fenced);
+                }
+                let now = coordinator.clock.now_unix_ms()?;
+                let mut active_manifest = manifest.clone();
+                active_manifest.state = SessionForkStateV1::Active;
+                active_manifest.activated_at_unix_ms = Some(now);
+                active_manifest
+                    .validate()
+                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+                let child_head = fork_child_head(&active_manifest, state.writer_epoch);
+                state.fork_base = Some(active_manifest.shared_prefix());
+                state.fork_manifest = Some(active_manifest);
+                state.head = Some(child_head.clone());
+                coordinator.store_state(session_dir, state)?;
+                Ok(child_head)
+            })
+        })
+        .await
+    }
+
     async fn materialize(
         &self,
         head: &SessionContextHeadV1,
@@ -450,7 +535,9 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
         let key = key.clone();
         let after_manifest_root = after_manifest_root.map(str::to_owned);
         self.run_blocking(move |coordinator| {
-            let head = coordinator.locked_state(&key, |state, _| Ok(state.head.clone()))?;
+            let (head, fork_base) = coordinator.locked_state(&key, |state, _| {
+                Ok((state.head.clone(), state.fork_base.clone()))
+            })?;
             let Some(head) = head else {
                 if after_manifest_root.is_some() {
                     return Err(SessionContextCoordinatorError::DivergentManifest);
@@ -460,6 +547,7 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                     key,
                     after_manifest_root: None,
                     head: None,
+                    shared_prefix: None,
                     missing_nodes: Vec::new(),
                     missing_canonical_bytes: 0,
                     missing_message_count: 0,
@@ -468,10 +556,15 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
             let owner_dir = coordinator.owner_objects_dir(&key);
             let mut current = Some(head.latest_manifest_root.clone());
             let mut reverse = Vec::new();
-            let mut found_after = after_manifest_root.is_none();
+            let boundary = after_manifest_root.as_deref().or_else(|| {
+                fork_base
+                    .as_ref()
+                    .map(|prefix| prefix.parent_manifest_root.as_str())
+            });
+            let mut found_after = boundary.is_none();
             let mut seen = HashSet::new();
             while let Some(root) = current {
-                if after_manifest_root.as_deref() == Some(root.as_str()) {
+                if boundary == Some(root.as_str()) {
                     found_after = true;
                     break;
                 }
@@ -497,7 +590,8 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                 return Err(SessionContextCoordinatorError::DivergentManifest);
             }
             reverse.reverse();
-            manifest_delta(key, after_manifest_root, Some(head), reverse)
+            let shared_prefix = after_manifest_root.is_none().then_some(fork_base).flatten();
+            manifest_delta(key, after_manifest_root, Some(head), shared_prefix, reverse)
         })
         .await
     }
@@ -1131,7 +1225,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         head: &SessionContextHeadV1,
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
-        let rows = sqlx::query(
+        let fork_base = self.load_fork_prefix(&head.key).await?;
+        let mut rows = sqlx::query(
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ?",
@@ -1143,6 +1238,27 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .fetch_all(self.pool.get())
         .await
         .map_err(|source| database_error("load_manifests", source))?;
+        if let Some(prefix) = &fork_base {
+            rows.extend(
+                sqlx::query(
+                    "SELECT manifest_json FROM conversation_manifest_nodes
+                     WHERE isolation_domain = ? AND owner_user_id = ?
+                       AND session_id = ? AND branch_id = ?
+                       AND conversation_seq <= ?",
+                )
+                .bind(&prefix.parent_key.isolation_domain)
+                .bind(&prefix.parent_key.owner_user_id)
+                .bind(&prefix.parent_key.session_id)
+                .bind(&prefix.parent_key.branch_id)
+                .bind(i64_from_u64(
+                    "fork parent conversation sequence",
+                    prefix.parent_cursor.conversation_seq,
+                )?)
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| database_error("load_fork_parent_manifests", source))?,
+            );
+        }
         let mut nodes = std::collections::HashMap::with_capacity(rows.len());
         for row in rows {
             let json = row
@@ -1151,7 +1267,11 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             let node: ContextManifestNodeV1 = database_json("manifest", &json)?;
             node.validate()
                 .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if node.key != head.key {
+            if node.key != head.key
+                && fork_base
+                    .as_ref()
+                    .is_none_or(|prefix| node.key != prefix.parent_key)
+            {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
                     "database manifest owner or branch mismatch".into(),
                 ));
@@ -1192,6 +1312,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 key: key.clone(),
                 after_manifest_root: None,
                 head: None,
+                shared_prefix: None,
                 missing_nodes: Vec::new(),
                 missing_canonical_bytes: 0,
                 missing_message_count: 0,
@@ -1202,36 +1323,62 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 key.clone(),
                 after_manifest_root.map(str::to_owned),
                 Some(head),
+                None,
                 Vec::new(),
             );
         }
 
-        let (after_sequence, lower_bound) = match after_manifest_root {
+        let fork_base = self.load_fork_prefix(key).await?;
+        let (after_sequence, lower_bound, chain_boundary, shared_prefix) = match after_manifest_root
+        {
             Some(root) => {
-                let row = sqlx::query(
-                    "SELECT conversation_seq FROM conversation_manifest_nodes
-                     WHERE isolation_domain = ? AND owner_user_id = ?
-                       AND session_id = ? AND branch_id = ? AND manifest_root = ?",
-                )
-                .bind(&key.isolation_domain)
-                .bind(&key.owner_user_id)
-                .bind(&key.session_id)
-                .bind(&key.branch_id)
-                .bind(root)
-                .fetch_optional(self.pool.get())
-                .await
-                .map_err(|source| database_error("load_manifest_delta_base", source))?;
-                let Some(row) = row else {
-                    return Err(SessionContextCoordinatorError::DivergentManifest);
+                let sequence = if let Some(prefix) = &fork_base
+                    && root == prefix.parent_manifest_root
+                {
+                    prefix.parent_cursor.conversation_seq
+                } else {
+                    let row = sqlx::query(
+                        "SELECT conversation_seq FROM conversation_manifest_nodes
+                         WHERE isolation_domain = ? AND owner_user_id = ?
+                           AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+                    )
+                    .bind(&key.isolation_domain)
+                    .bind(&key.owner_user_id)
+                    .bind(&key.session_id)
+                    .bind(&key.branch_id)
+                    .bind(root)
+                    .fetch_optional(self.pool.get())
+                    .await
+                    .map_err(|source| database_error("load_manifest_delta_base", source))?;
+                    let Some(row) = row else {
+                        return Err(SessionContextCoordinatorError::DivergentManifest);
+                    };
+                    database_u64(&row, "conversation_seq")?
                 };
-                let sequence = database_u64(&row, "conversation_seq")?;
                 if sequence >= head.cursor.conversation_seq {
                     return Err(SessionContextCoordinatorError::DivergentManifest);
                 }
-                (Some(sequence), sequence)
+                (Some(sequence), sequence, Some(root.to_owned()), None)
             }
-            None => (None, 0),
+            None => match &fork_base {
+                Some(prefix) => (
+                    Some(prefix.parent_cursor.conversation_seq),
+                    prefix.parent_cursor.conversation_seq,
+                    Some(prefix.parent_manifest_root.clone()),
+                    Some(prefix.clone()),
+                ),
+                None => (None, 0, None, None),
+            },
         };
+        if chain_boundary.as_deref() == Some(head.latest_manifest_root.as_str()) {
+            return manifest_delta(
+                key.clone(),
+                after_manifest_root.map(str::to_owned),
+                Some(head),
+                shared_prefix,
+                Vec::new(),
+            );
+        }
         let rows = sqlx::query(
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
@@ -1266,11 +1413,13 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             }
             nodes.insert(node.manifest_root.clone(), node);
         }
-        let missing = order_manifest_suffix(&head, after_manifest_root, after_sequence, nodes)?;
+        let missing =
+            order_manifest_suffix(&head, chain_boundary.as_deref(), after_sequence, nodes)?;
         manifest_delta(
             key.clone(),
             after_manifest_root.map(str::to_owned),
             Some(head),
+            shared_prefix,
             missing,
         )
     }
@@ -1380,6 +1529,230 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             .await
             .map_err(|source| database_error("commit_load_active_writer", source))?;
         Ok(lease)
+    }
+
+    async fn load_fork_prefix(
+        &self,
+        key: &SessionKeyV1,
+    ) -> Result<Option<SharedManifestPrefixV1>, SessionContextCoordinatorError> {
+        key.validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let row = sqlx::query(
+            "SELECT fork_base_json FROM session_context_heads
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ?",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|source| database_error("load_fork_prefix", source))?;
+        let prefix = row
+            .map(|row| {
+                row.try_get::<Option<String>, _>("fork_base_json")
+                    .map_err(|source| database_error("decode_fork_prefix", source))?
+                    .as_deref()
+                    .map(|json| database_json::<SharedManifestPrefixV1>("fork_prefix", json))
+                    .transpose()
+            })
+            .transpose()?
+            .flatten();
+        if let Some(prefix) = &prefix {
+            prefix
+                .validate_for_child(key)
+                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
+        }
+        Ok(prefix)
+    }
+
+    async fn activate_fork(
+        &self,
+        manifest: &SessionForkManifestV1,
+    ) -> Result<SessionContextHeadV1, SessionContextCoordinatorError> {
+        validate_prepared_fork(manifest)?;
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_activate_fork", source))?;
+        let row = sqlx::query(
+            "SELECT manifest_json, state FROM session_forks
+             WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?
+             FOR UPDATE",
+        )
+        .bind(&manifest.child_key.isolation_domain)
+        .bind(&manifest.child_key.owner_user_id)
+        .bind(&manifest.fork_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("lock_prepared_fork", source))?
+        .ok_or_else(|| {
+            SessionContextCoordinatorError::Invalid("prepared fork record does not exist".into())
+        })?;
+        let stored_json = row
+            .try_get::<String, _>("manifest_json")
+            .map_err(|source| database_error("decode_prepared_fork", source))?;
+        let stored: SessionForkManifestV1 = database_json("prepared_fork", &stored_json)?;
+        let stored_state = row
+            .try_get::<String, _>("state")
+            .map_err(|source| database_error("decode_prepared_fork_state", source))?;
+        if stored_state == "active" {
+            stored
+                .validate()
+                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
+            let mut replay_basis = stored.clone();
+            replay_basis.state = SessionForkStateV1::Prepared;
+            replay_basis.activated_at_unix_ms = None;
+            if replay_basis != *manifest {
+                return Err(SessionContextCoordinatorError::Fenced);
+            }
+            let active_head = sqlx::query(
+                "SELECT head_json FROM session_context_heads
+                 WHERE isolation_domain = ? AND owner_user_id = ?
+                   AND session_id = ? AND branch_id = ?",
+            )
+            .bind(&stored.child_key.isolation_domain)
+            .bind(&stored.child_key.owner_user_id)
+            .bind(&stored.child_key.session_id)
+            .bind(&stored.child_key.branch_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|source| database_error("load_active_fork_head", source))?
+            .try_get::<Option<String>, _>("head_json")
+            .map_err(|source| database_error("decode_active_fork_head", source))?
+            .ok_or_else(|| {
+                SessionContextCoordinatorError::NeedsRepair(
+                    "active fork has no canonical child head".into(),
+                )
+            })?;
+            let head: SessionContextHeadV1 = database_json("active_fork_head", &active_head)?;
+            validate_head(&head)?;
+            if head.key != stored.child_key {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "active fork child head escaped its owner scope".into(),
+                ));
+            }
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_active_fork_replay", source))?;
+            return Ok(head);
+        }
+        if stored_state != "prepared" || stored != *manifest {
+            return Err(SessionContextCoordinatorError::Fenced);
+        }
+
+        let parent_row = sqlx::query(
+            "SELECT manifest_json FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+        )
+        .bind(&manifest.parent_key.isolation_domain)
+        .bind(&manifest.parent_key.owner_user_id)
+        .bind(&manifest.parent_key.session_id)
+        .bind(&manifest.parent_key.branch_id)
+        .bind(&manifest.parent_head.latest_manifest_root)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| database_error("verify_fork_parent_manifest", source))?;
+        let parent_matches = if let Some(parent_row) = parent_row {
+            let parent_json = parent_row
+                .try_get::<String, _>("manifest_json")
+                .map_err(|source| database_error("decode_fork_parent_manifest", source))?;
+            let parent: ContextManifestNodeV1 =
+                database_json("fork_parent_manifest", &parent_json)?;
+            parent.key == manifest.parent_key && parent.cursor() == manifest.parent_head.cursor
+        } else {
+            let row = sqlx::query(
+                "SELECT fork_base_json FROM session_context_heads
+                 WHERE isolation_domain = ? AND owner_user_id = ?
+                   AND session_id = ? AND branch_id = ? FOR UPDATE",
+            )
+            .bind(&manifest.parent_key.isolation_domain)
+            .bind(&manifest.parent_key.owner_user_id)
+            .bind(&manifest.parent_key.session_id)
+            .bind(&manifest.parent_key.branch_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| database_error("load_nested_fork_parent_prefix", source))?;
+            let prefix_json = row
+                .map(|row| {
+                    row.try_get::<Option<String>, _>("fork_base_json")
+                        .map_err(|source| database_error("decode_nested_fork_prefix", source))
+                })
+                .transpose()?
+                .flatten();
+            let prefix = prefix_json
+                .map(|json| database_json::<SharedManifestPrefixV1>("nested_fork_prefix", &json))
+                .transpose()?;
+            prefix.is_some_and(|prefix| {
+                prefix.parent_manifest_root == manifest.parent_head.latest_manifest_root
+                    && cursor_projection_matches_head(
+                        &prefix.parent_cursor,
+                        &manifest.parent_head.cursor,
+                    )
+                    && prefix.total_canonical_bytes == manifest.parent_head.total_canonical_bytes
+                    && prefix.total_message_count == manifest.parent_head.total_message_count
+            })
+        };
+        if !parent_matches {
+            return Err(SessionContextCoordinatorError::Invalid(
+                "fork parent manifest is missing or does not match the prepared cursor".into(),
+            ));
+        }
+
+        ensure_database_state(&mut tx, &manifest.child_key, AuthorityEpochsV1::default()).await?;
+        let mut child_state = lock_database_state(&mut tx, &manifest.child_key).await?;
+        if child_state.head.is_some()
+            || child_state.active_writer.is_some()
+            || child_state.active_reservation.is_some()
+            || child_state.fork_base.is_some()
+        {
+            return Err(SessionContextCoordinatorError::Fenced);
+        }
+        let now = database_now_ms(&mut tx).await?;
+        let mut active = manifest.clone();
+        active.state = SessionForkStateV1::Active;
+        active.activated_at_unix_ms = Some(now);
+        active
+            .validate()
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let child_head = fork_child_head(&active, child_state.writer_epoch);
+        child_state.fork_base = Some(active.shared_prefix());
+        child_state.head = Some(child_head.clone());
+        update_database_state(&mut tx, &child_state).await?;
+        sqlx::query(
+            "UPDATE session_forks
+             SET state = 'active', manifest_json = ?, activated_at_ms = ?, updated_at = NOW(6)
+             WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?
+               AND state = 'prepared'",
+        )
+        .bind(database_to_json("active_fork", &active)?)
+        .bind(now)
+        .bind(&manifest.child_key.isolation_domain)
+        .bind(&manifest.child_key.owner_user_id)
+        .bind(&manifest.fork_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("activate_fork_record", source))?;
+        sqlx::query(
+            "UPDATE conversation_manifest_pins
+             SET pin_state = 'active', updated_at = NOW(6)
+             WHERE isolation_domain = ? AND owner_user_id = ? AND pin_id = ?",
+        )
+        .bind(&manifest.parent_key.isolation_domain)
+        .bind(&manifest.parent_key.owner_user_id)
+        .bind(&manifest.fork_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("activate_fork_pin", source))?;
+        insert_fork_event(&mut tx, &active, 1, "prepared", "active").await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_activate_fork", source))?;
+        Ok(child_head)
     }
 
     async fn acquire_writer(
@@ -2143,8 +2516,16 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 .collect(),
         )
         .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        self.persist_database_immutables(&reservation.key, &segments, &node)
-            .await?;
+        let (prepared_total_canonical_bytes, prepared_total_message_count) =
+            next_head_totals(base_head.as_ref(), &segments)?;
+        self.persist_database_immutables(
+            &reservation.key,
+            &segments,
+            &node,
+            prepared_total_canonical_bytes,
+            prepared_total_message_count,
+        )
+        .await?;
 
         let mut tx = self
             .pool
@@ -2283,6 +2664,13 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let cursor = node.cursor();
         let (total_canonical_bytes, total_message_count) =
             next_head_totals(state.head.as_ref(), &segments)?;
+        if (total_canonical_bytes, total_message_count)
+            != (prepared_total_canonical_bytes, prepared_total_message_count)
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "prepared manifest totals do not match the fenced parent head".into(),
+            ));
+        }
         state.head = Some(SessionContextHeadV1 {
             schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
             key: reservation.key.clone(),
@@ -2301,6 +2689,34 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         });
         state.active_reservation = None;
         update_database_state(&mut tx, &state).await?;
+        let reachable = sqlx::query(
+            "UPDATE conversation_manifest_nodes
+             SET reachable = 1
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND manifest_root = ?
+               AND total_canonical_bytes = ? AND total_message_count = ?",
+        )
+        .bind(&reservation.key.isolation_domain)
+        .bind(&reservation.key.owner_user_id)
+        .bind(&reservation.key.session_id)
+        .bind(&reservation.key.branch_id)
+        .bind(&cursor.canonical_root_hash)
+        .bind(i64_from_u64(
+            "reachable total canonical bytes",
+            total_canonical_bytes,
+        )?)
+        .bind(i64_from_u64(
+            "reachable total message count",
+            total_message_count,
+        )?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| database_error("activate_reachable_manifest", source))?;
+        if reachable.rows_affected() != 1 {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "canonical manifest was not durably activated".into(),
+            ));
+        }
         record_database_authority_event(
             &mut tx,
             &state,
@@ -2463,6 +2879,12 @@ impl FileSessionContextCoordinator {
     ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
         validate_head(head)?;
         let owner_dir = self.owner_objects_dir(&head.key);
+        let state_path = self.session_dir(&head.key).join("state.json");
+        let fork_base = if state_path.exists() {
+            read_json::<CoordinatorStateV1>(&state_path)?.fork_base
+        } else {
+            None
+        };
         let mut manifest_root = Some(head.latest_manifest_root.clone());
         let mut seen = HashSet::new();
         let mut reverse_nodes = Vec::new();
@@ -2481,7 +2903,11 @@ impl FileSessionContextCoordinator {
             let node: ContextManifestNodeV1 = read_json(&path)?;
             node.validate()
                 .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            if node.key != head.key || node.manifest_root != root {
+            let valid_key = node.key == head.key
+                || fork_base
+                    .as_ref()
+                    .is_some_and(|prefix| node.key == prefix.parent_key);
+            if !valid_key || node.manifest_root != root {
                 return Err(SessionContextCoordinatorError::NeedsRepair(
                     "manifest owner, branch, or root mismatch".into(),
                 ));
@@ -2492,7 +2918,7 @@ impl FileSessionContextCoordinator {
         reverse_nodes.reverse();
         if reverse_nodes
             .last()
-            .is_none_or(|node| node.cursor() != head.cursor)
+            .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
         {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "head cursor does not match its manifest".into(),
@@ -2614,6 +3040,8 @@ impl DatabaseSessionContextCoordinator {
         key: &SessionKeyV1,
         segments: &[ConversationSegmentV1],
         node: &ContextManifestNodeV1,
+        total_canonical_bytes: u64,
+        total_message_count: u64,
     ) -> Result<(), SessionContextCoordinatorError> {
         self.persist_database_segments(key, segments).await?;
         let canonical_segment_bytes =
@@ -2630,8 +3058,8 @@ impl DatabaseSessionContextCoordinator {
             "INSERT IGNORE INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
               parent_manifest_root, completed_turn, conversation_seq,
-              canonical_segment_bytes, manifest_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              canonical_segment_bytes, total_canonical_bytes, total_message_count, manifest_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
@@ -2647,6 +3075,14 @@ impl DatabaseSessionContextCoordinator {
         .bind(i64_from_u64(
             "manifest segment bytes",
             canonical_segment_bytes,
+        )?)
+        .bind(i64_from_u64(
+            "manifest total canonical bytes",
+            total_canonical_bytes,
+        )?)
+        .bind(i64_from_u64(
+            "manifest total message count",
+            total_message_count,
         )?)
         .bind(database_to_json("manifest", node)?)
         .execute(self.pool.get())
@@ -2749,13 +3185,24 @@ fn order_manifest_chain(
     reverse.reverse();
     if reverse
         .last()
-        .is_none_or(|node| node.cursor() != head.cursor)
+        .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "head cursor does not match database manifest".into(),
         ));
     }
     Ok(reverse)
+}
+
+fn cursor_projection_matches_head(node: &SessionCursorV1, head: &SessionCursorV1) -> bool {
+    node.schema_version == head.schema_version
+        && node.completed_turn == head.completed_turn
+        && node.journal_event_seq == head.journal_event_seq
+        && node.conversation_seq == head.conversation_seq
+        && node.canonical_root_hash == head.canonical_root_hash
+        && node.projection_schema == head.projection_schema
+        && node.compaction_generation == head.compaction_generation
+        && node.config_version_id == head.config_version_id
 }
 
 fn order_manifest_suffix(
@@ -2790,7 +3237,7 @@ fn order_manifest_suffix(
     reverse.reverse();
     if reverse
         .last()
-        .is_none_or(|node| node.cursor() != head.cursor)
+        .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "head cursor does not match manifest delta".into(),
@@ -2803,6 +3250,7 @@ fn manifest_delta(
     key: SessionKeyV1,
     after_manifest_root: Option<String>,
     head: Option<SessionContextHeadV1>,
+    shared_prefix: Option<SharedManifestPrefixV1>,
     missing_nodes: Vec<ContextManifestNodeV1>,
 ) -> Result<ManifestDeltaV1, SessionContextCoordinatorError> {
     let (missing_canonical_bytes, missing_message_count) = missing_nodes
@@ -2826,6 +3274,7 @@ fn manifest_delta(
         key,
         after_manifest_root,
         head,
+        shared_prefix,
         missing_nodes,
         missing_canonical_bytes,
         missing_message_count,
@@ -2939,6 +3388,10 @@ struct CoordinatorStateV1 {
     last_commit: Option<CommitReceiptV1>,
     #[serde(default)]
     last_transfer: Option<WriterTransferReceiptV1>,
+    #[serde(default)]
+    fork_base: Option<SharedManifestPrefixV1>,
+    #[serde(default)]
+    fork_manifest: Option<SessionForkManifestV1>,
 }
 
 impl CoordinatorStateV1 {
@@ -2953,6 +3406,8 @@ impl CoordinatorStateV1 {
             active_reservation: None,
             last_commit: None,
             last_transfer: None,
+            fork_base: None,
+            fork_manifest: None,
         }
     }
 
@@ -2970,6 +3425,15 @@ impl CoordinatorStateV1 {
                 .last_transfer
                 .as_ref()
                 .is_some_and(|receipt| receipt.lease.key != *key)
+            || self
+                .fork_base
+                .as_ref()
+                .is_some_and(|prefix| prefix.validate_for_child(key).is_err())
+            || self.fork_manifest.as_ref().is_some_and(|manifest| {
+                manifest.child_key != *key
+                    || manifest.state != SessionForkStateV1::Active
+                    || manifest.validate().is_err()
+            })
         {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "head key or writer epoch is invalid".into(),
@@ -3045,7 +3509,7 @@ async fn lock_database_state(
     let row = sqlx::query(
         "SELECT head_json, writer_epoch, authorization_epoch, device_trust_epoch,
                 permission_epoch, active_writer_json, active_reservation_json,
-                last_commit_json
+                last_commit_json, fork_base_json
          FROM session_context_heads
          WHERE isolation_domain = ? AND owner_user_id = ?
            AND session_id = ? AND branch_id = ?
@@ -3093,6 +3557,11 @@ async fn lock_database_state(
         .as_deref()
         .map(|json| database_json("commit_receipt", json))
         .transpose()?;
+    state.fork_base = optional_json("fork_base_json")
+        .map_err(|source| database_error("decode_fork_base_json", source))?
+        .as_deref()
+        .map(|json| database_json("fork_base", json))
+        .transpose()?;
     state.validate_for(key)?;
     Ok(state)
 }
@@ -3120,6 +3589,11 @@ async fn update_database_state(
         .last_commit
         .as_ref()
         .map(|receipt| database_to_json("commit_receipt", receipt))
+        .transpose()?;
+    let fork_base_json = state
+        .fork_base
+        .as_ref()
+        .map(|prefix| database_to_json("fork_base", prefix))
         .transpose()?;
     let (canonical_root, manifest_root, completed_turn, journal_event_seq, conversation_seq) =
         if let Some(head) = &state.head {
@@ -3149,7 +3623,7 @@ async fn update_database_state(
              authorization_epoch = ?, device_trust_epoch = ?, permission_epoch = ?,
              active_writer_json = ?, active_writer_expires_at_ms = ?,
              active_reservation_json = ?, active_reservation_expires_at_ms = ?,
-             last_commit_json = ?, updated_at = NOW(6)
+             last_commit_json = ?, fork_base_json = ?, updated_at = NOW(6)
          WHERE isolation_domain = ? AND owner_user_id = ?
            AND session_id = ? AND branch_id = ?",
     )
@@ -3195,6 +3669,7 @@ async fn update_database_state(
             .map(|reservation| reservation.expires_at_unix_ms),
     )
     .bind(last_commit_json)
+    .bind(fork_base_json)
     .bind(&state.key.isolation_domain)
     .bind(&state.key.owner_user_id)
     .bind(&state.key.session_id)
@@ -3469,6 +3944,64 @@ async fn archive_database_commit(
 
 fn database_error(operation: &'static str, source: sqlx::Error) -> SessionContextCoordinatorError {
     SessionContextCoordinatorError::Database { operation, source }
+}
+
+fn validate_prepared_fork(
+    manifest: &SessionForkManifestV1,
+) -> Result<(), SessionContextCoordinatorError> {
+    manifest
+        .validate()
+        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+    if manifest.state != SessionForkStateV1::Prepared {
+        return Err(SessionContextCoordinatorError::Invalid(
+            "fork activation requires a prepared manifest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn fork_child_head(manifest: &SessionForkManifestV1, writer_epoch: u64) -> SessionContextHeadV1 {
+    let mut cursor = manifest.parent_head.cursor.clone();
+    cursor.owner_id = manifest.child_key.owner_user_id.clone();
+    cursor.session_id = manifest.child_key.session_id.clone();
+    cursor.branch_id = manifest.child_key.branch_id.clone();
+    SessionContextHeadV1 {
+        schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
+        key: manifest.child_key.clone(),
+        cursor,
+        latest_manifest_root: manifest.parent_head.latest_manifest_root.clone(),
+        total_canonical_bytes: manifest.parent_head.total_canonical_bytes,
+        total_message_count: manifest.parent_head.total_message_count,
+        writer_epoch,
+    }
+}
+
+async fn insert_fork_event(
+    tx: &mut Transaction<'_, MySql>,
+    manifest: &SessionForkManifestV1,
+    transition_seq: u64,
+    from_state: &str,
+    to_state: &str,
+) -> Result<(), SessionContextCoordinatorError> {
+    sqlx::query(
+        "INSERT IGNORE INTO session_fork_events
+         (isolation_domain, owner_user_id, fork_id, transition_seq,
+          parent_session_id, child_session_id, from_state, to_state, event_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&manifest.child_key.isolation_domain)
+    .bind(&manifest.child_key.owner_user_id)
+    .bind(&manifest.fork_id)
+    .bind(i64_from_u64("fork transition sequence", transition_seq)?)
+    .bind(&manifest.parent_key.session_id)
+    .bind(&manifest.child_key.session_id)
+    .bind(from_state)
+    .bind(to_state)
+    .bind(database_to_json("fork_event", manifest)?)
+    .execute(&mut **tx)
+    .await
+    .map_err(|source| database_error("insert_fork_event", source))?;
+    Ok(())
 }
 
 fn database_json<T: DeserializeOwned>(
@@ -4229,7 +4762,10 @@ fn hash_field(digest: &mut Sha256, value: &str) {
 mod tests {
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    use astra_turn_types::{ActorKindV1, SessionSurfaceV1};
+    use astra_turn_types::{
+        ActorKindV1, ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
+        ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SessionSurfaceV1,
+    };
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -4332,6 +4868,53 @@ mod tests {
             } else {
                 HandoffRiskEvidenceV1::default()
             },
+        }
+    }
+
+    fn fork_manifest(
+        parent_head: &SessionContextHeadV1,
+        child_key: SessionKeyV1,
+    ) -> SessionForkManifestV1 {
+        SessionForkManifestV1 {
+            schema_version: SESSION_FORK_MANIFEST_SCHEMA_VERSION,
+            fork_id: "fork-exact-prefix".into(),
+            parent_key: parent_head.key.clone(),
+            child_key,
+            parent_head: parent_head.clone(),
+            dimensions: [
+                ForkBasisDimensionV1::Conversation,
+                ForkBasisDimensionV1::TaskBoard,
+                ForkBasisDimensionV1::Checkpoint,
+                ForkBasisDimensionV1::Workspace,
+                ForkBasisDimensionV1::Artifacts,
+            ]
+            .into_iter()
+            .map(|dimension| ForkDimensionEvidenceV1 {
+                dimension,
+                disposition: if dimension == ForkBasisDimensionV1::Conversation {
+                    ForkDimensionDispositionV1::SharedPrefix
+                } else {
+                    ForkDimensionDispositionV1::Gap
+                },
+                source_cursor: (dimension == ForkBasisDimensionV1::Conversation)
+                    .then(|| parent_head.cursor.clone()),
+                evidence_digest: (dimension == ForkBasisDimensionV1::Conversation)
+                    .then(|| parent_head.latest_manifest_root.clone()),
+                detail: (dimension != ForkBasisDimensionV1::Conversation)
+                    .then(|| "state dimension was unavailable at the fork boundary".into()),
+            })
+            .collect(),
+            excluded_authority: vec![
+                ForkExcludedAuthorityV1::Run,
+                ForkExcludedAuthorityV1::WriterLease,
+                ForkExcludedAuthorityV1::Approval,
+                ForkExcludedAuthorityV1::Mailbox,
+                ForkExcludedAuthorityV1::Invocation,
+            ],
+            state: SessionForkStateV1::Prepared,
+            created_at_unix_ms: 1_000,
+            activated_at_unix_ms: None,
+            status_detail: Some("test exact copy-on-write fork".into()),
         }
     }
 
@@ -4936,5 +5519,170 @@ mod tests {
         let materialized = coordinator.materialize(&head).await.unwrap();
         assert_eq!(materialized.logical_segment_count, 128);
         assert_eq!(materialized.messages.len(), 256);
+    }
+
+    #[tokio::test]
+    async fn long_session_fork_shares_constant_size_prefix_and_then_diverges() {
+        let temp = TempDir::new().unwrap();
+        let clock = Arc::new(ManualClock::new(1_000));
+        let coordinator = coordinator(&temp, clock);
+        let parent_key = key("owner-a");
+        let child_key = SessionKeyV1::owner_session("test", "owner-a", "fork-child", "main");
+        let parent_lease = acquired(
+            coordinator
+                .acquire_writer(
+                    &parent_key,
+                    None,
+                    &actor("owner-a"),
+                    Duration::from_secs(60),
+                    "parent-writer",
+                )
+                .await
+                .unwrap(),
+        );
+        let mut parent_cursor = None;
+        for turn in 1..=96 {
+            let reservation = reserved(
+                coordinator
+                    .reserve_turn(
+                        &parent_lease,
+                        parent_cursor.as_ref(),
+                        Duration::from_secs(30),
+                        &format!("parent-reserve-{turn}"),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            parent_cursor = Some(
+                match coordinator
+                    .commit_turn(
+                        &reservation,
+                        delta(turn, u64::from(turn), u64::from(turn)),
+                        &format!("parent-commit-{turn}"),
+                    )
+                    .await
+                    .unwrap()
+                {
+                    CoordinatorMutationV1::Applied { cursor } => cursor,
+                    other => panic!("unexpected parent outcome {other:?}"),
+                },
+            );
+        }
+        let fork_point = coordinator.load_head(&parent_key).await.unwrap().unwrap();
+        let object_dir = coordinator.owner_objects_dir(&parent_key);
+        let manifest_count_before = fs::read_dir(object_dir.join("manifests")).unwrap().count();
+        let segment_count_before = fs::read_dir(object_dir.join("segments")).unwrap().count();
+
+        let prepared = fork_manifest(&fork_point, child_key.clone());
+        let child_head = coordinator.activate_fork(&prepared).await.unwrap();
+        assert_eq!(
+            coordinator.activate_fork(&prepared).await.unwrap(),
+            child_head,
+            "activation must be exactly-once"
+        );
+        assert_eq!(
+            fs::read_dir(object_dir.join("manifests")).unwrap().count(),
+            manifest_count_before,
+            "fork activation must not copy manifest history"
+        );
+        assert_eq!(
+            fs::read_dir(object_dir.join("segments")).unwrap().count(),
+            segment_count_before,
+            "fork activation must not copy message payloads"
+        );
+        let cold_delta = coordinator
+            .load_manifest_delta(&child_key, None)
+            .await
+            .unwrap();
+        assert_eq!(cold_delta.shared_prefix, Some(prepared.shared_prefix()));
+        assert!(cold_delta.missing_nodes.is_empty());
+        assert_eq!(
+            coordinator
+                .materialize(&child_head)
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            192
+        );
+
+        let child_lease = acquired(
+            coordinator
+                .acquire_writer(
+                    &child_key,
+                    Some(&child_head.cursor),
+                    &actor("owner-a"),
+                    Duration::from_secs(60),
+                    "child-writer",
+                )
+                .await
+                .unwrap(),
+        );
+        let child_reservation = reserved(
+            coordinator
+                .reserve_turn(
+                    &child_lease,
+                    Some(&child_head.cursor),
+                    Duration::from_secs(30),
+                    "child-reserve-97",
+                )
+                .await
+                .unwrap(),
+        );
+        let child_cursor = match coordinator
+            .commit_turn(&child_reservation, delta(97, 97, 97), "child-commit-97")
+            .await
+            .unwrap()
+        {
+            CoordinatorMutationV1::Applied { cursor } => cursor,
+            other => panic!("unexpected child outcome {other:?}"),
+        };
+        let parent_reservation = reserved(
+            coordinator
+                .reserve_turn(
+                    &parent_lease,
+                    Some(&fork_point.cursor),
+                    Duration::from_secs(30),
+                    "parent-reserve-97",
+                )
+                .await
+                .unwrap(),
+        );
+        let parent_cursor = match coordinator
+            .commit_turn(&parent_reservation, delta(97, 97, 97), "parent-commit-97")
+            .await
+            .unwrap()
+        {
+            CoordinatorMutationV1::Applied { cursor } => cursor,
+            other => panic!("unexpected parent outcome {other:?}"),
+        };
+        assert_ne!(
+            child_cursor.canonical_root_hash,
+            parent_cursor.canonical_root_hash
+        );
+        let child_warm = coordinator
+            .load_manifest_delta(&child_key, Some(&fork_point.latest_manifest_root))
+            .await
+            .unwrap();
+        assert_eq!(child_warm.missing_nodes.len(), 1);
+        assert!(child_warm.shared_prefix.is_none());
+        assert_eq!(
+            coordinator
+                .materialize(&coordinator.load_head(&child_key).await.unwrap().unwrap())
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            194
+        );
+        assert_eq!(
+            coordinator
+                .materialize(&coordinator.load_head(&parent_key).await.unwrap().unwrap())
+                .await
+                .unwrap()
+                .messages
+                .len(),
+            194
+        );
     }
 }

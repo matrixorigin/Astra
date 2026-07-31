@@ -185,7 +185,25 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     },
     SessionDeleteStatement {
         label: "conversation_manifest_nodes",
-        sql: "DELETE FROM conversation_manifest_nodes WHERE session_id = ? AND owner_user_id = ?",
+        sql: "DELETE FROM conversation_manifest_nodes
+              WHERE session_id = ? AND owner_user_id = ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM conversation_manifest_pins
+                    WHERE conversation_manifest_pins.isolation_domain =
+                              conversation_manifest_nodes.isolation_domain
+                      AND conversation_manifest_pins.owner_user_id =
+                              conversation_manifest_nodes.owner_user_id
+                      AND conversation_manifest_pins.parent_session_id =
+                              conversation_manifest_nodes.session_id
+                      AND (
+                          conversation_manifest_pins.pin_state IN ('prepared', 'active')
+                          OR (
+                              conversation_manifest_pins.pin_state = 'grace'
+                              AND conversation_manifest_pins.grace_expires_at_ms >
+                                  CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+                          )
+                      )
+                )",
     },
     SessionDeleteStatement {
         label: "session_context_heads",
@@ -440,7 +458,6 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("agent_sessions", "user_id"),
     ("agent_session_execution_slots", "user_id"),
     ("session_context_heads", "owner_user_id"),
-    ("conversation_manifest_nodes", "owner_user_id"),
     ("session_context_operation_receipts", "owner_user_id"),
     ("session_context_authority_events", "owner_user_id"),
     ("session_handoff_events", "owner_user_id"),
@@ -578,6 +595,37 @@ async fn verify_core_session_tables_deleted(
                 "delete_session.verify.{table}: {remaining} rows remain for session/user after delete"
             ));
         }
+    }
+    let unpinned_manifests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_manifest_nodes
+         WHERE session_id = ? AND owner_user_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM conversation_manifest_pins
+               WHERE conversation_manifest_pins.isolation_domain =
+                         conversation_manifest_nodes.isolation_domain
+                 AND conversation_manifest_pins.owner_user_id =
+                         conversation_manifest_nodes.owner_user_id
+                 AND conversation_manifest_pins.parent_session_id =
+                         conversation_manifest_nodes.session_id
+                 AND (
+                     conversation_manifest_pins.pin_state IN ('prepared', 'active')
+                     OR (
+                         conversation_manifest_pins.pin_state = 'grace'
+                         AND conversation_manifest_pins.grace_expires_at_ms >
+                             CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+                     )
+                 )
+           )",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.verify.conversation_manifest_nodes: {source}"))?;
+    if unpinned_manifests > 0 {
+        return Err(format!(
+            "delete_session.verify.conversation_manifest_nodes: {unpinned_manifests} unpinned rows remain after delete"
+        ));
     }
     Ok(())
 }

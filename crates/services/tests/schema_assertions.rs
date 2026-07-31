@@ -1158,6 +1158,7 @@ async fn phase1_run_durability_schema_contract() {
         "permission_epoch",
         "active_writer_json",
         "active_reservation_json",
+        "fork_base_json",
     ] {
         assert!(
             context_heads.iter().any(|column| column == expected),
@@ -1189,6 +1190,33 @@ async fn phase1_run_durability_schema_contract() {
             "manifest_root"
         ],
         "manifest lookup must carry complete owner/session/branch identity"
+    );
+    let manifest_nodes = column_names(&pool, &schema, "conversation_manifest_nodes").await;
+    for expected in ["total_canonical_bytes", "total_message_count", "reachable"] {
+        assert!(
+            manifest_nodes.iter().any(|column| column == expected),
+            "conversation_manifest_nodes missing O(1) retained-fork coordinate {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_forks").await,
+        ["isolation_domain", "owner_user_id", "fork_id"],
+        "fork lifecycle identity must remain inside the owner isolation domain"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_fork_events").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "fork_id",
+            "transition_seq"
+        ],
+        "fork transitions must be owner-scoped and monotonically ordered"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_manifest_pins").await,
+        ["isolation_domain", "owner_user_id", "pin_id"],
+        "retention pins must not be reusable across owners"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_context_operation_receipts").await,
