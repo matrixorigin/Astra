@@ -39,7 +39,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use astra_core::SharedPool;
@@ -281,6 +281,460 @@ impl Drop for BridgePersistFenceGuard {
 }
 
 type BridgePersistTails = Arc<Mutex<HashMap<String, Weak<BridgePersistFence>>>>;
+
+const BRIDGE_CANONICAL_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+const BRIDGE_CANONICAL_RENEW_INTERVAL: Duration = Duration::from_secs(4 * 60);
+const BRIDGE_CANONICAL_RELEASE_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(25), Duration::from_millis(100)];
+
+async fn release_bridge_canonical_writer(
+    coordinator: &Arc<dyn astra_services::SessionContextCoordinator>,
+    lease: &astra_turn_types::ConversationWriterLeaseV1,
+) -> Result<(), astra_services::SessionContextCoordinatorError> {
+    for delay in BRIDGE_CANONICAL_RELEASE_RETRY_DELAYS {
+        match coordinator.release_writer(lease).await {
+            Ok(()) => return Ok(()),
+            Err(_) => tokio::time::sleep(delay).await,
+        }
+    }
+    coordinator.release_writer(lease).await
+}
+
+struct BridgeCanonicalAdmission {
+    coordinator: Arc<dyn astra_services::SessionContextCoordinator>,
+    lease: astra_turn_types::ConversationWriterLeaseV1,
+    reservation: astra_turn_types::TurnReservationV1,
+    current_turn_canonical_messages: Vec<Value>,
+    release_writer_on_finish: bool,
+    release_on_drop: bool,
+    renewal_cancel: CancellationToken,
+    turn_chain_id: String,
+}
+
+impl Drop for BridgeCanonicalAdmission {
+    fn drop(&mut self) {
+        self.renewal_cancel.cancel();
+        if !self.release_on_drop || !self.release_writer_on_finish {
+            return;
+        }
+        let coordinator = Arc::clone(&self.coordinator);
+        let lease = self.lease.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = release_bridge_canonical_writer(&coordinator, &lease).await;
+            });
+        }
+    }
+}
+
+impl BridgeCanonicalAdmission {
+    fn retain_for_continuation(&mut self) {
+        self.release_on_drop = false;
+    }
+
+    async fn commit_terminal(&mut self, assistant_text: &str) -> Result<(), String> {
+        self.renewal_cancel.cancel();
+        let mut final_messages = std::mem::take(&mut self.current_turn_canonical_messages);
+        if !assistant_text.trim().is_empty() {
+            final_messages.push(json!({
+                "role": "assistant",
+                "content": assistant_text,
+            }));
+        }
+        let canonical =
+            astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+                final_messages,
+            )
+            .map_err(|error| format!("bridge result has invalid turn semantics: {error}"))?;
+        let Some((mode, logical_segments)) = crate::turn::canonical_commit::canonical_commit_delta(
+            0, false, &canonical, false, false,
+        )?
+        else {
+            return Err("bridge terminal result produced no canonical delta".into());
+        };
+        let base = self.reservation.expected_cursor.as_ref();
+        let delta = astra_turn_types::CanonicalTurnDeltaV1 {
+            schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: self.reservation.reserved_turn,
+            journal_event_seq: base.map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
+            conversation_seq: base.map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
+            compaction_generation: base.map_or(0, |cursor| cursor.compaction_generation),
+            config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
+            mode,
+            logical_segments,
+        };
+        match self
+            .coordinator
+            .commit_turn(
+                &self.reservation,
+                delta,
+                &format!("server-bridge:{}:commit", self.turn_chain_id),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            astra_turn_types::CoordinatorMutationV1::Applied { .. }
+            | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { .. } => {}
+            astra_turn_types::CoordinatorMutationV1::Conflict { .. } => {
+                return Err("canonical conversation head changed before bridge commit".into());
+            }
+            astra_turn_types::CoordinatorMutationV1::NeedsRepair { reason, .. } => {
+                return Err(reason);
+            }
+        }
+        if self.release_writer_on_finish {
+            match release_bridge_canonical_writer(&self.coordinator, &self.lease).await {
+                Ok(()) => self.release_on_drop = false,
+                Err(error) => {
+                    // Keep `release_on_drop` set so the response-stream drop
+                    // performs one final detached retry without delaying the
+                    // already durable turn.
+                    self.release_on_drop = true;
+                    tracing::warn!(
+                        target: "astra_runtime::bridge_inprocess",
+                        session_id = %self.reservation.key.session_id,
+                        error = %error,
+                        "canonical bridge turn committed but writer release failed"
+                    );
+                }
+            }
+        } else {
+            self.release_on_drop = false;
+        }
+        Ok(())
+    }
+}
+
+struct BridgeCanonicalAdmissionResult {
+    admission: Option<BridgeCanonicalAdmission>,
+    provider_messages: Vec<Value>,
+}
+
+fn start_bridge_canonical_renewal(
+    coordinator: Arc<dyn astra_services::SessionContextCoordinator>,
+    mut lease: astra_turn_types::ConversationWriterLeaseV1,
+    mut reservation: astra_turn_types::TurnReservationV1,
+    authority_loss_cancel: CancellationToken,
+) -> CancellationToken {
+    let renewal_cancel = CancellationToken::new();
+    let heartbeat_cancel = renewal_cancel.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = heartbeat_cancel.cancelled() => break,
+                _ = tokio::time::sleep(BRIDGE_CANONICAL_RENEW_INTERVAL) => {}
+            }
+            lease = match coordinator
+                .renew_writer(&lease, BRIDGE_CANONICAL_LEASE_TTL)
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::bridge_inprocess",
+                        error = %error,
+                        "canonical bridge writer renewal failed; cancelling in-flight work"
+                    );
+                    authority_loss_cancel.cancel();
+                    break;
+                }
+            };
+            reservation = match coordinator
+                .renew_turn_reservation(&reservation, BRIDGE_CANONICAL_LEASE_TTL)
+                .await
+            {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_runtime::bridge_inprocess",
+                        error = %error,
+                        "canonical bridge turn renewal failed; cancelling in-flight work"
+                    );
+                    authority_loss_cancel.cancel();
+                    break;
+                }
+            };
+        }
+    });
+    renewal_cancel
+}
+
+fn canonical_bridge_current_turn_suffix_is_valid(
+    messages: &[Value],
+    allow_leading_system: bool,
+) -> bool {
+    let mut index = 0;
+    if allow_leading_system {
+        while messages
+            .get(index)
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("system")
+        {
+            index += 1;
+        }
+    }
+    if messages
+        .get(index)
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        != Some("user")
+    {
+        return false;
+    }
+    index += 1;
+
+    while index < messages.len() {
+        let Some(calls) = messages[index]
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .filter(|calls| !calls.is_empty())
+        else {
+            return false;
+        };
+        if messages[index].get("role").and_then(Value::as_str) != Some("assistant") {
+            return false;
+        }
+        index += 1;
+
+        let mut result_ids = HashSet::new();
+        while index < messages.len()
+            && messages[index].get("role").and_then(Value::as_str) == Some("tool")
+        {
+            let Some(tool_call_id) = messages[index]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            else {
+                return false;
+            };
+            if !result_ids.insert(tool_call_id) {
+                return false;
+            }
+            index += 1;
+        }
+        if calls.iter().any(|call| {
+            call.get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !result_ids.contains(id))
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn admit_canonical_bridge_prompt(
+    mut prior_messages: Vec<Value>,
+    request_messages: Vec<Value>,
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut request_canonical =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            request_messages.clone(),
+        )
+        .map_err(|error| format!("bridge prompt has invalid turn semantics: {error}"))?;
+
+    let had_canonical_head = !prior_messages.is_empty();
+    let (current_turn, provider_messages) = if request_canonical.starts_with(&prior_messages) {
+        let current_turn = request_canonical.split_off(prior_messages.len());
+        (current_turn, request_messages)
+    } else {
+        let mut provider_messages =
+            Vec::with_capacity(prior_messages.len() + request_messages.len());
+        provider_messages.append(&mut prior_messages);
+        provider_messages.extend(request_messages);
+        (request_canonical, provider_messages)
+    };
+
+    if !canonical_bridge_current_turn_suffix_is_valid(&current_turn, !had_canonical_head) {
+        return Err(
+            "bridge prompt must contain exactly one structurally valid current-turn suffix".into(),
+        );
+    }
+    Ok((current_turn, provider_messages))
+}
+
+async fn begin_bridge_canonical_admission(
+    coordinator: Option<&Arc<dyn astra_services::SessionContextCoordinator>>,
+    user_id: &str,
+    session_id: &str,
+    turn_chain_id: &str,
+    requested_turn: Option<u32>,
+    authority: Option<&astra_turn_types::ConversationAuthorityEnvelopeV1>,
+    request_messages: Vec<Value>,
+    authority_loss_cancel: CancellationToken,
+) -> Result<BridgeCanonicalAdmissionResult, (StatusCode, String)> {
+    let Some(coordinator) = coordinator.cloned() else {
+        return Ok(BridgeCanonicalAdmissionResult {
+            admission: None,
+            provider_messages: request_messages,
+        });
+    };
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        user_id,
+        session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let head = coordinator.load_head(&key).await.map_err(|error| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("failed to load canonical bridge head: {error}"),
+        )
+    })?;
+    let prior_messages = match &head {
+        Some(head) => coordinator
+            .materialize(head)
+            .await
+            .map(|materialized| materialized.messages)
+            .map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("canonical bridge history requires repair: {error}"),
+                )
+            })?,
+        None => Vec::new(),
+    };
+    let (current_turn_canonical_messages, provider_messages) =
+        admit_canonical_bridge_prompt(prior_messages, request_messages)
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
+
+    let (lease, release_writer_on_finish, release_writer_on_admission_failure) =
+        if let Some(authority) = authority {
+            let active = coordinator
+                .load_active_writer(&key)
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to load canonical bridge writer: {error}"),
+                    )
+                })?
+                .filter(|lease| {
+                    lease.key == key
+                        && lease.lease_id == authority.execution_grant.claims.lease_id
+                        && lease.writer_epoch == authority.writer_epoch
+                        && lease.actor.actor_id == authority.actor_id
+                        && authority.expected_cursor
+                            == head.as_ref().map(|head| head.cursor.clone())
+                })
+                .ok_or_else(|| {
+                    (
+                        StatusCode::CONFLICT,
+                        "bridge conversation authority no longer owns the active writer lease"
+                            .into(),
+                    )
+                })?;
+            (active, false, false)
+        } else {
+            let authority_epochs = coordinator
+                .load_authority_epochs(&key)
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to load canonical bridge authority epochs: {error}"),
+                    )
+                })?
+                .unwrap_or_default();
+            let actor = astra_turn_types::ActorContextV1::owner_user(
+                user_id,
+                format!("server-bridge:{turn_chain_id}"),
+                astra_turn_types::ActorKindV1::Server,
+                astra_turn_types::SessionSurfaceV1::Cli,
+                None,
+                authority_epochs,
+            );
+            match coordinator
+                .acquire_writer(
+                    &key,
+                    head.as_ref().map(|head| &head.cursor),
+                    &actor,
+                    BRIDGE_CANONICAL_LEASE_TTL,
+                    &format!("server-bridge:{turn_chain_id}:writer"),
+                )
+                .await
+                .map_err(|error| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to acquire canonical bridge writer: {error}"),
+                    )
+                })? {
+                astra_services::AcquireWriterOutcome::Acquired(lease) => (lease, true, true),
+                astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => {
+                    (lease, true, false)
+                }
+                astra_services::AcquireWriterOutcome::Conflict { .. } => {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "another controller owns this canonical session branch".into(),
+                    ));
+                }
+            }
+        };
+    let reservation = match coordinator
+        .reserve_turn(
+            &lease,
+            head.as_ref().map(|head| &head.cursor),
+            BRIDGE_CANONICAL_LEASE_TTL,
+            &format!("server-bridge:{turn_chain_id}:turn"),
+        )
+        .await
+    {
+        Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
+        | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => reservation,
+        Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+            if release_writer_on_admission_failure {
+                let _ = release_bridge_canonical_writer(&coordinator, &lease).await;
+            }
+            return Err((
+                StatusCode::CONFLICT,
+                "canonical session cursor changed before bridge reservation".into(),
+            ));
+        }
+        Err(error) => {
+            if release_writer_on_admission_failure {
+                let _ = release_bridge_canonical_writer(&coordinator, &lease).await;
+            }
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve canonical bridge turn: {error}"),
+            ));
+        }
+    };
+    if requested_turn.is_some_and(|turn| turn != reservation.reserved_turn) {
+        if release_writer_on_admission_failure {
+            let _ = release_bridge_canonical_writer(&coordinator, &lease).await;
+        }
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "bridge session_turn does not match reserved canonical turn {}",
+                reservation.reserved_turn
+            ),
+        ));
+    }
+    let renewal_cancel = start_bridge_canonical_renewal(
+        Arc::clone(&coordinator),
+        lease.clone(),
+        reservation.clone(),
+        authority_loss_cancel,
+    );
+    let admission = BridgeCanonicalAdmission {
+        coordinator,
+        lease,
+        reservation,
+        current_turn_canonical_messages,
+        release_writer_on_finish,
+        release_on_drop: release_writer_on_admission_failure,
+        renewal_cancel,
+        turn_chain_id: turn_chain_id.to_string(),
+    };
+    Ok(BridgeCanonicalAdmissionResult {
+        admission: Some(admission),
+        provider_messages,
+    })
+}
 
 fn track_ordered_bridge_persist<F>(
     tails: &BridgePersistTails,
@@ -1641,6 +2095,8 @@ pub struct InProcessChatTurnBridge {
     /// Shared DB pool — avoids creating a new connection per turn.
     /// When `None`, falls back to ephemeral single-connection pool.
     pub shared_pool: Option<SharedPool>,
+    /// Canonical conversation authority for every networked bridge turn.
+    session_context_coordinator: Option<Arc<dyn astra_services::SessionContextCoordinator>>,
     /// Same `Arc` as [`crate::AppState::edge_callback_ledger`] — bridge takes tool callbacks here.
     pub edge_callback_ledger: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     /// Cached Memoria client — created once, reused across turns.
@@ -1665,6 +2121,7 @@ impl InProcessChatTurnBridge {
             matrixone,
             encryptor,
             shared_pool: None,
+            session_context_coordinator: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env(),
             session_start_memory_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
@@ -1675,7 +2132,18 @@ impl InProcessChatTurnBridge {
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        self.session_context_coordinator = Some(Arc::new(
+            astra_services::DatabaseSessionContextCoordinator::new(pool.clone()),
+        ));
         self.shared_pool = Some(pool);
+        self
+    }
+
+    pub fn with_session_context_coordinator(
+        mut self,
+        coordinator: Arc<dyn astra_services::SessionContextCoordinator>,
+    ) -> Self {
+        self.session_context_coordinator = Some(coordinator);
         self
     }
 
@@ -1751,6 +2219,12 @@ impl InProcessChatTurnBridge {
 
         // Parse request body
         let payload = parse_bridge_payload(&body)?;
+        // Every response stream owns a cancellation token, including direct
+        // callers that did not supply one. It also terminates provider work
+        // immediately if the canonical writer/reservation renewal is fenced.
+        let response_cancel = client_cancel
+            .clone()
+            .unwrap_or_else(|| Arc::new(CancellationToken::new()));
         let agent_id = payload
             .get("agent_id")
             .and_then(Value::as_str)
@@ -1774,6 +2248,32 @@ impl InProcessChatTurnBridge {
             })?;
         let (messages, recovered_required_runtime_texts) =
             normalize_bridge_prompt_messages(optional_payload_array(&payload, "messages")?);
+        let conversation_authority = payload
+            .get("conversation_authority")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value::<astra_turn_types::ConversationAuthorityEnvelopeV1>)
+            .transpose()
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid bridge conversation authority: {error}"),
+                )
+            })?;
+        let BridgeCanonicalAdmissionResult {
+            admission: mut canonical_admission,
+            provider_messages: messages,
+        } = begin_bridge_canonical_admission(
+            self.session_context_coordinator.as_ref(),
+            &user_id,
+            &session_id,
+            &turn_chain_id,
+            header_session_turn,
+            conversation_authority.as_ref(),
+            messages,
+            response_cancel.as_ref().clone(),
+        )
+        .await?;
         let tool_results = optional_payload_array(&payload, "tool_results")?;
         let edge_tools = optional_payload_array(&payload, "edge_tools")?;
         let edge_profile = optional_payload_object(&payload, "edge_profile")?;
@@ -1894,12 +2394,6 @@ impl InProcessChatTurnBridge {
 
         let bridge_e2e_capture = bridge_e2e_for_stream.clone();
         let bridge_e2e_stream_blocks_capture = bridge_e2e_stream_blocks_for_stream.clone();
-        // Every response stream owns a cancellation token, including direct
-        // callers that did not supply one. The drop guard below therefore has
-        // one uniform way to terminate provider work and durable state.
-        let response_cancel = client_cancel
-            .clone()
-            .unwrap_or_else(|| Arc::new(CancellationToken::new()));
         let client_cancel_capture = response_cancel.clone();
         let memoria_client_owned = bind_bridge_memoria_owner(self.memoria_client.clone(), &user_id)
             .map_err(|error| {
@@ -4826,6 +5320,24 @@ impl InProcessChatTurnBridge {
             let has_tool_calls = !all_round_tool_calls.is_empty();
             let llm_content = full_text.trim().to_string();
             let should_persist_llm = !llm_content.is_empty() || has_tool_calls;
+            if has_tool_calls {
+                if let Some(admission) = canonical_admission.as_mut() {
+                    // The CLI owns the provisional messages between bridge
+                    // rounds. Keep the same database reservation so another
+                    // pod/device cannot interleave a different visible turn.
+                    admission.retain_for_continuation();
+                }
+            } else if let Some(admission) = canonical_admission.as_mut()
+                && let Err(error) = admission.commit_terminal(&llm_content).await
+            {
+                yield render_sse_map(&build_stream_error_event(
+                    &format!("canonical turn commit failed: {error}"),
+                    "durability_degraded",
+                    true,
+                ));
+                mark_disconnect_capture_finalized(&disconnect_capture_state);
+                return;
+            }
 
             // P2 fix: on continuation calls (CLI sent tool_results), the user query
             // was already persisted on the first bridge call. Skip to avoid duplicate event_id.
@@ -5722,6 +6234,192 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[tokio::test]
+    async fn canonical_bridge_reservation_spans_rounds_and_fences_competing_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
+            astra_services::FileSessionContextCoordinator::new(temp.path()),
+        );
+        let user_message = json!({"role": "user", "content": "inspect the repository"});
+        let mut first = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-1",
+            "session-1",
+            "turn-chain-1",
+            Some(1),
+            None,
+            vec![user_message.clone()],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+
+        let competing = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-1",
+            "session-1",
+            "turn-chain-2",
+            Some(1),
+            None,
+            vec![user_message.clone()],
+            CancellationToken::new(),
+        )
+        .await;
+        let Err(competing) = competing else {
+            panic!("a different visible turn must not interleave between tool rounds");
+        };
+        assert_eq!(competing.0, StatusCode::CONFLICT);
+
+        first.retain_for_continuation();
+        drop(first);
+
+        let stale_retry = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-1",
+            "session-1",
+            "turn-chain-1",
+            Some(2),
+            None,
+            vec![user_message.clone()],
+            CancellationToken::new(),
+        )
+        .await;
+        let Err(stale_retry) = stale_retry else {
+            panic!("a retry with a mismatched turn must be rejected");
+        };
+        assert_eq!(stale_retry.0, StatusCode::CONFLICT);
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            "owner-1",
+            "session-1",
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_some(),
+            "a rejected retry must not release the original request's writer lease"
+        );
+
+        let tool_call = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+            }]
+        });
+        let tool_result = json!({
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "repository contents"
+        });
+        let provisional = vec![user_message, tool_call, tool_result];
+        let mut continuation = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-1",
+            "session-1",
+            "turn-chain-1",
+            Some(1),
+            None,
+            provisional,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        continuation
+            .commit_terminal("inspection complete")
+            .await
+            .unwrap();
+
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(head.cursor.completed_turn, 1);
+        let materialized = coordinator.materialize(&head).await.unwrap();
+        assert_eq!(
+            materialized
+                .messages
+                .last()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("inspection complete")
+        );
+        assert!(
+            materialized
+                .messages
+                .iter()
+                .any(|message| message.get("tool_call_id") == Some(&json!("call-1"))),
+            "the canonical turn must retain the complete typed tool group"
+        );
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let next_user = json!({"role": "user", "content": "summarize the result"});
+        let BridgeCanonicalAdmissionResult {
+            admission,
+            provider_messages,
+        } = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-1",
+            "session-1",
+            "turn-chain-2",
+            Some(2),
+            None,
+            vec![next_user.clone()],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            provider_messages[..materialized.messages.len()],
+            materialized.messages,
+            "the server-owned canonical head must be prepended to a current-turn-only request"
+        );
+        assert_eq!(provider_messages.last(), Some(&next_user));
+        let mut next = admission.unwrap();
+        next.commit_terminal("summary complete").await.unwrap();
+
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(head.cursor.completed_turn, 2);
+        let materialized = coordinator.materialize(&head).await.unwrap();
+        assert_eq!(
+            materialized
+                .messages
+                .last()
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str),
+            Some("summary complete")
+        );
+    }
+
+    #[test]
+    fn canonical_bridge_prompt_rejects_divergent_completed_history() {
+        let prior = vec![
+            json!({"role": "user", "content": "first"}),
+            json!({"role": "assistant", "content": "first reply"}),
+        ];
+        let divergent = vec![
+            json!({"role": "user", "content": "different history"}),
+            json!({"role": "assistant", "content": "old reply"}),
+            json!({"role": "user", "content": "current"}),
+        ];
+
+        let error = admit_canonical_bridge_prompt(prior, divergent)
+            .expect_err("a completed client-side history must not be reinterpreted as one turn");
+        assert!(error.contains("structurally valid current-turn suffix"));
+    }
 
     #[test]
     fn disconnect_capture_clone_preserves_nested_wire_state() {

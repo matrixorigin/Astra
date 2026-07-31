@@ -3,6 +3,7 @@ pub mod agentic_loop;
 pub mod bedrock;
 pub mod bridge;
 pub mod budget_messaging;
+pub(crate) mod canonical_commit;
 pub mod chat_turn_budget_pressure;
 pub mod cloud;
 pub mod compaction_replay;

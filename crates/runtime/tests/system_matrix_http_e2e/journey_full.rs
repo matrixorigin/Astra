@@ -113,7 +113,11 @@ async fn run_tool_backed_chat_turn(
         }
     }
 
-    assert!(posted_result, "tool-backed chat never emitted tool_request");
+    assert!(
+        posted_result,
+        "tool-backed chat never emitted tool_request; SSE: {}",
+        String::from_utf8_lossy(&acc)
+    );
     assert!(
         saw_turn_complete,
         "tool-backed chat never reached turn_complete"
@@ -168,58 +172,6 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(
         put_s["title"].as_str(),
         Some("product matrix session (updated)")
-    );
-
-    let (st_close, closed) = post_empty(
-        app,
-        &format!("/sessions/{session_id}/close"),
-        Some(auth_header),
-    )
-    .await;
-    assert_eq!(st_close, StatusCode::OK, "close session: {closed}");
-    assert_eq!(
-        closed["status"].as_str(),
-        Some("closed"),
-        "close response: {closed}"
-    );
-
-    let sess_status =
-        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&user_id)
-            .fetch_one(pool)
-            .await
-            .expect("session status after close");
-    assert_eq!(
-        sess_status.try_get::<String, _>("status").ok().as_deref(),
-        Some("closed"),
-        "agent_sessions.status after POST .../close"
-    );
-
-    let (st_res, resm) = post_empty(
-        app,
-        &format!("/sessions/{session_id}/resume"),
-        Some(auth_header),
-    )
-    .await;
-    assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
-    assert_eq!(
-        resm["last_status"].as_str(),
-        Some("active"),
-        "resume response: {resm}"
-    );
-
-    let sess_active =
-        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
-            .bind(&session_id)
-            .bind(&user_id)
-            .fetch_one(pool)
-            .await
-            .expect("session status after resume");
-    assert_eq!(
-        sess_active.try_get::<String, _>("status").ok().as_deref(),
-        Some("active"),
-        "agent_sessions.status after POST .../resume"
     );
 
     let (st_act, act) = get_json(
@@ -1168,6 +1120,81 @@ pub async fn run_product_matrix_full_journey(
             .map(|s| s.is_empty())
             .unwrap_or(true),
         "reasoning_content should be empty for mock round with reasoning: \"\""
+    );
+
+    // A session is resumable only after it has a durable conversation
+    // generation. Exercise close/resume at that boundary so this journey
+    // verifies hydration, rather than treating resume as a status-only reopen.
+    let (st_close, closed) = post_empty(
+        app,
+        &format!("/sessions/{session_id}/close"),
+        Some(auth_header),
+    )
+    .await;
+    assert_eq!(st_close, StatusCode::OK, "close session: {closed}");
+    assert_eq!(
+        closed["status"].as_str(),
+        Some("closed"),
+        "close response: {closed}"
+    );
+
+    let sess_status =
+        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("session status after close");
+    assert_eq!(
+        sess_status.try_get::<String, _>("status").ok().as_deref(),
+        Some("closed"),
+        "agent_sessions.status after POST .../close"
+    );
+
+    let (st_res, resm) = post_empty(
+        app,
+        &format!("/sessions/{session_id}/resume"),
+        Some(auth_header),
+    )
+    .await;
+    assert_eq!(st_res, StatusCode::OK, "resume session: {resm}");
+    assert_eq!(
+        resm["last_status"].as_str(),
+        Some("active"),
+        "resume response: {resm}"
+    );
+    assert_eq!(
+        resm["resume_bundle"]["source"].as_str(),
+        Some("canonical_journal"),
+        "resume must hydrate from the canonical journal: {resm}"
+    );
+    let resumed_messages = resm["resume_bundle"]["conversation_messages"]
+        .as_array()
+        .expect("canonical resume must contain conversation messages");
+    assert!(
+        resumed_messages
+            .iter()
+            .any(|message| message.to_string().contains("matrix journey ping")),
+        "canonical resume lost the user message: {resm}"
+    );
+    assert!(
+        resumed_messages
+            .iter()
+            .any(|message| message.to_string().contains(LLM_TEXT)),
+        "canonical resume lost the assistant message: {resm}"
+    );
+
+    let sess_active =
+        sqlx::query("SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("session status after resume");
+    assert_eq!(
+        sess_active.try_get::<String, _>("status").ok().as_deref(),
+        Some("active"),
+        "agent_sessions.status after POST .../resume"
     );
 
     let turn_cnt_row = sqlx::query(
