@@ -2,7 +2,7 @@
 //!
 //! The TUI's draw cycle is: compute which source owns the active-cell
 //! region (active cell / task board / status line / next-hint / empty),
-//! then paint `active | separator | bottom pane` into the ratatui
+//! then paint `active | bottom pane` into the ratatui
 //! frame. This file owns that pipeline so the outer event loop in
 //! [`super::event_loop`] doesn't carry render details.
 //!
@@ -746,7 +746,7 @@ pub(crate) fn sync_task_footer(
 // ───────────────────────────────────────────────────────────────────────
 
 /// Paint one frame. Layout top-to-bottom:
-/// `task_board (optional) | active | separator | bottom_pane`.
+/// `task_board (optional) | active | bottom_pane`.
 /// The task board is its OWN slot — it does NOT race the active
 /// cell for priority, so a streaming tool/assistant cell can't
 /// hide it mid-frame.
@@ -842,13 +842,6 @@ pub(crate) fn do_draw(
         RenderableItem::Owned(Box::new(framed) as Box<dyn Renderable>)
     });
 
-    // Breathing room between scrollback and the bottom surface.
-    // Earlier versions used a full-width rule here, but the extra line
-    // made the composer feel boxed off rather than integrated with the
-    // rest of the screen.
-    let sep_line = separator_line(width);
-    let sep_renderable = RenderableItem::Owned(Box::new(sep_line));
-
     let bp_renderable = BottomPaneRenderable(bottom_pane);
     let bp_item = RenderableItem::Owned(Box::new(bp_renderable) as Box<dyn Renderable>);
 
@@ -856,7 +849,6 @@ pub(crate) fn do_draw(
     // Layout (top → bottom):
     //   active cell + scrollback   (weight=1, soaks remaining space)
     //   multi-agent strip          (weight=0, only if any sub-agents are live)
-    //   separator                  (weight=0)  ← visual break above board
     //   task board                 (weight=0, pinned just above composer)
     //   blank spacer               (weight=0)  ← only when board renders
     //   bottom pane / composer     (weight=0)
@@ -876,7 +868,6 @@ pub(crate) fn do_draw(
     if let Some(item) = multi_agent_renderable {
         flex.push(0, item);
     }
-    flex.push(0, sep_renderable);
     let board_rendered = task_board_lines
         .as_ref()
         .is_some_and(|lines| !lines.is_empty());
@@ -908,11 +899,6 @@ pub(crate) fn do_draw(
         })
         .map_err(|e| format!("draw: {e}"))?;
     Ok(())
-}
-
-fn separator_line(width: u16) -> Line<'static> {
-    let dim = Style::default().fg(crate::tui::theme::current().dim);
-    Line::from(Span::styled("─".repeat(width as usize), dim))
 }
 
 struct BottomPaneRenderable<'a>(&'a mut BottomPane);
@@ -2083,6 +2069,40 @@ mod multi_agent_strip_tests {
             settled_buffer[(0, 0)].fg,
             crate::tui::theme::current().gutter_frozen
         );
+    }
+
+    #[test]
+    fn live_and_frozen_tool_titles_render_in_the_same_terminal_column() {
+        use crate::tui::history_cell::{HistoryCell, tool::ToolCell};
+        use crate::tui::render::{line_utils::FullRowParagraph, renderable::Renderable};
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let area = Rect::new(0, 0, 40, 2);
+        let mut tool = ToolCell::new_running("bash", "$ cargo test");
+
+        let mut live_buffer = Buffer::empty(area);
+        LiveFramedCell {
+            lines: tool.display_lines(area.width.saturating_sub(2)),
+            live: true,
+        }
+        .render(area, &mut live_buffer);
+
+        tool.complete("success", 42, "$ cargo test".into(), None, None);
+        let mut frozen_buffer = Buffer::empty(area);
+        Widget::render(
+            FullRowParagraph::new(tool.display_lines(area.width)),
+            area,
+            &mut frozen_buffer,
+        );
+
+        let title_column = |buffer: &Buffer| {
+            (area.x..area.right())
+                .find(|&x| buffer[(x, area.y)].symbol() == "R")
+                .expect("tool title must contain its lifecycle verb")
+        };
+        assert_eq!(live_buffer[(0, 0)].symbol(), "█");
+        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
     }
 
     #[test]

@@ -49,10 +49,13 @@ fn seed_footer(pane: &mut BottomPane) {
     pane.footer.model = Some("sonnet-4.6".into());
     pane.footer.cwd = Some("~/github/astra".into());
     pane.footer.git_branch = Some("enqueue_new_after_next_call".into());
+    pane.footer.context_window = Some(astra_turn_types::ContextWindowUsage::provider_reported(
+        95_000, 800_000,
+    ));
 }
 
 #[test]
-fn active_turn_placeholder_explains_queue_vs_interrupt() {
+fn active_turn_keeps_the_composer_focused_on_input() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
@@ -65,8 +68,8 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
         "active composer should keep the same primary prompt as idle; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Enter queues follow-up") || rendered.contains("Ctrl+C stops"),
-        "active composer should keep an in-panel helper hint; got {rendered:?}"
+        !rendered.contains("Enter queues") && !rendered.contains("Ctrl+C stops"),
+        "active state already has a dedicated indicator; the composer must not repeat a key tutorial; got {rendered:?}"
     );
     assert!(
         rendered.contains("sonnet-4.6")
@@ -77,7 +80,7 @@ fn active_turn_placeholder_explains_queue_vs_interrupt() {
 }
 
 #[test]
-fn idle_composer_uses_clean_prompt_and_editor_hint() {
+fn idle_composer_uses_a_clean_prompt_without_permanent_key_legend() {
     let pane = BottomPane::new();
 
     let rendered = render_text(&pane, Rect::new(0, 0, 80, 5));
@@ -86,8 +89,8 @@ fn idle_composer_uses_clean_prompt_and_editor_hint() {
         "idle composer should render a short prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Alt+E editor") || rendered.contains("Shift+Enter newline"),
-        "idle composer should keep an in-panel helper hint; got {rendered:?}"
+        !rendered.contains("Alt+E editor") && !rendered.contains("Shift+Enter newline"),
+        "idle composer should leave shortcuts in help and command discovery; got {rendered:?}"
     );
 }
 
@@ -115,7 +118,7 @@ fn next_turn_queue_confirms_visibility_and_preserves_fifo() {
 }
 
 #[test]
-fn narrow_active_composer_degrades_helper_without_losing_stop_hint() {
+fn narrow_active_composer_does_not_reintroduce_key_chrome() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
@@ -127,19 +130,13 @@ fn narrow_active_composer_degrades_helper_without_losing_stop_hint() {
         "narrow composer should keep the primary prompt; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Ctrl+C stops") || rendered.contains("Enter queues"),
-        "narrow composer should keep a compressed helper hint; got {rendered:?}"
-    );
-    assert!(
-        rendered
-            .lines()
-            .any(|line| line.contains("~/") || line.contains("sonnet-4.6")),
-        "narrow footer should stay visible under the composer; got {rendered:?}"
+        !rendered.contains("Ctrl+C stops") && !rendered.contains("Enter queues"),
+        "narrow layouts must reduce chrome rather than invent another shorthand; got {rendered:?}"
     );
 }
 
 #[test]
-fn helper_row_stays_visible_after_typing_begins() {
+fn typing_does_not_allocate_a_second_tutorial_row() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
@@ -152,8 +149,8 @@ fn helper_row_stays_visible_after_typing_begins() {
         "typed text should remain visible inside the composer; got {rendered:?}"
     );
     assert!(
-        rendered.contains("Enter queues follow-up") || rendered.contains("Ctrl+C stops"),
-        "the helper row should stay visible after typing begins; got {rendered:?}"
+        !rendered.contains("Enter queues follow-up") && !rendered.contains("Ctrl+C stops"),
+        "typed content should remain the sole composer focus; got {rendered:?}"
     );
 }
 

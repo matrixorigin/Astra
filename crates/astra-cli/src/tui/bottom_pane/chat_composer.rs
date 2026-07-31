@@ -54,8 +54,6 @@ pub(crate) struct ChatComposer {
 const PASTE_INLINE_MAX_CHARS: usize = 800;
 const PASTE_INLINE_MAX_LINES: usize = 2;
 const COMPOSER_PLACEHOLDER: &str = "Message Astra";
-const IDLE_COMPOSER_HELPER: &str = "Enter send · Shift+Enter newline · / commands · Alt+E editor";
-const ACTIVE_TURN_HELPER: &str = "Enter queues follow-up · Ctrl+C stops · / commands";
 
 impl ChatComposer {
     pub fn new() -> Self {
@@ -359,8 +357,13 @@ impl ChatComposer {
 
     pub fn desired_height(&self, width: u16) -> u16 {
         let inner_w = width.saturating_sub(self.prefix_display_width());
-        let helper_rows = u16::from(text_area_can_show_helper(2));
-        (self.textarea.desired_height(inner_w) + helper_rows).clamp(2, 4)
+        // The second row is intentional breathing room, not a permanent key
+        // legend. It keeps the composer feeling like an editing surface and
+        // lets multiline input grow without changing visual language.
+        self.textarea
+            .desired_height(inner_w)
+            .saturating_add(1)
+            .clamp(2, 4)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposerAction {
@@ -439,7 +442,7 @@ impl ChatComposer {
         }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut Buffer, task_active: bool, queueing: bool) {
+    pub fn render(&self, area: Rect, buf: &mut Buffer, queueing: bool) {
         if area.height == 0 || area.width == 0 {
             return;
         }
@@ -464,7 +467,6 @@ impl ChatComposer {
         // The submit flash still wins outright when a send lands.
         let mut prefix_style = Style::default()
             .fg(theme.accent_dim())
-            .add_modifier(ratatui::style::Modifier::BOLD)
             .bg(panel.bg.unwrap_or(Color::Reset));
         if queueing && !self.is_flashing() {
             prefix_style = prefix_style.fg(theme.accent);
@@ -491,18 +493,11 @@ impl ChatComposer {
         );
         Widget::render(Line::from(prefix), prefix_area, buf);
 
-        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
             content_area.x + prefix_width.min(content_area.width),
             content_area.y,
             content_area.width.saturating_sub(prefix_width),
-            content_area.height.saturating_sub(helper_h).max(1),
-        );
-        let helper_area = Rect::new(
-            text_area.x,
-            text_area.y + text_area.height.min(content_area.height.saturating_sub(1)),
-            text_area.width,
-            helper_h,
+            content_area.height.max(1),
         );
 
         if self.textarea.is_empty() {
@@ -520,22 +515,6 @@ impl ChatComposer {
         } else {
             self.textarea.render(text_area, buf);
         }
-
-        if helper_area.height > 0 {
-            let helper_text = if task_active {
-                ACTIVE_TURN_HELPER
-            } else {
-                IDLE_COMPOSER_HELPER
-            };
-            let helper = Span::styled(
-                truncate_end(helper_text, helper_area.width as usize),
-                Style::default()
-                    .fg(theme.dim)
-                    .bg(panel.bg.unwrap_or(Color::Reset))
-                    .add_modifier(ratatui::style::Modifier::DIM),
-            );
-            Widget::render(Line::from(helper), helper_area, buf);
-        }
     }
 
     pub fn cursor_position(&self, area: Rect) -> Option<(u16, u16)> {
@@ -544,19 +523,14 @@ impl ChatComposer {
         let content_h = area.height.saturating_sub(top_inset);
         let content_area = Rect::new(area.x, content_y, area.width, content_h.max(1));
         let prefix_width = self.prefix_display_width();
-        let helper_h = u16::from(text_area_can_show_helper(content_area.height));
         let text_area = Rect::new(
             content_area.x + prefix_width.min(content_area.width),
             content_area.y,
             content_area.width.saturating_sub(prefix_width),
-            content_area.height.saturating_sub(helper_h).max(1),
+            content_area.height.max(1),
         );
         self.textarea.cursor_position(text_area)
     }
-}
-
-fn text_area_can_show_helper(content_h: u16) -> bool {
-    content_h >= 2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -774,8 +748,11 @@ mod paste_tests {
     }
 
     #[test]
-    fn active_turn_helper_surfaces_queue_semantics() {
-        assert!(ACTIVE_TURN_HELPER.contains("Enter queues"));
-        assert!(ACTIVE_TURN_HELPER.contains("Ctrl+C"));
+    fn composer_keeps_breathing_room_and_grows_for_multiline_input() {
+        let mut composer = ChatComposer::new_ephemeral();
+        assert_eq!(composer.desired_height(80), 2);
+
+        composer.set_text("first\nsecond\nthird");
+        assert_eq!(composer.desired_height(80), 4);
     }
 }

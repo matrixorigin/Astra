@@ -4406,10 +4406,6 @@ fn refresh_footer_from_state(
     state: &crate::cli::session::session_state::SessionState,
 ) {
     bottom_pane.footer.model = state.model.clone();
-    bottom_pane.footer.session_id = state
-        .session_id
-        .as_ref()
-        .map(|sid| sid[..8.min(sid.len())].to_string());
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     if let Some(trace) = latest_context_trace(state)
         && let Some(usage) = context_window_from_trace(&trace)
@@ -4683,9 +4679,6 @@ pub(crate) async fn run_tui_session(
 
     if let Some(ref model) = state.model {
         bottom_pane.footer.model = Some(model.clone());
-    }
-    if let Some(ref sid) = state.session_id {
-        bottom_pane.footer.session_id = Some(sid[..8.min(sid.len())].to_string());
     }
     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
     // Lock-free observer of `perm_manager.mode()` so the inner-tick
@@ -7366,8 +7359,6 @@ pub(crate) async fn run_tui_session(
 
                                     // Update footer
                                     if let Some(ref m) = state.model { bottom_pane.footer.model = Some(m.clone()); }
-                                    if let Some(ref s) = state.session_id { bottom_pane.footer.session_id = Some(s[..8.min(s.len())].to_string()); }
-                                    bottom_pane.footer.token_usage = Some(format!("{}↑ {}↓", state.total_prompt_tokens, state.total_completion_tokens));
                                     bottom_pane.footer.permission_mode = Some(state.perm_manager.mode());
                                     // The live stream has already updated the footer from the
                                     // current request's assembly and provider usage. A trace is
@@ -7845,10 +7836,6 @@ pub(crate) async fn run_tui_session(
                                                 &mut board_user_pin,
                                             );
                                         }
-                                        bottom_pane.footer.session_id = state
-                                            .session_id
-                                            .as_ref()
-                                            .map(|s| s[..8.min(s.len())].to_string());
                                     } else if let bottom_pane::view::ViewResult::Session {
                                         session_id: parent_id,
                                         intent: bottom_pane::view::SessionSelectionIntent::Fork,
@@ -7890,10 +7877,6 @@ pub(crate) async fn run_tui_session(
                                                         outcome.events_copied,
                                                         task_board_note,
                                                     )),
-                                                );
-                                                bottom_pane.footer.session_id = Some(
-                                                    outcome.new_session_id[..8.min(outcome.new_session_id.len())]
-                                                        .to_string(),
                                                 );
                                             }
                                             Err(error) => chat_widget.commit_system(
@@ -8833,7 +8816,6 @@ mod tests {
     use crate::background_task_error::BackgroundTaskError;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use crate::tui::background_tasks::BgTaskEvent;
-    use crate::tui::status_line::{StatusContext, StatusLine};
     use astra_runtime::turn::run_control::{
         RunControlStatus, RunStatusProvider, UserIntentProvider,
     };
@@ -10132,16 +10114,6 @@ mod tests {
             Some(astra_turn_types::ContextWindowUsage::provider_reported(
                 20_687, 800_000
             ))
-        );
-
-        let plain = StatusLine::from_context(&StatusContext {
-            context_window: usage,
-            ..StatusContext::default()
-        })
-        .plain();
-        assert!(
-            plain.contains("Ctx 3%") && plain.contains("21k/800k"),
-            "footer should present one request's context occupancy: {plain:?}"
         );
     }
 

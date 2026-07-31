@@ -40,15 +40,6 @@ fn snapshot_idle_minimal() {
 }
 
 #[test]
-fn snapshot_turn_active() {
-    let ctx = StatusContext {
-        turn_active: true,
-        ..base_ctx()
-    };
-    crate::tui::testing::assert_tui_snapshot!("status_turn_active_80", render_ctx(&ctx, 80));
-}
-
-#[test]
 fn snapshot_auto_mode() {
     let ctx = StatusContext {
         permission_mode: PermissionMode::Auto,
@@ -67,21 +58,6 @@ fn snapshot_deny_mode() {
 }
 
 #[test]
-fn snapshot_high_token_usage_with_cost() {
-    let ctx = StatusContext {
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            92_000, 100_000,
-        )),
-        cost_usd: Some(3.47),
-        ..base_ctx()
-    };
-    crate::tui::testing::assert_tui_snapshot!(
-        "status_high_tokens_with_cost_80",
-        render_ctx(&ctx, 80)
-    );
-}
-
-#[test]
 fn snapshot_git_branch_included() {
     let ctx = StatusContext {
         git_branch: Some("enhance_tui".into()),
@@ -95,12 +71,7 @@ fn snapshot_full_context_80() {
     let ctx = StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            40_000, 200_000,
-        )),
         permission_mode: PermissionMode::Auto,
-        turn_active: false,
-        cost_usd: Some(0.42),
         git_branch: Some("enhance_tui".into()),
         ..StatusContext::default()
     };
@@ -112,9 +83,6 @@ fn snapshot_narrow_drops_right_segments() {
     let ctx = StatusContext {
         model: Some("sonnet-4.6".into()),
         cwd: Some("~/projects/astra".into()),
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            40_000, 200_000,
-        )),
         git_branch: Some("enhance_tui".into()),
         ..StatusContext::default()
     };

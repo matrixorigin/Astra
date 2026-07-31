@@ -36,9 +36,8 @@ pub(crate) fn queue_panel_style() -> Style {
 }
 
 pub(crate) fn footer_surface_style() -> Style {
-    if let Some(bg) = default_bg() {
-        return Style::default().bg(footer_surface_bg(bg));
-    }
+    // The footer is chrome, not a card. Its semantic colours and alignment
+    // provide hierarchy without drawing another horizontal band.
     Style::default()
 }
 
@@ -101,15 +100,6 @@ fn queue_panel_rgb(terminal_bg: (u8, u8, u8)) -> (u8, u8, u8) {
         ((84, 111, 145), 0.10)
     };
     blend(top, terminal_bg, alpha)
-}
-
-fn footer_surface_bg(terminal_bg: (u8, u8, u8)) -> Color {
-    let (top, alpha) = if is_light(terminal_bg) {
-        ((0, 0, 0), 0.015)
-    } else {
-        ((255, 255, 255), 0.04)
-    };
-    best_color(blend(top, terminal_bg, alpha))
 }
 
 fn proposed_plan_bg(terminal_bg: (u8, u8, u8)) -> Color {

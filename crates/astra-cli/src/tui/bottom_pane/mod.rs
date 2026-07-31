@@ -1402,7 +1402,10 @@ impl BottomPane {
         let approval_h = self.focused_approval_height(width);
         let queue_h = self.user_intent_height();
         let popup_h = self.popup_height();
-        content_h + approval_h + queue_h + popup_h + 1
+        // One quiet row above the composer is reserved for the context rail.
+        // Keeping it stable avoids shifting the input when the first usage
+        // measurement arrives; before that it simply acts as breathing room.
+        content_h + approval_h + queue_h + popup_h + 2
     }
 
     /// Top-level key routing. Dispatches to named phase handlers so
@@ -1806,18 +1809,6 @@ impl BottomPane {
             self.pop_active_view();
             changed = true;
         }
-        if self.task_status.is_active() {
-            // The live status indicator already owns the "Thinking /
-            // Running / Waiting" narrative above the composer. Duplicating
-            // that same label + timer in the footer makes the bottom stack
-            // feel cramped, so the footer stays focused on mode + context
-            // while a turn is active.
-            self.footer.current_objective = None;
-            self.footer.turn_elapsed = None;
-        } else {
-            self.footer.current_objective = self.task_status.objective_label();
-            self.footer.turn_elapsed = self.task_status.elapsed();
-        }
         // Flush paste burst buffer when idle timeout expires.
         if self.composer.flush_paste_burst() {
             self.sync_popups();
@@ -1895,6 +1886,7 @@ impl BottomPane {
                 Constraint::Length(approval_h),
                 Constraint::Length(intent_queue_h),
                 Constraint::Length(next_turn_queue_h),
+                Constraint::Length(1),
                 Constraint::Length(content_h),
                 Constraint::Length(popup_h),
                 Constraint::Length(1),
@@ -1904,25 +1896,23 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.render_pending_user_intents(chunks[1], buf);
             self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.composer.render(
-                chunks[3],
-                buf,
-                self.task_status.is_active(),
-                self.has_pending_composer_queue(),
-            );
+            self.footer.render_context_bar(chunks[3], buf);
+            self.composer
+                .render(chunks[4], buf, self.has_pending_composer_queue());
             if let Some(ref menu) = self.slash_menu {
-                slash_popup_render::render_composer(menu, chunks[4], buf);
+                slash_popup_render::render_composer(menu, chunks[5], buf);
             } else if let Some(ref menu) = self.mention_menu {
-                mention_popup_render::render(menu, chunks[4], buf);
+                mention_popup_render::render(menu, chunks[5], buf);
             } else if let Some(ref popup) = self.skill_popup {
-                popup.render(chunks[4], buf);
+                popup.render(chunks[5], buf);
             }
-            self.footer.render(chunks[5], buf);
+            self.footer.render(chunks[6], buf);
         } else {
             let chunks = Layout::vertical([
                 Constraint::Length(approval_h),
                 Constraint::Length(intent_queue_h),
                 Constraint::Length(next_turn_queue_h),
+                Constraint::Length(1),
                 Constraint::Length(content_h),
                 Constraint::Length(1),
             ])
@@ -1931,13 +1921,10 @@ impl BottomPane {
             self.render_focused_approval(chunks[0], buf);
             self.render_pending_user_intents(chunks[1], buf);
             self.render_queued_next_turn_submissions(chunks[2], buf);
-            self.composer.render(
-                chunks[3],
-                buf,
-                self.task_status.is_active(),
-                self.has_pending_composer_queue(),
-            );
-            self.footer.render(chunks[4], buf);
+            self.footer.render_context_bar(chunks[3], buf);
+            self.composer
+                .render(chunks[4], buf, self.has_pending_composer_queue());
+            self.footer.render(chunks[5], buf);
         }
     }
 
@@ -2143,12 +2130,13 @@ impl BottomPane {
             Constraint::Length(approval_h),
             Constraint::Length(intent_queue_h),
             Constraint::Length(next_turn_queue_h),
+            Constraint::Length(1),
             Constraint::Length(content_h),
             Constraint::Min(0),
         ])
         .split(area);
 
-        self.composer.cursor_position(chunks[3])
+        self.composer.cursor_position(chunks[4])
     }
 }
 

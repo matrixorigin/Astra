@@ -23,9 +23,10 @@
 │                                                                 │
 │  ✶ Thinking … (2.3s · ↓ 340 tok)                                │  ← StatusIndicator
 │                                                                 │     or the active
-│────────────────────────────────────────────────────────────────│     HistoryCell
-│  › Ask astra to do anything                                     │  ← Composer
-│  / commands · $ skills · Ctrl+O transcript     ~/dir · 7k↑ 85↓ │  ← Footer
+│  ───────────────                                      95k / 800k │  ← Context rail
+│  › Message Astra                                                 │  ← Composer
+│                                                                  │
+│  sonnet-4.6                                      ~/dir  ⎇ branch │  ← Status
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -61,17 +62,17 @@ read paths:
 | Name | Description | Location |
 |------|-------------|----------|
 | **Scrollback** | Terminal native scrollback above the viewport. Committed HistoryCells flushed here. | Top of screen, grows upward |
-| **Viewport** | Fixed-height region at screen bottom managed by ratatui. Active cell + separator + bottom pane. | Bottom N rows |
+| **Viewport** | Fixed-height region at screen bottom managed by ratatui. Active cell + bottom pane. | Bottom N rows |
 | **Active-cell area** | Live `HistoryCell` (streaming assistant, running tool, reasoning) or `StatusIndicator` fallback. | Top of viewport |
-| **Separator** | Thin `────` dim line between active cell and composer. | Between active cell and bottom pane |
-| **Bottom Pane** | Composer + Footer, or an overlay view (HelpView, TranscriptView, …). | Bottom of viewport |
+| **Bottom Pane** | Context rail + composer + status, or an overlay view (HelpView, TranscriptView, …). | Bottom of viewport |
 
 ### Bottom-pane components
 
 | Name | Description | When visible |
 |------|-------------|--------------|
-| **Composer** | Input line with `› ` prefix. Emacs keybindings, multi-line with Shift+Enter. | Always (unless an overlay is active) |
-| **Footer** | Shortcuts hint (left) + model · dir · tokens · cost (right) | When no popup/overlay is active |
+| **Context rail** | Request input occupancy encoded by line length and semantic colour, with one compact absolute readout. | Above the composer once usage is known |
+| **Composer** | Two-row-minimum editing surface with `› ` prefix. Emacs keybindings, expands for multi-line input. | Always (unless an overlay is active) |
+| **Status** | Model and attention states on the left; workspace identity on the right. Default policy and key tutorials stay hidden. | When no popup/overlay is active |
 | **Slash Popup** | Command list under composer, filters as user types `/…` | Composer text starts with `/` |
 | **Skill Popup** | Skill mention list, triggered by `$` | Composer text starts with `$` |
 | **Workspace / Overlay Panel** | A primary workspace (root/agent transcript or task board) replaces compact chat; forms and pickers remain bounded overlays. | When a view is pushed onto `view_stack` |

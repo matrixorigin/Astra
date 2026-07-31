@@ -415,7 +415,7 @@ async fn sighup_while_idle_converges_through_tui_shutdown() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), "http://127.0.0.1:9");
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.signal(nix::sys::signal::Signal::SIGHUP);
 
     let status = astra.wait_for_exit(Duration::from_secs(10));
@@ -437,7 +437,7 @@ async fn sighup_during_an_active_turn_converges_through_tui_shutdown() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"keep_this_turn_active_until_shutdown\r");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
@@ -459,7 +459,7 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"hold this turn open\r");
 
     // Synchronize on the request reaching the provider. A transient activity
@@ -484,7 +484,7 @@ async fn ctrl_c_projects_stopping_until_a_slow_turn_settles() {
         astra.screen_diagnostic()
     );
     mock.release_held_response();
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
 }
 
 fn is_agent_journey_child_request(request: &serde_json::Value) -> bool {
@@ -704,7 +704,7 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), "http://127.0.0.1:9");
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
 
     // A single token stays contiguous in the terminal byte stream even when
     // ratatui positions separately styled words with cursor movement codes.
@@ -737,7 +737,7 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"complete_this_live_transcript_journey\r");
     astra.wait_for("Sending", UI_TRANSITION_TIMEOUT);
 
@@ -746,7 +746,7 @@ async fn ctrl_o_opens_during_an_active_turn_and_receives_live_completion() {
     astra.wait_for("successfully.", Duration::from_secs(10));
 
     astra.write(&[0x0f]);
-    astra.wait_for("Enter send", Duration::from_secs(10));
+    astra.wait_for("Message Astra", Duration::from_secs(10));
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -764,7 +764,7 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"/allow prompt\r");
     astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
     astra.write(b"exercise_tool_history_in_transcript\r");
@@ -779,7 +779,7 @@ async fn ctrl_o_replays_tool_history_after_a_real_tool_turn() {
     astra.wait_for("Ran Write file", UI_TRANSITION_TIMEOUT);
 
     astra.write(&[0x0f]);
-    astra.wait_for("Enter send", UI_TRANSITION_TIMEOUT);
+    astra.wait_for("Message Astra", UI_TRANSITION_TIMEOUT);
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
@@ -797,7 +797,7 @@ async fn ctrl_o_round_trip_preserves_a_live_tool_approval() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"/allow prompt\r");
     astra.wait_for("Mode → Ask", UI_TRANSITION_TIMEOUT);
     astra.write(b"request_a_write_and_wait_for_my_approval\r");
@@ -829,7 +829,7 @@ async fn ctrl_g_reopens_a_child_transcript_after_completion() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"delegate_one_child_and_keep_it_observable\r");
     wait_for_agent_journey_child_request(&mock, &mut astra, UI_TRANSITION_TIMEOUT).await;
 
@@ -890,7 +890,7 @@ async fn foreground_fanout_stays_observable_and_synthesizes_once_after_full_sett
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"launch_three_reviews_as_one_group\r");
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
@@ -1023,7 +1023,7 @@ async fn foreground_status_guidance_uses_canonical_group_truth_and_never_claims_
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"launch_then_ask_foreground_status\r");
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("parent waits for the complete group", UI_TRANSITION_TIMEOUT);
@@ -1144,7 +1144,7 @@ async fn failed_fanout_slot_preserves_its_cause_and_still_synthesizes_once() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"launch_three_reviews_with_one_unhappy_child\r");
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
@@ -1227,7 +1227,7 @@ async fn ctrl_b_promotes_the_whole_fanout_and_wakes_once_after_settlement() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"launch_then_explicitly_background_the_group\r");
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);
@@ -1304,7 +1304,7 @@ async fn background_group_is_queryable_before_its_single_terminal_wake() {
     seed_trusted_workspace(home.path());
     let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
 
-    astra.wait_for("Enter send", Duration::from_secs(15));
+    astra.wait_for("Message Astra", Duration::from_secs(15));
     astra.write(b"launch_then_ask_about_background_state\r");
     wait_for_three_fanout_children(&mock, &mut astra).await;
     astra.wait_for("↳ Work · Three mock reviews", UI_TRANSITION_TIMEOUT);

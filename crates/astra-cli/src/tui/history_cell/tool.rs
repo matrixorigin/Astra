@@ -1,12 +1,12 @@
-//! Tool-invocation history cell — the live `● Running Bash (42ms)` and
+//! Tool-invocation history cell — the live `Running Bash (42ms)` and
 //! terminal `● Ran Bash · 42ms` blocks.
 //!
 //! Three visual states:
-//! - **Running** — accent bullet, shimmer title, elapsed from
-//!   construction `Instant`, optional Braille spinner+progress bar
-//!   if the tool has been running more than 3 s. Not persisted
+//! - **Running** — shimmer title, elapsed from construction `Instant`, and an
+//!   optional compact activity row for real stream counters/backgrounding.
+//!   The outer live gutter already owns the running marker. Not persisted
 //!   until the final `complete()` call.
-//! - **Success** — green bullet, `Ran <name> · Xms` title, optional
+//! - **Success** — green `●`, `Ran <name> · Xms` title, optional
 //!   description (`│ <cmd>`) + output summary (`└ <first 5 lines>`).
 //! - **Failed** — red bullet, `Failed <name> · Xms`, otherwise identical to success.
 //! - **Rejected** — warning bullet, `Did not run <name> · Xms`; the
@@ -67,9 +67,8 @@ pub(crate) struct ToolCell {
     pub output: Option<String>,
     pub ts: Option<String>,
     /// Cumulative lines observed in the tool's stdout stream (bash
-    /// only today — other tools don't emit `ToolOutput` events so
-    /// these stay at 0 and the cell renders an indeterminate
-    /// breathing animation instead of a line counter).
+    /// only today — other tools don't emit `ToolOutput` events, so
+    /// these stay at 0 and no synthetic percentage is shown).
     pub progress_lines: u64,
     pub progress_bytes: u64,
     /// Whether the live bash row should advertise Ctrl+B promotion.
@@ -206,13 +205,10 @@ impl ToolCell {
     fn bullet(&self) -> Span<'static> {
         let theme = crate::tui::theme::current();
         match self.status {
-            // A solid state dot is easier to scan than a tiny middle dot.
-            // Running keeps the focus accent; success/failure use their
-            // narrow semantic roles and never recolor the surrounding prose.
-            ToolStatus::Running => {
-                let theme = crate::tui::theme::current();
-                Span::styled("● ", Style::default().fg(theme.accent).bold())
-            }
+            // Live cells already have a two-column `█ ` gutter. Keeping this
+            // span empty aligns the live title with the frozen title after
+            // the latter gains its `● ` terminal marker.
+            ToolStatus::Running => Span::raw(""),
             ToolStatus::Success => Span::styled("● ", Style::default().fg(theme.success).bold()),
             ToolStatus::Uncertain => Span::styled("● ", Style::default().fg(theme.warn).bold()),
             ToolStatus::Failed => Span::styled("● ", Style::default().fg(theme.error).bold()),
@@ -330,19 +326,10 @@ impl ToolCell {
         })
     }
 
-    /// Sub-line rendered under the header for tools that are still
-    /// running past the 3 s grace window.
-    ///
-    /// Two shapes:
-    /// - **Signal mode** (any `progress_lines` / `progress_bytes`
-    ///   arrived) — a Braille spinner + `"streaming · N lines · K KB"`
-    ///   counter. Honest, monotonic, no fake percentages.
-    /// - **Indeterminate mode** (no progress signal ever arrived —
-    ///   non-streaming tools like `read_file`, `git(action=log)`, skill
-    ///   dispatch) — a breathing bar with a small block sliding back
-    ///   and forth. Purely time-based; makes "still working" visible
-    ///   without pretending to track progress.
-    fn progress_line(&self, width: usize, elapsed_ms: u64) -> Line<'static> {
+    /// Compact sub-line for tools that have real stream counters or expose a
+    /// backgrounding action. Indeterminate progress needs no second animation:
+    /// the shimmer title and outer live gutter already communicate activity.
+    fn progress_line(&self, elapsed_ms: u64) -> Option<Line<'static>> {
         const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let frame_idx = ((elapsed_ms / 80) % FRAMES.len() as u64) as usize;
         let theme = crate::tui::theme::current();
@@ -355,7 +342,7 @@ impl ToolCell {
         // Signal mode: show real counters when the tool actually
         // streamed something.
         let background_hint = if self.name == "bash" && self.ctrl_b_background_hint {
-            " · Ctrl+B to background"
+            " · Ctrl+B background"
         } else {
             ""
         };
@@ -371,43 +358,21 @@ impl ToolCell {
                 format_bytes(self.progress_bytes),
                 background_hint,
             );
-            return Line::from(vec![
+            return Some(Line::from(vec![
                 Span::styled("    ", dim),
                 spinner,
                 Span::styled(body, dim),
-            ]);
+            ]));
         }
 
-        // Indeterminate mode: breathing block slides across a
-        // fixed-width track. Position is `t = elapsed_ms / 1400`,
-        // normalised to [0, 1] via a triangle wave so the block
-        // bounces off the ends rather than wrapping.
-        let bar_max = width.saturating_sub(12).clamp(10, 28);
-        let block_len = (bar_max / 4).max(2);
-        let travel = bar_max.saturating_sub(block_len);
-        let pos = if travel == 0 {
-            0
-        } else {
-            let t = (elapsed_ms as f32 / 1400.0).fract();
-            let tri = if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 };
-            (tri * travel as f32).round() as usize
-        };
-        let mut bar = String::with_capacity(bar_max);
-        for i in 0..bar_max {
-            if i >= pos && i < pos + block_len {
-                bar.push('▓');
-            } else {
-                bar.push('░');
-            }
+        if background_hint.is_empty() {
+            return None;
         }
-
-        Line::from(vec![
+        Some(Line::from(vec![
             Span::styled("    ", dim),
             spinner,
-            Span::raw(" "),
-            Span::styled(bar, Style::default().fg(theme.accent)),
-            Span::styled(background_hint.to_string(), dim),
-        ])
+            Span::styled("  Ctrl+B background", dim),
+        ]))
     }
 }
 
@@ -602,11 +567,13 @@ impl ToolCell {
         let has_preview_block = edited_diff.is_some() || preview_text.is_some();
         let description_has_children = missing_failure_details || has_preview_block;
 
-        // Spinner + progress bar for long-running tools.
+        // One compact activity row for real counters or a background action.
         if self.status == ToolStatus::Running {
             let elapsed = self.started_at.elapsed().as_millis() as u64;
-            if elapsed >= 3_000 {
-                lines.push(self.progress_line(w, elapsed));
+            if elapsed >= 3_000
+                && let Some(progress) = self.progress_line(elapsed)
+            {
+                lines.push(progress);
             }
         }
 
@@ -1165,6 +1132,21 @@ mod tests {
         buffer_to_string(&draw_widget(p, width, height))
     }
 
+    fn assert_diff_row(rendered: &str, line_number: usize, marker: char, content: &str) {
+        let body = format!("│ {marker} {content}");
+        let row = rendered
+            .lines()
+            .find(|row| row.contains(&body))
+            .unwrap_or_else(|| panic!("missing diff row `{body}` in:\n{rendered}"));
+        let gutter = row.split_once('│').expect("diff row has a gutter").0;
+        assert!(
+            gutter
+                .split_whitespace()
+                .any(|field| field == line_number.to_string()),
+            "diff row has no line number {line_number}: {row}"
+        );
+    }
+
     fn ok_tool(name: &str, desc: &str, dur: u64) -> ToolCell {
         let mut t = ToolCell::new_running(name, desc);
         t.status = ToolStatus::Success;
@@ -1301,6 +1283,22 @@ mod tests {
         let out = render(&t, 80, 3);
         assert!(out.contains("Running Agent Fanout"), "{out}");
         assert!(!out.contains("Ran Agent Fanout"), "{out}");
+        assert!(
+            !out.contains("● Running") && !out.contains("• Running"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn live_and_frozen_tool_titles_share_the_same_text_column() {
+        let mut tool = ToolCell::new_running("bash", "$ cargo test");
+        let live = tool.display_lines(80);
+        assert_eq!(live[0].spans[0].content.as_ref(), "");
+
+        tool.complete("success", 42, "$ cargo test".into(), None, None);
+        let frozen = tool.display_lines(80);
+        assert_eq!(frozen[0].spans[0].content.as_ref(), "● ");
+        assert_eq!(frozen[0].spans[0].content.width(), 2);
     }
 
     #[test]
@@ -1633,8 +1631,8 @@ mod tests {
 
         let out = render(&t, 100, 8);
         assert!(out.contains("hello.py"));
-        assert!(out.contains("   1 + #!/usr/bin/env python3"), "{out}");
-        assert!(out.contains("   2 + print(\"hello\")"), "{out}");
+        assert_diff_row(&out, 1, '+', "#!/usr/bin/env python3");
+        assert_diff_row(&out, 2, '+', "print(\"hello\")");
         assert!(!out.contains("[38;5;10m"));
         assert!(!out.contains("[2m"));
     }
@@ -1658,9 +1656,9 @@ mod tests {
         );
 
         let out = render(&t, 100, 12);
-        assert!(out.contains("   1 - print(\"old\")"), "{out}");
-        assert!(out.contains("   1 + print(\"new1\")"), "{out}");
-        assert!(out.contains("   5 + print(\"new5\")"), "{out}");
+        assert_diff_row(&out, 1, '-', "print(\"old\")");
+        assert_diff_row(&out, 1, '+', "print(\"new1\")");
+        assert_diff_row(&out, 5, '+', "print(\"new5\")");
         assert!(out.contains("… +1 more changed lines"), "{out}");
         assert!(out.contains("(Ctrl+O to view transcript)"), "{out}");
     }
@@ -1743,8 +1741,8 @@ mod tests {
         let out = render(&t, 100, 10);
         assert!(out.contains("● Edited src/main.rs · +2 -1"), "{out}");
         assert!(!out.contains("Ran Write file"), "{out}");
-        assert!(out.contains("   1 - fn old_name() {}"), "{out}");
-        assert!(out.contains("   2 + fn helper() {}"), "{out}");
+        assert_diff_row(&out, 1, '-', "fn old_name() {}");
+        assert_diff_row(&out, 2, '+', "fn helper() {}");
     }
 
     #[test]
@@ -1942,9 +1940,21 @@ mod tests {
             })
             .expect("expected first added diff row");
         let continuation = &lines[first_idx + 1];
-        assert_eq!(continuation.spans[0].content.as_ref(), "    ");
-        assert_eq!(continuation.spans[1].content.as_ref(), "     ");
-        assert_eq!(continuation.spans[2].content.as_ref(), "  ");
+        let first = &lines[first_idx];
+        for index in 0..3 {
+            assert!(
+                continuation.spans[index]
+                    .content
+                    .chars()
+                    .all(char::is_whitespace),
+                "continuation structural columns must be blank: {continuation:?}"
+            );
+            assert_eq!(
+                UnicodeWidthStr::width(continuation.spans[index].content.as_ref()),
+                UnicodeWidthStr::width(first.spans[index].content.as_ref()),
+                "continuation must preserve the source row's column grid"
+            );
+        }
         let bg = continuation.spans[1].style.bg;
         assert!(bg.is_some(), "expected wrapped diff background");
         assert_eq!(continuation.spans[0].style.bg, bg);
@@ -1974,7 +1984,8 @@ mod tests {
         t.set_ctrl_b_background_hint(true);
         t.started_at = Instant::now() - std::time::Duration::from_secs(4);
         let out = render(&t, 100, 4);
-        assert!(out.contains("Ctrl+B to background"), "{out}");
+        assert!(out.contains("Ctrl+B background"), "{out}");
+        assert!(!out.contains('░') && !out.contains('▓'), "{out}");
     }
 
     #[test]
@@ -1983,6 +1994,17 @@ mod tests {
         t.started_at = Instant::now() - std::time::Duration::from_secs(4);
         let out = render(&t, 100, 4);
         assert!(!out.contains("Ctrl+B"), "{out}");
+        assert!(!out.contains('░') && !out.contains('▓'), "{out}");
+    }
+
+    #[test]
+    fn real_stream_progress_keeps_compact_monotonic_counters() {
+        let mut t = ToolCell::new_running("bash", "$ cargo test");
+        t.started_at = Instant::now() - std::time::Duration::from_secs(4);
+        t.set_progress(12, 2_048);
+        let out = render(&t, 100, 4);
+        assert!(out.contains("streaming · 12 lines · 2.0 KB"), "{out}");
+        assert!(!out.contains('░') && !out.contains('▓'), "{out}");
     }
 
     #[test]

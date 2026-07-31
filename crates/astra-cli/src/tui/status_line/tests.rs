@@ -2,8 +2,6 @@
 
 #![cfg(test)]
 
-use std::time::Duration;
-
 use super::{BackgroundTaskCounts, StatusContext, StatusLine};
 use crate::tui::status_line::line::PermissionMode;
 use crate::tui::theme::current as current_theme;
@@ -15,12 +13,12 @@ fn ctx() -> StatusContext {
 // ─── Left-side state ──────────────────────────────────────────────
 
 #[test]
-fn idle_shows_mode_chip_without_tutorial_legend() {
+fn idle_hides_default_mode_and_tutorial_legend() {
     let s = StatusLine::from_context(&ctx());
     let plain = s.plain();
     assert!(
-        plain.contains("Ask"),
-        "default prompt mode should be visible; got {plain:?}"
+        !plain.contains("Ask"),
+        "the safe default should not consume permanent footer space; got {plain:?}"
     );
     assert!(
         !plain.contains("/commands"),
@@ -33,57 +31,6 @@ fn idle_shows_mode_chip_without_tutorial_legend() {
     assert!(
         !plain.contains("$shell"),
         "footer should not duplicate shell legend; got {plain:?}"
-    );
-}
-
-#[test]
-fn active_turn_without_objective_renders_no_interrupt_prompt() {
-    let c = StatusContext {
-        turn_active: true,
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert_eq!(
-        plain.matches("Ctrl+C interrupt").count(),
-        0,
-        "interrupt hint must not render in status line; got {plain:?}"
-    );
-}
-
-#[test]
-fn active_turn_keeps_footer_calm_even_with_objective_and_elapsed() {
-    let c = StatusContext {
-        turn_active: true,
-        current_objective: Some("Running bash".into()),
-        turn_elapsed: Some(Duration::from_secs(16)),
-        model: Some("sonnet-4.6".into()),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(
-        !plain.contains("Running bash") && !plain.contains("16s"),
-        "footer should not duplicate live objective/elapsed; got {plain:?}"
-    );
-    assert!(
-        !plain.contains("Ctrl+C interrupt"),
-        "interrupt hint should NOT appear in status line; got {plain:?}"
-    );
-    assert!(
-        plain.contains("sonnet-4.6"),
-        "model should remain visible after footer de-noising; got {plain:?}"
-    );
-}
-
-#[test]
-fn idle_turn_does_not_render_elapsed_chip() {
-    let c = StatusContext {
-        turn_elapsed: Some(Duration::from_secs(16)),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(
-        !plain.contains("16s"),
-        "elapsed chip must stay hidden when turn is idle; got {plain:?}"
     );
 }
 
@@ -113,7 +60,7 @@ fn very_narrow_width_degrades_idle_hint_to_tiny_form() {
     );
     assert!(
         rendered.contains("sonnet-4.6"),
-        "model should remain visible with the default mode chip; got {rendered:?}"
+        "model should remain visible in narrow layouts; got {rendered:?}"
     );
 }
 
@@ -144,7 +91,7 @@ fn model_stays_first_when_auto_mode_is_visible() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.starts_with("sonnet-4.6 · Auto"),
+        plain.starts_with("sonnet-4.6  Auto"),
         "model should anchor the left cluster before mode chips; got {plain:?}"
     );
 }
@@ -158,7 +105,7 @@ fn thinking_suffix_is_compacted_before_model_identity_is_lost() {
     };
     let plain = StatusLine::from_context(&c).plain();
     assert!(
-        plain.starts_with("deepseek-reasoner(high) · Auto"),
+        plain.starts_with("deepseek-reasoner(high)  Auto"),
         "thinking suffix should compact cleanly without ugly middle truncation; got {plain:?}"
     );
 }
@@ -166,20 +113,25 @@ fn thinking_suffix_is_compacted_before_model_identity_is_lost() {
 // ─── Permission mode chip ─────────────────────────────────────────
 
 #[test]
-fn ask_mode_renders_default_chip() {
+fn ask_mode_is_the_unlabelled_safe_default() {
     let s = StatusLine::from_context(&ctx());
-    assert!(s.plain().contains("Ask"));
+    assert!(!s.plain().contains("Ask"));
+    assert!(s.left.is_empty());
+}
+
+#[test]
+fn bypass_mode_uses_the_semantic_error_colour() {
+    let c = StatusContext {
+        permission_mode: PermissionMode::Bypass,
+        ..ctx()
+    };
+    let s = StatusLine::from_context(&c);
     let chip = s
         .left
         .iter()
-        .find(|seg| seg.text == "Ask")
-        .expect("ask chip segment");
-    assert_eq!(chip.style.fg, Some(current_theme().dim));
-    assert!(
-        chip.style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD)
-    );
+        .find(|seg| seg.text == "Bypass")
+        .expect("bypass chip");
+    assert_eq!(chip.style.fg, Some(current_theme().error));
 }
 
 #[test]
@@ -264,7 +216,7 @@ fn deny_mode_uses_the_semantic_error_colour() {
     );
 }
 
-// ─── Right-side segments: model · dir · tokens · cost · branch ────
+// ─── Stable identity and responsive layout ────────────────────────
 
 #[test]
 fn model_shows_on_right_when_set() {
@@ -332,16 +284,13 @@ fn narrow_footer_drops_mode_before_model_identity() {
 }
 
 #[test]
-fn dense_footer_preserves_mode_before_budget_and_branch() {
+fn dense_footer_preserves_model_and_mode_before_branch() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
     let c = StatusContext {
         model: Some("deepseek-v4-pro-official(thinking:high)".into()),
         cwd: Some("~/github/astra".into()),
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            138_000, 200_000,
-        )),
         git_branch: Some("enqueue_new_after_next_call".into()),
         permission_mode: PermissionMode::Auto,
         ..ctx()
@@ -356,151 +305,12 @@ fn dense_footer_preserves_mode_before_budget_and_branch() {
 
     assert!(
         rendered.contains("Auto"),
-        "permission mode is higher priority than budget/branch; got {rendered:?}"
+        "permission mode is higher priority than branch decoration; got {rendered:?}"
     );
     assert!(
         rendered.contains("deepseek"),
         "model identity should remain visible; got {rendered:?}"
     );
-}
-
-#[test]
-fn token_budget_renders_as_percent_and_absolute() {
-    let c = StatusContext {
-        turn_active: true,
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            25_000, 100_000,
-        )),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(plain.contains("25%"), "percent expected; got {plain:?}");
-    // Absolute count reference for quick math.
-    assert!(
-        plain.contains("25k") || plain.contains("25000") || plain.contains("25,000"),
-        "absolute used count expected; got {plain:?}"
-    );
-    // The "... left" chip was removed — it duplicated the percentage
-    // and wasted status-line width during active turns.
-    assert!(
-        !plain.contains("left"),
-        "unexpected 'left' chip; got {plain:?}"
-    );
-}
-
-#[test]
-fn previous_request_context_is_visible_and_explicitly_scoped() {
-    let c = StatusContext {
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            25_000, 100_000,
-        )),
-        context_window_is_previous: true,
-        turn_active: true,
-        ..ctx()
-    };
-
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(plain.contains("Ctx last 25%"), "{plain:?}");
-}
-
-#[test]
-fn idle_turn_hides_remaining_budget_suffix() {
-    let c = StatusContext {
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            25_000, 100_000,
-        )),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(
-        plain.contains("25%"),
-        "usage summary should remain visible; got {plain:?}"
-    );
-    assert!(
-        !plain.contains("left"),
-        "remaining budget suffix should be active-turn only; got {plain:?}"
-    );
-}
-
-#[test]
-fn high_token_usage_uses_warning_color() {
-    let c = StatusContext {
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            90_000, 100_000,
-        )),
-        ..ctx()
-    };
-    let s = StatusLine::from_context(&c);
-    let budget_seg = s
-        .right
-        .iter()
-        .find(|seg| seg.text.contains('%'))
-        .expect("budget segment");
-    assert!(
-        matches!(budget_seg.style.fg, Some(color) if color == current_theme().warn || color == current_theme().error),
-        "high-usage budget should highlight; style={:?}",
-        budget_seg.style.fg
-    );
-}
-
-#[test]
-fn narrow_footer_keeps_context_and_drops_cwd_first() {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let c = StatusContext {
-        model: Some("astra-model".into()),
-        cwd: Some("~/very/long/project/path".into()),
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            25_000, 100_000,
-        )),
-        ..ctx()
-    };
-    let status = StatusLine::from_context(&c);
-    let area = Rect::new(0, 0, 44, 1);
-    let mut buf = Buffer::empty(area);
-    status.render(area, &mut buf);
-    let rendered: String = (0..area.width)
-        .map(|x| buf[(x, 0)].symbol().to_string())
-        .collect();
-    assert!(rendered.contains("Ctx 25%"), "{rendered:?}");
-    assert!(!rendered.contains("very/long"), "{rendered:?}");
-}
-
-#[test]
-fn medium_footer_does_not_keep_cwd_at_contexts_expense() {
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
-
-    let c = StatusContext {
-        model: Some("astra-model".into()),
-        cwd: Some("~/very/long/project/path".into()),
-        context_window: Some(astra_turn_types::ContextWindowUsage::provider_reported(
-            25_000, 100_000,
-        )),
-        git_branch: Some("feature/long-lived-context-work".into()),
-        ..ctx()
-    };
-    let status = StatusLine::from_context(&c);
-    let area = Rect::new(0, 0, 55, 1);
-    let mut buf = Buffer::empty(area);
-    status.render(area, &mut buf);
-    let rendered: String = (0..area.width)
-        .map(|x| buf[(x, 0)].symbol().to_string())
-        .collect();
-
-    assert!(rendered.contains("Ctx 25%"), "{rendered:?}");
-    assert!(!rendered.contains("project/path"), "{rendered:?}");
-}
-
-#[test]
-fn cost_formats_with_two_decimals_and_dollar_sign() {
-    let c = StatusContext {
-        cost_usd: Some(1.2345),
-        ..ctx()
-    };
-    let plain = StatusLine::from_context(&c).plain();
-    assert!(plain.contains("$1.23"), "cost formatting; got {plain:?}");
 }
 
 #[test]
@@ -514,7 +324,7 @@ fn git_branch_renders_on_right() {
 }
 
 #[test]
-fn right_segments_joined_with_middle_dot() {
+fn status_segments_use_whitespace_instead_of_punctuation_chrome() {
     let c = StatusContext {
         model: Some("M".into()),
         cwd: Some("D".into()),
@@ -528,22 +338,22 @@ fn right_segments_joined_with_middle_dot() {
     );
     let plain = s.plain();
     assert!(
-        plain.contains(" · "),
-        "status segments should be joined with ' · '; got {plain:?}"
+        !plain.contains(" · ") && plain.contains("  "),
+        "colour and whitespace should group status segments; got {plain:?}"
     );
 }
 
 // ─── Composition hygiene ──────────────────────────────────────────
 
 #[test]
-fn empty_context_produces_some_left_content() {
+fn empty_context_produces_no_permanent_chrome() {
     let s = StatusLine::from_context(&ctx());
     assert_eq!(
         s.left
             .iter()
             .map(|seg| seg.text.as_str())
             .collect::<Vec<_>>(),
-        vec!["Ask"]
+        Vec::<&str>::new()
     );
 }
 

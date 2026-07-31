@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/status_line/snapshot_tests.rs
-assertion_line: 153
 expression: "render_ctx(&ctx, 80)"
 ---
-  claude-sonnet-4.6-super… · Ask · ~/…/that/exceeds/limit
+  claude-sonnet-4.6-super…                              ~/…/that/exceeds/limit

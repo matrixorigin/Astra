@@ -1,7 +1,5 @@
 //! Pure status-line composition.
 
-use std::time::Duration;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -17,20 +15,7 @@ pub(crate) use crate::cli::permission_manager::PermissionMode;
 pub(crate) struct StatusContext {
     pub model: Option<String>,
     pub cwd: Option<String>,
-    /// One request's usable context-window occupancy.
-    pub context_window: Option<astra_turn_types::ContextWindowUsage>,
-    pub raw_context_window_tokens: Option<u64>,
-    /// The displayed occupancy belongs to the preceding completed request
-    /// while the next request is still being assembled. Keeping it visible
-    /// avoids a false "unknown/zero" gap, while this bit prevents presenting
-    /// stale evidence as the current request.
-    pub context_window_is_previous: bool,
-    pub current_objective: Option<String>,
-    pub turn_elapsed: Option<Duration>,
     pub permission_mode: PermissionMode,
-    pub turn_active: bool,
-    pub session_id: Option<String>,
-    pub cost_usd: Option<f64>,
     pub git_branch: Option<String>,
     /// Number of approvals currently awaiting a user decision.
     pub pending_approvals: usize,
@@ -291,14 +276,10 @@ fn background_task_count_parts(counts: BackgroundTaskCounts) -> Vec<String> {
     parts
 }
 
-/// Threshold below which the budget chip is dim, above which it warns.
-const BUDGET_WARN_PERCENT: f32 = 75.0;
-const BUDGET_ERROR_PERCENT: f32 = 90.0;
 /// Max cwd segment width before the middle is elided.
 const MODEL_MAX_WIDTH: usize = 24;
 const BRANCH_MAX_WIDTH: usize = 16;
 const CWD_MAX_WIDTH: usize = 26;
-const PRIMARY_LEFT_FLOOR_WIDTH: usize = 14;
 
 fn permission_mode_label(mode: PermissionMode) -> &'static str {
     mode.chip_text()
@@ -322,12 +303,10 @@ impl StatusLine {
         // Permission mode changes whether tools run automatically or ask first.
         // Keep it visible so `/mode` feedback matches the persistent status line.
         match ctx.permission_mode {
-            PermissionMode::Prompt => {
-                out.left.push(Segment::styled(
-                    permission_mode_label(ctx.permission_mode),
-                    muted.add_modifier(Modifier::BOLD),
-                ));
-            }
+            // Prompt is the safe default. Repeating it forever adds no new
+            // information; modes that materially change execution remain
+            // visible and colour-coded.
+            PermissionMode::Prompt => {}
             PermissionMode::Auto => {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
@@ -338,7 +317,7 @@ impl StatusLine {
                 out.left.push(Segment::styled(
                     permission_mode_label(ctx.permission_mode),
                     Style::default()
-                        .fg(theme.accent)
+                        .fg(theme.error)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
@@ -426,48 +405,12 @@ impl StatusLine {
             out.left.push(Segment::styled(parts.join(" · "), style));
         }
 
-        // ── Right: cwd · budget · branch · cost ────────────────────
+        // ── Right: quiet workspace identity ───────────────────────
         if let Some(cwd) = ctx.cwd.as_deref() {
             out.right.push(Segment::styled(
                 truncate_cwd(cwd, CWD_MAX_WIDTH),
                 Style::default().fg(theme.path_file),
             ));
-        }
-
-        if let Some(usage) = ctx.context_window {
-            if usage.limit_tokens > 0 {
-                let pct = (usage.used_tokens as f32 / usage.limit_tokens as f32) * 100.0;
-                let style = if pct >= BUDGET_ERROR_PERCENT {
-                    Style::default().fg(theme.error)
-                } else if pct >= BUDGET_WARN_PERCENT {
-                    Style::default().fg(theme.warn)
-                } else {
-                    muted
-                };
-                let approximation = matches!(
-                    usage.source,
-                    astra_turn_types::ContextWindowUsageSource::Estimated
-                )
-                .then_some("~")
-                .unwrap_or("");
-                let scope = if ctx.context_window_is_previous {
-                    "last "
-                } else {
-                    ""
-                };
-                out.right.push(Segment::styled(
-                    format!(
-                        "Ctx {scope}{approximation}{pct:.0}% · {}/{}{}",
-                        format_tokens_compact(usage.used_tokens),
-                        format_tokens_compact(usage.limit_tokens),
-                        ctx.raw_context_window_tokens
-                            .filter(|raw| *raw != usage.limit_tokens)
-                            .map(|raw| format!(" usable · {} raw", format_tokens_compact(raw)))
-                            .unwrap_or_default(),
-                    ),
-                    style,
-                ));
-            }
         }
 
         if let Some(branch) = ctx.git_branch.as_deref() {
@@ -477,23 +420,17 @@ impl StatusLine {
             ));
         }
 
-        if should_render_cost(ctx) {
-            let cost = ctx.cost_usd.expect("cost checked above");
-            out.right
-                .push(Segment::styled(format!("${cost:.2}"), muted));
-        }
-
         out
     }
 
-    /// Render to a simple string for testing: left joined by ' · ',
-    /// two-space gap, right joined by ' · '.
+    /// Render to a simple string for testing. Colour carries grouping in the
+    /// actual TUI; two spaces preserve that rhythm in plain text.
     pub fn plain(&self) -> String {
         ordered_render_segments(&self.left, &self.right)
             .into_iter()
             .map(|seg| seg.text)
             .collect::<Vec<_>>()
-            .join(" · ")
+            .join("  ")
     }
 
     /// Draw into `area` of `buf`. Left side sticks to the left edge; right
@@ -506,100 +443,58 @@ impl StatusLine {
         }
         let surface = crate::tui::style::footer_surface_style();
         let bg = surface.bg.unwrap_or(Color::Reset);
-        let sep = Span::styled(
-            " · ",
-            Style::default().fg(crate::tui::theme::current().dim).bg(bg),
-        );
-
+        const MARGIN: usize = 2;
+        const INNER_GAP: &str = "  ";
+        let available = usize::from(area.width).saturating_sub(MARGIN * 2);
+        if available == 0 {
+            return;
+        }
+        let mut left_segments = self.left.clone();
         let mut right_segments = self.right.clone();
-        while right_segments.len() > 1
-            && status_line_total_width(&self.left, &right_segments) > usize::from(area.width)
-        {
-            // Context capacity is operational state. Drop optional decoration
-            // by meaning, not by its incidental position in the vector.
-            let remove_index = right_segments
-                .iter()
-                .rposition(|segment| segment.text.starts_with('$'))
-                .or_else(|| {
-                    right_segments
-                        .iter()
-                        .rposition(|segment| segment.text.starts_with("⎇ "))
-                })
-                .or_else(|| {
-                    right_segments
-                        .iter()
-                        .position(|segment| !segment.text.starts_with("Ctx "))
-                });
-            let Some(remove_index) = remove_index else {
-                break;
-            };
-            right_segments.remove(remove_index);
+        fit_clusters(&mut left_segments, &mut right_segments, available);
+
+        let left_spans = join_segments(&left_segments, INNER_GAP, bg);
+        let right_spans = join_segments(&right_segments, INNER_GAP, bg);
+        let left_width = spans_width(&left_spans);
+        let right_width = spans_width(&right_spans);
+
+        if !left_spans.is_empty() {
+            Widget::render(
+                Line::from(left_spans),
+                Rect::new(
+                    area.x.saturating_add(MARGIN as u16),
+                    area.y,
+                    u16::try_from(left_width.min(available)).unwrap_or(area.width),
+                    1,
+                ),
+                buf,
+            );
         }
-        tighten_primary_right_segment(&self.left, &mut right_segments, area.width);
-        let mut ordered = ordered_render_segments(&self.left, &right_segments);
-        loop {
-            let spans = join_segments(&ordered, &sep, 2 /* leading indent */, bg);
-            let used: usize = spans.iter().map(|s| s.content.width()).sum();
-            let total = used + 2; // trailing margin
-            if total <= area.width as usize || ordered.len() <= 1 {
-                let padding = (area.width as usize).saturating_sub(used + 2);
-                let mut all = spans;
-                all.push(Span::styled(" ".repeat(padding), Style::default().bg(bg)));
-                Widget::render(Line::from(all), area, buf);
-                break;
-            }
-            if compact_last_context_segment(&mut ordered, area.width) {
-                continue;
-            }
-            if ordered
-                .last()
-                .is_some_and(|segment| segment.text.starts_with("Ctx "))
-                && ordered.len() > 2
-            {
-                // Keep the primary left identity and capacity signal; shed a
-                // secondary left chip before discarding context altogether.
-                ordered.remove(ordered.len() - 2);
-                continue;
-            }
-            ordered.pop();
+        if !right_spans.is_empty() {
+            let right_x = area
+                .x
+                .saturating_add(area.width)
+                .saturating_sub(MARGIN as u16)
+                .saturating_sub(u16::try_from(right_width).unwrap_or(area.width));
+            Widget::render(
+                Line::from(right_spans),
+                Rect::new(
+                    right_x,
+                    area.y,
+                    u16::try_from(right_width.min(available)).unwrap_or(area.width),
+                    1,
+                ),
+                buf,
+            );
         }
     }
 }
 
-fn should_render_cost(ctx: &StatusContext) -> bool {
-    ctx.cost_usd.is_some() && !is_dense_footer_context(ctx)
-}
-
-fn is_dense_footer_context(ctx: &StatusContext) -> bool {
-    let mut signals = 0usize;
-    if ctx.context_window.is_some() {
-        signals += 1;
-    }
-    if ctx.git_branch.is_some() {
-        signals += 1;
-    }
-    if ctx.cost_usd.is_some() {
-        signals += 1;
-    }
-    signals >= 2
-}
-
-fn join_segments(
-    segments: &[Segment],
-    sep: &Span<'_>,
-    leading_spaces: usize,
-    bg: Color,
-) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
-    if leading_spaces > 0 {
-        spans.push(Span::styled(
-            " ".repeat(leading_spaces),
-            Style::default().bg(bg),
-        ));
-    }
+fn join_segments(segments: &[Segment], separator: &str, bg: Color) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2);
     for (i, seg) in segments.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(sep.content.to_string(), sep.style));
+            spans.push(Span::styled(separator.to_string(), Style::default().bg(bg)));
         }
         spans.push(Span::styled(seg.text.clone(), seg.style.bg(bg)));
     }
@@ -613,71 +508,48 @@ fn ordered_render_segments(left: &[Segment], right: &[Segment]) -> Vec<Segment> 
     ordered
 }
 
-fn status_line_total_width(left: &[Segment], right: &[Segment]) -> usize {
-    let segments = left.len() + right.len();
-    if segments == 0 {
-        return 0;
-    }
-    let segment_width: usize = left
-        .iter()
-        .chain(right.iter())
-        .map(|seg| seg.text.width())
-        .sum();
-    let separator_width = segments.saturating_sub(1) * " · ".width();
-    2 + segment_width + separator_width + 2
+fn spans_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.width()).sum()
 }
 
-fn tighten_ordered_cwd_segment(ordered: &mut [Segment], total_width: u16) {
-    if ordered.len() < 2 {
-        return;
-    }
-
-    let sep_w = " · ".width();
-    let lead_indent = 2usize;
-    let trailing_margin = 2usize;
-    let model_width = ordered[0].text.width();
-    let other_width: usize = ordered
+fn cluster_width(segments: &[Segment]) -> usize {
+    segments
         .iter()
-        .skip(2)
-        .map(|seg| seg.text.width() + sep_w)
-        .sum();
-    let separator_count = ordered.len().saturating_sub(1);
-    let separator_width = separator_count * sep_w;
-    let available = usize::from(total_width)
-        .saturating_sub(lead_indent + trailing_margin + model_width + other_width + separator_width)
-        .max(8);
-
-    if ordered[1].text.width() > available {
-        ordered[1].text = truncate_cwd(&ordered[1].text, available);
-    }
+        .map(|segment| segment.text.width())
+        .sum::<usize>()
+        + segments.len().saturating_sub(1) * 2
 }
 
-fn tighten_primary_right_segment(left: &[Segment], right: &mut [Segment], total_width: u16) {
-    if left.is_empty() || right.is_empty() || right[0].text.starts_with("Ctx ") {
-        return;
+fn fit_clusters(left: &mut Vec<Segment>, right: &mut Vec<Segment>, available: usize) {
+    const CLUSTER_GAP: usize = 3;
+    let total = |left: &[Segment], right: &[Segment]| {
+        cluster_width(left)
+            + cluster_width(right)
+            + usize::from(!left.is_empty() && !right.is_empty()) * CLUSTER_GAP
+    };
+
+    // Branch is decoration; cwd is the primary workspace anchor.
+    while right.len() > 1 && total(left, right) > available {
+        right.pop();
     }
-
-    let sep_w = " · ".width();
-    let lead_indent = 2usize;
-    let trailing_margin = 2usize;
-    let preferred_left = left[0]
-        .text
-        .width()
-        .min(MODEL_MAX_WIDTH.max(PRIMARY_LEFT_FLOOR_WIDTH));
-    let other_right_width: usize = right
-        .iter()
-        .skip(1)
-        .map(|seg| seg.text.width() + sep_w)
-        .sum();
-    let available_for_primary_right = usize::from(total_width)
-        .saturating_sub(lead_indent + trailing_margin + preferred_left + other_right_width);
-
-    if right[0].text.width() <= available_for_primary_right {
-        return;
+    // Secondary left chips yield before model identity on very narrow screens.
+    while left.len() > 1 && total(left, right) > available {
+        left.pop();
     }
-
-    let max_width = available_for_primary_right.max(8);
-    right[0].text = truncate_cwd(&right[0].text, max_width);
+    if total(left, right) > available && !right.is_empty() {
+        if left.is_empty() {
+            right[0].text = truncate_end(&right[0].text, available.max(1));
+            right.truncate(1);
+        } else {
+            right.clear();
+        }
+    }
+    if total(left, right) > available
+        && let Some(primary) = left.first_mut()
+    {
+        primary.text = truncate_end(&primary.text, available.max(1));
+        left.truncate(1);
+    }
 }
 
 /// Shorten `cwd` to at most `max_width` characters by replacing the
@@ -788,120 +660,4 @@ fn truncate_end(text: &str, max_width: usize) -> String {
     }
     let head: String = text.chars().take(max_width - 1).collect();
     format!("{head}…")
-}
-
-fn compact_last_context_segment(ordered: &mut [Segment], total_width: u16) -> bool {
-    let Some(last_text) = ordered.last().map(|seg| seg.text.as_str()) else {
-        return false;
-    };
-    if !last_text.starts_with("Ctx ") {
-        return false;
-    }
-
-    let sep_w = " · ".width();
-    let lead_indent = 2usize;
-    let trailing_margin = 2usize;
-    let fixed_width: usize = ordered
-        .iter()
-        .take(ordered.len().saturating_sub(1))
-        .map(|seg| seg.text.width())
-        .sum::<usize>()
-        + ordered.len().saturating_sub(1) * sep_w
-        + lead_indent
-        + trailing_margin;
-    let available = usize::from(total_width).saturating_sub(fixed_width);
-    if last_text.width() <= available {
-        return false;
-    }
-
-    let compact = compact_context_text(last_text, available);
-    if compact == last_text {
-        return false;
-    }
-    if let Some(last) = ordered.last_mut() {
-        last.text = compact;
-    }
-    true
-}
-
-fn compact_context_text(text: &str, max_width: usize) -> String {
-    if text.width() <= max_width {
-        return text.to_string();
-    }
-    if max_width <= 1 {
-        return "…".to_string();
-    }
-
-    let Some((prefix, tokens)) = text.rsplit_once(" · ") else {
-        return truncate_end(text, max_width);
-    };
-    let limit = tokens
-        .rsplit_once('/')
-        .map(|(_, limit)| limit)
-        .unwrap_or(tokens);
-    let limit_only = format!("…/{limit}");
-    if limit_only.width() > max_width {
-        return truncate_end(&limit_only, max_width);
-    }
-
-    let with_prefix = format!("{prefix} · {limit_only}");
-    if with_prefix.width() <= max_width {
-        with_prefix
-    } else {
-        limit_only
-    }
-}
-
-fn truncate_left_segments_to_fit(
-    segments: &[Segment],
-    right_width: usize,
-    total_width: u16,
-) -> Vec<Segment> {
-    if segments.is_empty() {
-        return Vec::new();
-    }
-
-    let sep_w = " · ".width();
-    let lead_indent = 2usize;
-    let trailing_margin = 2usize;
-    let mut kept = segments.to_vec();
-
-    loop {
-        let other_width: usize = kept
-            .iter()
-            .skip(1)
-            .map(|seg| seg.text.width() + sep_w)
-            .sum();
-        let available = usize::from(total_width)
-            .saturating_sub(right_width + lead_indent + trailing_margin + other_width);
-
-        if kept[0].text.width() <= available {
-            return kept;
-        }
-
-        if kept.len() > 1 {
-            kept.pop();
-            continue;
-        }
-
-        let floor = 10usize;
-        kept[0].text = truncate_end(&kept[0].text, available.max(floor));
-        return kept;
-    }
-}
-
-/// "25000" → "25k"; preserves exact count under 1k.
-fn format_tokens_compact(n: u64) -> String {
-    if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        let rounded_k = (n + 500) / 1_000;
-        if rounded_k >= 1_000 {
-            "1.0M".to_string()
-        } else {
-            format!("{rounded_k}k")
-        }
-    } else {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    }
 }

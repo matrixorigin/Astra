@@ -210,9 +210,10 @@ pub async fn run_session_end_governance(
             Ok(memory_id) if !memory_id.is_empty() => {
                 report.episode_memory_id = Some(memory_id);
                 report.episode_chars = overview.chars().count();
-                eprintln!(
-                    "[session-end] Stored episode ({} chars) for session {session_id}",
-                    report.episode_chars
+                tracing::debug!(
+                    session_id,
+                    episode_chars = report.episode_chars,
+                    "session-end episode stored"
                 );
             }
             Ok(_) => {
@@ -223,7 +224,11 @@ pub async fn run_session_end_governance(
             Err(e) => {
                 safe_to_purge_working = false;
                 report.working_retained_due_to_episode_failure = true;
-                eprintln!("[session-end] store_episode failed: {e}");
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "session-end episode persistence failed; retaining working memory"
+                );
             }
         }
     }
@@ -233,15 +238,24 @@ pub async fn run_session_end_governance(
         match client.purge_working(session_id).await {
             Ok(n) => {
                 report.working_purged = n;
-                eprintln!("[session-end] Purged {n} working memories for session {session_id}");
+                tracing::debug!(
+                    session_id,
+                    working_memories_purged = n,
+                    "session-end working memory purged"
+                );
             }
             Err(e) => {
-                eprintln!("[session-end] Failed to purge working memory: {e}");
+                tracing::warn!(
+                    session_id,
+                    error = %e,
+                    "session-end working-memory purge failed"
+                );
             }
         }
     } else {
-        eprintln!(
-            "[session-end] Retained working memory for session {session_id} because episode persistence failed"
+        tracing::warn!(
+            session_id,
+            "session-end retained working memory because episode persistence failed"
         );
     }
 
@@ -267,16 +281,22 @@ pub async fn run_session_end_governance(
                         report.scenes_stored += 1;
                     }
                     Ok(_) => report.scenes_stored += 1,
-                    Err(e) => {
-                        eprintln!("[session-end] store_scene failed: {e}");
-                    }
+                    Err(e) => tracing::warn!(
+                        session_id,
+                        error = %e,
+                        "session-end scene persistence failed"
+                    ),
                 }
             }
         }
         Err(e) => {
-            // Cooldown rejection is expected under hot activity; log at
-            // warn and keep going.
-            eprintln!("[session-end] reflect skipped/failed: {e}");
+            // Cooldown rejection is expected under hot activity; keep it in
+            // structured debug logs and continue without user-facing noise.
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "session-end reflection skipped or failed"
+            );
         }
     }
 
