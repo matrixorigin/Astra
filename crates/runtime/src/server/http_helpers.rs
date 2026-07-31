@@ -18,12 +18,20 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    sse_error_response_with_retryable(status, message, status_to_sse_retryable(status))
+}
+
+pub(super) fn sse_error_response_with_retryable(
+    status: StatusCode,
+    message: impl Into<String>,
+    retryable: bool,
+) -> Response {
     let message = message.into();
     tracing::warn!(
         target: "astra_runtime::sse",
         http_status = status.as_u16(),
         error_code = status_to_sse_error_code(status),
-        retryable = status_to_sse_retryable(status),
+        retryable,
         message = %message,
         "sse error response emitted to client",
     );
@@ -31,7 +39,7 @@ pub(super) fn sse_error_response(status: StatusCode, message: impl Into<String>)
         "type": "error",
         "message": message,
         "code": status_to_sse_error_code(status),
-        "retryable": status_to_sse_retryable(status),
+        "retryable": retryable,
     })])
 }
 
@@ -216,6 +224,7 @@ pub(super) fn status_to_sse_error_code(status: StatusCode) -> &'static str {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "AUTH_ERROR",
         StatusCode::NOT_FOUND => "NOT_FOUND",
+        StatusCode::CONFLICT => "CONFLICT",
         StatusCode::UNPROCESSABLE_ENTITY => "VALIDATION_ERROR",
         _ => "INTERNAL_ERROR",
     }
@@ -249,6 +258,29 @@ mod tests {
     #[test]
     fn sse_code_not_found() {
         assert_eq!(status_to_sse_error_code(StatusCode::NOT_FOUND), "NOT_FOUND");
+    }
+
+    #[test]
+    fn sse_conflict_has_a_typed_machine_code() {
+        assert_eq!(status_to_sse_error_code(StatusCode::CONFLICT), "CONFLICT");
+    }
+
+    #[tokio::test]
+    async fn sse_retry_override_is_scoped_to_the_call_site() {
+        let response = sse_error_response_with_retryable(StatusCode::CONFLICT, "busy", true);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let event: serde_json::Value = serde_json::from_str(
+            text.strip_prefix("data: ")
+                .and_then(|value| value.strip_suffix("\n\n"))
+                .expect("single SSE data event"),
+        )
+        .expect("json");
+        assert_eq!(event["code"], "CONFLICT");
+        assert_eq!(event["retryable"], true);
+        assert!(!status_to_sse_retryable(StatusCode::CONFLICT));
     }
 
     #[test]

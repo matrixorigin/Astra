@@ -587,7 +587,16 @@ pub(super) async fn dispatch_chat_turn_bridge(
     {
         Ok(response) => response,
         Err((status, error)) => {
-            sse_error_response(status, format!("Chat turn bridge unavailable: {error}"))
+            let context = if status.is_server_error() {
+                "Chat turn bridge unavailable"
+            } else {
+                "Chat turn bridge rejected request"
+            };
+            sse_error_response_with_retryable(
+                status,
+                format!("{context}: {error}"),
+                status == StatusCode::CONFLICT || status_to_sse_retryable(status),
+            )
         }
     }
 }

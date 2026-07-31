@@ -635,12 +635,7 @@ async fn prepare_chat_turn_bridge_identifiers(
     explicit_identity: Option<&ExplicitBridgeTurnIdentity>,
 ) -> Result<(String, String, u32), (StatusCode, Json<ErrorResponse>)> {
     if let Some(identity) = explicit_identity {
-        let inferred_session_turn = crate::server::session_turn::infer_session_turn(
-            state.shared_pool.as_ref(),
-            user_id,
-            session_id,
-        )
-        .await;
+        let next_session_turn = bridge_next_canonical_turn(state, user_id, session_id).await?;
         let now = current_unix_seconds();
         let cache_key = bridge_cache_key(user_id, session_id);
         let mut cache = state.chat_turn_bridge_cache.lock().await;
@@ -662,11 +657,11 @@ async fn prepare_chat_turn_bridge_identifiers(
                 == Some(identity.user_query_event_id.as_str());
         let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
         let minimum_session_turn = if is_continuation || same_identity {
-            cached_turn.unwrap_or(inferred_session_turn)
+            cached_turn.unwrap_or(next_session_turn)
         } else {
             cached_turn
                 .map(|turn| turn.saturating_add(1))
-                .unwrap_or(inferred_session_turn)
+                .unwrap_or(next_session_turn)
         };
         if identity.session_turn < minimum_session_turn {
             return Err(astra_core::error_response_coded_with_metadata(
@@ -704,12 +699,7 @@ async fn prepare_chat_turn_bridge_identifiers(
             identity.session_turn,
         ));
     }
-    let inferred_session_turn = crate::server::session_turn::infer_session_turn(
-        state.shared_pool.as_ref(),
-        user_id,
-        session_id,
-    )
-    .await;
+    let next_session_turn = bridge_next_canonical_turn(state, user_id, session_id).await?;
     let now = current_unix_seconds();
     let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
@@ -734,9 +724,9 @@ async fn prepare_chat_turn_bridge_identifiers(
             })?,
             None => None,
         };
-        cached_turn.unwrap_or(inferred_session_turn)
+        cached_turn.unwrap_or(next_session_turn)
     } else {
-        inferred_session_turn
+        next_session_turn
     };
     let mut updated_entry = prev_entry.unwrap_or_default();
     updated_entry.insert(
@@ -750,6 +740,43 @@ async fn prepare_chat_turn_bridge_identifiers(
     updated_entry.insert("session_turn".to_string(), serde_json::json!(session_turn));
     cache.insert(cache_key, updated_entry, now);
     Ok((turn_chain_id, user_query_event_id, session_turn))
+}
+
+async fn bridge_next_canonical_turn(
+    state: &AppState,
+    user_id: &str,
+    session_id: &str,
+) -> Result<u32, (StatusCode, Json<ErrorResponse>)> {
+    let Some(coordinator) = state.session_context_coordinator.as_ref() else {
+        return Ok(crate::server::session_turn::infer_session_turn(
+            state.shared_pool.as_ref(),
+            user_id,
+            session_id,
+        )
+        .await);
+    };
+    let key = astra_turn_types::SessionKeyV1::owner_session(
+        "server",
+        user_id,
+        session_id,
+        astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+    );
+    let head = coordinator.load_head(&key).await.map_err(|error| {
+        error_response_coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("failed to load canonical bridge head: {error}"),
+            "session_head_unavailable",
+        )
+    })?;
+    head.map_or(Ok(1), |head| {
+        head.cursor.completed_turn.checked_add(1).ok_or_else(|| {
+            error_response_coded(
+                StatusCode::CONFLICT,
+                "canonical bridge turn sequence is exhausted",
+                "session_turn_exhausted",
+            )
+        })
+    })
 }
 
 fn cached_bridge_session_turn(

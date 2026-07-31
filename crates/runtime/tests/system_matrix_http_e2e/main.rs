@@ -30,11 +30,11 @@
 //!   `tool_request` callbacks, then accepts the second callback result before the first while the
 //!   initial SSE handoff still ends with `has_tool_calls=true`.
 //! - **`e2e_matrix_same_session_concurrent_turns_isolated`** — two concurrent `POST /chat/turn`
-//!   requests target the same session; assert both complete with distinct persisted `event_id` and
-//!   `causal_chain_id` values instead of cross-wiring each other.
+//!   requests target the same session; assert one canonical writer commits, the other receives a
+//!   typed retryable conflict, and its serial retry persists a distinct causal chain.
 //! - **`e2e_matrix_same_session_waiting_turn_overlap_isolated`** — a same-session tool-backed
-//!   handoff can overlap a second plain turn without leaking the second turn's response into the
-//!   first stream (or vice versa).
+//!   handoff fences a second plain writer with a typed retryable conflict without leaking either
+//!   turn's data into the other stream.
 //! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), duplicate
 //!   register, bad login, and successful login after negative calls (replaces stub `auth_contract` /
 //!   `session_contract` negative coverage).

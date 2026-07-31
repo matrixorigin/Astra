@@ -23,6 +23,20 @@ fn parse_sse_events(raw: &str) -> Vec<Value> {
         .collect()
 }
 
+fn has_turn_complete(raw: &str) -> bool {
+    parse_sse_events(raw)
+        .iter()
+        .any(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+}
+
+fn has_retryable_conflict(raw: &str) -> bool {
+    parse_sse_events(raw).iter().any(|event| {
+        event.get("type").and_then(Value::as_str) == Some("error")
+            && event.get("code").and_then(Value::as_str) == Some("CONFLICT")
+            && event.get("retryable").and_then(Value::as_bool) == Some(true)
+    })
+}
+
 pub async fn run_session_cancel_then_delete() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -901,7 +915,8 @@ pub async fn run_same_session_concurrent_turns_isolated() {
         "messages": [{ "role": "user", "content": "same-session overlap request A" }],
         "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
-            "full_text": "Overlap response A"
+            "full_text": "Overlap response A",
+            "delay_ms": 250
         }]
     });
     let payload_b = json!({
@@ -911,7 +926,8 @@ pub async fn run_same_session_concurrent_turns_isolated() {
         "messages": [{ "role": "user", "content": "same-session overlap request B" }],
         "model_selection": seeded_model_selection(ctx),
         "test_llm_rounds": [{
-            "full_text": "Overlap response B"
+            "full_text": "Overlap response B",
+            "delay_ms": 250
         }]
     });
 
@@ -933,19 +949,13 @@ pub async fn run_same_session_concurrent_turns_isolated() {
 
         let mut stream = response.into_body().into_data_stream();
         let mut acc = Vec::new();
-        let mut saw_turn_complete = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.expect("overlap sse chunk");
             acc.extend_from_slice(&chunk);
             if String::from_utf8_lossy(&acc).contains("\"type\":\"turn_complete\"") {
-                saw_turn_complete = true;
                 break;
             }
         }
-        assert!(
-            saw_turn_complete,
-            "overlap turn never reached turn_complete"
-        );
         String::from_utf8_lossy(&acc).into_owned()
     };
 
@@ -953,16 +963,57 @@ pub async fn run_same_session_concurrent_turns_isolated() {
         collect_turn(
             ctx.app.clone(),
             b.auth_header.clone(),
-            payload_a,
+            payload_a.clone(),
             test_secret.clone(),
         ),
         collect_turn(
             ctx.app.clone(),
             b.auth_header.clone(),
-            payload_b,
-            test_secret
+            payload_b.clone(),
+            test_secret.clone()
         ),
     );
+
+    let completed_a = has_turn_complete(&raw_a);
+    let completed_b = has_turn_complete(&raw_b);
+    assert_eq!(
+        usize::from(completed_a) + usize::from(completed_b),
+        1,
+        "one concurrent writer must commit and one must be fenced: A={raw_a}; B={raw_b}"
+    );
+    assert_eq!(
+        usize::from(has_retryable_conflict(&raw_a)) + usize::from(has_retryable_conflict(&raw_b)),
+        1,
+        "the losing writer must receive one typed retryable conflict: A={raw_a}; B={raw_b}"
+    );
+
+    let (raw_a, raw_b) = if completed_a {
+        let retried_b = collect_turn(
+            ctx.app.clone(),
+            b.auth_header.clone(),
+            payload_b,
+            test_secret.clone(),
+        )
+        .await;
+        assert!(
+            has_turn_complete(&retried_b),
+            "the fenced turn must succeed after the winner commits: {retried_b}"
+        );
+        (raw_a, retried_b)
+    } else {
+        let retried_a = collect_turn(
+            ctx.app.clone(),
+            b.auth_header.clone(),
+            payload_a,
+            test_secret.clone(),
+        )
+        .await;
+        assert!(
+            has_turn_complete(&retried_a),
+            "the fenced turn must succeed after the winner commits: {retried_a}"
+        );
+        (retried_a, raw_b)
+    };
 
     assert!(
         raw_a.contains("Overlap response A"),
@@ -1089,19 +1140,13 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
 
         let mut stream = response.into_body().into_data_stream();
         let mut acc = Vec::new();
-        let mut saw_turn_complete = false;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.expect("waiting-overlap sse chunk");
             acc.extend_from_slice(&chunk);
             if String::from_utf8_lossy(&acc).contains("\"type\":\"turn_complete\"") {
-                saw_turn_complete = true;
                 break;
             }
         }
-        assert!(
-            saw_turn_complete,
-            "waiting-overlap turn never reached turn_complete"
-        );
         String::from_utf8_lossy(&acc).into_owned()
     };
 
@@ -1211,12 +1256,16 @@ pub async fn run_same_session_waiting_turn_overlap_isolated() {
         "tool-backed overlap turn should not leak the plain-turn response: {primary_raw}"
     );
     assert!(
-        overlap_raw.contains("Waiting overlap plain turn finished."),
-        "overlap turn should keep its own final text: {overlap_raw}"
+        has_retryable_conflict(&overlap_raw),
+        "a second writer must receive a typed retryable conflict while the tool turn owns the reservation: {overlap_raw}"
     );
     assert!(
         !overlap_raw.contains("tc-overlap-wait-1"),
         "plain overlap turn should not leak the tool-backed request id: {overlap_raw}"
+    );
+    assert!(
+        !overlap_raw.contains("Waiting overlap plain turn finished."),
+        "a fenced overlap must not execute its model fixture: {overlap_raw}"
     );
 
     ctx.pool.close().await;
