@@ -13,14 +13,27 @@ fn enqueue_ingestion(_state: &SessionState, event: &session_journal::JournalEven
 /// represented by an appended journal batch. The local journal is canonical;
 /// the projector owns durable outbox batching and crash recovery by source
 /// watermark, so this turn-local call never waits for its lock or fsync.
-fn enqueue_ingestion_batch(_state: &SessionState, events: &[session_journal::JournalEvent]) {
-    enqueue_ingestion_events(events);
+fn enqueue_ingestion_batch(state: &SessionState, events: &[session_journal::JournalEvent]) {
+    let owner_scope = state
+        .journal
+        .as_ref()
+        .map(|journal| journal.owner_scope().clone())
+        .unwrap_or_else(astra_services::local_owner_scope);
+    enqueue_ingestion_events_for_owner(&owner_scope, events);
 }
 
 /// Schedule journal-to-outbox projection for records written by a deferred
 /// local sidecar. The journal is already durable at this point; this is only a
 /// latency hint for the independently recoverable projector.
 pub(crate) fn enqueue_ingestion_events(events: &[session_journal::JournalEvent]) {
+    let owner_scope = astra_services::local_owner_scope();
+    enqueue_ingestion_events_for_owner(&owner_scope, events);
+}
+
+fn enqueue_ingestion_events_for_owner(
+    owner_scope: &astra_services::OwnerScope,
+    events: &[session_journal::JournalEvent],
+) {
     let mut source_sessions = BTreeSet::new();
     for event in events {
         if event
@@ -39,21 +52,39 @@ pub(crate) fn enqueue_ingestion_events(events: &[session_journal::JournalEvent])
     }
     let scheduled = !source_sessions.is_empty()
         && source_sessions.iter().all(|session_id| {
-            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion(session_id).accepted()
+            crate::cli::cloud_sync::schedule_sync_outbox_journal_ingestion_for_owner(
+                owner_scope,
+                session_id,
+            )
+            .accepted()
         });
     if !scheduled {
         // Non-interactive one-shot/tests can append journals without a Tokio
         // runtime. They still need a correct durable outbox boundary; this
         // fallback is outside the live TUI completion path.
-        enqueue_ingestion_batch_without_runtime(events);
+        enqueue_ingestion_batch_without_runtime(owner_scope, events);
     }
 }
 
-fn enqueue_ingestion_batch_without_runtime(events: &[session_journal::JournalEvent]) {
+fn enqueue_ingestion_batch_without_runtime(
+    owner_scope: &astra_services::OwnerScope,
+    events: &[session_journal::JournalEvent],
+) {
     if events.is_empty() {
         return;
     }
-    let store = astra_services::SyncOutboxStore::local();
+    let store = match astra_services::SyncOutboxStore::for_owner(owner_scope) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                owner_id = owner_scope.id(),
+                "failed to resolve owner-scoped sync outbox"
+            );
+            return;
+        }
+    };
     let mut deliverable = Vec::with_capacity(events.len());
     for event in events {
         if event
@@ -103,10 +134,15 @@ pub(crate) fn enqueue_ingestion_batch_pub(
 }
 
 pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
-    _state: &SessionState,
+    state: &SessionState,
     event: &session_journal::JournalEvent,
 ) {
-    enqueue_ingestion_batch_without_runtime(std::slice::from_ref(event));
+    let owner_scope = state
+        .journal
+        .as_ref()
+        .map(|journal| journal.owner_scope().clone())
+        .unwrap_or_else(astra_services::local_owner_scope);
+    enqueue_ingestion_batch_without_runtime(&owner_scope, std::slice::from_ref(event));
 }
 
 #[derive(Clone)]
@@ -198,11 +234,12 @@ pub(crate) fn build_bridge_pipeline_journal_events(
             .take(turns.len().saturating_sub(1))
             .filter(|turn| turn.model_id == model_id)
             .filter_map(|turn| {
-                let total_input = turn
-                    .usage
-                    .input_tokens
-                    .saturating_add(turn.usage.cached_input_tokens)
-                    .saturating_add(turn.usage.cache_creation_tokens);
+                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+                    turn.usage.input_tokens,
+                    turn.usage.cached_input_tokens,
+                    turn.usage.cache_creation_tokens,
+                )
+                .total_input_tokens();
                 (total_input > 0)
                     .then_some(turn.usage.cached_input_tokens as f64 / total_input as f64)
             })
@@ -405,10 +442,12 @@ fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<Journal
                 let Some(usage) = journal_usage_from_response_event(event) else {
                     continue;
                 };
-                let total_input = usage
-                    .input_tokens
-                    .saturating_add(usage.cached_input_tokens)
-                    .saturating_add(usage.cache_creation_tokens);
+                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+                    usage.input_tokens,
+                    usage.cached_input_tokens,
+                    usage.cache_creation_tokens,
+                )
+                .total_input_tokens();
                 let Some(mut snapshot) = journal_prompt_snapshot_from_messages(
                     &messages,
                     &tools,
@@ -475,12 +514,49 @@ fn journal_prompt_snapshot_from_messages(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_one_shot_journal_events, build_bridge_pipeline_journal_events};
+    use super::{
+        append_one_shot_journal_events, build_bridge_pipeline_journal_events, enqueue_ingestion_pub,
+    };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
     use astra_services::session_journal;
+
+    #[serial_test::serial]
+    #[test]
+    fn owner_switch_cannot_redirect_an_open_journal_to_another_outbox() {
+        let (_tmp, _journal_guard) = crate::tests::isolated_sessions_dir();
+        let _owner_a_guard =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "profile-a",
+                Some("account-a"),
+            )
+            .unwrap();
+        let owner_a = astra_services::local_owner_scope();
+        let session_id = "stable-owner-ingestion";
+        let event = session_journal::JournalEvent::session_start(Some(session_id), Some("model-a"));
+        let writer = session_journal::JournalWriter::new(session_id).unwrap();
+        writer.append(&event).unwrap();
+
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id(session_id);
+        state.journal = Some(writer);
+
+        let _owner_b_guard =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "profile-b",
+                Some("account-b"),
+            )
+            .unwrap();
+        let owner_b = astra_services::local_owner_scope();
+        enqueue_ingestion_pub(&state, &event);
+
+        let outbox_a = astra_services::SyncOutboxStore::for_owner(&owner_a).unwrap();
+        let outbox_b = astra_services::SyncOutboxStore::for_owner(&owner_b).unwrap();
+        assert_eq!(outbox_a.status().unwrap().pending, 1);
+        assert_eq!(outbox_b.status().unwrap().pending, 0);
+    }
 
     #[test]
     fn build_bridge_pipeline_journal_events_surfaces_unreadable_journal() {

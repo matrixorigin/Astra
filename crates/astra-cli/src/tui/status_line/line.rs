@@ -19,6 +19,7 @@ pub(crate) struct StatusContext {
     pub cwd: Option<String>,
     /// One request's usable context-window occupancy.
     pub context_window: Option<astra_turn_types::ContextWindowUsage>,
+    pub raw_context_window_tokens: Option<u64>,
     /// The displayed occupancy belongs to the preceding completed request
     /// while the next request is still being assembled. Keeping it visible
     /// avoids a false "unknown/zero" gap, while this bit prevents presenting
@@ -456,9 +457,13 @@ impl StatusLine {
                 };
                 out.right.push(Segment::styled(
                     format!(
-                        "Ctx {scope}{approximation}{pct:.0}% · {}/{}",
+                        "Ctx {scope}{approximation}{pct:.0}% · {}/{}{}",
                         format_tokens_compact(usage.used_tokens),
                         format_tokens_compact(usage.limit_tokens),
+                        ctx.raw_context_window_tokens
+                            .filter(|raw| *raw != usage.limit_tokens)
+                            .map(|raw| format!(" usable · {} raw", format_tokens_compact(raw)))
+                            .unwrap_or_default(),
                     ),
                     style,
                 ));

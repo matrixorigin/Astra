@@ -333,6 +333,7 @@ mod tests {
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(128_000),
+                    max_completion_tokens: Some(16_384),
                     request_headers: Some(serde_json::Map::from_iter([(
                         "x-model-mode".to_string(),
                         Value::String("coding".to_string()),

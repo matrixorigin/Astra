@@ -70,7 +70,7 @@ use astra_turn_core::bridge_rate_limit_cooldown::{
     CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
 };
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
-use astra_turn_core::compaction_types::CompactionTier;
+use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
@@ -91,6 +91,61 @@ fn observed_ttft_ms(
     first_stream_update_ms
         .or(first_visible_text_ms)
         .unwrap_or(completed_ms)
+}
+
+fn apply_pre_turn_summary(
+    state: &mut AgenticLoopState,
+    pressure: f64,
+    summary_text: String,
+) -> CompactionEvent {
+    let max_tokens = state.max_turn_input_tokens;
+    let (tokens_before, old_count) = (
+        crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            max_tokens,
+        )
+        .1,
+        state.messages.len(),
+    );
+    let keep_recent = (old_count / 4).max(4);
+    let spill_count =
+        crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
+            &state.messages,
+            old_count.saturating_sub(keep_recent),
+        );
+    let spilled_count = state.messages.drain(..spill_count).count();
+    state.messages.insert(
+        0,
+        serde_json::json!({
+            "role": "system",
+            "content": format!(
+                "[Conversation compacted — {} messages summarized]\n\n{}",
+                spilled_count,
+                summary_text,
+            )
+        }),
+    );
+    state.compact_tier_applied = CompactionTier::CompactHistory;
+
+    let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+        &state.messages,
+        state.pinned_tool_schema_tokens as usize,
+        max_tokens,
+    )
+    .1;
+    let tokens_freed = tokens_before.saturating_sub(tokens_after);
+    let messages_removed = old_count.saturating_sub(state.messages.len());
+    CompactionEvent::new(
+        CompactionKind::PreTurnSummary,
+        pressure,
+        tokens_freed,
+        tokens_before,
+        max_tokens,
+        messages_removed,
+        state.messages.len(),
+        vec!["llm_summary".to_string()],
+    )
 }
 
 fn insert_event_fields(event: &mut Map<String, Value>, fields: &Map<String, Value>) {
@@ -184,6 +239,16 @@ fn llm_main_attempt_label(attempt_in_round: u32) -> &'static str {
     } else {
         "retry"
     }
+}
+
+/// Identity for the next logical provider request in this agent turn.
+///
+/// The journal buffer advances only after a completed round is projected.
+/// Provider admission happens before that projection and must instead use the
+/// attempted-call counter, which advances on every host return (including a
+/// textless response that triggers one bounded settlement round).
+fn next_provider_request_round(state: &AgenticLoopState) -> u32 {
+    state.llm_rounds_completed
 }
 
 fn is_llm_provider_admission_error(error: &astra_core::ClassifiedError) -> bool {
@@ -310,9 +375,90 @@ fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
     // Provider tokenizers differ; the important invariant is not exact
     // accounting, it is that each LLM call's manifest records a non-zero,
     // queryable tool-schema budget when tools were actually exposed.
-    serde_json::to_string(tools)
-        .map(|value| u64::from(astra_turn_core::section_types::estimate_text_tokens(&value)))
-        .unwrap_or(0)
+    let site = astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization;
+    match serde_json::to_string(tools) {
+        Ok(value) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    value.len().try_into().unwrap_or(u64::MAX),
+                    tools.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                );
+            }
+            u64::from(astra_turn_core::section_types::estimate_text_tokens(&value))
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            0
+        }
+    }
+}
+
+fn record_existing_server_artifact(
+    site: astra_core::history_work::HistoryWorkSite,
+    bytes: usize,
+    rows: usize,
+) {
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            site,
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+            u64::try_from(rows).unwrap_or(u64::MAX),
+            0,
+        );
+    }
+}
+
+fn clone_server_fork_tool_schemas(tools: &[Value]) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ServerForkToolSchemaClone,
+        tools,
+    );
+    tools.to_vec()
+}
+
+fn record_server_context_trace_clone(trace: Option<&Value>) {
+    if let Some(trace) = trace {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ServerContextTraceClone,
+            trace,
+        );
+    }
+}
+
+fn clone_server_context_trace(trace: Option<&Value>) -> Option<Value> {
+    record_server_context_trace_clone(trace);
+    trace.cloned()
+}
+
+fn build_server_capture_request_json(
+    messages: &[Value],
+    tools: &[Value],
+    max_output_tokens: Option<usize>,
+) -> Value {
+    let request = crate::turn::llm::exchange_capture::build_capture_request_json(
+        messages,
+        tools,
+        max_output_tokens,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ServerRequestCaptureClone,
+        &request,
+    );
+    request
+}
+
+#[cfg(test)]
+fn server_fork_tool_schema_hash_dimensions(
+    tool_schemas: &[astra_turn_core::fork_prefix::ToolSchemaEntry],
+) -> (usize, usize) {
+    (
+        tool_schemas.iter().fold(0_usize, |bytes, schema| {
+            bytes.saturating_add(schema.canonical_bytes.len())
+        }),
+        tool_schemas.len(),
+    )
 }
 
 fn record_full_llm_request_event(
@@ -369,7 +515,7 @@ fn record_full_llm_request_event(
                 "turn_chain_id": trace.turn_chain_id,
                 "user_query_event_id": trace.user_query_event_id,
             },
-            "request": crate::turn::llm::exchange_capture::build_capture_request_json(
+            "request": build_server_capture_request_json(
                 messages,
                 tools,
                 max_output_tokens,
@@ -505,6 +651,8 @@ struct ResolvedTurnLlmConfig {
     /// did not provide model metadata; callers must choose an explicit fallback
     /// policy rather than inferring from the model name.
     context_window: Option<u32>,
+    /// Catalog-declared completion ceiling used by the exact context policy.
+    max_completion_tokens: Option<u32>,
 }
 
 impl ResolvedTurnLlmConfig {
@@ -654,6 +802,7 @@ async fn resolve_llm_model_for_turn(
             completions_url_override: execution.completions_url_override.clone(),
             request_timeout: execution.request_timeout_ms.map(Duration::from_millis),
             context_window: execution.context_window,
+            max_completion_tokens: execution.max_completion_tokens,
         });
     }
     let resolved =
@@ -674,6 +823,7 @@ async fn resolve_llm_model_for_turn(
         completions_url_override: None,
         request_timeout: None,
         context_window: resolved.context_window,
+        max_completion_tokens: resolved.max_completion_tokens,
     })
 }
 
@@ -995,6 +1145,8 @@ pub struct ServerAgenticLoopHost {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    inference_ledger_persistence:
+        Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     resolved_model_name: Option<String>,
@@ -1258,6 +1410,8 @@ pub struct ServerAgenticLoopHostBuilder {
     matrixone: MatrixOneSettings,
     encryptor: Arc<FernetTokenEncryptor>,
     shared_pool: Option<SharedPool>,
+    inference_ledger_persistence:
+        Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     edge_tools: Vec<Value>,
@@ -1317,6 +1471,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone,
             encryptor,
             shared_pool: None,
+            inference_ledger_persistence: None,
             model_override: None,
             admitted_model_execution: None,
             edge_tools: Vec::new(),
@@ -1390,6 +1545,15 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_test_inference_ledger(
+        mut self,
+        persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
+    ) -> Self {
+        self.inference_ledger_persistence = Some(Arc::new(persistence));
         self
     }
 
@@ -1694,6 +1858,7 @@ impl ServerAgenticLoopHostBuilder {
             matrixone: self.matrixone,
             encryptor: self.encryptor,
             shared_pool: self.shared_pool,
+            inference_ledger_persistence: self.inference_ledger_persistence,
             model_override: self.model_override,
             admitted_model_execution: self.admitted_model_execution,
             resolved_model_name: None,
@@ -2144,13 +2309,8 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         operation_id: &'static str,
     ) -> Option<RuntimeSummaryClient> {
-        let ledger = match crate::turn::llm::durable::DurableInferenceLedger::from_optional(
-            self.shared_pool.as_ref(),
-            self.admitted_model_execution.as_ref(),
-            &self.user_id,
-        ) {
-            Ok(Some(ledger)) => ledger,
-            Ok(None) => return None,
+        let ledger = match self.required_inference_ledger() {
+            Ok(ledger) => ledger,
             Err(error) => {
                 tracing::warn!(
                     target: "astra::inference",
@@ -2173,6 +2333,27 @@ impl ServerAgenticLoopHost {
                 logical_attempt: 0,
             },
         ))
+    }
+
+    fn required_inference_ledger(
+        &self,
+    ) -> Result<crate::turn::llm::durable::DurableInferenceLedger, astra_core::ClassifiedError>
+    {
+        match self.inference_ledger_persistence.as_ref() {
+            Some(persistence) => {
+                crate::turn::llm::durable::DurableInferenceLedger::required_with_persistence(
+                    self.shared_pool.as_ref(),
+                    self.admitted_model_execution.as_ref(),
+                    &self.user_id,
+                    Some(persistence.clone()),
+                )
+            }
+            None => crate::turn::llm::durable::DurableInferenceLedger::required(
+                self.shared_pool.as_ref(),
+                self.admitted_model_execution.as_ref(),
+                &self.user_id,
+            ),
+        }
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -3040,7 +3221,7 @@ impl ServerAgenticLoopHost {
             &self.always_load_tool_names,
         );
         self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
-        self.last_turn_tool_schemas = annotated_tools.clone();
+        self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&annotated_tools);
         let (provider, model) = self
             .mock_provider
             .clone()
@@ -3058,6 +3239,7 @@ impl ServerAgenticLoopHost {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         };
         let wire_messages = self.assemble_llm_messages(
             system_msgs.clone(),
@@ -3068,15 +3250,21 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
         );
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-            crate::turn::llm::context::augment_manifest_trace_with_wire(
+            crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                 trace,
                 &wire_messages,
                 &annotated_tools,
+                if self.full_llm_capture {
+                    crate::turn::llm::context::WireTraceDetail::Debug
+                } else {
+                    crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                },
             );
         }
         self.emit_context_meta(
             &mock_pipeline.breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
+            &[],
         );
         // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
         // post-compact attachments]`. For the capture's downstream
@@ -3152,7 +3340,9 @@ impl ServerAgenticLoopHost {
                     error_message: Some(error.message.clone()),
                     system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
                     system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
-                    context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
+                    context_manifest_trace: clone_server_context_trace(
+                        state.last_llm_context_manifest_trace.as_ref(),
+                    ),
                     ..Default::default()
                 };
                 return Ok(HostTurnResult {
@@ -3242,7 +3432,9 @@ impl ServerAgenticLoopHost {
             has_usage: true,
             system_prompt_tokens: Some(mock_pipeline.breakdown.total_tokens),
             system_prompt_breakdown: serde_json::to_value(&mock_pipeline.breakdown).ok(),
-            context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
+            context_manifest_trace: clone_server_context_trace(
+                state.last_llm_context_manifest_trace.as_ref(),
+            ),
             ..Default::default()
         };
 
@@ -4170,11 +4362,16 @@ impl ServerAgenticLoopHost {
         &mut self,
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
         manifest_trace: Option<&Value>,
+        compactions: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
     ) {
-        self.emit_progress_event(crate::turn::llm::context::context_meta_event(
-            breakdown,
-            manifest_trace,
-        ));
+        record_server_context_trace_clone(manifest_trace);
+        self.emit_progress_event(
+            crate::turn::llm::context::context_meta_event_with_compactions(
+                breakdown,
+                manifest_trace,
+                compactions,
+            ),
+        );
     }
 
     /// Compute the tool schemas visible for the current turn after applying
@@ -4185,6 +4382,10 @@ impl ServerAgenticLoopHost {
     /// constraints and are pruned here; skill `allowed_tools` is only a hint
     /// and must not silently hide otherwise-callable tools from the model.
     fn filtered_turn_tools(&self, restricted_tools: &HashSet<String>) -> Vec<Value> {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ServerToolPolicySchemaClone,
+            &self.tool_schemas,
+        );
         filter_tool_schemas_by_excluded_names(self.tool_schemas.clone(), restricted_tools)
     }
 
@@ -4244,7 +4445,15 @@ impl ServerAgenticLoopHost {
         &self,
     ) -> Vec<astra_turn_core::introspect::ToolAdmissionSnapshotEntry> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ServerToolAdmissionSnapshotClone,
+            &self.admission_tool_schemas,
+        );
         let mut snapshot_schemas = self.admission_tool_schemas.clone();
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ServerToolAdmissionSnapshotClone,
+            &self.tool_schemas,
+        );
         append_tool_schemas_unique(&mut snapshot_schemas, self.tool_schemas.clone());
         let tool_names = snapshot_schemas
             .iter()
@@ -4708,6 +4917,34 @@ impl ServerAgenticLoopHost {
         memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
+        self.run_turn_pipeline_with_model_limits_and_session_memory(
+            state,
+            visible_tools,
+            provider,
+            model_name,
+            model_context_window,
+            None,
+            cache_capability,
+            session_memory_entry,
+            memory_entries,
+            user_content,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_turn_pipeline_with_model_limits_and_session_memory(
+        &mut self,
+        state: &mut AgenticLoopState,
+        visible_tools: &[Value],
+        provider: &str,
+        model_name: &str,
+        model_context_window: Option<u32>,
+        model_max_completion_tokens: Option<u32>,
+        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
+        memory_entries: &[astra_turn_core::context_sources::MemoryEntry],
+        user_content: &str,
+    ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
         let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
@@ -4760,6 +4997,7 @@ impl ServerAgenticLoopHost {
                 provider,
                 model_name,
                 context_window: model_context_window,
+                max_completion_tokens: model_max_completion_tokens,
                 cache_capability,
                 user_content,
                 query_source: "agentic_loop",
@@ -5302,12 +5540,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             has_session_memory = initial_session_memory_entry.is_some(),
             "turn pipeline: session memory loaded"
         );
-        let turn_pipeline = self.run_turn_pipeline_with_cache_capability_and_session_memory(
+        let turn_pipeline = self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
             &visible_tools,
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.context_window,
+            llm_cfg.max_completion_tokens,
             llm_cfg.cache_capability,
             initial_session_memory_entry.clone(),
             &memoria_prefetch_entries,
@@ -5343,6 +5582,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // from the pure assembly step. `execute_turn` orchestrates both so
         // the wire-building flow is readable and each phase is individually
         // testable / replaceable.
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ServerCompactionFixedContextClone,
+            &final_system_messages,
+        );
         let mut compaction_fixed_context = final_system_messages.clone();
         compaction_fixed_context.extend(final_volatile_preamble.iter().cloned());
         let compact_result = self
@@ -5355,6 +5598,31 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg,
             )
             .await;
+        // One Server HTTP turn may execute multiple LLM rounds. Keep repeated
+        // snapshots stable within a round without conflating later compactions.
+        let context_compactions = crate::turn::wire_assembly::observe_context_compaction(
+            format!("server_wire:{}", state.current_round_index),
+            CompactionKind::WireAssembly,
+            &pipeline_messages,
+            &compact_result,
+            &compaction_fixed_context,
+            &visible_tools,
+            Some(
+                crate::prompts::budget_for_model_with_metadata(
+                    Some(&llm_cfg.model_name),
+                    llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
+                )
+                .window_policy(),
+            ),
+        )
+        .into_iter()
+        .collect::<Vec<_>>();
+        crate::turn::agentic_loop::execution_phase::record_context_compactions(
+            self,
+            state,
+            &context_compactions,
+        );
         if let Some(rerun) = crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
             compact_result.session_memory_context.as_deref(),
             initial_session_memory_entry.as_ref(),
@@ -5362,12 +5630,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &memoria_prefetch_entries,
             &compact_result.retrieved_memory_entries,
             |session_memory_entry, memory_entries| {
-                self.run_turn_pipeline_with_cache_capability_and_session_memory(
+                self.run_turn_pipeline_with_model_limits_and_session_memory(
                     state,
                     &visible_tools,
                     &llm_cfg.provider,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     llm_cfg.cache_capability,
                     session_memory_entry,
                     memory_entries,
@@ -5406,9 +5675,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
-        let budget = crate::prompts::budget_for_model_with_override(
+        let budget = crate::prompts::budget_for_model_with_metadata(
             Some(&llm_cfg.model_name),
             llm_cfg.context_window,
+            llm_cfg.max_completion_tokens,
         );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
@@ -5444,28 +5714,35 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // built, so syncing earlier can admit or reject tools the model did
         // not actually see this turn.
         self.sync_valid_tools_to_wire_surface_for_state(&final_tools, state);
-        self.last_turn_tool_schemas = final_tools.clone();
+        self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&final_tools);
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                crate::turn::llm::context::augment_manifest_trace_with_wire(
+                crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
                     trace,
                     &llm_messages,
                     &final_tools,
+                    if self.full_llm_capture {
+                        crate::turn::llm::context::WireTraceDetail::Debug
+                    } else {
+                        crate::turn::llm::context::WireTraceDetail::MetricsOnly
+                    },
                 );
-                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget(
+                crate::turn::wire_assembly::augment_manifest_trace_with_wire_budget_and_metadata(
                     trace,
                     &llm_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     max_output_tokens,
                 )
             } else {
-                crate::turn::wire_assembly::wire_budget_status(
+                crate::turn::wire_assembly::wire_budget_status_with_metadata(
                     &llm_messages,
                     &final_tools,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
+                    llm_cfg.max_completion_tokens,
                     max_output_tokens,
                 )
             };
@@ -5477,10 +5754,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "final wire estimate exceeds the model limit; provider tokenizer remains authoritative"
             );
         }
-        self.emit_context_meta(
-            &final_system_prompt_breakdown,
-            state.last_llm_context_manifest_trace.as_ref(),
-        );
         state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
@@ -5527,11 +5800,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
             }
-            let prompt_round = state
-                .turn_event_buffer
-                .as_ref()
-                .map(|buffer| buffer.current_round())
-                .unwrap_or(state.llm_rounds_completed);
+            let prompt_round = next_provider_request_round(state);
+            let attempt_wire_budget_status =
+                final_wire_budget_status.with_requested_output_tokens(effective_max_output);
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::wire_assembly::set_manifest_wire_budget(
+                    trace,
+                    attempt_wire_budget_status,
+                );
+            }
             let prompt_request_plan =
                 astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
@@ -5544,7 +5821,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     tools: &final_tools,
                     max_output_tokens: Some(effective_max_output),
                 })
-                .ok();
+                .map_err(|error| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        format!("failed to plan prompt delta projection: {error}"),
+                    )
+                })?;
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::llm::context::clear_manifest_provider_request(trace);
+            }
+            self.emit_context_meta(
+                &final_system_prompt_breakdown,
+                state.last_llm_context_manifest_trace.as_ref(),
+                &context_compactions,
+            );
             record_full_llm_request_event(
                 state,
                 self.full_llm_capture,
@@ -5558,61 +5848,54 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
-            if let Some(prompt_request_plan) = prompt_request_plan.as_ref() {
-                crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
-                    "server_loop_host",
-                    self.shared_pool.clone(),
-                    astra_services::PromptRequestPersistInput {
+            crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                "server_loop_host",
+                self.shared_pool.clone(),
+                astra_services::PromptRequestPersistInput {
+                    session_id: self.session_id.clone(),
+                    user_id: self.user_id.clone(),
+                    run_id: state.current_run_id.clone(),
+                    turn: state.session_turn,
+                    round: prompt_round,
+                    attempt: attempt_in_round,
+                    source: "server_loop_host".to_string(),
+                    model: llm_cfg.model_name.clone(),
+                    provider: llm_cfg.provider.clone(),
+                },
+                prompt_request_plan,
+            );
+            let durable_ledger = self.required_inference_ledger()?;
+            let run_id = state.current_run_id.clone().ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "durable inference admission failed: Server execution has no durable run identity",
+                )
+            })?;
+            let request_context =
+                crate::turn::llm::context::model_request_context_seed_from_manifest(
+                    astra_services::ModelRequestTopology::ServerOnly,
+                    state.last_llm_context_manifest_trace.as_ref(),
+                );
+            let durable_invocation = durable_ledger
+                .admit_with_request_context(
+                    astra_turn_types::InferenceInvocationScope::Run {
                         session_id: self.session_id.clone(),
-                        user_id: self.user_id.clone(),
-                        run_id: state.current_run_id.clone(),
+                        run_id,
                         turn: state.session_turn,
                         round: prompt_round,
-                        attempt: attempt_in_round,
-                        source: "server_loop_host".to_string(),
-                        model: llm_cfg.model_name.clone(),
-                        provider: llm_cfg.provider.clone(),
+                        operation_id: "agent_turn".to_string(),
+                        logical_attempt: attempt_in_round,
                     },
-                    prompt_request_plan.clone(),
-                );
-            }
-            let durable_ledger = crate::turn::llm::durable::DurableInferenceLedger::from_optional(
-                self.shared_pool.as_ref(),
-                self.admitted_model_execution.as_ref(),
-                &self.user_id,
-            )?;
-            let durable_invocation = match durable_ledger {
-                Some(ledger) => {
-                    let run_id = state.current_run_id.clone().ok_or_else(|| {
-                        astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "durable inference admission failed: Server execution has no durable run identity",
-                        )
-                    })?;
-                    Some(
-                        ledger
-                            .admit(
-                                astra_turn_types::InferenceInvocationScope::Run {
-                                    session_id: self.session_id.clone(),
-                                    run_id,
-                                    turn: state.session_turn,
-                                    round: prompt_round,
-                                    operation_id: "agent_turn".to_string(),
-                                    logical_attempt: attempt_in_round,
-                                },
-                                state.inference_purpose,
-                                &llm_cfg.model_name,
-                                llm_cfg
-                                    .wire_model_name
-                                    .as_deref()
-                                    .unwrap_or(&llm_cfg.model_name),
-                                &llm_cfg.provider,
-                            )
-                            .await?,
-                    )
-                }
-                None => None,
-            };
+                    state.inference_purpose,
+                    &llm_cfg.model_name,
+                    llm_cfg
+                        .wire_model_name
+                        .as_deref()
+                        .unwrap_or(&llm_cfg.model_name),
+                    &llm_cfg.provider,
+                    request_context,
+                )
+                .await?;
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
@@ -5758,12 +6041,26 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     },
                     llm_cancel,
                     Some(&mut on_stream_update),
-                    durable_invocation
-                        .as_ref()
-                        .map(|invocation| invocation.attempt_observer()),
+                    Some(durable_invocation.attempt_observer()),
                 )
                 .await
             };
+
+            let provider_attempts = durable_invocation.provider_attempt_facts().await;
+            if !provider_attempts.is_empty() {
+                if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                    crate::turn::llm::context::augment_manifest_trace_with_provider_attempts(
+                        trace,
+                        &provider_attempts,
+                        prompt_round,
+                    );
+                }
+                self.emit_context_meta(
+                    &final_system_prompt_breakdown,
+                    state.last_llm_context_manifest_trace.as_ref(),
+                    &context_compactions,
+                );
+            }
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
@@ -5790,37 +6087,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "fallback_required",
                         llm_capture_error_response(&e),
                     );
-                    if let Some(invocation) = durable_invocation.as_ref() {
-                        invocation.finish_error(&e).await?;
-                        return Err(astra_core::ClassifiedError::new(
-                            astra_core::ErrorKind::ContractViolation,
-                            "admitted Offering attempted to cross its credential-owner boundary",
-                        ));
-                    }
-                    match try_resolve_same_owner_fallback(
-                        rate_limit_cooldown(),
-                        &fallback_chain,
-                        reason,
-                        &self.matrixone,
-                        self.encryptor.as_ref(),
-                        self.shared_pool.as_ref().map(SharedPool::get),
-                        &credential_owner,
-                    )
-                    .await
-                    {
-                        FallbackOutcome::Resolved(fallback) => {
-                            llm_cfg = fallback;
-                            attempt_in_round = attempt_in_round.saturating_add(1);
-                            continue;
-                        }
-                        FallbackOutcome::NoFallbackConfigured
-                        | FallbackOutcome::AllExhausted { .. } => return Err(e),
-                    }
+                    durable_invocation.finish_error(&e).await?;
+                    return Err(astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        format!(
+                            "admitted Offering attempted to cross its credential-owner boundary: {reason:?}"
+                        ),
+                    ));
                 }
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
-                    if let Some(invocation) = durable_invocation.as_ref() {
-                        invocation.finish_error(e).await?;
-                    }
+                    durable_invocation.finish_error(e).await?;
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -5896,7 +6172,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             &final_system_prompt_breakdown,
                         )
                         .ok(),
-                        context_manifest_trace: state.last_llm_context_manifest_trace.clone(),
+                        context_manifest_trace: clone_server_context_trace(
+                            state.last_llm_context_manifest_trace.as_ref(),
+                        ),
                         ..Default::default()
                     };
                     let ttft_ms = Some(turn_started.elapsed().as_millis() as u64);
@@ -5908,9 +6186,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
-                    if let Some(invocation) = durable_invocation.as_ref() {
-                        invocation.finish_error(&e).await?;
-                    }
+                    durable_invocation.finish_error(&e).await?;
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -5985,9 +6261,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
 
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
-                if let Some(invocation) = durable_invocation.as_ref() {
-                    invocation.finish_result(&r).await?;
-                }
+                durable_invocation.finish_result(&r).await?;
                 crate::llm_provider_admission::record_llm_provider_admission_calibration(
                     admission_estimated_tokens as u64,
                     &r.usage,
@@ -6185,7 +6459,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut accum = Self::result_to_accum(&result);
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
-        accum.context_manifest_trace = state.last_llm_context_manifest_trace.clone();
+        accum.context_manifest_trace =
+            clone_server_context_trace(state.last_llm_context_manifest_trace.as_ref());
 
         Ok(HostTurnResult {
             accum,
@@ -6215,6 +6490,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }));
     }
 
+    fn on_compaction(&mut self, event: astra_turn_core::compaction_types::CompactionEvent) {
+        self.emit_progress_event(json!({
+            "type": "compaction",
+            "data": event,
+        }));
+    }
+
     fn is_quiet(&self) -> bool {
         true
     }
@@ -6223,13 +6505,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &mut crate::turn::agentic_loop::host::AgenticLoopState,
         pressure: f64,
-        quiet: bool,
-    ) {
-        if pressure < 0.80
-            || state.compact_tier_applied >= CompactionTier::CompactHistory
+    ) -> Option<CompactionEvent> {
+        if state.compact_tier_applied >= CompactionTier::CompactHistory
             || state.messages.len() <= 10
         {
-            return;
+            return None;
         }
         if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
             tracing::debug!(
@@ -6238,7 +6518,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason,
                 "pre-turn LLM compaction skipped by capacity policy"
             );
-            return;
+            return None;
         }
         let config = match self.resolve_llm_config_for_state(state).await {
             Ok(config) => config,
@@ -6248,7 +6528,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     %error,
                     "pre-turn LLM compaction skipped because Offering revalidation failed"
                 );
-                return;
+                return None;
             }
         };
 
@@ -6279,13 +6559,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "skipping pre-turn compaction because context pipeline failed: {}",
                     error
                 );
-                return;
+                return None;
             }
         };
-        let Some(client) = self.durable_summary_client(&config, 4096, state, "pre_turn_compaction")
-        else {
-            return;
-        };
+        let client = self.durable_summary_client(&config, 4096, state, "pre_turn_compaction")?;
         if let Some(summary_text) = astra_turn_core::cloud_summary::generate_inline_summary(
             &system_messages,
             &state.messages,
@@ -6293,57 +6570,16 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         )
         .await
         {
-            let old_count = state.messages.len();
-            let keep_recent = (old_count / 4).max(4);
-            let mut spill_count = old_count - keep_recent;
-            // Snap to a safe role boundary so we never split an assistant/tool pair.
-            spill_count =
-                crate::turn::agentic_loop::execution_phase::adjust_spill_boundary_for_tool_pairs(
-                    &state.messages,
-                    spill_count,
-                );
-            let spilled: Vec<_> = state.messages.drain(..spill_count).collect();
-            let tokens_freed = spilled
-                .iter()
-                .map(|m| serde_json::to_string(m).map(|s| s.len()).unwrap_or(0))
-                .sum::<usize>() as u64
-                / 4;
-
-            state.messages.insert(
-                0,
-                serde_json::json!({
-                    "role": "system",
-                    "content": format!(
-                        "[Conversation compacted — {} messages summarized]\n\n{}",
-                        spilled.len(),
-                        summary_text,
-                    )
-                }),
+            Some(apply_pre_turn_summary(state, pressure, summary_text))
+        } else {
+            state.compaction_effectiveness.record_futile();
+            tracing::warn!(
+                target: "astra::pre_turn_compaction",
+                pressure,
+                session_id = %self.session_id,
+                "pre-turn LLM compaction produced no summary"
             );
-            state.compact_tier_applied = CompactionTier::CompactHistory;
-
-            if let Some(ref mut sess) = state.pipeline_session {
-                sess.recovery.record_reactive_compact();
-                sess.stats.record_compaction(tokens_freed);
-            }
-            if !quiet {
-                self.emit_headless_line(
-                    HeadlessStderrStyle::Yellow,
-                    format!(
-                        "♻ Pre-turn LLM compact: freed ~{} tokens ({} → summary)",
-                        tokens_freed,
-                        spilled.len(),
-                    ),
-                );
-            }
-        } else if !quiet {
-            self.emit_headless_line(
-                HeadlessStderrStyle::Dim,
-                format!(
-                    "  ⚠ Pre-turn LLM compact failed; continuing at {:.0}% pressure",
-                    pressure * 100.0,
-                ),
-            );
+            None
         }
     }
 
@@ -6385,9 +6621,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let model_id = self.model_override.clone().unwrap_or_default();
         let provider = astra_turn_core::fork_prefix::ProviderKind::from_provider_hint(&model_id);
         let raw_provider = provider.raw_provider_name().to_owned();
-        let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
-            return;
+        let canonical_prefix_bytes = match serde_json::to_vec(&state.messages) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::ServerForkPrefixSerialization,
+                    &error,
+                );
+                return;
+            }
         };
+        record_existing_server_artifact(
+            astra_core::history_work::HistoryWorkSite::ServerForkPrefixSerialization,
+            canonical_prefix_bytes.len(),
+            state.messages.len(),
+        );
         let captured_at_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -7046,6 +7294,101 @@ mod tests {
         assert_eq!(observed_ttft_ms(None, None, 1_600), 1_600);
     }
 
+    #[test]
+    fn provider_request_round_advances_when_journal_projection_lags() {
+        let mut state = create_test_state();
+        assert_eq!(next_provider_request_round(&state), 0);
+
+        state.llm_rounds_completed = 1;
+        state.turn_event_buffer = Some(
+            astra_services::session_journal::TurnEventBuffer::begin_turn(
+                state.current_session_id.as_deref(),
+                state.session_turn,
+            ),
+        );
+        assert_eq!(
+            state
+                .turn_event_buffer
+                .as_ref()
+                .expect("journal buffer")
+                .current_round(),
+            0,
+            "fixture must represent a lagging observation projection"
+        );
+        assert_eq!(
+            next_provider_request_round(&state),
+            1,
+            "provider identity must follow attempted calls, not journal projection timing"
+        );
+    }
+
+    #[test]
+    fn server_capture_wrapper_preserves_nested_unicode_request_artifact() {
+        let messages = vec![json!({
+            "role": "user",
+            "content": {"text": "你好🚀", "parts": [1, true, null]}
+        })];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {"name": "读取", "parameters": {"type": "object"}}
+        })];
+        let request = build_server_capture_request_json(&messages, &tools, Some(321));
+
+        assert_eq!(
+            request,
+            crate::turn::llm::exchange_capture::build_capture_request_json(
+                &messages,
+                &tools,
+                Some(321),
+            )
+        );
+        assert_eq!(request["messages"], Value::Array(messages));
+        assert_eq!(request["tools"], Value::Array(tools));
+    }
+
+    #[test]
+    fn server_context_trace_clone_preserves_typed_nested_trace() {
+        let trace = json!({
+            "wire": {
+                "roles": ["system", "用户", "assistant"],
+                "message_hashes": ["sha256:a", "sha256:b"],
+                "nested": {"count": 2, "enabled": true}
+            }
+        });
+
+        let cloned = clone_server_context_trace(Some(&trace)).expect("trace clone");
+        assert_eq!(cloned, trace);
+        assert!(clone_server_context_trace(None).is_none());
+    }
+
+    #[test]
+    fn server_fork_tool_hash_dimensions_use_existing_canonical_buffers() {
+        let schemas = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "读取",
+                    "description": "nested 🚀",
+                    "parameters": {"type": "object", "properties": {"路径": {"type": "string"}}}
+                }
+            }),
+            json!({"name": "flat", "input_schema": {"type": "object"}}),
+        ];
+        let entries = astra_turn_core::fork_prefix::build_tool_schema_entries(&schemas);
+
+        assert_eq!(
+            server_fork_tool_schema_hash_dimensions(&entries),
+            (
+                entries
+                    .iter()
+                    .map(|entry| entry.canonical_bytes.len())
+                    .sum(),
+                entries.len(),
+            )
+        );
+        assert_eq!(entries.len(), schemas.len());
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -7113,6 +7456,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         }
     }
 
@@ -9379,6 +9723,86 @@ mod tests {
     }
 
     #[test]
+    fn quiet_server_compaction_emits_only_the_typed_event() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        assert!(host.is_quiet());
+        let event = CompactionEvent::new(
+            CompactionKind::WireAssembly,
+            0.8,
+            5_000,
+            12_000,
+            20_000,
+            8,
+            6,
+            Vec::new(),
+        );
+
+        host.on_compaction(event.clone());
+
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "compaction");
+        assert_eq!(host.emitted_events[0]["data"], json!(event));
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|emitted| emitted["type"] != "headless_line")
+        );
+    }
+
+    #[test]
+    fn pre_turn_summary_event_matches_the_applied_state_mutation() {
+        let mut state = create_test_state();
+        state.max_turn_input_tokens = 20_000;
+        state.pinned_tool_schema_tokens = 17;
+        for index in 0..8 {
+            state.messages.push(json!({
+                "role": "user",
+                "content": format!("问题 {index}: {}", "context ".repeat(80))
+            }));
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": format!("answer {index}: {}", "detail ".repeat(80))
+            }));
+        }
+        let messages_before = state.messages.len();
+        let tokens_before = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        )
+        .1;
+
+        let event = apply_pre_turn_summary(
+            &mut state,
+            0.82,
+            "Preserve the structured facts and continue.".to_string(),
+        );
+        let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
+            &state.messages,
+            state.pinned_tool_schema_tokens as usize,
+            state.max_turn_input_tokens,
+        )
+        .1;
+
+        assert_eq!(event.kind, CompactionKind::PreTurnSummary);
+        assert_eq!(event.tokens_before, tokens_before);
+        assert_eq!(event.tokens_after, tokens_after);
+        assert_eq!(event.tokens_freed, tokens_before - tokens_after);
+        assert_eq!(
+            event.messages_removed,
+            messages_before - state.messages.len()
+        );
+        assert_eq!(event.messages_after, state.messages.len());
+        assert_eq!(state.compact_tier_applied, CompactionTier::CompactHistory);
+    }
+
+    #[test]
     fn push_reasoning_events_emits_done_marker() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -9442,6 +9866,7 @@ mod tests {
             completions_url_override: None,
             request_timeout: None,
             context_window: None,
+            max_completion_tokens: None,
         };
         let msgs = host.assemble_llm_messages(
             vec![json!({"role": "system", "content": "system prompt text"})],
@@ -10727,6 +11152,13 @@ mod tests {
         }
     }
 
+    fn create_durable_execution_test_state(session_id: &str) -> AgenticLoopState {
+        let mut state = create_test_state();
+        state.current_session_id = Some(session_id.to_string());
+        state.current_run_id = Some(format!("test-run-{session_id}"));
+        state
+    }
+
     #[derive(Clone)]
     struct GatewayState {
         requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
@@ -11998,6 +12430,7 @@ mod tests {
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(64_000),
+                max_completion_tokens: Some(8_192),
                 request_headers: Some(serde_json::Map::from_iter([(
                     "x-provider-mode".to_string(),
                     Value::String("coding".to_string()),
@@ -12524,6 +12957,8 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn text_first_control_window_streams_before_provider_completion() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-stream-window";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let delay = Duration::from_millis(750);
         let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
             delay,
@@ -12559,10 +12994,11 @@ mod tests {
             mock_matrixone(),
             mock_encryptor(),
             "user-stream-window".to_string(),
-            "".to_string(),
+            session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
@@ -12578,7 +13014,7 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         host.set_event_tx(tx);
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.message = "answer normally".to_string();
         state.user_intent = state.message.clone();
 
@@ -12617,6 +13053,7 @@ mod tests {
             host.take_terminal_control_outcome(),
             None | Some(crate::turn::terminal_control::TerminalControlOutcome::Passthrough)
         ));
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -12624,6 +13061,8 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn ordinary_tool_first_closes_control_window_before_provider_completion() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-tool-window";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let ordinary_tool = "mcp__provider__status";
         let terminal_tool = "mcp__provider__runtime_control";
         let delay = Duration::from_millis(750);
@@ -12664,10 +13103,11 @@ mod tests {
             mock_matrixone(),
             mock_encryptor(),
             "user-tool-window".to_string(),
-            "".to_string(),
+            session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
@@ -12693,7 +13133,7 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         host.set_event_tx(tx);
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.message = "check status".to_string();
         state.user_intent = state.message.clone();
 
@@ -12723,6 +13163,7 @@ mod tests {
         );
         assert!(provider_completed.load(Ordering::SeqCst));
         assert!(host.take_terminal_control_outcome().is_none());
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -12730,6 +13171,8 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn streamed_terminal_handoff_never_projects_buffered_reasoning() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-terminal-stream";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let terminal_tool = "mcp__provider__runtime_control";
         let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
             Duration::from_millis(200),
@@ -12771,10 +13214,11 @@ mod tests {
             mock_matrixone(),
             mock_encryptor(),
             "user-terminal-stream".to_string(),
-            "".to_string(),
+            session_id.to_string(),
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.install_runtime_tool_schemas(
@@ -12794,7 +13238,7 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
         host.set_event_tx(tx);
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.message = "revise the agent".to_string();
         state.user_intent = state.message.clone();
 
@@ -12818,6 +13262,7 @@ mod tests {
             host.take_terminal_control_outcome(),
             Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
         ));
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -12826,6 +13271,7 @@ mod tests {
     async fn execute_turn_persists_full_journal_request_and_response_when_session_capture_enabled()
     {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000126";
@@ -12851,10 +13297,11 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_full_llm_capture(true)
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.session_turn = 1;
         state.turn_event_buffer =
             Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
@@ -12965,6 +13412,7 @@ mod tests {
         let gateway_requests = requests.lock().await;
         assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
 
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -12972,6 +13420,7 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_persists_full_journal_error_response_when_session_capture_enabled() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         // Collapse llm_client's 1s/2s/4s exponential backoff so the retry
         // loop behind a 500 upstream completes in tens of ms instead of 7s.
         let _backoff = crate::turn::llm::client::set_test_retry_backoff_ms(0);
@@ -12992,10 +13441,11 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_full_llm_capture(true)
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.session_turn = 1;
         state.turn_event_buffer =
             Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
@@ -13059,6 +13509,7 @@ mod tests {
             Some("state")
         );
 
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -13066,6 +13517,7 @@ mod tests {
     #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
     async fn execute_turn_does_not_persist_full_journal_events_when_session_capture_disabled() {
         let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
         let temp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
         let session_id = "00000000-0000-0000-0000-000000000128";
@@ -13091,9 +13543,10 @@ mod tests {
         )
         .with_edge_tools(sample_edge_tools())
         .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_test_inference_ledger(inference_ledger.clone())
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(2000))))
         .build();
-        let mut state = create_test_state();
+        let mut state = create_durable_execution_test_state(session_id);
         state.session_turn = 1;
         state.turn_event_buffer =
             Some(astra_services::session_journal::TurnEventBuffer::begin_turn(Some(session_id), 1));
@@ -13136,6 +13589,7 @@ mod tests {
         let gateway_requests = requests.lock().await;
         assert_eq!(gateway_requests.len(), 1, "one upstream request expected");
 
+        inference_ledger.assert_quiescent();
         server.abort();
     }
 
@@ -13333,13 +13787,13 @@ mod tests {
                 .push(json!({"role": "assistant", "content": format!("answer {i}")}));
         }
 
-        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+        let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
             &mut host,
             &mut state,
             0.95,
-            true,
         )
         .await;
+        assert!(event.is_none());
         assert_eq!(
             state.compact_tier_applied,
             CompactionTier::Normal,
@@ -13417,13 +13871,13 @@ mod tests {
                 .push(json!({"role": "assistant", "content": format!("answer {i}")}));
         }
 
-        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
+        let event = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::maybe_pre_turn_compact(
             &mut host,
             &mut state,
             0.95,
-            true,
         )
         .await;
+        assert!(event.is_none());
 
         assert_eq!(state.compact_tier_applied, CompactionTier::Normal);
         assert_eq!(
@@ -14705,7 +15159,14 @@ mod tests {
             let mut host = build_host_with(Some(store_arc), sample_edge_tools());
             // execute_turn would normally stash this; mimic it here.
             host.last_turn_tool_schemas = sample_edge_tools();
-            host.on_turn_completed(&state_with_run("run-capture"));
+            let mut state = state_with_run("run-capture");
+            state.messages.push(json!({
+                "role": "assistant",
+                "content": {"text": "nested 你好🚀", "parts": [1, true, null]}
+            }));
+            let expected_prefix =
+                serde_json::to_vec(&state.messages).expect("serialize canonical prefix");
+            host.on_turn_completed(&state);
             assert_eq!(
                 store.tracked_count(),
                 1,
@@ -14723,6 +15184,11 @@ mod tests {
             let names: Vec<_> = pfx.tool_schemas().iter().map(|t| t.name.as_str()).collect();
             assert!(names.contains(&"bash"));
             assert!(names.contains(&"read_file"));
+            assert_eq!(
+                pfx.canonical_prefix_bytes().as_slice(),
+                expected_prefix.as_slice(),
+                "server capture must hash and store the exact existing prefix buffer"
+            );
         }
 
         #[test]

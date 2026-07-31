@@ -29,6 +29,16 @@ pub struct ContextWindowUsage {
     pub source: ContextWindowUsageSource,
 }
 
+/// Provider-normalized token lanes for one physical request. These are shown
+/// separately from cumulative session billing totals.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestTokenUsage {
+    pub fresh_input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub output_tokens: u64,
+}
+
 impl ContextWindowUsage {
     pub const fn estimated(used_tokens: u64, limit_tokens: u64) -> Self {
         Self {

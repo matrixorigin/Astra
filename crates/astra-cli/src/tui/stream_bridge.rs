@@ -300,11 +300,19 @@ async fn recv_next_live_event(
 /// stay identical across execution modes.
 pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
     Some(match event {
+        StreamEvent::ContextWindowPolicy {
+            raw_window_tokens,
+            usable_input_tokens,
+        } => TuiAppEvent::ContextWindowPolicy {
+            raw_window_tokens,
+            usable_input_tokens,
+        },
         StreamEvent::ContextWindowEstimated(usage) => TuiAppEvent::ContextWindowEstimated(usage),
         StreamEvent::ContextSystemPromptTokens(tokens) => {
             TuiAppEvent::ContextSystemPromptTokens(tokens)
         }
         StreamEvent::ContextWindowMeasured(tokens) => TuiAppEvent::ContextWindowMeasured(tokens),
+        StreamEvent::RequestTokenUsage(usage) => TuiAppEvent::RequestTokenUsage(usage),
         StreamEvent::Token(text) => TuiAppEvent::Token(text),
         StreamEvent::Thinking(true) => TuiAppEvent::ThinkingStarted,
         StreamEvent::Thinking(false) => TuiAppEvent::ThinkingStopped,

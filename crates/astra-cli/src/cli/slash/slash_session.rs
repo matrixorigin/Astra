@@ -1,9 +1,10 @@
 use std::io::Write;
 
-use astra_core::{DriftCause, EvidenceType};
+use astra_services::introspection::{
+    IntentDriftAssessmentStatus, IntentDriftCheckResponseV2, IntentDriftLevel, IntentDriftVerdict,
+};
 use astra_services::session_restore::RestoredSession;
 use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
-use astra_turn_core::decision_explainer::{DriftDetector, FocusDriftAnalysis};
 use chrono::{DateTime, Utc};
 
 use crate::cli::permission_manager::PermissionMode;
@@ -1055,7 +1056,7 @@ pub(crate) async fn handle_session_command(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     state: &mut SessionState,
-    _token: Option<&str>,
+    token: Option<&str>,
 ) {
     let (sub_cmd, sub_arg) = match arg.find(char::is_whitespace) {
         Some(pos) => (arg[..pos].trim(), arg[pos..].trim()),
@@ -2599,7 +2600,7 @@ pub(crate) async fn handle_session_command(
             handle_session_verify(state);
         }
         "drift" => {
-            handle_session_drift(sub_arg, state);
+            handle_session_drift(sub_arg, api, profile, state, token).await;
         }
         "adaptive" | "profile" | "tuning" => {
             handle_session_adaptive(sub_arg, state);
@@ -3628,185 +3629,263 @@ fn handle_session_adaptive(_arg: &str, state: &SessionState) {
 
 // ── Session verify / sync status ────────────────────────────────────────────
 
-/// Analyze and display focus drift in the current session.
-///
-/// Usage: /session drift [--verbose]
-///
-/// Uses the DriftDetector to analyze the conversation history for signs of
-/// focus drift caused by compression, topic shifts, or user corrections.
-fn handle_session_drift(arg: &str, state: &SessionState) {
-    let verbose = arg.contains("--verbose") || arg.contains("-v");
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionDriftOptions {
+    verbose: bool,
+}
 
+fn parse_session_drift_options(arg: &str) -> Result<SessionDriftOptions, String> {
+    let mut options = SessionDriftOptions::default();
+    for token in arg.split_whitespace() {
+        match token {
+            "--verbose" | "-v" => options.verbose = true,
+            other => {
+                return Err(format!(
+                    "Unknown option {other}. Usage: /session drift [--verbose]"
+                ));
+            }
+        }
+    }
+    Ok(options)
+}
+
+async fn fetch_session_drift_assessment(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    session_id: &str,
+) -> Result<IntentDriftCheckResponseV2, String> {
+    let response = api
+        .get_bearer_path_query_json::<IntentDriftCheckResponseV2>(
+            token,
+            astra_thin_client::paths::INTROSPECTION_DRIFT_CHECK,
+            &[("session_id", session_id.to_string())],
+        )
+        .await
+        .map_err(|error| format!("server assessment request failed: {error}"))?;
+    response
+        .validate()
+        .map_err(|error| format!("server returned an invalid assessment contract: {error}"))?;
+    if response.session_id != session_id {
+        return Err(format!(
+            "server returned assessment for session {} instead of {}",
+            response.session_id, session_id
+        ));
+    }
+    Ok(response)
+}
+
+fn session_drift_unavailable(reason: &str) -> String {
+    format!(
+        "  Intent-drift assessment unavailable.\n    {reason}\n    This command does not infer intent drift from local transcript text."
+    )
+}
+
+fn intent_drift_verdict_label(verdict: IntentDriftVerdict) -> &'static str {
+    match verdict {
+        IntentDriftVerdict::Aligned => "aligned",
+        IntentDriftVerdict::Drifting => "drifting",
+    }
+}
+
+fn intent_drift_level_label(level: IntentDriftLevel) -> &'static str {
+    match level {
+        IntentDriftLevel::Aligned => "aligned",
+        IntentDriftLevel::Mild => "mild",
+        IntentDriftLevel::Moderate => "moderate",
+        IntentDriftLevel::High => "high",
+    }
+}
+
+fn format_session_drift_assessment(
+    response: &IntentDriftCheckResponseV2,
+    verbose: bool,
+) -> Result<String, String> {
+    response.validate()?;
+    if response.assessment_status == IntentDriftAssessmentStatus::Unavailable {
+        return Ok(session_drift_unavailable(
+            "The server has no durable LLM-judge assessment for this session.",
+        ));
+    }
+
+    let verdict = response
+        .verdict
+        .ok_or_else(|| "assessed response is missing verdict".to_string())?;
+    let score = response
+        .score
+        .ok_or_else(|| "assessed response is missing score".to_string())?;
+    let level = response
+        .level
+        .ok_or_else(|| "assessed response is missing level".to_string())?;
+    let provenance = response
+        .provenance
+        .as_ref()
+        .ok_or_else(|| "assessed response is missing provenance".to_string())?;
+    let turn = response
+        .turn
+        .ok_or_else(|| "assessed response is missing turn".to_string())?;
+    let round = response
+        .round
+        .ok_or_else(|| "assessed response is missing round".to_string())?;
+    let assessed_at = response
+        .assessed_at
+        .as_deref()
+        .ok_or_else(|| "assessed response is missing assessed_at".to_string())?;
+
+    let mut lines = vec![
+        format!("  LLM assessment: {}", intent_drift_verdict_label(verdict)),
+        format!("    Level: {}", intent_drift_level_label(level)),
+        format!("    Score: {:.0}%", score * 100.0),
+        format!("    Assessed turn: {turn} (round {round})"),
+        format!("    Judge: {}/{}", provenance.provider, provenance.model),
+        format!("    Assessed at: {assessed_at}"),
+    ];
+
+    if verbose {
+        lines.push(String::new());
+        lines.push("  Provenance".to_string());
+        lines.push(format!("    Invocation: {}", provenance.invocation_id));
+        if let Some(provider_response_id) = provenance.provider_response_id.as_deref() {
+            lines.push(format!("    Provider response: {provider_response_id}"));
+        }
+        lines.push(format!(
+            "    Source event: {}",
+            response
+                .source_event_id
+                .as_deref()
+                .ok_or_else(|| "assessed response is missing source_event_id".to_string())?
+        ));
+        lines.push(String::new());
+        lines.push("  LLM evidence".to_string());
+        if response.evidence.is_empty() {
+            lines.push("    none supplied".to_string());
+        } else {
+            lines.extend(response.evidence.iter().map(|item| format!("    • {item}")));
+        }
+    }
+
+    Ok(lines.join("\n"))
+}
+
+/// Display the latest durable LLM intent-drift assessment for this session.
+///
+/// Usage: `/session drift [--verbose]`
+async fn handle_session_drift(
+    arg: &str,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    state: &SessionState,
+    token: Option<&str>,
+) {
     eprintln!(
         "\n{}",
-        "─── Focus Drift Analysis ─────────────────────────"
+        "─── Intent Drift Assessment ──────────────────────"
             .bold()
             .magenta()
     );
 
-    // Collect recent user queries from history (first element of each tuple)
-    let user_queries: Vec<String> = state
-        .history
-        .iter()
-        .map(|(user_msg, _assistant_msg)| user_msg.clone())
-        .collect();
-
-    if user_queries.is_empty() {
-        eprintln!("  {} No conversation history yet.", theme::icon_ok());
+    let options = match parse_session_drift_options(arg) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("  {}", error.yellow());
+            eprintln!();
+            return;
+        }
+    };
+    let Some(session_id) = state.session_id.as_deref().filter(|id| !id.is_empty()) else {
+        eprintln!(
+            "{}",
+            session_drift_unavailable("There is no active server session.")
+        );
         eprintln!();
         return;
-    }
-
-    // Build detector inputs
-    let original_query = state
-        .drift_original_query
-        .as_deref()
-        .unwrap_or_else(|| user_queries.first().map(|s| s.as_str()).unwrap_or(""));
-    let compressed_turns: Vec<u32> = state.drift_compressed_turns.clone();
-    let user_corrections: Vec<u32> = state.drift_user_corrections.clone();
-
-    let analysis: FocusDriftAnalysis = {
-        let detector = DriftDetector::default();
-        detector.analyze(
-            original_query,
-            &user_queries,
-            &compressed_turns,
-            &user_corrections,
-        )
     };
 
-    // Display results
-    if analysis.drift_detected {
+    let fallback_token = token
+        .is_none()
+        .then(|| session_runtime::current_access_token(profile))
+        .flatten();
+    let Some(token) = token.or(fallback_token.as_deref()) else {
         eprintln!(
-            "  {} Focus drift detected (severity: {:.0}%)",
-            theme::icon_warn(),
-            analysis.drift_severity * 100.0
+            "{}",
+            session_drift_unavailable(
+                "Authentication is required to read the server-owned assessment."
+            )
         );
+        eprintln!();
+        return;
+    };
 
-        if let Some(turn) = analysis.drift_turn {
-            eprintln!(
-                "    Likely drift began at turn {}",
-                turn.to_string().yellow()
-            );
-        }
-
-        // Show cause
-        let cause_str = match &analysis.likely_cause {
-            DriftCause::HistoryCompression { lost_context, .. } => {
-                let ctx = if lost_context.is_empty() {
-                    "history".to_string()
-                } else if lost_context.len() <= 3 {
-                    lost_context.join(", ")
-                } else {
-                    format!(
-                        "{} and {} more",
-                        lost_context[..3].join(", "),
-                        lost_context.len() - 3
-                    )
-                };
-                format!("History compression (lost: {})", ctx)
-            }
-            DriftCause::MemoryMiss {
-                expected_but_not_retrieved,
-                ..
-            } => {
-                if expected_but_not_retrieved.is_empty() {
-                    "Memory miss (expected memories not retrieved)".to_string()
-                } else {
-                    format!(
-                        "Memory miss (expected: {})",
-                        expected_but_not_retrieved.join(", ")
-                    )
-                }
-            }
-            DriftCause::TopicShift {
-                original_topic,
-                new_topic,
-                ..
-            } => {
-                format!("Topic shift ('{}' → '{}')", original_topic, new_topic)
-            }
-            DriftCause::TokenBudgetPressure {
-                budget_available,
-                budget_needed,
-                ..
-            } => {
-                format!(
-                    "Token budget pressure ({} needed vs {} available)",
-                    budget_needed, budget_available
-                )
-            }
-            DriftCause::AmbiguousInstruction { instruction, .. } => {
-                format!("Ambiguous instruction: {}", instruction)
-            }
-            DriftCause::Unknown => "Unknown cause".to_string(),
-        };
-        eprintln!("    Cause: {}", cause_str.yellow());
-
-        // Show recovery suggestion
-        if !analysis.recovery_suggestion.is_empty() {
-            eprintln!("\n  💡 {}", analysis.recovery_suggestion.green());
-        }
-    } else {
-        eprintln!(
-            "  {} No significant focus drift detected.",
-            theme::icon_ok()
-        );
+    match fetch_session_drift_assessment(api, token, session_id).await {
+        Ok(response) => match format_session_drift_assessment(&response, options.verbose) {
+            Ok(report) => eprintln!("{report}"),
+            Err(error) => eprintln!(
+                "{}",
+                session_drift_unavailable(&format!(
+                    "The server assessment contract was invalid: {error}"
+                ))
+            ),
+        },
+        Err(error) => eprintln!("{}", session_drift_unavailable(&error)),
     }
-
-    // Show tracked data if verbose
-    if verbose {
-        eprintln!("\n  {}", "Tracked Data".dim());
-        eprintln!("    {:<22} {}", "History turns:".dim(), user_queries.len());
-        eprintln!(
-            "    {:<22} {}",
-            "Compressed turns:".dim(),
-            if compressed_turns.is_empty() {
-                "none".to_string()
-            } else {
-                format!("{:?}", compressed_turns)
-            }
-        );
-        eprintln!(
-            "    {:<22} {}",
-            "User corrections:".dim(),
-            if user_corrections.is_empty() {
-                "none".to_string()
-            } else {
-                format!("{:?}", user_corrections)
-            }
-        );
-        eprintln!(
-            "    {:<22} \"{}\"",
-            "Original query:".dim(),
-            ellipsize(original_query, 50)
-        );
-
-        // Show evidence
-        if !analysis.evidence.is_empty() {
-            eprintln!("\n  {}", "Evidence".dim());
-            for ev in &analysis.evidence {
-                // ev is DriftEvidence { turn, evidence_type, description, confidence }
-                let type_str = match &ev.evidence_type {
-                    EvidenceType::ToolCallTopicChange => "topic change",
-                    EvidenceType::UserCorrection => "user correction",
-                    EvidenceType::ClarificationRequest => "clarification",
-                    EvidenceType::TermDisappearance => "term lost",
-                    EvidenceType::CompressionLoss => "compression",
-                    EvidenceType::MemoryMismatch => "memory miss",
-                };
-                eprintln!(
-                    "    • Turn {}: [{}] {} ({:.0}%)",
-                    ev.turn,
-                    type_str,
-                    ellipsize(&ev.description, 50),
-                    ev.confidence.point * 100.0
-                );
-            }
-        }
-    }
-
     eprintln!();
+}
+
+#[cfg(test)]
+mod session_drift_tests {
+    use super::{format_session_drift_assessment, parse_session_drift_options};
+    use astra_services::introspection::IntentDriftCheckResponseV2;
+
+    fn assessed_response() -> IntentDriftCheckResponseV2 {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 2,
+            "user_id": "owner-1",
+            "session_id": "session-1",
+            "assessment_status": "assessed",
+            "verdict": "drifting",
+            "score": 0.75,
+            "level": "high",
+            "evidence": ["model-judged trajectory evidence"],
+            "provenance": {
+                "kind": "llm_judge",
+                "invocation_id": "invocation-1",
+                "provider": "provider-1",
+                "model": "model-1"
+            },
+            "turn": 4,
+            "round": 2,
+            "source_event_id": "event-1",
+            "assessed_at": "2026-07-30T12:00:00Z"
+        }))
+        .expect("valid typed response")
+    }
+
+    #[test]
+    fn drift_options_are_exact_command_syntax() {
+        assert!(parse_session_drift_options("").is_ok());
+        assert!(parse_session_drift_options("-v").unwrap().verbose);
+        assert!(
+            parse_session_drift_options("--verbose-ish").is_err(),
+            "partial text matches are not command options"
+        );
+    }
+
+    #[test]
+    fn unavailable_projection_is_not_rendered_as_alignment() {
+        let response = IntentDriftCheckResponseV2::unavailable("owner-1", "session-1").unwrap();
+        let report = format_session_drift_assessment(&response, false).unwrap();
+        assert!(report.contains("unavailable"));
+        assert!(!report.contains("LLM assessment: aligned"));
+        assert!(report.contains("does not infer intent drift"));
+    }
+
+    #[test]
+    fn assessed_projection_renders_llm_owned_fields() {
+        let report = format_session_drift_assessment(&assessed_response(), true).unwrap();
+        assert!(report.contains("LLM assessment: drifting"));
+        assert!(report.contains("provider-1/model-1"));
+        assert!(report.contains("Invocation: invocation-1"));
+        assert!(report.contains("model-judged trajectory evidence"));
+    }
 }
 
 // ── Session Analyze ─────────────────────────────────────────────────────────
@@ -4942,7 +5021,12 @@ fn apply_heavy_state_fallback(
     }
     if state.history.is_empty() {
         let pairs = session_continuation::history_pairs_from_messages(
-            &session_continuation::sanitize_continuation_messages(messages.to_vec()),
+            &session_continuation::sanitize_continuation_messages(
+                session_continuation::materialize_cli_continuation_messages(
+                    astra_core::history_work::HistoryWorkSite::CliResumeCanonicalHistoryClone,
+                    messages,
+                ),
+            ),
         );
         if !pairs.is_empty() {
             state.history = pairs;
@@ -4964,18 +5048,24 @@ fn apply_heavy_checkpoint_fallback(
     );
 }
 
-fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &RestoredSession) {
+fn apply_restored_cloud_heavy_state(
+    state: &mut SessionState,
+    restored: &RestoredSession,
+    resume_messages: &[serde_json::Value],
+) {
     apply_heavy_state_fallback(
         state,
         &restored.blocked_tools,
         &restored.recent_tools,
-        &restored.conversation_messages,
+        resume_messages,
         restored.approval_overrides.as_ref(),
     );
 }
 
 struct PreparedForkRestore {
     history: Vec<(String, String)>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
+    resume: Option<astra_turn_types::ResumeDescriptorV1>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
@@ -5006,6 +5096,7 @@ struct ForkStateSnapshot {
     last_turn_event: Option<session_journal::JournalEvent>,
     run_id: Option<String>,
     history: Vec<(String, String)>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
@@ -5025,7 +5116,11 @@ impl ForkStateSnapshot {
             total_cache_creation_tokens: state.total_cache_creation_tokens,
             last_turn_event: state.last_turn_event.clone(),
             run_id: state.run_id.clone(),
-            history: state.history.clone(),
+            history: crate::cli::history_work::clone_pair_history(
+                astra_core::history_work::HistoryWorkSite::CliSlashForkRollbackSnapshot,
+                &state.history,
+            ),
+            active_conversation: state.active_conversation.clone(),
             recent_tools: state.recent_tools.clone(),
             activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
             csl_manager: state.csl_manager.take(),
@@ -5053,6 +5148,7 @@ impl ForkStateSnapshot {
         state.last_turn_event = self.last_turn_event;
         state.run_id = self.run_id;
         state.history = self.history;
+        state.active_conversation = self.active_conversation;
         state.recent_tools = self.recent_tools;
         state.activated_deferred_tool_names = self.activated_deferred_tool_names;
         state.csl_manager = self.csl_manager;
@@ -5096,14 +5192,33 @@ fn materialize_prepared_fork_restore(
     mgr: astra_turn_core::conversation_log::manager::CslManager,
     mat: Option<astra_turn_core::conversation_log::MaterializedState>,
     restored_journal: session_runtime::RestoredJournalState,
+    session_id: &str,
 ) -> PreparedForkRestore {
-    let mut history = restored_journal.session.history.clone();
+    let has_csl_materialization = mat.is_some();
+    let mut history = crate::cli::history_work::clone_pair_history(
+        astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
+        &restored_journal.session.history,
+    );
     let mut recent_tools = restored_journal.session.recent_tools.clone();
     let mut activated_deferred_tool_names = Vec::new();
+    let mut active_conversation = None;
     if let Some(ref materialized) = mat {
-        history = session_continuation::history_pairs_from_messages(
-            &session_continuation::sanitize_continuation_messages(materialized.messages.clone()),
+        let canonical_messages = session_continuation::sanitize_continuation_messages(
+            session_continuation::materialize_cli_continuation_messages(
+                astra_core::history_work::HistoryWorkSite::CliSlashForkCanonicalHistoryClone,
+                &materialized.messages,
+            ),
         );
+        history = session_continuation::history_pairs_from_messages(&canonical_messages);
+        active_conversation =
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                session_id,
+                canonical_messages,
+                materialized.last_turn,
+                astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
+            )
+            .ok();
         if !materialized.session_state.recent_tools.is_empty() {
             recent_tools = materialized.session_state.recent_tools.clone();
         }
@@ -5117,9 +5232,11 @@ fn materialize_prepared_fork_restore(
     }
     PreparedForkRestore {
         history,
+        active_conversation,
+        resume: None,
         recent_tools,
         activated_deferred_tool_names,
-        csl_manager: Some(mgr),
+        csl_manager: has_csl_materialization.then_some(mgr),
         journal_state: restored_journal.session,
         last_turn_event: restored_journal.last_turn_event,
     }
@@ -5129,7 +5246,12 @@ fn prepared_fork_restore_from_restored_journal(
     restored_journal: session_runtime::RestoredJournalState,
 ) -> PreparedForkRestore {
     PreparedForkRestore {
-        history: restored_journal.session.history.clone(),
+        history: crate::cli::history_work::clone_pair_history(
+            astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
+            &restored_journal.session.history,
+        ),
+        active_conversation: None,
+        resume: None,
         recent_tools: restored_journal.session.recent_tools.clone(),
         activated_deferred_tool_names: Vec::new(),
         csl_manager: None,
@@ -5153,31 +5275,28 @@ async fn prepared_fork_restore_from_journal(
         Default::default(),
     )
     .map_err(|e| format!("initialize CSL state for session {session_id}: {e}"))?;
-    match mgr.load().await {
-        Ok(Some(mat)) => {
-            return Ok(materialize_prepared_fork_restore(
-                mgr,
-                Some(mat),
-                restored_journal,
-            ));
+    let mut prepared = match mgr.load().await {
+        Ok(materialized) => {
+            materialize_prepared_fork_restore(mgr, materialized, restored_journal, session_id)
         }
-        Ok(None) => {}
         Err(e) => {
             return Err(format!("load CSL state for session {session_id}: {e}"));
         }
-    }
+    };
 
-    // Fall back to prompt-facing transcript before journal summary. The
-    // transcript records visible user/assistant/tool stages even when a long
-    // turn did not reach a final journal Turn event, so it is the better resume
-    // source for interrupted or abandoned work.
-    let mut prepared = prepared_fork_restore_from_restored_journal(restored_journal);
-    let canonical_history =
-        session_continuation::load_session_messages_for_continuation(session_id)
-            .map(|messages| session_continuation::history_pairs_from_messages(&messages))
-            .unwrap_or_default();
-    if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
-        prepared.history = canonical_history;
+    // The canonical journal lane is authoritative even when the asynchronous
+    // CSL projection has not caught up yet.
+    if let Some(continuation) =
+        session_continuation::load_session_continuation_for_recovery(session_id)
+    {
+        let canonical_history =
+            session_continuation::history_pairs_from_messages(&continuation.messages);
+        if canonical_history.len() > prepared.history.len() || prepared.history.is_empty() {
+            prepared.history = canonical_history;
+        }
+        prepared.activated_deferred_tool_names = continuation.activated_deferred_tool_names;
+        prepared.active_conversation = Some(continuation.active_conversation);
+        prepared.resume = Some(continuation.resume);
     }
     Ok(prepared)
 }
@@ -5209,6 +5328,7 @@ async fn load_prepared_fork_restore(
                 child_mgr,
                 child_mat,
                 restored_journal,
+                new_sid,
             )),
             Err(e) => {
                 tracing::warn!(
@@ -5300,6 +5420,7 @@ async fn apply_prepared_fork_restore(
     state.last_turn_event = restored_child.last_turn_event;
     state.run_id = None;
     state.history = restored_child.history;
+    state.active_conversation = restored_child.active_conversation;
     state.recent_tools = restored_child.recent_tools;
     state.activated_deferred_tool_names = restored_child.activated_deferred_tool_names;
     state.csl_manager = restored_child.csl_manager;
@@ -5408,6 +5529,7 @@ async fn restore_journal_history_if_available(
         state.recent_tools = restored.recent_tools;
     }
     state.activated_deferred_tool_names = restored.activated_deferred_tool_names;
+    state.active_conversation = restored.active_conversation;
     state.csl_manager = restored.csl_manager;
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     Ok(())
@@ -5417,8 +5539,47 @@ async fn apply_restored_session(
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
     state: &mut SessionState,
-    restored: RestoredSession,
+    mut restored: RestoredSession,
 ) -> Result<(), String> {
+    let had_versioned_resume_bundle = restored.resume_bundle.is_some();
+    let resume_bundle = restored.resume_bundle.take().or_else(|| {
+        let messages = session_continuation::sanitize_continuation_messages(std::mem::take(
+            &mut restored.conversation_messages,
+        ));
+        if messages.is_empty() {
+            return None;
+        }
+        let cursor = astra_turn_types::legacy_resume_cursor(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            &restored.session_id,
+            restored.turn_count,
+            &messages,
+        );
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                degraded_reasons: vec![
+                    astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+                    astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
+                    astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback,
+                ],
+                repair_actions: vec![
+                    astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
+                    astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
+                ],
+                projections: Default::default(),
+            }],
+        )
+        .ok()
+    });
+    let typed_continuation =
+        resume_bundle.and_then(session_continuation::continuation_from_resume_bundle);
+    if had_versioned_resume_bundle && typed_continuation.is_none() {
+        return Err("restored ResumeBundle failed causal validation".to_string());
+    }
     let local_journal = session_runtime::restored_journal_state(&restored.session_id)?;
     if !restored.restored_from_cloud && !local_journal.exists {
         return Err(format!(
@@ -5426,8 +5587,6 @@ async fn apply_restored_session(
             restored.session_id
         ));
     }
-    let restored_permission_mode = parse_restored_permission_mode(&restored)?;
-
     let local_state = local_journal.session;
     let total_cache_read_tokens = restored
         .total_cache_read_tokens
@@ -5437,7 +5596,78 @@ async fn apply_restored_session(
         .max(local_state.total_cache_creation_tokens);
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
-    let mut restored_activation = restored.activated_deferred_tool_names.clone();
+    let use_typed_continuation = match (
+        prepared_history.resume.as_ref(),
+        typed_continuation.as_ref(),
+    ) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(local), Some(remote)) => {
+            let candidates = [
+                session_continuation::portable_resume_descriptor(local.clone()),
+                session_continuation::portable_resume_descriptor(remote.resume.clone()),
+            ];
+            astra_turn_types::select_resume_candidate_index(None, &candidates).map_err(|error| {
+                format!("TUI resume candidates are causally inconsistent: {error}")
+            })? == 1
+        }
+    };
+    let selected_cursor = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.resume.cursor.clone())
+    } else {
+        prepared_history
+            .resume
+            .as_ref()
+            .map(|resume| resume.cursor.clone())
+    };
+    // Local-only legacy metadata did not carry a cursor envelope. It remains
+    // admissible only when the local canonical journal proves that it was
+    // persisted at the exact same completed-turn boundary. A remote,
+    // checkpoint, or differently versioned projection must still lose all
+    // turn-sensitive controls when the local canonical generation wins.
+    let exact_local_legacy_projection = !restored.restored_from_cloud
+        && typed_continuation.is_none()
+        && prepared_history.journal_state.turn == restored.turn_count;
+    let use_restored_projection = use_typed_continuation
+        || prepared_history.resume.is_none()
+        || exact_local_legacy_projection;
+    if !use_restored_projection {
+        // The local canonical generation won causal selection. Do not retain
+        // independently persisted cloud/checkpoint controls from a different
+        // generation.
+        restored.activated_deferred_tool_names.clear();
+        restored.recent_tools.clear();
+        restored.blocked_tools.clear();
+        restored.approval_overrides = None;
+        restored.interruption = None;
+        restored.compaction_state = None;
+        restored.pipeline_state = None;
+        restored.executing_plan_json = None;
+        restored.plan_goal = None;
+        restored.plan_config_json = None;
+        restored.plan_execution_rounds = 0;
+        restored.contract_json = None;
+        restored.model = None;
+        restored.permission_mode = None;
+    }
+    let restored_permission_mode = parse_restored_permission_mode(&restored)?;
+    let restored_resume_messages = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.messages.as_slice())
+            .unwrap_or_default()
+    } else if let Some(active) = prepared_history.active_conversation.as_ref() {
+        active.messages()
+    } else {
+        restored.conversation_messages.as_slice()
+    };
+    let mut restored_activation = if use_restored_projection {
+        restored.activated_deferred_tool_names.clone()
+    } else {
+        Vec::new()
+    };
     let last_turn_event = local_journal.last_turn_event;
     let user_id = state
         .ingestion_user_id
@@ -5447,8 +5677,38 @@ async fn apply_restored_session(
         .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
 
     let mut step_restore_error = None;
+    let local_checkpoint_is_admissible = match selected_cursor.as_ref() {
+        None => true,
+        Some(selected) => {
+            match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(
+                &user_id,
+                &restored.session_id,
+            ) {
+                Ok(None) => true,
+                Ok(Some(checkpoint)) => {
+                    checkpoint
+                        .conversation_cursor
+                        .as_ref()
+                        .is_some_and(|source| {
+                            session_continuation::cursor_is_exact_for_attached_account(
+                                source, selected,
+                            )
+                        })
+                }
+                // Let the established recovery path surface the concrete I/O
+                // or decode error instead of replacing it with a causal one.
+                Err(_) => true,
+            }
+        }
+    };
     // Try new crash recovery state machine first; fall back to legacy restore
-    let step_restored =
+    let step_restored = if !local_checkpoint_is_admissible {
+        tracing::warn!(
+            session_id = %restored.session_id,
+            "skipping crash recovery from a checkpoint outside the selected conversation generation"
+        );
+        None
+    } else {
         match astra_pipeline::crash_recovery::recover_from_crash(&user_id, &restored.session_id) {
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::AutoRecovered {
                 restored: cr_restored,
@@ -5578,23 +5838,55 @@ async fn apply_restored_session(
                     }
                 }
             }
+        }
+    };
+    let step_restored = step_restored.filter(|checkpoint| {
+        let admissible = match (
+            selected_cursor.as_ref(),
+            checkpoint.conversation_cursor.as_ref(),
+        ) {
+            (None, _) => true,
+            (Some(selected), Some(source)) => {
+                session_continuation::cursor_is_exact_for_attached_account(source, selected)
+            }
+            _ => false,
         };
-    let has_cloud_heavy_fallback = !restored.conversation_messages.is_empty()
-        || !restored.blocked_tools.is_empty()
-        || restored.approval_overrides.is_some()
-        || restored.interruption.is_some()
-        || restored.compaction_state.is_some();
+        if !admissible {
+            tracing::warn!(
+                session_id = %restored.session_id,
+                "ignoring a local step checkpoint outside the selected conversation generation"
+            );
+        }
+        admissible
+    });
+    let has_cloud_heavy_fallback = use_restored_projection
+        && (!restored_resume_messages.is_empty()
+            || !restored.blocked_tools.is_empty()
+            || restored.approval_overrides.is_some()
+            || restored.interruption.is_some()
+            || restored.compaction_state.is_some());
     if let Some(step_restored) = step_restored.as_ref() {
         restored_activation.extend(step_restored.activated_deferred_tool_names.iter().cloned());
     }
-    restored_activation.extend(
-        prepared_history
-            .activated_deferred_tool_names
-            .iter()
-            .cloned(),
-    );
+    let prepared_activation_is_admissible =
+        match (selected_cursor.as_ref(), prepared_history.resume.as_ref()) {
+            (None, _) => true,
+            (Some(selected), Some(source)) => {
+                session_continuation::cursor_is_exact_for_attached_account(&source.cursor, selected)
+            }
+            _ => false,
+        };
+    if prepared_activation_is_admissible {
+        restored_activation.extend(
+            prepared_history
+                .activated_deferred_tool_names
+                .iter()
+                .cloned(),
+        );
+    }
     if step_restore_error.is_some()
         && !has_cloud_heavy_fallback
+        && selected_cursor.is_none()
         && let Some(error) = step_restore_error.as_ref()
     {
         return Err(format!(
@@ -5663,7 +5955,7 @@ async fn apply_restored_session(
         }
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if has_cloud_heavy_fallback {
-        apply_restored_cloud_heavy_state(state, &restored);
+        apply_restored_cloud_heavy_state(state, &restored, restored_resume_messages);
         apply_resume_recovery_state(
             state,
             restored.interruption.as_ref(),
@@ -5695,22 +5987,38 @@ async fn apply_restored_session(
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
     crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
 
-    if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
+    if use_typed_continuation {
+        state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
+    } else if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
         state.history = prepared_history.history;
     }
-    if !prepared_history.recent_tools.is_empty() {
+    if prepared_activation_is_admissible && !prepared_history.recent_tools.is_empty() {
         state.recent_tools = prepared_history.recent_tools;
     }
-    state.csl_manager = prepared_history.csl_manager;
+    state.csl_manager = prepared_activation_is_admissible
+        .then_some(prepared_history.csl_manager)
+        .flatten();
+    state.active_conversation = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.active_conversation.clone())
+    } else {
+        prepared_history.active_conversation.clone()
+    };
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
     let fallback_resume_messages;
-    let canonical_resume_messages = if !restored.conversation_messages.is_empty() {
-        restored.conversation_messages.as_slice()
+    let canonical_resume_messages = if !restored_resume_messages.is_empty() {
+        restored_resume_messages
     } else {
         fallback_resume_messages =
             session_continuation::load_session_messages_for_continuation(&restored.session_id)
-                .unwrap_or_else(|| session_projection::history_as_messages(&state.history));
+                .unwrap_or_else(|| {
+                    session_projection::history_as_messages_for(
+                        astra_core::history_work::HistoryWorkSite::CliResumeHistoryMaterialization,
+                        &state.history,
+                    )
+                });
         fallback_resume_messages.as_slice()
     };
     state.activated_deferred_tool_names = session_continuation::continuation_activation_names(
@@ -6410,6 +6718,38 @@ mod resume_tests {
         session_workspace::write_workspace(&ws).unwrap();
     }
 
+    fn attach_checkpoint_to_canonical_test_generation(
+        session_id: &str,
+        turn_count: u32,
+        heavy: &mut astra_pipeline::step_protocol::HeavyCheckpoint,
+    ) {
+        let owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, session_id)
+                .unwrap();
+        let prepared = active
+            .prepare_commit(turn_count, None, heavy.messages.clone())
+            .unwrap();
+        heavy.conversation_cursor = Some(prepared.next.cursor().clone());
+        session_journal::JournalWriter::new(session_id)
+            .unwrap()
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(session_id),
+                    turn_count,
+                    Some("gpt-5"),
+                    "display user",
+                    "display assistant",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(prepared.commit),
+            )
+            .unwrap();
+    }
+
     fn write_local_step_checkpoint_with_interruption(session_id: &str, turn_count: u32) {
         let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
             format!("step-{turn_count}"),
@@ -6433,6 +6773,7 @@ mod resume_tests {
             "turns_completed": turn_count,
             "remaining_turns": 2,
         }));
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -6462,6 +6803,7 @@ mod resume_tests {
             serde_json::json!({"role": "assistant", "content": "restoring session approvals"}),
         ];
         heavy.approval_overrides = Some(approval_overrides);
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -6605,6 +6947,7 @@ mod resume_tests {
             "recovery": {"ptl_error_count": 2},
         }));
         heavy.consecutive_context_window_errors = 2;
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let completed_event_created_at = heavy.light.created_at.saturating_add(1);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
@@ -6747,6 +7090,78 @@ mod resume_tests {
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert!(guidance.contains("15000 tokens freed"), "{guidance}");
         assert!(guidance.contains("insufficient"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_only_typed_resume_installs_the_selected_active_conversation() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("resume-typed-cloud-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "retain typed history"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "file body"
+            }),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.clone(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 3,
+            journal_event_seq: 3,
+            conversation_seq: 3,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let bundle = astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor: cursor.clone(),
+            source: astra_turn_types::ResumeSourceV1::Checkpoint,
+            conversation_messages: messages.clone(),
+            degraded_reasons: vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        };
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 3,
+            restored_from_cloud: true,
+            resume_bundle: Some(bundle),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("apply typed cloud resume");
+
+        let active = state
+            .active_conversation
+            .expect("typed cloud resume must install active conversation");
+        assert_eq!(active.cursor(), &cursor);
+        assert_eq!(active.messages(), messages);
+        assert!(
+            state
+                .history
+                .iter()
+                .any(|(_, assistant)| assistant == "done")
+        );
     }
 
     #[serial_test::serial]
@@ -7075,7 +7490,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn apply_restored_session_fails_when_local_step_checkpoint_is_invalid_without_fallback() {
+    async fn apply_restored_session_ignores_corrupt_checkpoint_when_journal_is_recoverable() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-step-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -7096,20 +7511,19 @@ mod resume_tests {
             ..Default::default()
         };
 
-        let error = apply_restored_session(None, &api, &mut state, restored)
+        apply_restored_session(None, &api, &mut state, restored)
             .await
-            .expect_err("invalid checkpoint without fallback should fail restore");
+            .expect("the journal is a valid degraded recovery source");
 
-        assert!(
-            error.contains("Failed to restore local step checkpoint"),
-            "{error}"
-        );
-        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
-        assert_eq!(state.turn, 7);
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 2);
         assert_eq!(
             state.history,
-            vec![("old".to_string(), "state".to_string())]
+            vec![("continue".to_string(), "restored".to_string())]
         );
+        assert!(state.runtime_compaction_state.is_none());
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.tool_health_entries.is_empty());
     }
 
     #[serial_test::serial]
@@ -8513,6 +8927,8 @@ mod resume_tests {
             };
             let restored_child = PreparedForkRestore {
                 history: child_state.history.clone(),
+                active_conversation: None,
+                resume: None,
                 recent_tools: child_state.recent_tools.clone(),
                 activated_deferred_tool_names: Vec::new(),
                 csl_manager: None,
@@ -8601,6 +9017,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8668,6 +9086,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8720,6 +9140,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8784,6 +9206,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8838,6 +9262,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8891,6 +9317,8 @@ mod resume_tests {
         };
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
+            active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,

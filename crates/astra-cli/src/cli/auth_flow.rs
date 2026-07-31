@@ -1,7 +1,10 @@
 use crate::cli::cli_config::cli_utils::{
-    CredentialStore, Profile, credential_store, map_thin_err, profile_name,
+    CredentialStore, Profile, cli_profile_owner_scope, credential_store, load_credentials,
+    map_thin_err, profile_name,
 };
+use crate::cli::session::session_state::SessionState;
 use serde::Deserialize;
+use std::time::Duration;
 
 /// Session authentication failure that can be repaired by `/login`.
 ///
@@ -35,12 +38,13 @@ pub(crate) fn clear_profile_auth(profile: Option<&str>) -> Result<(), String> {
 }
 
 #[derive(Deserialize)]
-struct AuthTokenPayload {
-    access_token: String,
-    refresh_token: String,
+pub(crate) struct AuthTokenPayload {
+    pub(crate) user_id: String,
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: String,
 }
 
-fn parse_auth_tokens(body: &str) -> Result<AuthTokenPayload, String> {
+pub(crate) fn parse_auth_tokens(body: &str) -> Result<AuthTokenPayload, String> {
     let tokens: AuthTokenPayload = serde_json::from_str(body).map_err(|e| e.to_string())?;
     if tokens.access_token.is_empty() {
         return Err("missing access_token".to_string());
@@ -48,10 +52,13 @@ fn parse_auth_tokens(body: &str) -> Result<AuthTokenPayload, String> {
     if tokens.refresh_token.is_empty() {
         return Err("missing refresh_token".to_string());
     }
+    if tokens.user_id.trim().is_empty() {
+        return Err("missing user_id".to_string());
+    }
     Ok(tokens)
 }
 
-fn save_profile_auth_tokens(
+pub(crate) fn save_profile_auth_tokens(
     profile: Option<&str>,
     username: &str,
     tokens: &AuthTokenPayload,
@@ -59,27 +66,65 @@ fn save_profile_auth_tokens(
     let username = username.to_string();
     let access = tokens.access_token.clone();
     let refresh = tokens.refresh_token.clone();
-    credential_store()
+    let name = credential_store()
         .mutate(|creds| {
             let name =
                 CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
             let existing = creds.profiles.get(&name).cloned().unwrap_or_default();
-            let prev_session = if existing.username.as_deref() == Some(&username) {
+            let prev_session = if existing.account_id.as_deref() == Some(tokens.user_id.as_str()) {
                 existing.last_session_id
             } else {
                 None
             };
             let updated = Profile {
                 username: Some(username.clone()),
+                account_id: Some(tokens.user_id.clone()),
                 access_token: Some(access.clone()),
                 refresh_token: Some(refresh.clone()),
                 last_session_id: prev_session,
                 memoria_api_key: existing.memoria_api_key,
             };
             creds.current_profile = Some(name.clone());
-            creds.profiles.insert(name, updated);
+            creds.profiles.insert(name.clone(), updated);
+            name
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    crate::cli::cli_config::cli_utils::install_cli_profile_identity(
+        name,
+        Some(tokens.user_id.clone()),
+    )
+}
+
+pub(crate) fn save_refreshed_profile_tokens(
+    profile: Option<&str>,
+    tokens: &AuthTokenPayload,
+) -> Result<(), String> {
+    let user_id = tokens.user_id.clone();
+    let access = tokens.access_token.clone();
+    let refresh = tokens.refresh_token.clone();
+    credential_store()
+        .mutate(|creds| {
+            let name =
+                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
+            let entry = creds.profiles.entry(name.clone()).or_default();
+            match entry.account_id.as_deref() {
+                Some(existing_account_id) if existing_account_id == user_id => {}
+                Some(existing_account_id) => {
+                    return Err(format!(
+                    "refresh response account_id {user_id:?} does not match profile '{name}' account_id {existing_account_id:?}"
+                ));
+                }
+                None => {
+                    return Err(format!(
+                        "profile '{name}' has no server-issued account_id; log in again instead of refreshing unbound credentials"
+                    ));
+                }
+            }
+            entry.access_token = Some(access.clone());
+            entry.refresh_token = Some(refresh.clone());
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?
 }
 
 pub(crate) async fn do_login(
@@ -88,13 +133,21 @@ pub(crate) async fn do_login(
     username: &str,
     password: &str,
 ) -> Result<String, String> {
+    let tokens = request_login_tokens(api, username, password).await?;
+    save_profile_auth_tokens(profile, username, &tokens)?;
+    Ok(tokens.access_token)
+}
+
+async fn request_login_tokens(
+    api: &astra_thin_client::ThinClient,
+    username: &str,
+    password: &str,
+) -> Result<AuthTokenPayload, String> {
     let body = api
         .post_auth_login_json(&serde_json::json!({ "username": username, "password": password }))
         .await
         .map_err(map_thin_err)?;
-    let tokens = parse_auth_tokens(&body)?;
-    save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    parse_auth_tokens(&body)
 }
 
 pub(crate) async fn do_register(
@@ -104,6 +157,17 @@ pub(crate) async fn do_register(
     email: &str,
     password: &str,
 ) -> Result<String, String> {
+    let tokens = request_register_tokens(api, username, email, password).await?;
+    save_profile_auth_tokens(profile, username, &tokens)?;
+    Ok(tokens.access_token)
+}
+
+async fn request_register_tokens(
+    api: &astra_thin_client::ThinClient,
+    username: &str,
+    email: &str,
+    password: &str,
+) -> Result<AuthTokenPayload, String> {
     let body = api
         .post_auth_register_json(&serde_json::json!({
             "username": username,
@@ -112,18 +176,275 @@ pub(crate) async fn do_register(
         }))
         .await
         .map_err(map_thin_err)?;
-    let tokens = parse_auth_tokens(&body)?;
+    parse_auth_tokens(&body)
+}
+
+const AUTH_RUNTIME_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
+
+async fn retire_auth_runtime(state: &mut SessionState) {
+    if let Some(spawner) = state.agent_spawner.take() {
+        spawner
+            .shutdown_and_wait_with_reason(AUTH_RUNTIME_SHUTDOWN_WAIT, AUTH_RUNTIME_REPLACED_REASON)
+            .await;
+    }
+    state.delegation_engine = None;
+    state.unregister_root_mailbox().await;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparedAuthTransition {
+    owner_changed: bool,
+    runtime_needs_initialization: bool,
+}
+
+async fn prepare_session_auth_transition(
+    profile: Option<&str>,
+    account_id: &str,
+    state: &mut SessionState,
+) -> Result<PreparedAuthTransition, String> {
+    let credentials = load_credentials();
+    let profile_name = profile_name(profile, &credentials);
+    let target_owner = cli_profile_owner_scope(&profile_name, Some(account_id))?;
+    let owner_changed = target_owner != astra_services::local_owner_scope();
+    let runtime_needs_initialization =
+        state.agent_spawner.is_none() || state.delegation_engine.is_none();
+
+    if owner_changed {
+        // The old session must reach its durable boundary while the old owner
+        // scope and credentials are still installed. Only then may local
+        // ownerless APIs be rebound to the authenticated account.
+        retire_auth_runtime(state).await;
+        crate::cli::session::session_cleanup::finalize_session(state).await;
+        state.reset_for_new_session();
+        state.clear_session_id();
+    } else if runtime_needs_initialization {
+        // A same-owner login after `/logout`, or a partially initialized
+        // runtime, is not a session boundary. Retire any incomplete half and
+        // rebuild it after the new credentials have been saved.
+        retire_auth_runtime(state).await;
+    }
+    Ok(PreparedAuthTransition {
+        owner_changed,
+        runtime_needs_initialization: owner_changed || runtime_needs_initialization,
+    })
+}
+
+async fn initialize_authenticated_runtime(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    access_token: String,
+    state: &mut SessionState,
+) {
+    crate::cli::agent_runtime::initialize_multi_agent_runtime(state, api, access_token, profile)
+        .await;
+}
+
+pub(crate) async fn do_login_for_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    username: &str,
+    password: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    let tokens = request_login_tokens(api, username, password).await?;
+    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    tracing::debug!(
+        owner_changed = transition.owner_changed,
+        runtime_needs_initialization = transition.runtime_needs_initialization,
+        "prepared authenticated session transition"
+    );
     save_profile_auth_tokens(profile, username, &tokens)?;
-    Ok(tokens.access_token)
+    let access_token = tokens.access_token.clone();
+    if transition.runtime_needs_initialization {
+        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    }
+    Ok(access_token)
+}
+
+pub(crate) async fn do_register_for_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    username: &str,
+    email: &str,
+    password: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    let tokens = request_register_tokens(api, username, email, password).await?;
+    let transition = prepare_session_auth_transition(profile, &tokens.user_id, state).await?;
+    tracing::debug!(
+        owner_changed = transition.owner_changed,
+        runtime_needs_initialization = transition.runtime_needs_initialization,
+        "prepared authenticated session transition"
+    );
+    save_profile_auth_tokens(profile, username, &tokens)?;
+    let access_token = tokens.access_token;
+    if transition.runtime_needs_initialization {
+        initialize_authenticated_runtime(api, profile, access_token.clone(), state).await;
+    }
+    Ok(access_token)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_profile_auth, do_login, is_auth_error, is_llm_provider_auth_error};
+    use super::{
+        AuthTokenPayload, clear_profile_auth, do_login, do_login_for_session, is_auth_error,
+        is_llm_provider_auth_error, parse_auth_tokens, save_refreshed_profile_tokens,
+    };
     use crate::cli::cli_config::cli_utils::{Profile, load_credentials, save_credentials};
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn auth_token_payload_requires_server_issued_user_identity() {
+        let Err(missing) =
+            parse_auth_tokens(r#"{"access_token":"access","refresh_token":"refresh"}"#)
+        else {
+            panic!("responses without user_id must not bind local ownership");
+        };
+        assert!(missing.contains("missing field `user_id`"), "{missing}");
+
+        let Err(blank) = parse_auth_tokens(
+            r#"{"user_id":"  ","access_token":"access","refresh_token":"refresh"}"#,
+        ) else {
+            panic!("blank user_id must not bind local ownership");
+        };
+        assert_eq!(blank, "missing user_id");
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn refresh_account_mismatch_is_atomic() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = load_credentials();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                account_id: Some("account-a".to_string()),
+                access_token: Some("access-a".to_string()),
+                refresh_token: Some("refresh-a".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+
+        let error = save_refreshed_profile_tokens(
+            None,
+            &AuthTokenPayload {
+                user_id: "account-b".to_string(),
+                access_token: "access-b".to_string(),
+                refresh_token: "refresh-b".to_string(),
+            },
+        )
+        .expect_err("refresh must not move a profile to another account");
+        assert!(error.contains("does not match"), "{error}");
+
+        let profile = load_credentials().profiles.remove("default").unwrap();
+        assert_eq!(profile.account_id.as_deref(), Some("account-a"));
+        assert_eq!(profile.access_token.as_deref(), Some("access-a"));
+        assert_eq!(profile.refresh_token.as_deref(), Some("refresh-a"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn login_account_change_closes_old_owner_session_before_rebinding() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let (_sessions_dir, _journal_guard) = crate::tests::isolated_sessions_dir();
+        let _identity_guard =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default", None,
+            )
+            .unwrap();
+        let old_owner = astra_services::local_owner_scope();
+        let session_id = "account-transition-session";
+        let writer = astra_services::session_journal::JournalWriter::new(session_id).unwrap();
+        writer
+            .append(
+                &astra_services::session_journal::JournalEvent::session_start(
+                    Some(session_id),
+                    Some("model-a"),
+                ),
+            )
+            .unwrap();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id(session_id);
+        state.journal = Some(writer);
+        state.turn = 1;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": "account-b",
+                "access_token": "access-b",
+                "refresh_token": "refresh-b"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let token = do_login_for_session(&api, None, "user-b", "password", &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(token, "access-b");
+        assert!(state.session_id.is_none());
+        assert_ne!(astra_services::local_owner_scope(), old_owner);
+        let old_events =
+            astra_services::session_journal::read_journal_for_owner(&old_owner, session_id)
+                .unwrap();
+        assert!(old_events.iter().any(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::SessionEnd
+        }));
+        assert_eq!(
+            load_credentials().profiles["default"].account_id.as_deref(),
+            Some("account-b")
+        );
+        assert!(state.delegation_engine.is_some());
+        assert!(state.agent_spawner.is_some());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn same_owner_login_rebuilds_missing_runtime_without_resetting_session() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let _identity_guard =
+            crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+                "default",
+                Some("account-a"),
+            )
+            .unwrap();
+        let owner = astra_services::local_owner_scope();
+        let mut state = crate::cli::session::session_state::SessionState::default();
+        state.set_session_id("same-owner-session");
+        assert!(state.agent_spawner.is_none());
+        assert!(state.delegation_engine.is_none());
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": "account-a",
+                "access_token": "access-new",
+                "refresh_token": "refresh-new"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+
+        let token = do_login_for_session(&api, None, "user-a", "password", &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(token, "access-new");
+        assert_eq!(astra_services::local_owner_scope(), owner);
+        assert_eq!(state.session_id.as_deref(), Some("same-owner-session"));
+        assert!(state.delegation_engine.is_some());
+        assert!(state.agent_spawner.is_some());
+    }
 
     #[test]
     fn auth_error_predicates_distinguish_provider_from_session() {
@@ -187,6 +508,7 @@ mod tests {
                 "password": "astra-pass"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": "astra-user-id",
                 "access_token": "internal-access",
                 "refresh_token": "internal-refresh"
             })))

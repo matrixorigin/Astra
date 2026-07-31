@@ -70,6 +70,9 @@ impl Default for CacheRestoreReport {
 /// Restored session state — everything needed to resume execution.
 #[derive(Debug)]
 pub struct RestoredSession {
+    /// Canonical conversation boundary projected by the heavy checkpoint.
+    /// Absent for legacy checkpoints.
+    pub conversation_cursor: Option<astra_turn_types::SessionCursorV1>,
     /// Full conversation messages (for LLM context)
     pub messages: Vec<serde_json::Value>,
     /// Remaining token budget
@@ -175,11 +178,34 @@ fn build_restored_session(
     session_id: &str,
     heavy: HeavyCheckpoint,
 ) -> Result<Option<RestoredSession>, RestoreError> {
+    if let Some(cursor) = heavy.conversation_cursor.as_ref() {
+        if cursor.session_id != session_id {
+            return Err(RestoreError::InvalidCheckpoint(format!(
+                "conversation cursor belongs to session `{}`, expected `{session_id}`",
+                cursor.session_id
+            )));
+        }
+        if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
+            || cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(RestoreError::InvalidCheckpoint(
+                "conversation cursor schema is unsupported".to_string(),
+            ));
+        }
+        if astra_turn_types::canonical_conversation_root(&heavy.messages)
+            != cursor.canonical_root_hash
+        {
+            return Err(RestoreError::InvalidCheckpoint(
+                "checkpoint messages do not match the conversation cursor root".to_string(),
+            ));
+        }
+    }
     let resume_turn = extract_resume_turn(&heavy);
     let (completed_results, cache_restore_report) =
         recover_completed_tool_audit_from_events(user_id, session_id);
 
     Ok(Some(RestoredSession {
+        conversation_cursor: heavy.conversation_cursor,
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
@@ -486,6 +512,7 @@ mod tests {
                 total_tokens: 1000,
                 created_at: epoch_ms(),
             },
+            conversation_cursor: None,
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
@@ -547,6 +574,32 @@ mod tests {
         assert!(matches!(result, Err(RestoreError::VersionMismatch { .. })));
     }
 
+    #[test]
+    fn checkpoint_cursor_root_must_match_its_messages_before_restore() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "actual"})];
+        let mut heavy = make_heavy_checkpoint(3, messages, vec![]);
+        heavy.conversation_cursor = Some(astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: TEST_USER_ID.into(),
+            session_id: "session-1".into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 3,
+            journal_event_seq: 3,
+            conversation_seq: 3,
+            canonical_root_hash: "wrong-root".into(),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        });
+
+        let error = build_restored_session(TEST_USER_ID, "session-1", heavy).unwrap_err();
+        assert!(
+            matches!(error, RestoreError::InvalidCheckpoint(ref detail)
+                if detail.contains("cursor root")),
+            "{error:?}"
+        );
+    }
+
     // ── Resume turn extraction ──
 
     #[test]
@@ -595,6 +648,7 @@ mod tests {
     #[test]
     fn restore_summary_format() {
         let restored = RestoredSession {
+            conversation_cursor: None,
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,

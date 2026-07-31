@@ -9,8 +9,9 @@ use astra_turn_core::conversation_log::manager::CslManager;
 use super::turn_commit::{PrimaryTurnCommit, TurnCommitOutcome, commit_primary_turn};
 use super::turn_learning::{analyze_chat_turn_learning, turn_quality_feedback_from_eval};
 use super::turn_post_commit::{
-    TurnPostCommitJob, apply_turn_post_commit_completion, attach_deferred_sidecars,
-    execute_turn_post_commit_job, extract_csl_fields_from_result, prepare_turn_post_commit_job,
+    TurnPostCommitJob, account_turn_post_commit_queue, apply_turn_post_commit_completion,
+    attach_deferred_sidecars, execute_turn_post_commit_job, extract_csl_fields_from_result,
+    prepare_turn_post_commit_job,
 };
 use super::turn_reporting::{build_history_text, print_turn_status_line};
 use crate::cli::cli_config::cli_utils::persist_profile_last_session_or_warn;
@@ -57,7 +58,10 @@ pub(crate) async fn apply_turn_success_async(
     // semantics. Keep the messages on `result` until that synchronous state
     // transition completes; the deferred CSL worker receives its own owned
     // snapshot.
-    let final_messages = result.final_messages.clone();
+    let final_messages = crate::cli::history_work::clone_json_history(
+        astra_core::history_work::HistoryWorkSite::CliPostCommitSnapshot,
+        &result.final_messages,
+    );
     let csl_checkpoint_fields = extract_csl_fields_from_result(&result);
     let primary_commit_started = Instant::now();
     let primary_commit =
@@ -81,6 +85,7 @@ pub(crate) async fn apply_turn_success_async(
         );
         attach_deferred_sidecars(&mut post_commit, primary_commit.deferred_sidecars);
         if let Some(tx) = post_commit_tx {
+            account_turn_post_commit_queue(&mut post_commit);
             match tx.try_send(post_commit) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(post_commit)) => {
@@ -129,6 +134,14 @@ async fn apply_turn_success_on_blocking_worker(
     result: StreamResult,
     turn_start: Instant,
 ) -> PrimaryTurnCommit {
+    let history_queue_reservation = crate::cli::history_work::reserve_pair_history_queue(
+        astra_core::history_work::HistoryWorkSite::CliPrimaryCommitWorkerHistoryQueue,
+        &state.history,
+    );
+    let final_messages_queue_reservation = crate::cli::history_work::reserve_json_history_queue(
+        astra_core::history_work::HistoryWorkSite::CliPrimaryCommitWorkerFinalMessagesQueue,
+        &result.final_messages,
+    );
     let state_slot = Arc::new(Mutex::new(Some(std::mem::take(state))));
     let worker_slot = Arc::clone(&state_slot);
     let profile = profile.map(str::to_owned);
@@ -136,6 +149,8 @@ async fn apply_turn_success_on_blocking_worker(
     let journal_dir_override = astra_services::session_journal::current_journal_dir_override();
 
     let worker = tokio::task::spawn_blocking(move || {
+        drop(history_queue_reservation);
+        drop(final_messages_queue_reservation);
         let _journal_dir_guard = journal_dir_override
             .as_deref()
             .map(astra_services::session_journal::JournalDirGuard::new);
@@ -209,6 +224,7 @@ struct TurnSuccessLiveSnapshot {
     last_response: Option<String>,
     continuation_anchor: Option<ContinuationAnchor>,
     pending_followup_suggestion: Option<crate::cli::followup_suggestion::FollowupSuggestion>,
+    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     redo_stack: Vec<(String, String, u32)>,
     history: Vec<(String, String)>,
     recent_tools: Vec<String>,
@@ -245,8 +261,12 @@ impl TurnSuccessLiveSnapshot {
             last_response: state.last_response.clone(),
             continuation_anchor: state.continuation_anchor.clone(),
             pending_followup_suggestion: state.pending_followup_suggestion.clone(),
+            active_conversation: state.active_conversation.clone(),
             redo_stack: state.redo_stack.clone(),
-            history: state.history.clone(),
+            history: crate::cli::history_work::clone_pair_history(
+                astra_core::history_work::HistoryWorkSite::CliSettlementRollbackSnapshot,
+                &state.history,
+            ),
             recent_tools: state.recent_tools.clone(),
             activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
             resume_restricted_tools: state.resume_restricted_tools.clone(),
@@ -286,6 +306,7 @@ impl TurnSuccessLiveSnapshot {
         state.last_response = self.last_response;
         state.continuation_anchor = self.continuation_anchor;
         state.pending_followup_suggestion = self.pending_followup_suggestion;
+        state.active_conversation = self.active_conversation;
         state.redo_stack = self.redo_stack;
         state.history = self.history;
         state.recent_tools = self.recent_tools;
@@ -409,14 +430,10 @@ fn apply_turn_success_primary_sync(
 
     state.latest_turn_quality_feedback =
         turn_quality_feedback_from_eval(state.turn, &learning_snap.eval);
-    let routing_domain = learning_snap
-        .routing
-        .domain_hint
-        .map(|domain| astra_turn_core::routing_engine::domain_hint_to_label(domain).to_string());
     let entity_skipped = learning_snap.eval.success
         && !result.tools_used.is_empty()
-        && learning_snap.routing.domain_hint.is_none();
-    result.set_repl_learning_journal_fields(routing_domain, entity_skipped);
+        && result.routing_domain_hint.is_none();
+    result.entity_learn_skipped_no_domain = entity_skipped;
 
     let primary_commit = commit_primary_turn(state, line, &mut result, &learning_snap, turn_start);
     if !primary_commit.outcome.turn_persisted {
@@ -504,7 +521,6 @@ mod tests {
         apply_turn_post_commit_completion, execute_turn_post_commit_job,
     };
     use crate::tests::{HomeGuard, heavy_checkpoint_with_runtime_state};
-    use astra_runtime::tool_registry::ToolRegistry;
     use astra_services::session_journal;
     use astra_turn_core::tool_health_persistence::{ToolHealthEntry, load_tool_health};
     use std::time::Instant;
@@ -527,6 +543,70 @@ mod tests {
                 .map(|suggestion| suggestion.text.as_str()),
             Some("run the tests")
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn turn_success_does_not_infer_domain_from_keyword_rich_text() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("typed-domain-none-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result_with_records(
+            "Done.",
+            vec![session_journal::ToolCallRecord {
+                name: "git".to_string(),
+                ok: true,
+                ..Default::default()
+            }],
+        );
+        result.session_id = Some(session_id.clone());
+
+        apply_turn_success(
+            &mut state,
+            None,
+            "show github database memory and fix code",
+            result,
+            Instant::now(),
+        );
+
+        let event = session_journal::read_journal(&session_id)
+            .expect("journal")
+            .into_iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(event.routing_domain_hint, None);
+        assert!(
+            event.entity_learn_skipped_no_domain,
+            "missing typed domain must remain observably unknown"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn turn_success_preserves_typed_llm_domain_without_reclassification() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("typed-domain-value-{}", uuid::Uuid::new_v4());
+        let mut state = SessionState::default();
+        let mut result = crate::tests::stub_stream_result_with_records(
+            "Done.",
+            vec![session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: true,
+                ..Default::default()
+            }],
+        );
+        result.session_id = Some(session_id.clone());
+        result.routing_domain_hint = Some("database".to_string());
+
+        apply_turn_success(&mut state, None, "opaque input", result, Instant::now());
+
+        let event = session_journal::read_journal(&session_id)
+            .expect("journal")
+            .into_iter()
+            .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+            .expect("turn event");
+        assert_eq!(event.routing_domain_hint.as_deref(), Some("database"));
+        assert!(!event.entity_learn_skipped_no_domain);
     }
 
     #[test]
@@ -682,31 +762,6 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("46 tool call(s) completed")
-        );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn preserved_recent_tools_keep_ack_followup_tool_bearing() {
-        let (_tmp, _g) = crate::tests::isolated_sessions_dir();
-        let mut state = SessionState {
-            recent_tools: vec!["git".into(), "bash".into()],
-            ..Default::default()
-        };
-        let result = crate::tests::stub_stream_result("我将逐个修复所有发现的问题。");
-
-        apply_turn_success(&mut state, None, "修复这些问题", result, Instant::now());
-
-        let registry = ToolRegistry::new(astra_tools::schemas::all_tool_schemas());
-        let (schemas, report) =
-            registry.build_initial_surface_with_report_ctx("？", 800, &state.recent_tools);
-        assert!(
-            !schemas.is_empty(),
-            "a short follow-up after a toolful context must not get an empty tool surface"
-        );
-        assert!(
-            report.visible_count > 0,
-            "tool surface report must match the non-empty schema surface"
         );
     }
 

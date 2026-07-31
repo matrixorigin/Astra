@@ -1367,6 +1367,7 @@ pub(crate) async fn handle_info_command(
                 incremental_state: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
+                stream_json_emitter: None,
                 agent_live_event_sink: None,
                 approval_request_tx: None,
                 ask_user_request_tx: None,

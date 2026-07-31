@@ -1496,6 +1496,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "get_results": ["group_id"],
                         "stop_slot": ["group_id", "slot_index"],
                         "stop_group": ["group_id"]
+                    },
+                    "x-astra-per-action-allowed": {
+                        "start": ["action", "group_id", "title", "target_count", "slots", "defaults"],
+                        "get_results": ["action", "group_id", "slot_index", "offset", "max_bytes"],
+                        "stop_slot": ["action", "group_id", "slot_index"],
+                        "stop_group": ["action", "group_id"]
                     }
                 }
             }

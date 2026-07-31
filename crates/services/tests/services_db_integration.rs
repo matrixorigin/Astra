@@ -14,6 +14,9 @@
 
 use astra_core::{EvidenceRef, MatrixOneSettings, SharedPool};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
+use astra_services::introspection::{
+    IntentDriftAssessmentStatus, IntentDriftLevel, IntentDriftVerdict,
+};
 use astra_services::replay::ReplaySessionRequestData;
 use astra_services::session_audit::TurnListParams;
 use astra_services::session_audit::{
@@ -2630,7 +2633,14 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     .await
     .expect("seed owner session");
 
-    let first_messages = [serde_json::json!({"role": "user", "content": "stable"})];
+    let first_messages = (0..260)
+        .map(|index| {
+            serde_json::json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!("stable-{index}"),
+            })
+        })
+        .collect::<Vec<_>>();
     let first_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
         user_id: &owner_user_id,
         session_id: &session_id,
@@ -2660,7 +2670,16 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
     )
     .await
     .expect("persist first prompt");
-    assert_eq!(first.delta_counts.append, 1);
+    assert_eq!(first.delta_counts.append, 260);
+    assert!(
+        first.delta_counts.token_weights.append > 0,
+        "new prompt chunks must carry token-weighted delta evidence"
+    );
+    assert_eq!(
+        first.delta_counts.token_weights.tokenizer_revision,
+        astra_turn_types::token_estimate::CANONICAL_JSON_TOKENIZER_REVISION
+    );
+    assert!(first.delta_counts.token_weights.complete);
 
     sqlx::query(
         "INSERT INTO prompt_deltas
@@ -2710,11 +2729,157 @@ async fn prompt_delta_previous_chunks_are_owner_session_bound() {
         second.previous_request_id.as_deref(),
         Some(first.request_id.as_str())
     );
-    assert_eq!(second.delta_counts.reuse, 1);
+    assert_eq!(second.delta_counts.reuse, 260);
+    assert_eq!(
+        second.delta_counts.token_weights.reuse, first.delta_counts.token_weights.append,
+        "the same retained chunk must preserve its tokenizer-independent weight"
+    );
     assert_eq!(
         second.delta_counts.drop, 0,
         "foreign prompt_deltas rows with the same request_id must not affect owner diffing"
     );
+    assert!(second.delta_counts.token_weights.complete);
+    let second_delta_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prompt_deltas
+         WHERE user_id = ? AND session_id = ? AND request_id = ?",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .bind(&second.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count compressed reuse rows");
+    let second_reuse_count: Option<i32> = sqlx::query_scalar(
+        "SELECT reuse_count FROM prompt_deltas
+         WHERE user_id = ? AND session_id = ? AND request_id = ? AND op = 'reuse_prefix'",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .bind(&second.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load compressed reuse count");
+    assert_eq!(second_delta_rows, 1);
+    assert_eq!(second_reuse_count, Some(260));
+
+    let third_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+        user_id: &owner_user_id,
+        session_id: &session_id,
+        turn: 3,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &first_messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("third prompt plan");
+    let third = astra_services::persist_prompt_request(
+        &shared,
+        &astra_services::PromptRequestPersistInput {
+            session_id: session_id.clone(),
+            user_id: owner_user_id.clone(),
+            run_id: None,
+            turn: 3,
+            round: 0,
+            attempt: 0,
+            source: "turn".into(),
+            model: "test-model".into(),
+            provider: "other-provider".into(),
+        },
+        &third_plan,
+    )
+    .await
+    .expect("persist provider-change prompt");
+    assert_eq!(third.delta_counts.reuse, 260);
+    assert!(
+        !third.delta_counts.token_weights.complete,
+        "provider changes must not claim cache evidence from another namespace"
+    );
+
+    let mut previous_request_id = third.request_id;
+    for turn in 4..=100 {
+        let plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+            user_id: &owner_user_id,
+            session_id: &session_id,
+            turn,
+            round: 0,
+            attempt: 0,
+            source: "turn",
+            messages: &first_messages,
+            tools: &[],
+            max_output_tokens: None,
+        })
+        .expect("long-session prompt plan");
+        let persisted = astra_services::persist_prompt_request(
+            &shared,
+            &astra_services::PromptRequestPersistInput {
+                session_id: session_id.clone(),
+                user_id: owner_user_id.clone(),
+                run_id: None,
+                turn,
+                round: 0,
+                attempt: 0,
+                source: "turn".into(),
+                model: "test-model".into(),
+                provider: "other-provider".into(),
+            },
+            &plan,
+        )
+        .await
+        .expect("persist long-session prompt");
+        assert_eq!(
+            persisted.previous_request_id.as_deref(),
+            Some(previous_request_id.as_str())
+        );
+        assert_eq!(persisted.delta_counts.reuse, 260);
+        previous_request_id = persisted.request_id;
+    }
+
+    let mut changed_messages = first_messages.clone();
+    changed_messages.last_mut().expect("tail")["content"] = serde_json::json!("changed-tail");
+    let tail_plan = astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+        user_id: &owner_user_id,
+        session_id: &session_id,
+        turn: 101,
+        round: 0,
+        attempt: 0,
+        source: "turn",
+        messages: &changed_messages,
+        tools: &[],
+        max_output_tokens: None,
+    })
+    .expect("tail-change prompt plan");
+    let tail = astra_services::persist_prompt_request(
+        &shared,
+        &astra_services::PromptRequestPersistInput {
+            session_id: session_id.clone(),
+            user_id: owner_user_id.clone(),
+            run_id: None,
+            turn: 101,
+            round: 0,
+            attempt: 0,
+            source: "turn".into(),
+            model: "test-model".into(),
+            provider: "other-provider".into(),
+        },
+        &tail_plan,
+    )
+    .await
+    .expect("persist tail-change prompt");
+    assert_eq!(tail.delta_counts.reuse, 259);
+    assert_eq!(tail.delta_counts.replace, 1);
+    let tail_delta_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM prompt_deltas
+         WHERE user_id = ? AND session_id = ? AND request_id = ?",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .bind(&tail.request_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count tail-change delta rows");
+    assert_eq!(tail_delta_rows, 2);
 
     cleanup_restore_fixture_for_owners(&pool, &[session_id], &[&owner_user_id, &other_user_id])
         .await;
@@ -3918,7 +4083,7 @@ async fn durable_task_resume_loads_verification_history_from_db() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
+async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_metadata() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
@@ -4208,22 +4373,26 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(restored_a.total_tokens_in, 200);
     assert_eq!(restored_a.total_tokens_out, 50);
     assert_eq!(restored_a.checkpoint_count, 1);
-    assert_eq!(
-        restored_a.recent_tools,
-        vec!["bash".to_string(), "rg".to_string()]
+    assert!(
+        restored_a.resume_bundle.is_none(),
+        "isolated user_query rows do not prove a complete causal conversation"
+    );
+    assert!(
+        restored_a.recent_tools.is_empty(),
+        "an ordinary checkpoint without the selected conversation cursor cannot supply prompt state"
     );
     assert_eq!(
         restored_a.git_branch.as_deref(),
         Some("feature/cloud-sync"),
         "cloud restore should recover git_branch from session metadata"
     );
-    assert_eq!(restored_a.model.as_deref(), Some("gpt-5.4"));
-    assert_eq!(
-        restored_a
-            .last_context_trace
-            .as_ref()
-            .map(|trace| trace.turn_id.as_str()),
-        Some("turn-a")
+    assert!(
+        restored_a.model.is_none(),
+        "picker metadata without a cursor cannot select the resumed provider"
+    );
+    assert!(
+        restored_a.last_context_trace.is_none(),
+        "diagnostic context traces are not causal resume projections"
     );
     assert!(restored_a.executing_plan_json.is_none());
     assert!(restored_a.plan_goal.is_none());
@@ -4240,27 +4409,26 @@ async fn session_restore_cloud_roundtrip_restores_resume_and_picker_fields() {
     assert_eq!(restored_b.total_tokens_in, 40);
     assert_eq!(restored_b.total_tokens_out, 10);
     assert_eq!(restored_b.checkpoint_count, 0);
-    assert_eq!(
-        restored_b.recent_tools,
-        vec!["grep".to_string(), "view".to_string()],
-        "cloud restore should fall back to context-trace selected tools when no ordinary checkpoint exists"
+    assert!(
+        restored_b.resume_bundle.is_none(),
+        "an incomplete transcript must not manufacture a causal resume bundle"
+    );
+    assert!(
+        restored_b.recent_tools.is_empty(),
+        "context-trace tool visibility is diagnostic, not resumable tool state"
     );
     assert_eq!(restored_b.git_branch.as_deref(), Some("legacy-fallback"));
-    assert_eq!(
-        restored_b.model.as_deref(),
-        Some("claude-sonnet-4.5"),
-        "older sessions should fall back to latest llm_model_used when metadata lacks model"
+    assert!(
+        restored_b.model.is_none(),
+        "an event-level model observation without the selected cursor cannot bind the next request"
     );
-    assert_eq!(
-        restored_b.executing_plan_json.as_deref(),
-        Some(plan_b_json.as_str())
+    assert!(
+        restored_b.executing_plan_json.is_none(),
+        "uncursored session metadata cannot become active task state"
     );
-    assert_eq!(restored_b.plan_goal.as_deref(), Some("finish session B"));
-    assert_eq!(
-        restored_b.plan_config_json.as_deref(),
-        Some(plan_b_config.as_str())
-    );
-    assert_eq!(restored_b.plan_execution_rounds, 2);
+    assert!(restored_b.plan_goal.is_none());
+    assert!(restored_b.plan_config_json.is_none());
+    assert_eq!(restored_b.plan_execution_rounds, 0);
 
     let resumable = restore
         .list_resumable_sessions(&user_id)
@@ -4866,7 +5034,12 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     );
     assert_eq!(
         session.plan_goal.as_deref(),
-        Some("prove remote composite snapshot restore")
+        None,
+        "a checkpoint restore must not splice uncursored session metadata into its exact state"
+    );
+    assert!(
+        session.resume_bundle.is_none(),
+        "the fixture has no complete causal conversation from which to build a resume bundle"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
@@ -5021,6 +5194,36 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
         1,
         "context trace delta update should create the missing session row with the correct event count"
     );
+    let trace_row = sqlx::query(
+        "SELECT event_type, CAST(metadata AS CHAR) AS metadata_json \
+         FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'context_trace_signal'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load persisted context trace event");
+    assert_eq!(
+        trace_row
+            .try_get::<String, _>("event_type")
+            .expect("trace event type"),
+        "context_trace_signal"
+    );
+    let persisted_trace = serde_json::from_str::<ContextTraceSignal>(
+        &trace_row
+            .try_get::<String, _>("metadata_json")
+            .expect("trace metadata"),
+    )
+    .expect("parse persisted context trace");
+    assert_eq!(
+        persisted_trace
+            .tool_surface
+            .as_ref()
+            .map(|surface| surface.visible_tools.as_slice()),
+        Some(["rg".to_string(), "view".to_string()].as_slice()),
+        "the diagnostic event must retain its exact tool-surface evidence"
+    );
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
@@ -5031,16 +5234,13 @@ async fn context_trace_push_lazily_creates_session_row_on_live_matrixone() {
     assert!(restored.restored_from_cloud);
     assert_eq!(restored.turn_count, 0);
     assert_eq!(restored.checkpoint_count, 0);
-    assert_eq!(
-        restored.recent_tools,
-        vec!["rg".to_string(), "view".to_string()]
+    assert!(
+        restored.recent_tools.is_empty(),
+        "a cursorless context trace is diagnostic evidence, not admissible prompt state"
     );
-    assert_eq!(
-        restored
-            .last_context_trace
-            .as_ref()
-            .map(|saved| saved.turn_id.as_str()),
-        Some("turn-missing-row")
+    assert!(
+        restored.last_context_trace.is_none(),
+        "cursorless diagnostic events must not be projected into a causal resume bundle"
     );
 
     flusher.shutdown.cancel();
@@ -5061,15 +5261,36 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     let session_id = Uuid::new_v4().to_string();
     let heavy_only_session = Uuid::new_v4().to_string();
 
-    let heavy_state_json = |messages: serde_json::Value,
+    let heavy_state_json = |owner_id: &str,
+                            session_id: &str,
+                            sequence: u64,
+                            messages: serde_json::Value,
                             blocked_tools: serde_json::Value,
                             recent_tools: serde_json::Value,
                             approval_overrides: serde_json::Value,
                             interruption: serde_json::Value,
                             compaction_state: serde_json::Value| {
+        let conversation_cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: owner_id.to_string(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: 1,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(
+                messages
+                    .as_array()
+                    .expect("checkpoint messages must be an array"),
+            ),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
         serde_json::json!({
             "Heavy": {
                 "light": {},
+                "conversation_cursor": conversation_cursor,
                 "messages": messages,
                 "blocked_tools": blocked_tools,
                 "recent_tools": recent_tools,
@@ -5179,6 +5400,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "step-heavy-v1",
         &serde_json::json!(["step-one"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &session_id,
+            2,
             serde_json::json!([{"role":"user","content":"first"}]),
             serde_json::json!(["dangerous_tool"]),
             serde_json::json!(["step-one"]),
@@ -5206,6 +5430,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "step-heavy-v2",
         &serde_json::json!(["step-two"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &session_id,
+            3,
             serde_json::json!([
                 {"role":"user","content":"first"},
                 {"role":"assistant","content":"reply"},
@@ -5230,6 +5457,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "heavy-only-v1",
         &serde_json::json!(["heavy-only-tool"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &heavy_only_session,
+            1,
             serde_json::json!([
                 {"role":"user","content":"heavy-only user"},
                 {"role":"assistant","content":"heavy-only answer"}
@@ -5283,6 +5513,18 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             .try_get::<Option<String>, _>("state_json")
             .expect("ordinary state"),
         None
+    );
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(
+            ordinary
+                .try_get::<Option<String>, _>("tools_json")
+                .expect("ordinary tools")
+                .as_deref()
+                .expect("ordinary tools JSON"),
+        )
+        .expect("parse ordinary tools"),
+        vec!["bash".to_string(), "rg".to_string()],
+        "ordinary checkpoint tools must remain physically separate from the namespaced step row"
     );
 
     let step = &rows[1];
@@ -5344,11 +5586,13 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     assert_eq!(restored.checkpoint_count, 1);
     assert_eq!(
         restored.recent_tools,
-        vec!["bash".to_string(), "rg".to_string()]
+        vec!["step-two".to_string()],
+        "the exact-cursor heavy checkpoint projection must win prompt-facing state; \
+         ordinary checkpoint tools remain available only through checkpoint history"
     );
-    assert_eq!(restored.conversation_messages.len(), 4);
-    assert_eq!(restored.conversation_messages[0]["role"], "user");
-    assert_eq!(restored.conversation_messages[3]["content"], "done");
+    assert_eq!(restored.resume_messages().len(), 4);
+    assert_eq!(restored.resume_messages()[0]["role"], "user");
+    assert_eq!(restored.resume_messages()[3]["content"], "done");
     assert_eq!(
         restored.blocked_tools,
         vec!["dangerous_tool".to_string(), "web_fetch".to_string()]
@@ -5386,7 +5630,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "cloud restore should fall back to heavy checkpoint recent_tools when no ordinary checkpoint exists"
     );
     assert_eq!(restored_heavy_only.blocked_tools, vec!["grep".to_string()]);
-    assert_eq!(restored_heavy_only.conversation_messages.len(), 2);
+    assert_eq!(restored_heavy_only.resume_messages().len(), 2);
     assert_eq!(
         restored_heavy_only
             .interruption
@@ -5595,6 +5839,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         })
         .await;
     shutdown.signal();
@@ -6110,8 +6355,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
     let session_id = Uuid::new_v4().to_string();
     let owner_query_event_id = Uuid::new_v4().to_string();
     let owner_llm_event_id = Uuid::new_v4().to_string();
+    let owner_drift_assessment_event_id = Uuid::new_v4().to_string();
+    let owner_legacy_drift_event_id = Uuid::new_v4().to_string();
     let other_query_event_id = Uuid::new_v4().to_string();
     let other_llm_event_id = Uuid::new_v4().to_string();
+    let other_drift_assessment_event_id = Uuid::new_v4().to_string();
     let owner_context_id = Uuid::new_v4().to_string();
     let other_context_id = Uuid::new_v4().to_string();
     let owner_decision_id = Uuid::new_v4().to_string();
@@ -6121,7 +6369,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_query_event_id.clone(), owner_llm_event_id.clone()],
+        &[
+            owner_query_event_id.clone(),
+            owner_llm_event_id.clone(),
+            owner_drift_assessment_event_id.clone(),
+            owner_legacy_drift_event_id.clone(),
+        ],
         std::slice::from_ref(&owner_decision_id),
     )
     .await;
@@ -6129,14 +6382,18 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &other_user_id,
         std::slice::from_ref(&session_id),
-        &[other_query_event_id.clone(), other_llm_event_id.clone()],
+        &[
+            other_query_event_id.clone(),
+            other_llm_event_id.clone(),
+            other_drift_assessment_event_id.clone(),
+        ],
         std::slice::from_ref(&other_decision_id),
     )
     .await;
 
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
-         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 2)",
+         VALUES (?, ?, 'mixed-owner-derived-it', 'active', 4)",
     )
     .bind(&session_id)
     .bind(&owner_user_id)
@@ -6210,6 +6467,78 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .execute(&pool)
         .await
         .expect("insert mixed owner event");
+    }
+
+    for (event_id, user_id, event_type, metadata, created_at) in [
+        (
+            &owner_drift_assessment_event_id,
+            &owner_user_id,
+            astra_services::introspection::INTENT_DRIFT_ASSESSMENT_EVENT_TYPE,
+            serde_json::json!({
+                "schema_version": 1,
+                "provenance": {
+                    "kind": "llm_judge",
+                    "invocation_id": "owner-drift-invocation",
+                    "provider": "owner-provider",
+                    "model": "owner-model",
+                    "provider_response_id": "owner-response"
+                },
+                "verdict": "drifting",
+                "score": 0.42,
+                "level": "moderate",
+                "evidence": ["owner-visible structured evidence"],
+                "turn": 1,
+                "round": 2
+            }),
+            "2026-06-01 10:04:00.000000",
+        ),
+        (
+            &owner_legacy_drift_event_id,
+            &owner_user_id,
+            "drift_detected",
+            serde_json::json!({
+                "severity": 0.99,
+                "evidence": ["ambiguous legacy evidence must not be projected"]
+            }),
+            "2026-06-01 10:06:00.000000",
+        ),
+        (
+            &other_drift_assessment_event_id,
+            &other_user_id,
+            astra_services::introspection::INTENT_DRIFT_ASSESSMENT_EVENT_TYPE,
+            serde_json::json!({
+                "schema_version": 1,
+                "provenance": {
+                    "kind": "llm_judge",
+                    "invocation_id": "other-drift-invocation",
+                    "provider": "other-provider",
+                    "model": "other-model",
+                    "provider_response_id": "other-response"
+                },
+                "verdict": "drifting",
+                "score": 0.99,
+                "level": "high",
+                "evidence": ["foreign evidence must not be projected"],
+                "turn": 9,
+                "round": 9
+            }),
+            "2026-06-01 10:05:00.000000",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO agent_events \
+             (event_id, session_id, user_id, event_type, metadata, created_at) \
+             VALUES (?, ?, ?, ?, CAST(? AS JSON), ?)",
+        )
+        .bind(event_id)
+        .bind(&session_id)
+        .bind(user_id)
+        .bind(event_type)
+        .bind(metadata.to_string())
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .expect("insert mixed owner drift assessment");
     }
 
     for (
@@ -6319,12 +6648,12 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         )
         .await
         .expect("owner reflect report");
-    assert_eq!(report.data_coverage.events, 2);
+    assert_eq!(report.data_coverage.events, 4);
     assert_eq!(report.data_coverage.decisions, 1);
     let view = report.view.as_ref().expect("reflect report includes view");
     assert_eq!(view.topic, "overview");
     assert_eq!(view.facet, "overview");
-    assert_eq!(view.data_coverage.events, 2);
+    assert_eq!(view.data_coverage.events, 4);
     assert_eq!(view.data_coverage.decisions, 1);
     assert!(!report.summary.is_empty());
     assert!(
@@ -6387,14 +6716,45 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         .get_drift_check(&owner_user_id, &session_id)
         .await
         .expect("owner drift check");
-    assert_eq!(drift["original_intent_preview"], "owner original intent");
-    assert_eq!(drift["current_focus_preview"], "owner current focus");
+    assert_eq!(drift.schema_version, 2);
+    assert_eq!(
+        drift.assessment_status,
+        IntentDriftAssessmentStatus::Assessed
+    );
+    assert_eq!(drift.verdict, Some(IntentDriftVerdict::Drifting));
+    assert_eq!(drift.score, Some(0.42));
+    assert_eq!(drift.level, Some(IntentDriftLevel::Moderate));
+    assert_eq!(
+        drift
+            .provenance
+            .as_ref()
+            .expect("assessed drift must carry LLM provenance")
+            .invocation_id,
+        "owner-drift-invocation",
+    );
+    assert_eq!(
+        drift.evidence,
+        vec!["owner-visible structured evidence".to_string()]
+    );
+    assert_ne!(
+        drift.source_event_id.as_deref(),
+        Some(owner_legacy_drift_event_id.as_str())
+    );
+    assert_ne!(
+        drift.source_event_id.as_deref(),
+        Some(other_drift_assessment_event_id.as_str())
+    );
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
-        &[owner_query_event_id, owner_llm_event_id],
+        &[
+            owner_query_event_id,
+            owner_llm_event_id,
+            owner_drift_assessment_event_id,
+            owner_legacy_drift_event_id,
+        ],
         &[owner_decision_id],
     )
     .await;
@@ -6402,7 +6762,11 @@ async fn reflect_and_introspection_ignore_mixed_owner_derived_rows_on_live_matri
         &pool,
         &other_user_id,
         &[session_id],
-        &[other_query_event_id, other_llm_event_id],
+        &[
+            other_query_event_id,
+            other_llm_event_id,
+            other_drift_assessment_event_id,
+        ],
         &[other_decision_id],
     )
     .await;

@@ -43,6 +43,7 @@ fn build_sources() -> (
             run_id: "test-run".into(),
             model_id: "test-model".into(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -103,6 +104,7 @@ fn pipeline_single_turn_produces_valid_output() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -179,6 +181,7 @@ fn pipeline_compaction_under_pressure() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -219,6 +222,7 @@ fn pipeline_ptl_recovery_escalates() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -267,6 +271,7 @@ fn pipeline_emergent_context_flows() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -314,6 +319,7 @@ fn pipeline_shadow_diff_identical() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -390,6 +396,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
     let plan_input_normal = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,
@@ -427,6 +434,7 @@ fn pipeline_shadow_diff_detects_recovery_divergence() {
     let plan_input_recovery = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,

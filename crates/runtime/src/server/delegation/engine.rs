@@ -65,6 +65,22 @@ use crate::server::run::engine::RunEngine;
 use astra_messaging::router::AgentMailboxRouter;
 use astra_prompts::team_prompts;
 
+fn clone_delegation_context(
+    site: astra_core::history_work::HistoryWorkSite,
+    context: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    astra_core::history_work::record_serialized_value(site, context);
+    context.clone()
+}
+
+fn clone_delegation_value(
+    site: astra_core::history_work::HistoryWorkSite,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    astra_core::history_work::record_serialized_value(site, value);
+    value.clone()
+}
+
 /// Grace period for cooperative children to publish a canonical terminal
 /// result after their parent is cancelled. Keep this comfortably above a
 /// scheduler tick, but below the interactive cancellation latency budget.
@@ -1967,7 +1983,10 @@ impl DelegationEngine {
     }
 
     fn child_task_context(request: &DelegationRequest) -> HashMap<String, serde_json::Value> {
-        let mut context = request.context.clone();
+        let mut context = clone_delegation_context(
+            astra_core::history_work::HistoryWorkSite::DelegationContextClone,
+            &request.context,
+        );
         context.remove(Self::SESSION_ID_CONTEXT_KEY);
         context
     }
@@ -3081,6 +3100,10 @@ impl DelegationEngine {
             ),
         > = HashMap::new();
         for config in &configs {
+            let retry_context = clone_delegation_context(
+                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
+                &config.context,
+            );
             retry_templates.insert(
                 config.agent_profile.agent_id.clone(),
                 (
@@ -3088,7 +3111,7 @@ impl DelegationEngine {
                     config.task.clone(),
                     config.session_id.clone(),
                     config.user_id.clone(),
-                    config.context.clone(),
+                    retry_context,
                     config.delegation_chain.clone(),
                 ),
             );
@@ -3293,7 +3316,13 @@ impl DelegationEngine {
                 let cancel_for_retry = cancel_token.cloned();
                 // Build retry config from stored template
                 let retry_agent_id = result.agent_id.clone();
-                let template = retry_templates.get(&retry_agent_id).cloned();
+                let template = retry_templates.get(&retry_agent_id).map(|template| {
+                    astra_core::history_work::record_serialized_value(
+                        astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
+                        &template.4,
+                    );
+                    template.clone()
+                });
                 let gated = self
                     .apply_gate(
                         &request.user_id,
@@ -3302,6 +3331,12 @@ impl DelegationEngine {
                         &request.parent_run_id,
                         per_agent_timeout,
                         || {
+                            if let Some(template) = template.as_ref() {
+                                astra_core::history_work::record_serialized_value(
+                                    astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
+                                    &template.4,
+                                );
+                            }
                             let Some((profile, task, sess, uid, ctx, delegation_chain)) =
                                 template.clone()
                             else {
@@ -3617,7 +3652,10 @@ impl DelegationEngine {
                             session_id: sess.clone(),
                             user_id: uid.clone(),
                             previous_output: prev.clone(),
-                            context: ctx.clone(),
+                            context: clone_delegation_context(
+                                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
+                                &ctx,
+                            ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             request_constraints: request_constraints.clone(),
@@ -3893,7 +3931,10 @@ impl DelegationEngine {
                             session_id: sess.clone(),
                             user_id: uid.clone(),
                             previous_output: prev.clone(),
-                            context: ctx.clone(),
+                            context: clone_delegation_context(
+                                astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
+                                &ctx,
+                            ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
                             request_constraints: request_constraints.clone(),
@@ -4132,7 +4173,12 @@ impl DelegationEngine {
         let parent_messages = request
             .context
             .get("parent_messages")
-            .cloned()
+            .map(|messages| {
+                clone_delegation_value(
+                    astra_core::history_work::HistoryWorkSite::DelegationParentMessagesClone,
+                    messages,
+                )
+            })
             .unwrap_or_else(|| serde_json::json!([]));
 
         let session_id = Self::session_id_for(request);
@@ -4233,7 +4279,13 @@ impl DelegationEngine {
             // Build fork-specific context: parent messages + fork instruction
             let mut fork_context = Self::child_task_context(request);
             fork_context.insert("fork_index".to_string(), serde_json::json!(i));
-            fork_context.insert("parent_messages".to_string(), parent_messages.clone());
+            fork_context.insert(
+                "parent_messages".to_string(),
+                clone_delegation_value(
+                    astra_core::history_work::HistoryWorkSite::DelegationParentMessagesClone,
+                    &parent_messages,
+                ),
+            );
             fork_context.insert("is_fork_child".to_string(), serde_json::json!(true));
 
             let has_parent_ctx = !parent_messages.as_array().map_or(true, |a| a.is_empty());
@@ -4759,6 +4811,24 @@ mod tests {
     use super::*;
     use astra_services::coordination::{AgentProfile, AgentTier, PipelineStage};
     use astra_services::runs::{InMemoryRunStateStore, RunStateStore};
+
+    #[test]
+    fn delegation_context_clone_preserves_structured_parent_messages() {
+        let context = HashMap::from([(
+            "parent_messages".to_string(),
+            serde_json::json!([
+                {"role": "user", "content": {"text": "你好🚀"}},
+                {"role": "assistant", "tool_calls": [{"id": "call-1"}]}
+            ]),
+        )]);
+
+        let cloned = clone_delegation_context(
+            astra_core::history_work::HistoryWorkSite::DelegationContextClone,
+            &context,
+        );
+
+        assert_eq!(cloned, context);
+    }
 
     fn setup() -> (
         Arc<RwLock<AgentProfileRegistry>>,

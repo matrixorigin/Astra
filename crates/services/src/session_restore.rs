@@ -324,6 +324,10 @@ pub struct RestoredSession {
     /// Conversation messages from Step Protocol heavy checkpoint (for LLM resume).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conversation_messages: Vec<serde_json::Value>,
+    /// One causally selected conversation generation. New clients consume
+    /// this instead of independently comparing turn counts and message arrays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_bundle: Option<astra_turn_types::ResumeBundleV1>,
     /// Deferred schemas materialized in the retained conversation.
     ///
     /// This is prompt continuity, not execution authority; consumers must
@@ -371,6 +375,21 @@ pub struct RestoredSession {
     pub workspace: Option<super::session_workspace::WorkspaceMetadata>,
 }
 
+impl RestoredSession {
+    /// Return the one selected conversation payload.
+    ///
+    /// Versioned responses carry it in `resume_bundle`; the legacy field is
+    /// read only for generation-zero restore data. Keeping this accessor as
+    /// the read path prevents cloud responses from serializing the same long
+    /// history twice.
+    pub fn resume_messages(&self) -> &[serde_json::Value] {
+        self.resume_bundle
+            .as_ref()
+            .map(|bundle| bundle.conversation_messages.as_slice())
+            .unwrap_or(self.conversation_messages.as_slice())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ResumableSessionsResponse {
     pub sessions: Vec<RestoredSession>,
@@ -389,6 +408,8 @@ pub struct SessionMetadataState {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CloudHeavyCheckpointState {
+    pub conversation_cursor: Option<astra_turn_types::SessionCursorV1>,
+    pub config_version_id: Option<String>,
     pub messages: Vec<serde_json::Value>,
     pub blocked_tools: Vec<String>,
     pub recent_tools: Vec<String>,
@@ -716,7 +737,7 @@ impl HybridRestoreService {
             // never pair an old turn clock with a newer Server session.
             if let Some(cloud) = self.restore_cloud_session(user_id, session_id).await? {
                 projection = Some(match projection {
-                    Some(local) => reconcile_restored_session_candidates(local, cloud),
+                    Some(local) => reconcile_restored_session_candidates(user_id, local, cloud)?,
                     None => cloud,
                 });
             }
@@ -928,7 +949,7 @@ impl HybridRestoreService {
                 let metadata_state = metadata_json_state(metadata_str.as_deref())?;
 
                 let heavy_started_at = std::time::Instant::now();
-                let heavy_state = self
+                let mut heavy_state = self
                     .restore_latest_heavy_checkpoint_state(user_id, session_id)
                     .await?;
                 let heavy_checkpoint_ms = elapsed_ms(heavy_started_at);
@@ -943,26 +964,16 @@ impl HybridRestoreService {
                 };
                 let transcript_ms = elapsed_ms(transcript_started_at);
 
-                let context_trace_started_at = std::time::Instant::now();
-                let last_context_trace = self
-                    .restore_latest_context_trace_signal(user_id, session_id)
-                    .await?;
-                let context_trace_ms = elapsed_ms(context_trace_started_at);
+                // Context traces are asynchronous diagnostics and currently
+                // carry no conversation cursor. Do not query or hydrate them
+                // on the causal resume path.
+                let context_trace_ms = 0;
 
-                let recent_tools_started_at = std::time::Instant::now();
-                let mut recent_tools = self.restore_recent_tools(user_id, session_id).await?;
-                if recent_tools.is_empty()
-                    && let Some(heavy) = heavy_state.as_ref()
-                {
-                    append_unique_names(
-                        &mut recent_tools,
-                        heavy.recent_tools.iter().map(String::as_str),
-                    );
-                }
-                if recent_tools.is_empty() {
-                    recent_tools = recent_tools_from_context_trace(last_context_trace.as_ref());
-                }
-                let recent_tools_ms = elapsed_ms(recent_tools_started_at);
+                // Recent-tool state influences prompt assembly, so only the
+                // checkpoint copy carrying the selected conversation cursor
+                // is admissible. Do not issue another unversioned projection
+                // query and then splice its result into this generation.
+                let recent_tools_ms = 0;
 
                 let latest_model = astra_core::model_override::normalize_model_override_owned(
                     mysql_optional_string(&row, "restore_cloud_session", "latest_model")?,
@@ -998,13 +1009,49 @@ impl HybridRestoreService {
                 }
                 .emit(session_id, true);
 
-                Ok(Some(RestoredSession {
+                let completed_turn =
+                    non_negative_i64_to_u32(turn_count, "restore_cloud_session", "turn_count")?;
+                let conversation_from_checkpoint = heavy_state
+                    .as_ref()
+                    .is_some_and(|heavy| !heavy.messages.is_empty());
+                let conversation_messages = heavy_state
+                    .as_mut()
+                    .map(|heavy| {
+                        astra_core::history_work::record_serialized_value(
+                            astra_core::history_work::HistoryWorkSite::SessionRestoreHydration,
+                            &heavy.messages,
+                        );
+                        std::mem::take(&mut heavy.messages)
+                    })
+                    .filter(|messages| !messages.is_empty())
+                    .unwrap_or(transcript_messages);
+                let resume_bundle = build_resume_bundle(
+                    user_id,
+                    session_id,
+                    completed_turn,
+                    conversation_messages,
+                    conversation_from_checkpoint,
+                    heavy_state.as_ref(),
+                    ResumeBundleSupplementalProjections {
+                        task: astra_turn_types::ResumeTaskProjectionV1 {
+                            executing_plan_json: metadata_state.executing_plan_json.clone(),
+                            plan_goal: metadata_state.plan_goal.clone(),
+                            plan_config_json: metadata_state.plan_config_json.clone(),
+                            plan_execution_rounds: metadata_state.plan_execution_rounds,
+                            contract_json: contract_json.clone(),
+                        },
+                        provider: astra_turn_types::ResumeProviderProjectionV1 {
+                            model: model.clone(),
+                            permission_mode: metadata_state.permission_mode.clone(),
+                            config_version_id: heavy_state
+                                .as_ref()
+                                .and_then(|state| state.config_version_id.clone()),
+                        },
+                    },
+                )?;
+                let mut restored = RestoredSession {
                     session_id: session_id.to_string(),
-                    turn_count: non_negative_i64_to_u32(
-                        turn_count,
-                        "restore_cloud_session",
-                        "turn_count",
-                    )?,
+                    turn_count: completed_turn,
                     total_tokens_in: non_negative_i64_to_u64(
                         total_tokens_in,
                         "restore_cloud_session",
@@ -1028,48 +1075,20 @@ impl HybridRestoreService {
                     last_status: status,
                     title,
                     restored_from_cloud: true,
-                    recent_tools,
                     checkpoint_count: non_negative_i64_to_u32(
                         checkpoint_count,
                         "restore_cloud_session",
                         "checkpoint_count",
                     )?,
                     git_branch: metadata_state.git_branch.clone(),
-                    model,
-                    permission_mode: metadata_state.permission_mode.clone(),
-                    conversation_messages: heavy_state
-                        .as_ref()
-                        .map(|heavy| heavy.messages.clone())
-                        .filter(|messages| !messages.is_empty())
-                        .unwrap_or(transcript_messages),
-                    activated_deferred_tool_names: heavy_state
-                        .as_ref()
-                        .map(|heavy| heavy.activated_deferred_tool_names.clone())
-                        .unwrap_or_default(),
-                    blocked_tools: heavy_state
-                        .as_ref()
-                        .map(|heavy| heavy.blocked_tools.clone())
-                        .unwrap_or_default(),
-                    approval_overrides: heavy_state
-                        .as_ref()
-                        .and_then(|heavy| heavy.approval_overrides.clone()),
-                    interruption: heavy_state
-                        .as_ref()
-                        .and_then(|heavy| heavy.interruption.clone()),
-                    compaction_state: heavy_state
-                        .as_ref()
-                        .and_then(|heavy| heavy.compaction_state.clone()),
-                    pipeline_state: heavy_state
-                        .as_ref()
-                        .and_then(|heavy| heavy.pipeline_state.clone()),
-                    executing_plan_json: metadata_state.executing_plan_json,
-                    plan_goal: metadata_state.plan_goal,
-                    plan_config_json: metadata_state.plan_config_json,
-                    plan_execution_rounds: metadata_state.plan_execution_rounds,
-                    contract_json,
-                    last_context_trace,
+                    // Versioned restore owns the potentially large history in
+                    // exactly one response field.
+                    conversation_messages: Vec::new(),
+                    resume_bundle,
                     ..Default::default()
-                }))
+                };
+                apply_selected_resume_bundle(&mut restored);
+                Ok(Some(restored))
             }
             None => {
                 CloudRestoreTimings {
@@ -1193,44 +1212,6 @@ impl HybridRestoreService {
         Ok(tools)
     }
 
-    /// Restore the latest structured context-trace signal from cloud events.
-    async fn restore_latest_context_trace_signal(
-        &self,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<super::session_workspace::ContextTraceSignal>, String> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(None),
-        };
-
-        let row = sqlx::query(
-            "SELECT CAST(metadata AS CHAR) AS metadata_json FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'context_trace_signal' \
-             ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("restore_latest_context_trace_signal: {e}"))?;
-
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let Some(metadata_json) =
-            mysql_optional_string(&row, "restore_latest_context_trace_signal", "metadata_json")?
-        else {
-            return Ok(None);
-        };
-        if metadata_json.trim().is_empty() {
-            return Ok(None);
-        }
-        serde_json::from_str(&metadata_json)
-            .map(Some)
-            .map_err(|e| format!("restore_latest_context_trace_signal: parse metadata_json: {e}"))
-    }
-
     async fn restore_latest_heavy_checkpoint_state(
         &self,
         user_id: &str,
@@ -1279,6 +1260,20 @@ impl HybridRestoreService {
                     "content": content,
                 })),
                 _ => {}
+            }
+        }
+        if astra_core::history_work::instrumentation_enabled() {
+            match astra_core::history_work::serialized_bytes(&messages) {
+                Ok(bytes) => astra_core::history_work::record_operation(
+                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
+                    bytes,
+                    rows.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                ),
+                Err(error) => astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::SessionRestoreTranscriptHydration,
+                    &error,
+                ),
             }
         }
         Ok(messages)
@@ -1352,6 +1347,248 @@ impl HybridRestoreService {
     }
 }
 
+fn cloud_projection_envelope<T>(
+    source_cursor: Option<&astra_turn_types::SessionCursorV1>,
+    payload: T,
+) -> astra_turn_types::CausalProjectionEnvelopeV1<T> {
+    match source_cursor {
+        Some(cursor) => {
+            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload)
+        }
+        None => astra_turn_types::CausalProjectionEnvelopeV1::unversioned(payload),
+    }
+}
+
+fn validate_resume_cursor_identity(
+    owner_id: &str,
+    session_id: &str,
+    cursor: &astra_turn_types::SessionCursorV1,
+) -> Result<(), String> {
+    if cursor.owner_id != owner_id {
+        return Err(format!(
+            "resume cursor belongs to owner `{}`, expected `{owner_id}`",
+            cursor.owner_id
+        ));
+    }
+    if cursor.session_id != session_id {
+        return Err(format!(
+            "resume cursor belongs to session `{}`, expected `{session_id}`",
+            cursor.session_id
+        ));
+    }
+    if cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID {
+        return Err(format!(
+            "resume cursor branch `{}` is unsupported",
+            cursor.branch_id
+        ));
+    }
+    Ok(())
+}
+
+struct ResumeBundleSupplementalProjections {
+    task: astra_turn_types::ResumeTaskProjectionV1,
+    provider: astra_turn_types::ResumeProviderProjectionV1,
+}
+
+fn build_resume_bundle(
+    owner_id: &str,
+    session_id: &str,
+    completed_turn: u32,
+    messages: Vec<serde_json::Value>,
+    conversation_from_checkpoint: bool,
+    heavy: Option<&CloudHeavyCheckpointState>,
+    supplemental: ResumeBundleSupplementalProjections,
+) -> Result<Option<astra_turn_types::ResumeBundleV1>, String> {
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    let source = if conversation_from_checkpoint {
+        astra_turn_types::ResumeSourceV1::Checkpoint
+    } else {
+        astra_turn_types::ResumeSourceV1::TranscriptProjection
+    };
+    let cursor = conversation_from_checkpoint
+        .then(|| heavy.and_then(|state| state.conversation_cursor.clone()))
+        .flatten()
+        .unwrap_or_else(|| {
+            astra_turn_types::legacy_resume_cursor(owner_id, session_id, completed_turn, &messages)
+        });
+    validate_resume_cursor_identity(owner_id, session_id, &cursor)?;
+    let mut degraded_reasons = if conversation_from_checkpoint {
+        vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback]
+    } else {
+        vec![astra_turn_types::ResumeDegradedReasonV1::TranscriptOnly]
+    };
+    if cursor.schema_version == 0 {
+        degraded_reasons.extend([
+            astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+            astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
+        ]);
+    }
+    let checkpoint = heavy.map(|state| {
+        cloud_projection_envelope(
+            state.conversation_cursor.as_ref(),
+            astra_turn_types::ResumeCheckpointProjectionV1 {
+                blocked_tools: state.blocked_tools.clone(),
+                recent_tools: state.recent_tools.clone(),
+                approval_overrides: state.approval_overrides.clone(),
+                interruption: state.interruption.clone(),
+                compaction_state: state.compaction_state.clone(),
+                pipeline_state: state.pipeline_state.clone(),
+            },
+        )
+    });
+    let activation = heavy.map(|state| {
+        cloud_projection_envelope(
+            state.conversation_cursor.as_ref(),
+            astra_turn_types::ResumeActivationProjectionV1 {
+                deferred_tool_names: state.activated_deferred_tool_names.clone(),
+            },
+        )
+    });
+    let task = (!supplemental.task.is_empty())
+        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.task));
+    let provider = (!supplemental.provider.is_empty())
+        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.provider));
+    if (task.is_some() || provider.is_some())
+        && !degraded_reasons
+            .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
+    {
+        degraded_reasons.push(astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing);
+    }
+    let candidate = astra_turn_types::ResumeCandidateV1 {
+        source,
+        cursor,
+        conversation_messages: messages,
+        degraded_reasons,
+        repair_actions: vec![
+            astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
+            astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
+        ],
+        projections: astra_turn_types::ResumeProjectionSetV1 {
+            checkpoint,
+            task,
+            provider,
+            activation,
+        },
+    };
+    astra_turn_types::select_resume_bundle(None, [candidate])
+        .map(Some)
+        .map_err(|error| format!("cloud resume projection failed causal selection: {error}"))
+}
+
+fn merge_exact_resume_projections(
+    current: &mut astra_turn_types::ResumeBundleV1,
+    other: &astra_turn_types::ResumeBundleV1,
+) {
+    if current.cursor != other.cursor {
+        return;
+    }
+    let cursor = current.cursor.clone();
+    if current.projections.checkpoint_at(&cursor).is_none()
+        && let Some(payload) = other.projections.checkpoint_at(&cursor)
+    {
+        current.projections.checkpoint =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                cursor.clone(),
+                payload.clone(),
+            ));
+    }
+    if current.projections.task_at(&cursor).is_none()
+        && let Some(payload) = other.projections.task_at(&cursor)
+    {
+        current.projections.task = Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+            cursor.clone(),
+            payload.clone(),
+        ));
+    }
+    if current.projections.provider_at(&cursor).is_none()
+        && let Some(payload) = other.projections.provider_at(&cursor)
+    {
+        current.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                cursor.clone(),
+                payload.clone(),
+            ));
+    }
+
+    let mut activated = current.activated_deferred_tool_names().to_vec();
+    if let Some(other_activation) = other.projections.activation_at(&cursor) {
+        append_unique_names(
+            &mut activated,
+            other_activation
+                .deferred_tool_names
+                .iter()
+                .map(String::as_str),
+        );
+    }
+    if !activated.is_empty() {
+        current.projections.activation =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                cursor,
+                astra_turn_types::ResumeActivationProjectionV1 {
+                    deferred_tool_names: activated,
+                },
+            ));
+    }
+}
+
+fn apply_selected_resume_bundle(session: &mut RestoredSession) {
+    let Some(bundle) = session.resume_bundle.as_ref() else {
+        return;
+    };
+    let cursor = bundle.cursor.clone();
+    let checkpoint = bundle.projections.checkpoint_at(&cursor).cloned();
+    let task = bundle.projections.task_at(&cursor).cloned();
+    let provider = bundle.projections.provider_at(&cursor).cloned();
+    let activated_deferred_tool_names = bundle.activated_deferred_tool_names().to_vec();
+
+    session.activated_deferred_tool_names = activated_deferred_tool_names;
+    session.recent_tools = checkpoint
+        .as_ref()
+        .map(|projection| projection.recent_tools.clone())
+        .unwrap_or_default();
+    session.blocked_tools = checkpoint
+        .as_ref()
+        .map(|projection| projection.blocked_tools.clone())
+        .unwrap_or_default();
+    session.approval_overrides = checkpoint
+        .as_ref()
+        .and_then(|projection| projection.approval_overrides.clone());
+    session.interruption = checkpoint
+        .as_ref()
+        .and_then(|projection| projection.interruption.clone());
+    session.compaction_state = checkpoint
+        .as_ref()
+        .and_then(|projection| projection.compaction_state.clone());
+    session.pipeline_state = checkpoint
+        .as_ref()
+        .and_then(|projection| projection.pipeline_state.clone());
+    session.executing_plan_json = task
+        .as_ref()
+        .and_then(|projection| projection.executing_plan_json.clone());
+    session.plan_goal = task
+        .as_ref()
+        .and_then(|projection| projection.plan_goal.clone());
+    session.plan_config_json = task
+        .as_ref()
+        .and_then(|projection| projection.plan_config_json.clone());
+    session.plan_execution_rounds = task
+        .as_ref()
+        .map(|projection| projection.plan_execution_rounds)
+        .unwrap_or_default();
+    session.contract_json = task.and_then(|projection| projection.contract_json);
+    session.model = provider
+        .as_ref()
+        .and_then(|projection| projection.model.clone());
+    session.permission_mode = provider.and_then(|projection| projection.permission_mode);
+
+    // These runtime-bearing legacy projections have no cursor envelope.
+    session.plan_corrections.clear();
+    session.last_context_trace = None;
+    session.workspace = None;
+}
+
 /// Reconcile two restore projections without combining history from different
 /// causal turns.
 ///
@@ -1359,17 +1596,76 @@ impl HybridRestoreService {
 /// turn-sensitive state. Projections at the same turn may safely complement
 /// one another because they describe the same causal boundary.
 fn reconcile_restored_session_candidates(
+    owner_id: &str,
     first: RestoredSession,
     second: RestoredSession,
-) -> RestoredSession {
-    debug_assert_eq!(first.session_id, second.session_id);
+) -> Result<RestoredSession, String> {
+    if first.session_id != second.session_id {
+        return Err(format!(
+            "cannot reconcile restore candidates for different sessions: `{}` and `{}`",
+            first.session_id, second.session_id
+        ));
+    }
+    for bundle in [first.resume_bundle.as_ref(), second.resume_bundle.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        validate_resume_cursor_identity(owner_id, &first.session_id, &bundle.cursor)?;
+    }
+    let authoritative_turn = match (first.restored_from_cloud, second.restored_from_cloud) {
+        (true, true) | (false, false) => first.turn_count.max(second.turn_count),
+        (true, false) => first.turn_count,
+        (false, true) => second.turn_count,
+    };
+    let observed_cloud = first.restored_from_cloud || second.restored_from_cloud;
 
-    let same_turn = first.turn_count == second.turn_count;
-    let (mut current, other) = if second.turn_count > first.turn_count {
+    let first_bundle = first.resume_bundle.as_ref();
+    let second_bundle = second.resume_bundle.as_ref();
+    let selected_side = match (first_bundle, second_bundle) {
+        (None, None) => None,
+        _ => {
+            let candidates = [first_bundle, second_bundle]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(side, bundle)| {
+                    bundle.map(|bundle| (side, bundle.descriptor(), bundle.validates_root()))
+                })
+                .collect::<Vec<_>>();
+            if candidates.iter().any(|(_, _, valid)| !valid) {
+                return Err(format!(
+                    "causal resume selection failed for owner {owner_id}: projection root mismatch"
+                ));
+            }
+            let descriptors = candidates
+                .iter()
+                .map(|(_, descriptor, _)| descriptor.clone())
+                .collect::<Vec<_>>();
+            let selected = astra_turn_types::select_resume_candidate_index(None, &descriptors)
+                .map_err(|error| format!("causal resume selection failed: {error}"))?;
+            Some(candidates[selected].0)
+        }
+    };
+    let same_generation = match (first_bundle, second_bundle) {
+        (Some(first), Some(second)) => first.cursor == second.cursor,
+        (None, None) => first.turn_count == second.turn_count,
+        _ => false,
+    };
+    let (mut current, other) = if selected_side == Some(1)
+        || (selected_side.is_none() && second.turn_count > first.turn_count)
+    {
         (second, first)
     } else {
         (first, second)
     };
+    if same_generation
+        && let (Some(current_bundle), Some(other_bundle)) =
+            (current.resume_bundle.as_mut(), other.resume_bundle.as_ref())
+    {
+        merge_exact_resume_projections(current_bundle, other_bundle);
+    }
+    apply_selected_resume_bundle(&mut current);
+    current.turn_count = authoritative_turn;
+    current.restored_from_cloud = observed_cloud;
 
     current.total_tokens_in = current.total_tokens_in.max(other.total_tokens_in);
     current.total_tokens_out = current.total_tokens_out.max(other.total_tokens_out);
@@ -1380,31 +1676,28 @@ fn reconcile_restored_session_candidates(
         .total_cache_creation_tokens
         .max(other.total_cache_creation_tokens);
     current.checkpoint_count = current.checkpoint_count.max(other.checkpoint_count);
-    // Schema materialization is monotonic within a session. Unlike messages
-    // and runtime controls, retaining an older activation cannot splice two
-    // causal histories and is still constrained by the current live surface.
-    append_unique_names(
-        &mut current.activated_deferred_tool_names,
-        other
-            .activated_deferred_tool_names
-            .iter()
-            .map(String::as_str),
-    );
 
     if current.git_branch.is_none() {
         current.git_branch = other.git_branch.clone();
-    }
-    if current.model.is_none() {
-        current.model = other.model.clone();
-    }
-    if current.permission_mode.is_none() {
-        current.permission_mode = other.permission_mode.clone();
     }
     if current.title.is_none() {
         current.title = other.title.clone();
     }
 
-    if same_turn {
+    if same_generation && current.resume_bundle.is_none() {
+        append_unique_names(
+            &mut current.activated_deferred_tool_names,
+            other
+                .activated_deferred_tool_names
+                .iter()
+                .map(String::as_str),
+        );
+        if current.model.is_none() {
+            current.model = other.model.clone();
+        }
+        if current.permission_mode.is_none() {
+            current.permission_mode = other.permission_mode.clone();
+        }
         if current.recent_tools.is_empty() {
             current.recent_tools = other.recent_tools;
         }
@@ -1455,7 +1748,7 @@ fn reconcile_restored_session_candidates(
         }
     }
 
-    current
+    Ok(current)
 }
 
 fn local_checkpoint_count(
@@ -1857,9 +2150,31 @@ pub fn parse_cloud_heavy_checkpoint_state(
             format!(
                 "invalid cloud heavy checkpoint JSON field: field=activated_deferred_tool_names, source={source}"
             )
-        })?
+    })?
         .unwrap_or_default();
     Ok(Some(CloudHeavyCheckpointState {
+        conversation_cursor: heavy
+            .get("conversation_cursor")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|source| {
+                format!(
+                    "invalid cloud heavy checkpoint JSON field: field=conversation_cursor, source={source}"
+                )
+            })?,
+        config_version_id: heavy
+            .get("config_version_id")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|source| {
+                format!(
+                    "invalid cloud heavy checkpoint JSON field: field=config_version_id, source={source}"
+                )
+            })?,
         messages: required_cloud_heavy_field(heavy, "messages")?,
         blocked_tools: required_cloud_heavy_field(heavy, "blocked_tools")?,
         recent_tools: normalize_name_list(recent_tools),
@@ -2901,6 +3216,53 @@ mod tests {
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
 
+    fn typed_resume_bundle(
+        owner_id: &str,
+        session_id: &str,
+        sequence: u64,
+        text: &str,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        typed_resume_bundle_from_messages(
+            owner_id,
+            session_id,
+            sequence,
+            vec![serde_json::json!({"role": "user", "content": text})],
+        )
+    }
+
+    fn typed_resume_bundle_from_messages(
+        owner_id: &str,
+        session_id: &str,
+        sequence: u64,
+        messages: Vec<serde_json::Value>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: owner_id.into(),
+            session_id: session_id.into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: sequence as u32,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: astra_turn_types::ResumeProjectionSetV1::default(),
+            }],
+        )
+        .unwrap()
+    }
+
     struct FakeSessionRestoreRow {
         failed_column: Option<&'static str>,
     }
@@ -3627,7 +3989,7 @@ mod tests {
     }
 
     #[test]
-    fn restore_reconciliation_uses_the_furthest_completed_turn_without_mixing_history() {
+    fn legacy_restore_reconciliation_keeps_the_selected_generation_together() {
         let local_projection = RestoredSession {
             session_id: "session-1".into(),
             turn_count: 1,
@@ -3656,7 +4018,9 @@ mod tests {
             ..Default::default()
         };
 
-        let restored = reconcile_restored_session_candidates(local_projection, cloud_projection);
+        let restored =
+            reconcile_restored_session_candidates("owner-1", local_projection, cloud_projection)
+                .unwrap();
 
         assert_eq!(restored.turn_count, 4);
         assert_eq!(restored.model.as_deref(), Some("cloud-model"));
@@ -3676,9 +4040,253 @@ mod tests {
         );
         assert_eq!(
             restored.activated_deferred_tool_names,
-            vec!["web_fetch", "github"],
-            "monotonic schema materialization may be unioned without mixing causal message projections"
+            vec!["web_fetch"],
+            "unversioned activation state from another generation must not be spliced in"
         );
+    }
+
+    #[test]
+    fn typed_restore_reconciliation_never_splices_richer_stale_runtime_state() {
+        let local = RestoredSession {
+            session_id: "session-typed".into(),
+            turn_count: 9,
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-1",
+                "session-typed",
+                9,
+                "stale local",
+            )),
+            blocked_tools: vec!["stale-block".into()],
+            executing_plan_json: Some(r#"{"goal":"stale"}"#.into()),
+            activated_deferred_tool_names: vec!["stale-provider".into()],
+            total_tokens_in: 900,
+            ..Default::default()
+        };
+        let cloud = RestoredSession {
+            session_id: "session-typed".into(),
+            turn_count: 10,
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-1",
+                "session-typed",
+                10,
+                "current cloud",
+            )),
+            total_tokens_in: 1_000,
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+
+        let restored = reconcile_restored_session_candidates("owner-1", local, cloud).unwrap();
+        assert_eq!(restored.turn_count, 10);
+        assert_eq!(restored.resume_messages()[0]["content"], "current cloud");
+        assert!(restored.blocked_tools.is_empty());
+        assert!(restored.executing_plan_json.is_none());
+        assert!(restored.activated_deferred_tool_names.is_empty());
+    }
+
+    #[test]
+    fn typed_restore_reconciliation_keeps_a_newer_local_generation_over_stale_cloud() {
+        let mut local_bundle =
+            typed_resume_bundle("owner-1", "session-local-newer", 11, "current local");
+        local_bundle.projections.checkpoint =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                local_bundle.cursor.clone(),
+                astra_turn_types::ResumeCheckpointProjectionV1 {
+                    blocked_tools: vec!["current-block".into()],
+                    ..Default::default()
+                },
+            ));
+        let local = RestoredSession {
+            session_id: "session-local-newer".into(),
+            turn_count: 11,
+            resume_bundle: Some(local_bundle),
+            blocked_tools: vec!["current-block".into()],
+            total_tokens_in: 500,
+            ..Default::default()
+        };
+        let cloud = RestoredSession {
+            session_id: "session-local-newer".into(),
+            // The Server head can be ahead of its latest warm checkpoint.
+            turn_count: 12,
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-1",
+                "session-local-newer",
+                10,
+                "stale cloud",
+            )),
+            blocked_tools: vec!["stale-block".into()],
+            total_tokens_in: 1_000,
+            restored_from_cloud: true,
+            ..Default::default()
+        };
+
+        let restored = reconcile_restored_session_candidates("owner-1", local, cloud).unwrap();
+        assert_eq!(restored.turn_count, 12);
+        assert_eq!(
+            restored
+                .resume_bundle
+                .as_ref()
+                .unwrap()
+                .cursor
+                .completed_turn,
+            11
+        );
+        assert_eq!(restored.resume_messages()[0]["content"], "current local");
+        assert_eq!(restored.blocked_tools, ["current-block"]);
+        assert_eq!(
+            restored.total_tokens_in, 1_000,
+            "monotonic usage accounting may advance independently"
+        );
+        assert!(restored.restored_from_cloud);
+    }
+
+    #[test]
+    fn typed_restore_reconciliation_rejects_cross_owner_candidates() {
+        let local = RestoredSession {
+            session_id: "same-visible-id".into(),
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-a",
+                "same-visible-id",
+                1,
+                "owner a",
+            )),
+            ..Default::default()
+        };
+        let cloud = RestoredSession {
+            session_id: "same-visible-id".into(),
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-b",
+                "same-visible-id",
+                99,
+                "owner b",
+            )),
+            ..Default::default()
+        };
+
+        let error = reconcile_restored_session_candidates("owner-a", local, cloud).unwrap_err();
+        assert!(error.contains("expected `owner-a`"), "{error}");
+    }
+
+    #[test]
+    fn typed_restore_reconciliation_rejects_candidates_for_another_owner() {
+        let first = RestoredSession {
+            session_id: "same-visible-id".into(),
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-b",
+                "same-visible-id",
+                1,
+                "first",
+            )),
+            ..Default::default()
+        };
+        let second = RestoredSession {
+            session_id: "same-visible-id".into(),
+            resume_bundle: Some(typed_resume_bundle(
+                "owner-b",
+                "same-visible-id",
+                2,
+                "second",
+            )),
+            ..Default::default()
+        };
+
+        let error = reconcile_restored_session_candidates("owner-a", first, second).unwrap_err();
+        assert!(error.contains("expected `owner-a`"), "{error}");
+    }
+
+    #[test]
+    fn typed_restore_response_serializes_long_history_once() {
+        let messages = (0..2_048)
+            .map(|index| serde_json::json!({"role": "user", "content": format!("m-{index}")}))
+            .collect::<Vec<_>>();
+        let session = RestoredSession {
+            session_id: "long-session".into(),
+            resume_bundle: Some(typed_resume_bundle_from_messages(
+                "owner-1",
+                "long-session",
+                1_024,
+                messages,
+            )),
+            ..Default::default()
+        };
+
+        let encoded = serde_json::to_value(&session).unwrap();
+        assert!(
+            encoded.get("conversation_messages").is_none(),
+            "the generation-zero field must stay absent from a typed response"
+        );
+        assert_eq!(
+            encoded["resume_bundle"]["conversation_messages"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2_048
+        );
+    }
+
+    #[test]
+    fn corrupt_checkpoint_root_is_rejected_instead_of_degraded_into_current_state() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "actual"})];
+        let mut cursor = typed_resume_bundle("owner-1", "corrupt-session", 3, "different").cursor;
+        cursor.canonical_root_hash = "not-the-actual-root".into();
+        let heavy = CloudHeavyCheckpointState {
+            conversation_cursor: Some(cursor),
+            messages: messages.clone(),
+            ..Default::default()
+        };
+
+        let error = build_resume_bundle(
+            "owner-1",
+            "corrupt-session",
+            3,
+            messages,
+            true,
+            Some(&heavy),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1::default(),
+                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("no valid resume candidate"), "{error}");
+    }
+
+    #[test]
+    fn transcript_fallback_does_not_borrow_an_empty_checkpoint_cursor() {
+        let empty_checkpoint =
+            typed_resume_bundle("owner-1", "transcript-session", 4, "checkpoint");
+        let heavy = CloudHeavyCheckpointState {
+            conversation_cursor: Some(empty_checkpoint.cursor),
+            messages: Vec::new(),
+            blocked_tools: vec!["checkpoint-only".into()],
+            ..Default::default()
+        };
+        let transcript = vec![
+            serde_json::json!({"role": "user", "content": "transcript"}),
+            serde_json::json!({"role": "assistant", "content": "fallback"}),
+        ];
+
+        let bundle = build_resume_bundle(
+            "owner-1",
+            "transcript-session",
+            4,
+            transcript,
+            false,
+            Some(&heavy),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1::default(),
+                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            bundle.source,
+            astra_turn_types::ResumeSourceV1::TranscriptProjection
+        );
+        assert_eq!(bundle.cursor.schema_version, 0);
+        assert!(bundle.projections.checkpoint_at(&bundle.cursor).is_none());
     }
 
     #[test]
@@ -4838,10 +5446,25 @@ mod tests {
     #[test]
     fn parse_cloud_heavy_checkpoint_state_accepts_only_tagged_shape() {
         let messages = vec![serde_json::json!({"role":"user","content":"hi"})];
+        let conversation_cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: "owner-1".into(),
+            session_id: "session-1".into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: Some("cfg-1".into()),
+        };
         let approval_overrides = serde_json::json!({"rules": []});
         let interruption = serde_json::json!({"kind":"rate_limited"});
         let compaction_state = serde_json::json!({"attempt_count": 2});
         let expected = CloudHeavyCheckpointState {
+            conversation_cursor: Some(conversation_cursor.clone()),
+            config_version_id: Some("cfg-1".into()),
             messages: messages.clone(),
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["rg".into()],
@@ -4854,6 +5477,8 @@ mod tests {
         let tagged = serde_json::json!({
             "Heavy": {
                 "light": {},
+                "conversation_cursor": conversation_cursor,
+                "config_version_id": "cfg-1",
                 "messages": messages,
                 "blocked_tools": ["bash"],
                 "recent_tools": ["rg"],

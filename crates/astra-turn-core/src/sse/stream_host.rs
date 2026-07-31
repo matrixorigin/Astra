@@ -20,7 +20,7 @@ use crate::chat_turn_sse_dispatch::{
     ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, EdgeApprovalRequest, SseRenderEffect,
     dispatch_chat_turn_sse_event_block,
 };
-use crate::sse::data_lines::json_events_from_sse_event_block;
+use crate::sse::data_lines::{json_events_from_sse_event_block, validate_sse_event_block_json};
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
@@ -160,6 +160,25 @@ pub type SseAbortReason = astra_core::ErrorKind;
 /// tool execution via edge callback ledger.
 #[async_trait]
 pub trait SseStreamHost: Send {
+    /// Whether this host requires every non-empty `data:` payload to be valid
+    /// JSON. The default remains permissive for UI clients that predate the
+    /// machine observation stream; strict machine consumers opt in.
+    fn requires_strict_sse_json(&self) -> bool {
+        false
+    }
+
+    /// Called for each syntactically valid JSON `data:` event after the shared
+    /// typed dispatcher has accepted the containing SSE block.
+    async fn on_accepted_sse_event(&mut self, _event: &Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Called only after the shared dispatcher observes the transport's
+    /// terminal `[DONE]` marker.
+    async fn on_sse_done(&mut self, _accum: &ChatTurnSseAccum) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called for each batch of render effects parsed from an SSE event block.
     /// CLI: prints text deltas, starts/stops thinking spinner.
     /// Headless: no-op.
@@ -420,7 +439,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         };
         let mut terminal_marker_seen = false;
         for event_str in event_blocks {
-            let _ = process_sse_event_block(
+            let processed = process_sse_event_block(
                 &event_str,
                 host,
                 &mut accum,
@@ -429,10 +448,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                 &mut reported_session_id,
             )
             .await;
+            if let Err(error) = processed {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: invalid SSE protocol: {error}"));
+                break;
+            }
             if accum.stream_complete {
                 terminal_marker_seen = true;
                 break;
             }
+        }
+        if abort.is_some() {
+            break;
         }
 
         // Parallel tool calls often arrive as several adjacent SSE
@@ -479,7 +506,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     };
                     for event_str in event_blocks {
                         saw_event = true;
-                        all_events_extended_batch &= process_sse_event_block(
+                        match process_sse_event_block(
                             &event_str,
                             host,
                             &mut accum,
@@ -487,7 +514,18 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                             &mut first_sse_frame_seen,
                             &mut reported_session_id,
                         )
-                        .await;
+                        .await
+                        {
+                            Ok(extends_batch) => {
+                                all_events_extended_batch &= extends_batch;
+                            }
+                            Err(error) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort_message =
+                                    Some(format!("Error: invalid SSE protocol: {error}"));
+                                break;
+                            }
+                        }
                         if accum.stream_complete {
                             terminal_marker_seen = true;
                             break;
@@ -530,6 +568,8 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             | Some(astra_core::ErrorKind::Cancelled)
             | Some(astra_core::ErrorKind::StreamTransport)
     ) {
+        accum.stream_complete = false;
+        accum.error_kind = abort;
         accum.full_text.clear();
         accum.reasoning_content.clear();
         accum.tool_calls.clear();
@@ -560,6 +600,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let tail = match framer.take_trailing_dispatch_blob() {
         Ok(tail) => tail,
         Err(error) => {
+            abort = Some(astra_core::ErrorKind::StreamTransport);
+            accum.stream_complete = false;
+            accum.error_kind = abort;
             accum.full_text.clear();
             accum.reasoning_content.clear();
             accum.tool_calls.clear();
@@ -574,7 +617,7 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     };
     let ttft_ms = framer.ttft_ms;
     if abort.is_none() && !accum.stream_complete && !tail.trim().is_empty() {
-        let _ = process_sse_event_block(
+        let processed = process_sse_event_block(
             &tail,
             host,
             &mut accum,
@@ -583,16 +626,44 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             &mut reported_session_id,
         )
         .await;
-        prioritize_skill_tools(&mut pending);
-        flush_pending_via_host(
-            &mut pending,
-            host,
-            accum.session_id.as_deref(),
-            accum.run_id.as_deref(),
-            &mut tool_results,
-            &mut approval_results,
-        )
-        .await;
+        match processed {
+            Ok(_) => {
+                prioritize_skill_tools(&mut pending);
+                flush_pending_via_host(
+                    &mut pending,
+                    host,
+                    accum.session_id.as_deref(),
+                    accum.run_id.as_deref(),
+                    &mut tool_results,
+                    &mut approval_results,
+                )
+                .await;
+            }
+            Err(error) => {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                accum.stream_complete = false;
+                accum.error_kind = abort;
+                accum.full_text.clear();
+                accum.reasoning_content.clear();
+                accum.tool_calls.clear();
+                pending.clear();
+                accum.error_message = Some(format!("Error: invalid SSE protocol: {error}"));
+                host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
+                    .await;
+            }
+        }
+    }
+    if host.requires_strict_sse_json() && abort.is_none() && !accum.stream_complete {
+        abort = Some(astra_core::ErrorKind::StreamTransport);
+        accum.error_kind = abort;
+        accum.full_text.clear();
+        accum.reasoning_content.clear();
+        accum.tool_calls.clear();
+        pending.clear();
+        accum.error_message =
+            Some("Error: SSE stream ended before the terminal [DONE] marker".to_string());
+        host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
+            .await;
     }
 
     // Degraded tool-call fallback: if the model emitted <invoke> or <tool_call>
@@ -635,24 +706,30 @@ async fn process_sse_event_block<H: SseStreamHost>(
     pending: &mut Vec<ChatTurnEdgePending>,
     first_sse_frame_seen: &mut bool,
     reported_session_id: &mut Option<String>,
-) -> bool {
+) -> Result<bool, String> {
     // `[DONE]` establishes the only terminal transport boundary.  The
     // consumer normally stops before this function can be called again, but
     // retain the guard here so a future caller cannot forward late typed agent
     // events before the dispatcher gets a chance to ignore them.
     if accum.stream_complete {
-        return false;
+        return Ok(false);
     }
+    if host.requires_strict_sse_json() {
+        validate_sse_event_block_json(event_str)?;
+    }
+    let parsed = json_events_from_sse_event_block(event_str);
     if !*first_sse_frame_seen {
         *first_sse_frame_seen = true;
         host.on_first_sse_frame();
     }
     let tc_len_before = accum.tool_calls.len();
     let pending_len_before = pending.len();
-    for event in json_events_from_sse_event_block(event_str).events {
+    for event in &parsed.events {
         match event.get("type").and_then(Value::as_str) {
             Some("agent_communication") => {
-                match serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(event) {
+                match serde_json::from_value::<astra_turn_types::AgentCommunicationEvent>(
+                    event.clone(),
+                ) {
                     Ok(event) => host.on_agent_communication(event),
                     Err(error) => tracing::warn!(
                         target: "astra_turn_core::sse",
@@ -661,7 +738,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
                     ),
                 }
             }
-            Some("agent_live_event") => match agent_live_event_from_sse(&event) {
+            Some("agent_live_event") => match agent_live_event_from_sse(event) {
                 Ok(event) => host.on_agent_live_event(event),
                 Err(error) => tracing::warn!(
                     target: "astra_turn_core::sse",
@@ -669,7 +746,7 @@ async fn process_sse_event_block<H: SseStreamHost>(
                     "ignored malformed agent live SSE evidence"
                 ),
             },
-            Some("agent_live_gap") => match agent_live_gap_from_sse(&event) {
+            Some("agent_live_gap") => match agent_live_gap_from_sse(event) {
                 Ok(gap) => host.on_agent_live_gap(gap),
                 Err(error) => tracing::warn!(
                     target: "astra_turn_core::sse",
@@ -709,7 +786,13 @@ async fn process_sse_event_block<H: SseStreamHost>(
             host.on_tool_call_complete(idx, &tc).await;
         }
     }
-    extends_coalescible_batch
+    for event in &parsed.events {
+        host.on_accepted_sse_event(event).await?;
+    }
+    if parsed.stream_finished {
+        host.on_sse_done(accum).await?;
+    }
+    Ok(extends_coalescible_batch)
 }
 
 fn agent_live_event_from_sse(event: &Value) -> Result<AgentLiveEvent, String> {
@@ -989,6 +1072,9 @@ struct RecordingSseStreamHost {
     agent_communications: Vec<astra_turn_types::AgentCommunicationEvent>,
     agent_live_events: Vec<AgentLiveEvent>,
     agent_live_gaps: Vec<AgentLiveGap>,
+    strict_sse_json: bool,
+    accepted_sse_events: Vec<Value>,
+    done_count: usize,
     stream_completed: bool,
 }
 
@@ -1003,6 +1089,9 @@ impl RecordingSseStreamHost {
             agent_communications: Vec::new(),
             agent_live_events: Vec::new(),
             agent_live_gaps: Vec::new(),
+            strict_sse_json: false,
+            accepted_sse_events: Vec::new(),
+            done_count: 0,
             stream_completed: false,
         }
     }
@@ -1012,11 +1101,31 @@ impl RecordingSseStreamHost {
             .insert(tool.to_string(), output.to_string());
         self
     }
+
+    fn strict(mut self) -> Self {
+        self.strict_sse_json = true;
+        self
+    }
 }
 
 #[cfg(test)]
 #[async_trait]
 impl SseStreamHost for RecordingSseStreamHost {
+    fn requires_strict_sse_json(&self) -> bool {
+        self.strict_sse_json
+    }
+
+    async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        self.accepted_sse_events.push(event.clone());
+        Ok(())
+    }
+
+    async fn on_sse_done(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
+        assert!(accum.stream_complete);
+        self.done_count += 1;
+        Ok(())
+    }
+
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
         self.render_effects.extend(effects);
     }
@@ -1137,6 +1246,74 @@ mod tests {
         assert_eq!(result.accum.prompt_tokens, 100);
         assert_eq!(result.accum.completion_tokens, 50);
         assert!(result.accum.has_usage);
+    }
+
+    #[tokio::test]
+    async fn strict_host_observes_accepted_events_and_done_in_protocol_order() {
+        let events = format!(
+            "{}{}data: [DONE]\n\n",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"run-1\""
+            ),
+            sse_event("usage", ",\"input_tokens\":7,\"output_tokens\":2"),
+        );
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new().strict();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert!(result.accum.stream_complete);
+        assert_eq!(host.accepted_sse_events.len(), 2);
+        assert_eq!(host.accepted_sse_events[0]["type"], "session_info");
+        assert_eq!(host.accepted_sse_events[1]["type"], "usage");
+        assert_eq!(host.done_count, 1);
+    }
+
+    #[tokio::test]
+    async fn strict_host_rejects_malformed_json_without_done_observation() {
+        let events = "data: {not-json}\n\ndata: [DONE]\n\n";
+        let mut stream = stream::iter(chunks_from_sse(events));
+        let mut host = RecordingSseStreamHost::new().strict();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(!result.accum.stream_complete);
+        assert!(result.accum.error_message.is_some());
+        assert!(host.accepted_sse_events.is_empty());
+        assert_eq!(host.done_count, 0);
+    }
+
+    #[tokio::test]
+    async fn strict_host_rejects_eof_without_done_observation() {
+        let events = sse_event("text_delta", ",\"content\":\"partial\"");
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new().strict();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::StreamTransport));
+        assert!(!result.accum.stream_complete);
+        assert!(result.accum.full_text.is_empty());
+        assert_eq!(host.accepted_sse_events.len(), 1);
+        assert_eq!(host.done_count, 0);
     }
 
     #[tokio::test]

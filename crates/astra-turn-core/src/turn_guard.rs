@@ -126,9 +126,6 @@ pub struct TurnGuard {
     pub correction_history: Vec<CorrectionOutcome>,
     /// Adaptive thresholds tuned by correction effectiveness.
     adaptive_thresholds: stall::AdaptiveStallThresholds,
-    /// Drift observation count (persists across turns, fed from StallTrackingState).
-    /// When >= 3, TurnGuard raises advisory evidence strength.
-    pub drift_nudge_count: usize,
     /// Monotonic turn/process-incarnation-local epoch for observations whose
     /// result depends on workspace state. Successful workspace mutations
     /// advance the epoch. This is an in-memory invalidation token, not durable
@@ -195,7 +192,6 @@ impl TurnGuard {
             pending_correction: None,
             correction_history: Vec::new(),
             adaptive_thresholds: stall::AdaptiveStallThresholds::default(),
-            drift_nudge_count: 0,
             workspace_epoch: 0,
             validation_attempts_since_workspace_mutation: HashMap::new(),
         }
@@ -219,12 +215,6 @@ impl TurnGuard {
 
     pub fn set_task_profile(&mut self, task_profile: TaskExecutionProfile) {
         self.task_profile = task_profile;
-    }
-
-    /// Sync drift nudge count from StallTrackingState.
-    /// Call this before evaluate() to feed drift signals into TurnGuard.
-    pub fn sync_drift_nudge_count(&mut self, count: usize) {
-        self.drift_nudge_count = count;
     }
 
     /// Current turn-local workspace observation epoch.
@@ -923,23 +913,7 @@ impl TurnGuard {
         // Consolidate: at most 2 injection messages to avoid noise overload.
         // Primary = first (highest-priority: stall/divergence/escalation).
         // Secondary = remaining tips joined into one message.
-        let mut injections = consolidate_injections(injections);
-
-        // 9. Drift evidence strength
-        // Repeated drift raises the evidence severity without stopping the turn.
-        const DRIFT_ADVISORY_THRESHOLD: usize = 3;
-        let drift_advisory_threshold_reached = self.drift_nudge_count >= DRIFT_ADVISORY_THRESHOLD;
-        if drift_advisory_threshold_reached {
-            injections.push(format!(
-                "Observation: intent drift has been detected {} times. \
-                 Recommendation: re-check the user's original request before choosing the next action.",
-                self.drift_nudge_count
-            ));
-            severity = VerdictSeverity::Critical;
-        }
-
-        let advisory_threshold_reached =
-            advisory_threshold_reached || drift_advisory_threshold_reached;
+        let injections = consolidate_injections(injections);
 
         TurnVerdict {
             injections,
@@ -1885,50 +1859,6 @@ mod tests {
             guard.errors.total_errors, 0,
             "lifetime error count should reset with telemetry"
         );
-    }
-
-    #[test]
-    fn drift_escalation_triggers_advisory_threshold_reached_at_threshold() {
-        let mut guard = TurnGuard::new();
-        guard.drift_nudge_count = 3;
-
-        let verdict = guard.evaluate();
-        assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(verdict.advisory_threshold_reached);
-        assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("intent drift") && m.contains("Recommendation"))
-        );
-    }
-
-    #[test]
-    fn drift_escalation_below_threshold_no_advisory_threshold_reached() {
-        let mut guard = TurnGuard::new();
-        guard.drift_nudge_count = 2;
-
-        let verdict = guard.evaluate();
-        assert!(!verdict.advisory_threshold_reached);
-        assert!(
-            !verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("intent drift") && m.contains("Recommendation"))
-        );
-    }
-
-    #[test]
-    fn drift_escalation_persists_across_evaluate_calls() {
-        let mut guard = TurnGuard::new();
-        guard.drift_nudge_count = 3;
-
-        let v1 = guard.evaluate();
-        assert!(v1.advisory_threshold_reached);
-
-        // drift_nudge_count should not be cleared by evaluate
-        let v2 = guard.evaluate();
-        assert!(v2.advisory_threshold_reached);
     }
 
     #[test]

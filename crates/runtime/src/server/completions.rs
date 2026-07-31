@@ -257,8 +257,7 @@ fn completion_usage(raw: &serde_json::Map<String, serde_json::Value>) -> Option<
         return None;
     }
     let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(raw);
-    let prompt_tokens =
-        usage.input_tokens + usage.cached_input_tokens + usage.cache_creation_tokens;
+    let prompt_tokens = usage.normalized_prompt_cache_usage().total_input_tokens();
     Some(CompletionUsage {
         prompt_tokens,
         completion_tokens: usage.output_tokens,
@@ -348,6 +347,7 @@ mod tests {
                     prompt_cache_capability: None,
                     thinking_capability: None,
                     context_window: Some(32_000),
+                    max_completion_tokens: Some(4_096),
                     request_headers: Some(serde_json::Map::from_iter([(
                         "x-offering-route".into(),
                         serde_json::Value::String("admitted".into()),

@@ -100,12 +100,18 @@ fn canonical_token_usage_columns(
     let creation = canonical_token_count(value, "cache_creation_tokens")?;
     let output = canonical_token_count(value, "output_tokens")?;
     let total = canonical_token_count(value, "total_tokens")?;
-    let token_input = input
-        .checked_add(cached)
-        .and_then(|value| value.checked_add(creation))
+    let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        input as u64,
+        cached as u64,
+        creation as u64,
+    );
+    let token_input = normalized_input
+        .checked_total_input_tokens()
+        .and_then(|value| i64::try_from(value).ok())
         .ok_or_else(|| token_usage_protocol_error("token_usage input column overflow"))?;
-    let expected_total = token_input
-        .checked_add(output)
+    let expected_total = normalized_input
+        .checked_total_tokens_with_output(output as u64)
+        .and_then(|value| i64::try_from(value).ok())
         .ok_or_else(|| token_usage_protocol_error("token_usage total column overflow"))?;
     if total != expected_total {
         return Err(token_usage_protocol_error(format!(

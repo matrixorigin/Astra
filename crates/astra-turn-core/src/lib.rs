@@ -13,13 +13,13 @@
 )]
 
 pub mod action_compensation;
+pub mod active_conversation;
 pub mod activity;
 pub mod agent_live_event;
 
 pub mod agentic;
 pub mod alert_dispatcher;
 pub mod approval;
-pub mod boost_domain_hints;
 pub mod cache;
 pub mod cache_diagnostics;
 pub mod cache_placement;
@@ -78,8 +78,6 @@ pub mod recovery_state;
 pub mod response_guard;
 pub mod resume_hydration;
 pub mod routing;
-pub mod routing_engine;
-pub mod routing_metrics;
 pub mod runtime_scaffolding;
 pub mod safety_middleware;
 pub mod section_types;
@@ -157,7 +155,6 @@ pub use tool::registry::chain as tool_registry_chain;
 pub use tool::registry::meta as tool_registry_meta;
 pub use tool::registry::plugin as tool_registry_plugin;
 pub use tool::registry::report as tool_registry_report;
-pub use tool::registry::state as tool_registry_state;
 pub use tool::result::compression as tool_result_compression;
 pub use tool::result::dedup as tool_result_dedup;
 pub use tool::result::sanitize as tool_result_sanitize;

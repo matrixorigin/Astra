@@ -23,7 +23,7 @@
 //!     ── cancel check ──────────────── cooperative, via cancel_flag
 //!     host.execute_turn(&mut state) → HostTurnResult    ← host-specific
 //!     ingest_agentic_turn_stream(...)                    ← runtime
-//!     agentic_round_stall_preflight_with_tool_calls(...) ← runtime
+//!     agentic_round_stall_preflight(...)                 ← runtime
 //!     run_agentic_headless_tool_round(...)               ← runtime
 //!     apply_agentic_post_tool_policy(...)                ← runtime
 //! ```
@@ -74,7 +74,6 @@ use astra_turn_core::guardrails::turn_guard::TurnGuard;
 use astra_turn_core::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use astra_turn_core::headless_tool_body_preview::HeadlessStderrStyle;
 use astra_turn_core::sse_stream_host::EdgeToolExecResult;
-use astra_turn_core::stall::IntentDrift;
 use astra_turn_core::tool_registry_report::ToolSelectionReport;
 use tokio_util::sync::CancellationToken;
 
@@ -390,24 +389,6 @@ pub trait AgenticLoopHost: Send {
         false
     }
 
-    /// Semantic intent drift detection using LLM classification.
-    ///
-    /// Given the user's original query and recent tool calls, determine if
-    /// the agent has drifted from the intended task. Uses LLM semantic understanding
-    /// rather than keyword matching to handle partial matches, synonyms, and
-    /// multi-language queries.
-    ///
-    /// Default implementation returns `OnTask` (no drift detection). Hosts with
-    /// LLM access should override to provide semantic classification via a
-    /// **separate** LLM call (not cached with main conversation).
-    async fn detect_intent_drift(
-        &mut self,
-        _user_query: &str,
-        _recent_tool_turns: &[(Vec<String>, String)],
-    ) -> IntentDrift {
-        IntentDrift::OnTask
-    }
-
     /// Host-provided turn-start lifecycle summary for prompt/introspection.
     ///
     /// Default is empty; hosts can override to surface mode/run/resume/delegation
@@ -457,17 +438,19 @@ pub trait AgenticLoopHost: Send {
     ///
     /// Hosts that can build the exact next-turn system prompt may override
     /// this to run cache-friendly inline summarization before the next LLM
-    /// round. On success the implementation must bump
+    /// round. On success the implementation must return the typed event that
+    /// describes the applied mutation and bump
     /// [`AgenticLoopState::compact_tier_applied`] to at least
     /// [`CompactionTier::CompactHistory`] so the downstream budget guard
-    /// skips redundant mechanical compression. Default is a no-op so
-    /// non-server hosts preserve legacy behavior.
+    /// skips redundant mechanical compression. Lifecycle accounting and
+    /// delivery are owned by the caller, independently of quiet rendering.
+    /// Default is a no-op so non-server hosts preserve legacy behavior.
     async fn maybe_pre_turn_compact(
         &mut self,
         _state: &mut AgenticLoopState,
         _pressure: f64,
-        _quiet: bool,
-    ) {
+    ) -> Option<CompactionEvent> {
+        None
     }
 
     /// Valid tool names from the host's tool schemas.
@@ -721,13 +704,8 @@ fn build_introspect_snapshot_with_tool_admission(
             if state.stall.exploration_family_advisory_emitted {
                 corrections.push("exploration_family".to_string());
             }
-            if state.stall.intent_drift_advisory_emitted {
-                corrections.push("intent_drift".to_string());
-            }
             corrections
         },
-        drift_nudge_count: state.stall.drift_nudge_count,
-        last_drift_correction_round: state.stall.last_drift_correction_round,
     };
 
     let current_round = state.current_round_index;
@@ -753,17 +731,11 @@ fn build_introspect_snapshot_with_tool_admission(
         })
         .collect();
 
-    // ── Build live alerts from stall / drift / error state ──
+    // ── Build live alerts from stall / error state ──
     let mut alerts: Vec<String> = Vec::new();
     let forced = &stall_state.advisory_signals;
     if !forced.is_empty() {
         alerts.push(format!("advisory_signals: {}", forced.join(", ")));
-    }
-    if stall_state.drift_nudge_count > 0 {
-        alerts.push(format!(
-            "drift_nudge_count={} drift_nudge_count_last_round={}",
-            stall_state.drift_nudge_count, stall_state.last_drift_correction_round,
-        ));
     }
     if stall_state.nudge_count > 0 {
         alerts.push(format!("stall_nudge_count={}", stall_state.nudge_count));
@@ -1159,8 +1131,6 @@ pub struct StallTrackingState {
     pub turn_tool_names: Vec<HashSet<String>>,
     /// Stall events: `(description, turn_number)`.
     pub events: Vec<(String, u32)>,
-    /// Per-turn intent+tool pairs for stall analysis.
-    pub intent_tool_turns: Vec<(Vec<String>, String)>,
     /// Verdict audit trail.
     pub verdict_events: Vec<AgenticVerdictAuditEvent>,
     /// Last heavy checkpoint for step resumption.
@@ -1215,18 +1185,6 @@ pub struct StallTrackingState {
     /// Dominant exploratory family named by the latest advisory. Used to
     /// detect whether later rounds repeat the same low-yield path.
     pub exploration_family_advisory_family: Option<String>,
-    /// Whether the intent-drift mid-loop advisory has fired this turn.
-    /// One-shot per turn — prevents repeated volatile injection that would
-    /// break prompt-cache prefix stability on every subsequent round.
-    pub intent_drift_advisory_emitted: bool,
-    /// How many times intent-drift correction has been injected this session.
-    /// Persists across turns (unlike `intent_drift_advisory_emitted` which is per-turn).
-    /// Used by TurnGuard escalation: if drift_nudge_count >= threshold,
-    /// escalate to force-stop.
-    pub drift_nudge_count: usize,
-    /// The round index at which the last drift correction was injected.
-    /// Used to detect if agent ignored the correction (next round still drifting).
-    pub last_drift_correction_round: usize,
     /// How many stall correction nudges have been injected this loop.
     /// Limits nudge frequency (at most one per stall type per session).
     pub nudge_count: u32,
@@ -1881,12 +1839,6 @@ pub enum VolatileKind {
     /// its plan via `exit_plan_mode(plan="…")` for user approval.
     /// Singleton — only the latest one ever rides the wire.
     PlanModeMarker,
-    /// Intent-drift evidence: "⚠ INTENT DRIFT DETECTED — you have
-    /// spent N consecutive turns on tools unrelated to the user's
-    /// request…". Singleton so only the latest observation rides the
-    /// wire, avoiding prompt cache bloat from accumulated drift
-    /// messages across rounds.
-    IntentDrift,
 }
 
 impl VolatileKind {
@@ -1910,7 +1862,6 @@ impl VolatileKind {
                 | Self::SessionHookContext
                 | Self::HarnessBoundary
                 | Self::PlanModeMarker
-                | Self::IntentDrift
                 | Self::SelfStatus
                 | Self::PolicyAdvisory
                 | Self::BudgetUpdate
@@ -1948,8 +1899,7 @@ impl VolatileKind {
             | Self::BudgetReview
             | Self::ContextPressure
             | Self::TaskBoardAdvisory
-            | Self::StopHookEvidence
-            | Self::IntentDrift => VolatileDeliveryClass::AdvisoryEvidence,
+            | Self::StopHookEvidence => VolatileDeliveryClass::AdvisoryEvidence,
         }
     }
 
@@ -2546,17 +2496,22 @@ impl AgenticLoopState {
     /// cost signal that is meant to cap actual provider usage must use this
     /// total instead of only `prompt + completion`.
     pub fn provider_total_tokens(&self) -> u64 {
-        self.total_prompt
-            .saturating_add(self.total_cache_read)
-            .saturating_add(self.total_cache_creation)
-            .saturating_add(self.total_completion)
+        astra_turn_types::NormalizedPromptCacheUsage::new(
+            self.total_prompt,
+            self.total_cache_read,
+            self.total_cache_creation,
+        )
+        .total_tokens_with_output(self.total_completion)
     }
 
     /// Provider-reported input tokens, including cache reads and cache writes.
     pub fn provider_input_tokens(&self) -> u64 {
-        self.total_prompt
-            .saturating_add(self.total_cache_read)
-            .saturating_add(self.total_cache_creation)
+        astra_turn_types::NormalizedPromptCacheUsage::new(
+            self.total_prompt,
+            self.total_cache_read,
+            self.total_cache_creation,
+        )
+        .total_input_tokens()
     }
 
     #[must_use]
@@ -3774,6 +3729,14 @@ pub(crate) mod tests {
         }
     }
 
+    fn local_spill_session_dir(session_id: &str) -> std::path::PathBuf {
+        use astra_services::SessionArtifactStore as _;
+
+        astra_services::local_session_artifact_store()
+            .session_dir(session_id)
+            .expect("test session id must resolve an owner-scoped spill directory")
+    }
+
     fn structured_task_profile(
         mutates_workspace: bool,
         exploratory_task: bool,
@@ -3793,6 +3756,8 @@ pub(crate) mod tests {
         current_turn: usize,
         pub(crate) valid_tools: HashSet<String>,
         pub(crate) emitted_lines: Vec<String>,
+        pub(crate) compaction_events: Vec<CompactionEvent>,
+        pub(crate) rendered_compaction_summaries: Vec<String>,
         quiet: bool,
         interaction_mode: TurnInteractionMode,
         pub(crate) injected_schemas: Vec<Value>,
@@ -3824,6 +3789,8 @@ pub(crate) mod tests {
                 current_turn: 0,
                 valid_tools: HashSet::new(),
                 emitted_lines: Vec::new(),
+                compaction_events: Vec::new(),
+                rendered_compaction_summaries: Vec::new(),
                 quiet: true,
                 interaction_mode: TurnInteractionMode::NonInteractive,
                 injected_schemas: Vec::new(),
@@ -3856,6 +3823,11 @@ pub(crate) mod tests {
 
         pub(crate) fn with_interaction_mode(mut self, mode: TurnInteractionMode) -> Self {
             self.interaction_mode = mode;
+            self
+        }
+
+        pub(crate) fn with_quiet(mut self, quiet: bool) -> Self {
+            self.quiet = quiet;
             self
         }
 
@@ -4004,6 +3976,14 @@ pub(crate) mod tests {
 
         fn emit_headless_line(&mut self, _style: HeadlessStderrStyle, line: String) {
             self.emitted_lines.push(line);
+        }
+
+        fn on_compaction(&mut self, event: CompactionEvent) {
+            if !self.quiet {
+                self.rendered_compaction_summaries
+                    .push(event.summary.clone());
+            }
+            self.compaction_events.push(event);
         }
 
         fn is_quiet(&self) -> bool {
@@ -5036,6 +5016,19 @@ pub(crate) mod tests {
         assert_eq!(state.telemetry.first_ttft_ms, Some(42));
     }
 
+    fn assert_phase0_terminal_usage_fixture(state: &AgenticLoopState) {
+        assert_eq!(state.total_prompt, 200);
+        assert_eq!(state.total_cache_read, 800);
+        assert_eq!(state.total_cache_creation, 100);
+        assert_eq!(state.provider_input_tokens(), 1_100);
+        assert_eq!(state.last_measured_prompt_tokens, Some(1_100));
+
+        // Output is a disjoint bucket: it contributes to provider spend, but
+        // never to current-request input occupancy.
+        assert_eq!(state.total_completion, 50);
+        assert_eq!(state.provider_total_tokens(), 1_150);
+    }
+
     #[tokio::test]
     async fn terminal_handoff_stops_source_loop_before_tool_execution_or_second_llm() {
         let terminal_call = json!({
@@ -5051,8 +5044,10 @@ pub(crate) mod tests {
                 reasoning_content: "internal reasoning".to_string(),
                 tool_calls: vec![terminal_call],
                 has_tool_calls: true,
-                prompt_tokens: 31,
-                completion_tokens: 7,
+                prompt_tokens: 200,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+                completion_tokens: 50,
                 has_usage: true,
                 ..Default::default()
             },
@@ -5084,8 +5079,7 @@ pub(crate) mod tests {
             1,
             "source must not issue a second LLM call"
         );
-        assert_eq!(state.total_prompt, 31);
-        assert_eq!(state.total_completion, 7);
+        assert_phase0_terminal_usage_fixture(&state);
         assert_eq!(
             state.total_tool_calls, 0,
             "control action is not an executed tool"
@@ -5115,8 +5109,10 @@ pub(crate) mod tests {
                 reasoning_content: "private invalid handoff reasoning".to_string(),
                 tool_calls: vec![invalid_terminal_call],
                 has_tool_calls: true,
-                prompt_tokens: 19,
-                completion_tokens: 5,
+                prompt_tokens: 200,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+                completion_tokens: 50,
                 has_usage: true,
                 ..Default::default()
             },
@@ -5144,6 +5140,7 @@ pub(crate) mod tests {
         };
         assert_eq!(rejection.code, "terminal_handoff_contract_violation");
         assert_eq!(host.turn_count(), 1, "source must not call the LLM again");
+        assert_phase0_terminal_usage_fixture(&state);
         assert_eq!(
             state.total_tool_calls, 0,
             "invalid terminal action must not execute as a tool"
@@ -8607,8 +8604,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -8681,8 +8677,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -8749,8 +8744,7 @@ pub(crate) mod tests {
                 .expect("system time")
                 .as_nanos()
         );
-        let _guard =
-            SpillDirGuard(astra_services::session_journal::local_sessions_dir().join(&session_id));
+        let _guard = SpillDirGuard(local_spill_session_dir(&session_id));
 
         let mut host = MockHost::new(vec![
             edge_tool_result(
@@ -10717,32 +10711,15 @@ mod parallel_execution_tests {
 
     #[test]
     fn singleton_volatile_replaces_not_appends_on_wire() {
-        // Critical for prompt cache: pushing two IntentDrift advisories
-        // in the same round must REPLACE, not APPEND. Otherwise the wire
-        // format changes every round drift is detected, breaking the cache
-        // prefix stability.
+        // Snapshot-style signals must replace rather than append within a
+        // round, otherwise repeated observations destabilize the wire prefix.
         let mut state = make_state();
-        state.push_volatile(VolatileKind::IntentDrift, "first correction");
-        state.push_volatile(VolatileKind::IntentDrift, "second correction");
         state.push_volatile(VolatileKind::ContextPressure, "pressure 70");
         state.push_volatile(VolatileKind::ContextPressure, "pressure 71");
         assert_eq!(
             state.volatile_pending.len(),
-            2,
+            1,
             "singleton kind must replace, not append — cache invariant violated"
-        );
-        let content = state
-            .volatile_pending
-            .iter()
-            .find(|entry| entry.kind == VolatileKind::IntentDrift)
-            .expect("intent drift singleton")
-            .payload
-            .get("evidence")
-            .and_then(Value::as_str)
-            .expect("intent drift payload text");
-        assert!(
-            content.contains("second"),
-            "replacement must keep the LATEST correction, got: {content}"
         );
         let pressure_content = state
             .volatile_pending
@@ -10781,38 +10758,19 @@ mod parallel_execution_tests {
     }
 
     #[test]
-    fn intent_drift_advisory_emitted_flag_is_orthogonal_to_quality_corrections() {
-        // Drift correction (intent alignment) is semantically orthogonal to
-        // quality corrections (redundant reads, cache waste, etc.).
-        // It should NOT block other correction families in the same turn.
-        let mut state = make_state();
-        assert!(
-            !state.stall.intent_drift_advisory_emitted,
-            "flag must start false each turn"
-        );
-        state.stall.intent_drift_advisory_emitted = true;
-        assert!(
-            !state.stall.any_behavior_advisory_emitted(),
-            "intent_drift_advisory_emitted must NOT be in any_behavior_advisory_emitted() — \
-             drift is orthogonal to quality corrections"
-        );
-    }
-
-    #[test]
     fn different_volatile_kinds_coexist_on_wire() {
-        // Different kinds (StallNudge vs IntentDrift) are NOT singletons
+        // Different kinds (StallNudge vs ContextPressure) are NOT singletons
         // relative to each other — they coexist so the model sees all
         // runtime signals. Only same-kind pushes replace.
         let mut state = make_state();
         state.push_volatile(VolatileKind::StallNudge, "stall warning");
-        state.push_volatile(VolatileKind::IntentDrift, "drift correction");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 70");
         assert_eq!(
             state.volatile_pending.len(),
             2,
             "different kinds must coexist on the wire"
         );
-        // Same singleton kind replaces (IntentDrift is singleton)
-        state.push_volatile(VolatileKind::IntentDrift, "updated drift");
+        state.push_volatile(VolatileKind::ContextPressure, "pressure 71");
         assert_eq!(
             state.volatile_pending.len(),
             2,
@@ -10821,12 +10779,12 @@ mod parallel_execution_tests {
         let content = state
             .volatile_pending
             .iter()
-            .find(|v| matches!(v.kind, VolatileKind::IntentDrift))
+            .find(|v| matches!(v.kind, VolatileKind::ContextPressure))
             .and_then(|v| v.payload.get("evidence"))
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
-            content.contains("updated drift"),
+            content.contains("71"),
             "singleton must keep LATEST value, got: {content}"
         );
     }

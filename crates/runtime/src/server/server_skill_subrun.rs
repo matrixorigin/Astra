@@ -609,7 +609,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
         let turns = SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) as u32;
-        let tokens_used = (state.total_prompt + state.total_completion) as u32;
+        let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
 
         Ok(SubRunResult {
             output: state.final_text,

@@ -663,8 +663,6 @@ pub struct AdaptiveStallThresholds {
     pub stall_window: usize,
     /// Max exploration rounds before divergence (default: MAX_EXPLORATION_ROUNDS).
     pub max_exploration_rounds: usize,
-    /// Intent drift detection window (default: INTENT_DRIFT_WINDOW).
-    pub intent_drift_window: usize,
 }
 
 impl Default for AdaptiveStallThresholds {
@@ -672,7 +670,6 @@ impl Default for AdaptiveStallThresholds {
         Self {
             stall_window: SERVER_STALL_WINDOW,
             max_exploration_rounds: MAX_EXPLORATION_ROUNDS,
-            intent_drift_window: INTENT_DRIFT_WINDOW,
         }
     }
 }
@@ -692,40 +689,10 @@ impl AdaptiveStallThresholds {
     }
 }
 
-// ─── Intent drift detection ─────────────────────────────────────────────────
-
-/// Result of intent drift analysis.
-#[derive(Debug, Clone, PartialEq)]
-pub enum IntentDrift {
-    /// Agent is on-task — tools relate to the user's query.
-    OnTask,
-    /// Agent may be drifting — low relevance for N consecutive turns.
-    Drifting {
-        consecutive_off_task: usize,
-        correction: String,
-    },
-}
-
-/// Minimum consecutive off-task turns before flagging drift.
-pub const INTENT_DRIFT_WINDOW: usize = 3;
-
-/// Format correction message for intent drift.
-pub fn format_drift_correction(user_query: &str, consecutive_off_task: usize) -> String {
-    let original_snippet: String = user_query.chars().take(100).collect();
-    format!(
-        "⚠ INTENT DRIFT DETECTED — you have spent {} consecutive turns on tools \
-         unrelated to the user's request: \"{}\". \
-         STOP your current approach and refocus on what the user asked. \
-         If you cannot accomplish the original task, explain why and ask for guidance.",
-        consecutive_off_task, original_snippet
-    )
-}
-
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use crate::tool::registry::state::word_boundary_match;
 
     fn make_sigs(rounds: &[&[&str]]) -> Vec<BTreeSet<String>> {
         rounds
@@ -1117,35 +1084,6 @@ mod tests {
         assert!(message.contains("Retry-cautioned tools: [read_file, grep]"));
     }
 
-    // ── Universal stemming ──
-
-    #[test]
-    fn word_boundary_match_stemming() {
-        // Plurals match
-        assert!(word_boundary_match(
-            "list all pull requests and issues",
-            "pull request"
-        ));
-        assert!(word_boundary_match(
-            "list all pull requests and issues",
-            "issue"
-        ));
-        // Gerund matches
-        assert!(word_boundary_match(
-            "committing changes to the branch",
-            "commit"
-        ));
-        // Past tense matches
-        assert!(word_boundary_match("committed the fix yesterday", "commit"));
-        // No false positive on partial substring
-        assert!(!word_boundary_match("the community is growing", "commit"));
-        // Exact match still works
-        assert!(word_boundary_match("git diff", "git"));
-        assert!(word_boundary_match("git diff", "diff"));
-        // Plurals: "prs" matches "pr"
-        assert!(word_boundary_match("show me the prs", "pr"));
-    }
-
     // ── Structured reflection ──
 
     #[test]
@@ -1279,59 +1217,6 @@ mod tests {
         used.insert("bash".to_string());
         let ignored = detect_nudge_ignored(&avoid, &used);
         assert!(ignored.is_empty());
-    }
-
-    // ─── IntentDrift and format_drift_correction tests ─────────────────────
-
-    #[allow(dead_code)]
-    fn make_intent_turns(turns: &[(&[&str], &str)]) -> Vec<(Vec<String>, String)> {
-        turns
-            .iter()
-            .map(|(names, args)| {
-                (
-                    names.iter().map(|n| n.to_string()).collect(),
-                    args.to_string(),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn format_drift_correction_truncates_long_query() {
-        let long_query = "a".repeat(200);
-        let correction = format_drift_correction(&long_query, 5);
-        assert!(correction.contains("INTENT DRIFT"));
-        assert!(correction.contains("5 consecutive turns"));
-        // Query should be truncated to 100 chars
-        assert!(correction.len() < 200 + 200);
-    }
-
-    #[test]
-    fn format_drift_correction_includes_consecutive_count() {
-        let correction = format_drift_correction("fix auth bug", 3);
-        assert!(correction.contains("3 consecutive turns"));
-        assert!(correction.contains("fix auth bug"));
-    }
-
-    #[test]
-    fn intent_drift_variants_constructible() {
-        let on_task = IntentDrift::OnTask;
-        assert_eq!(on_task, IntentDrift::OnTask);
-
-        let drifting = IntentDrift::Drifting {
-            consecutive_off_task: 4,
-            correction: "test".to_string(),
-        };
-        if let IntentDrift::Drifting {
-            consecutive_off_task,
-            correction,
-        } = drifting
-        {
-            assert_eq!(consecutive_off_task, 4);
-            assert_eq!(correction, "test");
-        } else {
-            panic!("Expected Drifting variant");
-        }
     }
 
     // ── Tool call signature format tests ──

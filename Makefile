@@ -161,6 +161,10 @@ DURABLE_EVENT_PRESSURE_ARGS ?=
 
 NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
+# Phase-0 production baselines require hermetic binary/model inputs and the
+# ASTRA_PHASE0_BASELINE_EXCLUSIVE guard. They are owned by
+# scripts/phase0-production-baseline.sh, not the generic ignored-test lane.
+NEXTEST_PHASE0_BASELINE_EXCLUSION := not test(/e2e_matrix_phase0_(server_only_production_baseline|external_(production_topologies|edge_server_m1))/)
 
 # ============================================================================
 # Environment Setup
@@ -1087,6 +1091,7 @@ test-ignored-integration:
 				--features astra-runtime/bridge-e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
+				-E '$(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED runtime-plan-perf"; \
 		else \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \
@@ -1094,7 +1099,7 @@ test-ignored-integration:
 				--features astra-runtime/bridge-e2e-hooks \
 				--tests --run-ignored only \
 				$(NEXTEST_ONLINE_FLAGS) $$JOBS_FLAG \
-				-E 'not binary(perf_benchmarks)' \
+				-E 'not binary(perf_benchmarks) and $(NEXTEST_PHASE0_BASELINE_EXCLUSION)' \
 					|| FAILED="$$FAILED integration"; \
 			echo "Running online performance benchmarks in an isolated serial lane (blocking unless ASTRA_STRICT_ONLINE_PERF=0)..."; \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) \

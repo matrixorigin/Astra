@@ -261,6 +261,10 @@ pub fn rehydrate_sections(
 /// mutated `schemas` vec itself. Uses `Value` equality (no re-serialization)
 /// to keep the hot path allocation-light.
 fn prune_tool_schemas(schemas: &mut Vec<Value>, tier: CompactionTier) -> u32 {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextOptimization,
+        schemas,
+    );
     let pruned = crate::tool::schema::prune::prune_tool_schemas(schemas, tier);
     let touched = pruned
         .iter()
@@ -280,6 +284,10 @@ fn prune_tool_schemas(schemas: &mut Vec<Value>, tier: CompactionTier) -> u32 {
 /// assistant `tool_calls` declaration was removed.
 /// Returns estimated tokens dropped.
 fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextOptimization,
+        messages,
+    );
     let mut units = Vec::<Vec<usize>>::new();
     for (idx, message) in messages.iter().enumerate() {
         let role = message.get("role").and_then(Value::as_str);
@@ -446,6 +454,10 @@ fn compact_tool_results_gated(
         _ => pressure,
     };
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextOptimization,
+        messages,
+    );
     let mut candidate = messages.to_vec();
     let stats = crate::microcompact::compact_tool_results_adaptive(
         &mut candidate,
@@ -460,6 +472,10 @@ fn compact_tool_results_gated(
             skipped_over_budget: true,
         };
     }
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextOptimization,
+        &candidate,
+    );
     messages.clone_from_slice(&candidate);
     ClearResult {
         count: u32::try_from(stats.results_compacted).unwrap_or(u32::MAX),
@@ -587,6 +603,7 @@ mod tests {
             run_id: "r1".into(),
             model_id: "m1".into(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::default(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -632,6 +649,7 @@ mod tests {
         let plan_input = PlanInput {
             tokens: &turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &turn.recovery,
             latches: &latches,
             stats: &stats,

@@ -25,9 +25,10 @@ use astra_core::sync_poison::{recover_rwlock_read, recover_rwlock_write};
 
 use crate::context_assembly_trace::{
     CompressionMethod, ContextAssemblyTrace, ContextAssemblyTraceBuilder, DecisionExplanation,
-    HistorySelectionTrace, MemoryRetrievalTrace, SystemPromptBreakdown, TokenBudgetTrace,
-    ToolSurfaceTrace, build_history_trace_from_compression, build_memory_trace_from_retrieval,
-    build_tool_surface_trace, build_tool_surface_trace_with_deferred,
+    HistorySelectionTrace, MemoryRetrievalTrace, ModelRequestTraceIdentity, SystemPromptBreakdown,
+    TokenBudgetTrace, ToolSurfaceTrace, build_history_trace_from_compression,
+    build_memory_trace_from_retrieval, build_tool_surface_trace,
+    build_tool_surface_trace_with_deferred,
 };
 
 /// Thread-safe trace collector for a single turn.
@@ -44,6 +45,7 @@ struct CollectorState {
     turn_id: String,
     session_id: String,
     started_at: Instant,
+    request_identity: Option<ModelRequestTraceIdentity>,
     system_prompt: Option<SystemPromptBreakdown>,
     history: Option<HistorySelectionTrace>,
     memory: Option<MemoryRetrievalTrace>,
@@ -70,6 +72,7 @@ impl TurnTraceCollector {
                 turn_id: turn_id.into(),
                 session_id: session_id.into(),
                 started_at: Instant::now(),
+                request_identity: None,
                 system_prompt: None,
                 history: None,
                 memory: None,
@@ -104,6 +107,12 @@ impl TurnTraceCollector {
     }
 
     // ─── Recording Methods ───────────────────────────────────────────────────
+
+    /// Record the exact identity of the latest provider-bound request.
+    pub fn record_request_identity(&self, identity: ModelRequestTraceIdentity) {
+        let mut state = recover_rwlock_write(&self.inner);
+        state.request_identity = Some(identity);
+    }
 
     /// Record system prompt breakdown.
     pub fn record_system_prompt(&self, breakdown: SystemPromptBreakdown) {
@@ -143,6 +152,10 @@ impl TurnTraceCollector {
     /// Record memory retrieval results.
     /// Set per-turn history retention data.
     pub fn set_history_retained(&self, turns: &[crate::context_assembly_trace::TurnRetention]) {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::TurnTraceHistoryClone,
+            turns,
+        );
         let mut state = recover_rwlock_write(&self.inner);
         let had_history = state.history.is_some();
         let hist = state
@@ -301,10 +314,17 @@ impl TurnTraceCollector {
 
         let mut builder = ContextAssemblyTraceBuilder::new(&state.turn_id, &state.session_id);
 
+        if let Some(ref identity) = state.request_identity {
+            builder = builder.with_request_identity(identity.clone());
+        }
         if let Some(ref sp) = state.system_prompt {
             builder = builder.with_system_prompt(sp.clone());
         }
         if let Some(ref h) = state.history {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::TurnTraceHistoryClone,
+                h,
+            );
             builder = builder.with_history(h.clone());
         }
         if let Some(ref m) = state.memory {
@@ -326,6 +346,7 @@ impl TurnTraceCollector {
     pub fn has_data(&self) -> bool {
         let state = recover_rwlock_read(&self.inner);
         state.system_prompt.is_some()
+            || state.request_identity.is_some()
             || state.history.is_some()
             || state.memory.is_some()
             || state.tools.is_some()
@@ -390,6 +411,31 @@ mod tests {
         assert_eq!(trace.session_id, "session-abc");
         assert_eq!(trace.tools.visible_tools.len(), 2);
         assert_eq!(trace.memory.memories_selected.len(), 1);
+    }
+
+    #[test]
+    fn collector_keeps_latest_request_identity_across_rounds_and_attempts() {
+        let collector = TurnTraceCollector::new("turn-1", "session-abc");
+        for (round, attempt) in [(0, 0), (1, 0), (1, 1)] {
+            collector.record_request_identity(ModelRequestTraceIdentity {
+                request_id: format!("request-{round}-{attempt}"),
+                request_hash: format!("sha256:{round:02x}{attempt:02x}"),
+                round,
+                attempt,
+                provider_response_id: None,
+            });
+        }
+
+        assert_eq!(
+            collector.finalize().request_identity,
+            Some(ModelRequestTraceIdentity {
+                request_id: "request-1-1".to_string(),
+                request_hash: "sha256:0101".to_string(),
+                round: 1,
+                attempt: 1,
+                provider_response_id: None,
+            })
+        );
     }
 
     #[test]

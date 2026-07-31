@@ -98,6 +98,17 @@ pub(crate) fn build_capture_response_json(outcome: &str, response: Value) -> Val
     })
 }
 
+fn record_capture_artifact_clone(messages: &[Value], tools: &[Value]) {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmCaptureArtifactClone,
+        messages,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmCaptureArtifactClone,
+        tools,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_capture_payload_json(
     messages: &[Value],
@@ -109,6 +120,7 @@ pub(crate) fn build_capture_payload_json(
     round: u32,
     trace: Option<CaptureTrace<'_>>,
 ) -> Value {
+    record_capture_artifact_clone(messages, tools);
     json!({
         "request": build_capture_request_json(messages, tools, max_output_tokens),
         "response": response,
@@ -410,6 +422,7 @@ fn persist_capture_inner(
     std::fs::create_dir_all(parent)
         .map_err(|error| format!("create capture dir {}: {error}", parent.display()))?;
 
+    record_capture_artifact_clone(messages, tools);
     let payload = json!({
         "captured_at_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
         "session_id": session_id,
@@ -425,8 +438,32 @@ fn persist_capture_inner(
         "trace": build_capture_trace_json(turn, round, trace),
     });
 
-    let content = serde_json::to_string_pretty(&payload)
-        .map_err(|error| format!("serialize capture payload for {}: {error}", path.display()))?;
+    let serialization_site =
+        astra_core::history_work::HistoryWorkSite::LlmCaptureArtifactSerialization;
+    let content = match serde_json::to_string_pretty(&payload) {
+        Ok(content) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    serialization_site,
+                    content.len().try_into().unwrap_or(u64::MAX),
+                    messages
+                        .len()
+                        .saturating_add(tools.len())
+                        .try_into()
+                        .unwrap_or(u64::MAX),
+                    0,
+                );
+            }
+            content
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(serialization_site, &error);
+            return Err(format!(
+                "serialize capture payload for {}: {error}",
+                path.display()
+            ));
+        }
+    };
     std::fs::write(&path, content)
         .map_err(|error| format!("write capture file {}: {error}", path.display()))?;
     #[cfg(unix)]

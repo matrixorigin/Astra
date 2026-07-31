@@ -170,6 +170,10 @@ pub(crate) async fn initialize_multi_agent_runtime(
     // delegate and spawn paths stay in lockstep on observability.
     let runtime_cfg = astra_config::runtime_config::RuntimeConfig::load();
     let shared_fork_cache_sink = fork_cache_event_sink(runtime_cfg.fork_prefix.sink);
+    let profile_owned = profile.map(str::to_string);
+    let token_provider: spawn_subrun::TokenProvider = std::sync::Arc::new(move || {
+        session_runtime::current_access_token(profile_owned.as_deref())
+    });
 
     let mut delegate_executor = delegate_subrun::CliDelegateSubRunExecutor::new(
         api.clone(),
@@ -180,7 +184,8 @@ pub(crate) async fn initialize_multi_agent_runtime(
         None,
     )
     .with_skill_resolver(skill_resolver.clone())
-    .with_progress_broadcaster(progress_broadcaster.clone());
+    .with_progress_broadcaster(progress_broadcaster.clone())
+    .with_token_provider(token_provider.clone());
     delegate_executor = delegate_executor.with_fork_cache_sink(shared_fork_cache_sink.clone());
 
     // Build the shared fork-prefix store once up-front so both the
@@ -221,13 +226,7 @@ pub(crate) async fn initialize_multi_agent_runtime(
     // takes only `Option<&str>` for the profile and reads the
     // credentials file fresh on each call. So we capture an owned
     // profile string and the closure becomes Send + Sync + 'static.
-    {
-        let profile_owned = profile.map(str::to_string);
-        let provider: spawn_subrun::TokenProvider = std::sync::Arc::new(move || {
-            session_runtime::current_access_token(profile_owned.as_deref())
-        });
-        spawn_executor = spawn_executor.with_token_provider(provider);
-    }
+    spawn_executor = spawn_executor.with_token_provider(token_provider);
     if let Some(session_id) = state.session_id.clone() {
         spawn_executor = spawn_executor.with_session_transcript(session_id);
     }

@@ -295,6 +295,10 @@ pub fn apply_micro_compact(
     messages: &[Value],
     tool_ids_to_clear: &[String],
 ) -> (Vec<Value>, usize) {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        messages,
+    );
     if tool_ids_to_clear.is_empty() {
         return (messages.to_vec(), 0);
     }
@@ -494,6 +498,10 @@ fn merge_overlapping_ranges(ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> 
 
 /// Compact a range of messages using the specified tier.
 fn compact_range(messages: &[Value], tier: CompactionTier, budget_chars: usize) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        messages,
+    );
     // Apply tier-specific compaction
     match tier {
         CompactionTier::Normal => messages.to_vec(),

@@ -225,11 +225,15 @@ mod tests {
     }
 
     #[test]
-    fn context_window_path_uses_full_window_with_output_reserve() {
-        let pressure = budget_pressure_for_chat_turn_with_context_window(&[], 115_000, 200_000);
-        assert!(
-            (0.3..0.6).contains(&pressure),
-            "200K context with 10% output reserve should trim schemas but not compact history at 115K, got {pressure}"
+    fn context_window_path_applies_the_resolved_policy_before_classifying_pressure() {
+        let trim_pressure = budget_pressure_for_chat_turn_with_context_window(&[], 90_000, 200_000);
+        let compact_pressure =
+            budget_pressure_for_chat_turn_with_context_window(&[], 115_000, 200_000);
+
+        assert_eq!(trim_pressure, 0.3);
+        assert_eq!(
+            compact_pressure, 0.6,
+            "the exact output, summary, and protocol reserves must all affect pressure"
         );
     }
 

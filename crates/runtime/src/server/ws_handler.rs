@@ -1273,6 +1273,7 @@ fn build_ws_chat_request(
         forward_headers: std::collections::HashMap::new(),
         provider_workspace_id: None,
         execution_budget,
+        conversation_authority: None,
         execution_policy: Default::default(),
         explain,
         interaction_mode,
@@ -2355,7 +2356,6 @@ fn apply_prepared_headers(
     set_header!(user_query_event_id, "x-mo-user-query-event-id");
     set_header!(user_query_b64, "x-mo-user-query-b64");
     set_header!(routing_meta_b64, "x-mo-routing-meta-b64");
-    set_header!(force_intent, "x-mo-force-intent");
     set_header!(execution_state_b64, "x-mo-execution-state-b64");
     if prepared.full_llm_capture == Some(true) {
         headers.insert(
@@ -3314,7 +3314,6 @@ mod tests {
             tools_changed: None,
             user_query_b64: None,
             routing_meta_b64: None,
-            force_intent: None,
             execution_state_b64: None,
         };
         let explain = bridge_run_started_explain(true);
@@ -3399,7 +3398,6 @@ mod tests {
             tools_changed: None,
             user_query_b64: None,
             routing_meta_b64: None,
-            force_intent: None,
             execution_state_b64: None,
         };
 
@@ -4059,7 +4057,6 @@ mod tests {
             tools_changed: Some(true),
             user_query_b64: Some("aGVsbG8=".into()),
             routing_meta_b64: Some("cm91dGU=".into()),
-            force_intent: Some("question".into()),
             execution_state_b64: Some("c3RhdGU=".into()),
         }
     }
@@ -4075,7 +4072,6 @@ mod tests {
             tools_changed: None,
             user_query_b64: None,
             routing_meta_b64: None,
-            force_intent: None,
             execution_state_b64: None,
         }
     }
@@ -4094,7 +4090,6 @@ mod tests {
         assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
         assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
         assert_eq!(headers.get("x-mo-routing-meta-b64").unwrap(), "cm91dGU=");
-        assert_eq!(headers.get("x-mo-force-intent").unwrap(), "question");
         assert_eq!(headers.get("x-mo-execution-state-b64").unwrap(), "c3RhdGU=");
     }
 

@@ -7,8 +7,9 @@
 //! payload hash, explicit retry/backoff state, a contiguous ack watermark, and
 //! poison isolation so one bad record cannot block later records forever.
 
-use crate::session_journal::{self, JournalEvent, JournalEventType};
+use crate::session_journal::{JournalEvent, JournalEventType};
 use crate::sync_engine::SyncDomain;
+use crate::{OwnerScope, SessionArtifactStore};
 use astra_core::canonical_json_string;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,40 @@ pub const SYNC_OUTBOX_SKIPPED_RETAINED_RECORDS: usize = 128;
 pub const SYNC_OUTBOX_PENDING_HIGH_WATERMARK: usize = 8192;
 const SYNC_OUTBOX_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_OUTBOX_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn record_serialized_history<T: Serialize + ?Sized>(
+    site: astra_core::history_work::HistoryWorkSite,
+    value: &T,
+    rows: usize,
+) {
+    if !astra_core::history_work::instrumentation_enabled() {
+        return;
+    }
+    match astra_core::history_work::serialized_bytes(value) {
+        Ok(bytes) => astra_core::history_work::record_operation(
+            site,
+            bytes,
+            rows.try_into().unwrap_or(u64::MAX),
+            0,
+        ),
+        Err(error) => astra_core::history_work::record_serialization_failure(site, &error),
+    }
+}
+
+fn record_existing_history(
+    site: astra_core::history_work::HistoryWorkSite,
+    bytes: usize,
+    rows: usize,
+) {
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            site,
+            bytes.try_into().unwrap_or(u64::MAX),
+            rows.try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,12 +114,23 @@ pub struct SyncOutboxRecord {
 
 impl SyncOutboxRecord {
     pub fn canonical_payload_json(&self) -> String {
-        canonical_json_string(&self.payload)
+        let payload_json = canonical_json_string(&self.payload);
+        record_existing_history(
+            astra_core::history_work::HistoryWorkSite::SyncOutboxDeliverySerialization,
+            payload_json.len(),
+            1,
+        );
+        payload_json
     }
 }
 
 pub fn sync_outbox_canonical_payload_hash(payload: &Value) -> String {
     let payload_json = canonical_json_string(payload);
+    record_existing_history(
+        astra_core::history_work::HistoryWorkSite::SyncOutboxPayloadHash,
+        payload_json.len(),
+        1,
+    );
     sha256_prefixed(payload_json.as_bytes())
 }
 
@@ -258,7 +304,16 @@ pub struct SyncOutboxStore {
 
 impl SyncOutboxStore {
     pub fn local() -> Self {
-        Self::new(session_journal::local_sessions_dir().join("sync"))
+        Self::for_owner(&crate::local_owner_scope())
+            .expect("configured local owner scope must resolve an outbox path")
+    }
+
+    pub fn for_owner(owner_scope: &OwnerScope) -> std::io::Result<Self> {
+        let root = crate::local_session_artifact_store()
+            .owner_root(owner_scope)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+            .join("sync");
+        Ok(Self::new(root))
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -359,11 +414,17 @@ impl SyncOutboxStore {
         events: &[JournalEvent],
     ) -> std::io::Result<SyncOutboxJournalDeltaOutcome> {
         let source_session_id = source_session_id.to_string();
+        let cloned_events = events.to_vec();
+        record_serialized_history(
+            astra_core::history_work::HistoryWorkSite::SyncOutboxJournalDeltaClone,
+            &cloned_events,
+            cloned_events.len(),
+        );
         let batch = self.append_journal_deltas(&[SyncOutboxJournalDelta {
             source_session_id: source_session_id.clone(),
             expected_offset,
             next_offset,
-            events: events.to_vec(),
+            events: cloned_events,
         }])?;
         batch
             .outcomes
@@ -590,6 +651,11 @@ impl SyncOutboxStore {
                     claimed.push(record.clone());
                 }
             }
+            record_serialized_history(
+                astra_core::history_work::HistoryWorkSite::SyncOutboxDeliveryClone,
+                &claimed,
+                claimed.len(),
+            );
             Ok(claimed)
         })
     }
@@ -703,7 +769,15 @@ impl SyncOutboxStore {
         &self,
         f: impl FnOnce(SyncOutboxFile) -> std::io::Result<R>,
     ) -> std::io::Result<R> {
-        self.locked(|state| f(state.clone()))
+        self.locked(|state| {
+            let cloned = state.clone();
+            record_serialized_history(
+                astra_core::history_work::HistoryWorkSite::SyncOutboxStateClone,
+                &cloned,
+                cloned.records.len(),
+            );
+            f(cloned)
+        })
     }
 
     fn locked<R>(
@@ -1043,6 +1117,11 @@ fn build_record(
     now: u64,
 ) -> std::io::Result<SyncOutboxRecord> {
     let payload = serde_json::to_value(event).map_err(invalid_data)?;
+    record_serialized_history(
+        astra_core::history_work::HistoryWorkSite::SyncOutboxPayloadClone,
+        &payload,
+        1,
+    );
     let payload_hash = sync_outbox_canonical_payload_hash(&payload);
     let record_id = sync_outbox_stable_event_id(event, &payload_hash)?;
     let event_type = event_type_string(&event.event_type);
@@ -1110,7 +1189,13 @@ fn read_state(path: &Path) -> std::io::Result<SyncOutboxFile> {
     if text.trim().is_empty() {
         return Ok(SyncOutboxFile::default());
     }
-    serde_json::from_str(&text).map_err(invalid_data)
+    let state: SyncOutboxFile = serde_json::from_str(&text).map_err(invalid_data)?;
+    record_existing_history(
+        astra_core::history_work::HistoryWorkSite::SyncOutboxQueueRead,
+        text.len(),
+        state.records.len(),
+    );
+    Ok(state)
 }
 
 fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
@@ -1125,6 +1210,11 @@ fn write_state(path: &Path, state: &SyncOutboxFile) -> std::io::Result<()> {
             .write(true)
             .open(&tmp)?;
         let bytes = serde_json::to_vec(state).map_err(invalid_data)?;
+        record_existing_history(
+            astra_core::history_work::HistoryWorkSite::SyncOutboxQueueRewrite,
+            bytes.len().saturating_add(1),
+            state.records.len(),
+        );
         file.write_all(&bytes)?;
         file.write_all(b"\n")?;
         file.sync_data()?;
@@ -1365,6 +1455,47 @@ mod tests {
         let mut event = JournalEvent::config_change(Some("sess-1"), "model", value);
         event.ts = "2026-07-08T00:00:00Z".to_string();
         event
+    }
+
+    #[test]
+    fn full_request_payload_is_an_independent_nested_unicode_value() {
+        let mut event = JournalEvent::llm_request_full(
+            Some("sess-1"),
+            3,
+            2,
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": "问题🙂"},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"key\":\"值\"}"
+                            }
+                        }]
+                    }
+                ]
+            }),
+        );
+        event.ts = "2026-07-08T00:00:00Z".to_string();
+        let record = build_record(&event, 1, 10).expect("full request record");
+
+        event.metadata.as_mut().unwrap()["messages"][0]["content"] = serde_json::json!("mutated");
+        assert_eq!(
+            record.payload["metadata"]["messages"][0]["content"],
+            "问题🙂"
+        );
+        assert_eq!(
+            record.payload["metadata"]["messages"][1]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+
+        let canonical = record.canonical_payload_json();
+        assert!(
+            canonical.len() > canonical.chars().count(),
+            "queue and hash accounting must use the actual UTF-8 payload bytes"
+        );
     }
 
     #[test]

@@ -7,6 +7,25 @@
 
 use serde_json::Value;
 
+fn include_grouped_clone_measurement(measurement: &mut Option<(u64, u64)>, value: &Value) {
+    let Some((bytes, rows)) = measurement.as_mut() else {
+        return;
+    };
+    match astra_core::history_work::serialized_bytes(value) {
+        Ok(value_bytes) => {
+            *bytes = bytes.saturating_add(value_bytes);
+            *rows = rows.saturating_add(1);
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::CloudHistoryGroupingClone,
+                &error,
+            );
+            *measurement = None;
+        }
+    }
+}
+
 /// A single API round: the user message(s) that triggered it, the assistant
 /// response, and any tool messages that followed.
 #[derive(Debug, Clone)]
@@ -55,13 +74,17 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
     let mut system_messages = Vec::new();
     let mut rounds: Vec<ApiRound> = Vec::new();
     let mut current_round: Option<ApiRound> = None;
+    let mut clone_measurement =
+        astra_core::history_work::instrumentation_enabled().then_some((0_u64, 0_u64));
 
     for msg in messages {
         let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
 
         match role {
             "system" if current_round.is_none() => {
-                system_messages.push(msg.clone());
+                let cloned = msg.clone();
+                include_grouped_clone_measurement(&mut clone_measurement, &cloned);
+                system_messages.push(cloned);
                 // system messages mid-conversation are treated as user-side injections
             }
             "system" => {
@@ -79,11 +102,16 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
                         tool_messages: Vec::new(),
                     })
                     .user_messages
-                    .push(msg.clone());
+                    .push({
+                        let cloned = msg.clone();
+                        include_grouped_clone_measurement(&mut clone_measurement, &cloned);
+                        cloned
+                    });
             }
             "assistant" => {
                 let sanitized =
                     crate::chat_history_openai::sanitize_empty_assistant_tool_calls_cloned(msg);
+                include_grouped_clone_measurement(&mut clone_measurement, &sanitized);
                 if let Some(round) = current_round.as_mut() {
                     round.assistant_message = Some(sanitized);
                 } else {
@@ -97,7 +125,9 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
             }
             "tool" => {
                 if let Some(round) = current_round.as_mut() {
-                    round.tool_messages.push(msg.clone());
+                    let cloned = msg.clone();
+                    include_grouped_clone_measurement(&mut clone_measurement, &cloned);
+                    round.tool_messages.push(cloned);
                 }
                 // tool without a round context is ignored
             }
@@ -108,6 +138,14 @@ pub fn group_by_api_round(messages: &[Value]) -> (Vec<Value>, Vec<ApiRound>) {
     // Flush the last in-progress round
     if let Some(round) = current_round {
         rounds.push(round);
+    }
+    if let Some((bytes, rows)) = clone_measurement {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::CloudHistoryGroupingClone,
+            bytes,
+            rows,
+            0,
+        );
     }
 
     (system_messages, rounds)
@@ -222,6 +260,42 @@ mod tests {
         let (_, rounds) = group_by_api_round(&msgs);
         let assistant = rounds[0].assistant_message.as_ref().unwrap();
         assert!(assistant.get("tool_calls").is_none(), "{assistant:?}");
+    }
+
+    #[test]
+    fn grouping_owns_independent_nested_unicode_history() {
+        let mut messages = vec![
+            system("系统🙂"),
+            json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "问题🚀"}],
+                "metadata": {"nested": ["甲", {"answer": "乙"}]}
+            }),
+            json!({
+                "role": "assistant",
+                "content": "réponse",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"key\":\"值\"}"}
+                }]
+            }),
+        ];
+
+        let (system_messages, rounds) = group_by_api_round(&messages);
+        messages[0]["content"] = json!("mutated");
+        messages[1]["metadata"]["nested"][1]["answer"] = json!("mutated");
+        messages[2]["tool_calls"][0]["function"]["name"] = json!("mutated");
+
+        assert_eq!(system_messages[0]["content"], "系统🙂");
+        assert_eq!(
+            rounds[0].user_messages[0]["metadata"]["nested"][1]["answer"],
+            "乙"
+        );
+        assert_eq!(
+            rounds[0].assistant_message.as_ref().unwrap()["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
     }
 
     #[test]

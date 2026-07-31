@@ -120,6 +120,14 @@ pub fn reconstruct_messages(
             });
         }
     };
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ForkPrefixReconstruction,
+            bytes.len().try_into().unwrap_or(u64::MAX),
+            prefix_msgs.len().try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
 
     for (index, msg) in prefix_msgs.iter().enumerate() {
         if !msg.is_object() {

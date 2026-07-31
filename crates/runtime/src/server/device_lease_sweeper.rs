@@ -6,7 +6,20 @@ use uuid::Uuid;
 
 const SWEEP_INTERVAL_SECS: u64 = 300;
 
-static DEVICE_LEASE_EVENTS: OnceLock<broadcast::Sender<serde_json::Value>> = OnceLock::new();
+static DEVICE_LEASE_EVENTS: OnceLock<broadcast::Sender<DeviceLeaseEvent>> = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeviceLeaseEvent {
+    pub owner_user_id: String,
+    pub session_id: String,
+    pub payload: serde_json::Value,
+}
+
+impl DeviceLeaseEvent {
+    pub fn belongs_to(&self, owner_user_id: &str, session_id: &str) -> bool {
+        self.owner_user_id == owner_user_id && self.session_id == session_id
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ExpiringDeviceLeaseRow {
@@ -44,19 +57,38 @@ fn decode_expiring_device_lease_row(row: &impl RowExt) -> Result<ExpiringDeviceL
     })
 }
 
-fn event_sender() -> &'static broadcast::Sender<serde_json::Value> {
+fn event_sender() -> &'static broadcast::Sender<DeviceLeaseEvent> {
     DEVICE_LEASE_EVENTS.get_or_init(|| {
         let (tx, _rx) = broadcast::channel(1024);
         tx
     })
 }
 
-pub fn subscribe_device_lease_events() -> broadcast::Receiver<serde_json::Value> {
+pub fn subscribe_device_lease_events() -> broadcast::Receiver<DeviceLeaseEvent> {
     event_sender().subscribe()
 }
 
-pub fn publish_device_lease_event(event: serde_json::Value) {
-    let _ = event_sender().send(event);
+pub fn publish_device_lease_event(
+    owner_user_id: impl Into<String>,
+    session_id: impl Into<String>,
+    payload: serde_json::Value,
+) {
+    let sender = event_sender();
+    if sender.receiver_count() == 0 {
+        return;
+    }
+    let event = DeviceLeaseEvent {
+        owner_user_id: owner_user_id.into(),
+        session_id: session_id.into(),
+        payload,
+    };
+    if let Err(error) = sender.send(event) {
+        tracing::debug!(
+            target: "astra_runtime::device_lease_sweeper",
+            %error,
+            "device lease event had no live subscriber"
+        );
+    }
 }
 
 pub async fn expire_due_device_leases_once(
@@ -80,9 +112,15 @@ pub async fn expire_due_device_leases_once(
         let result = sqlx::query(
             "UPDATE session_device_leases
              SET status = 'expired', revoked_at = NOW(6), updated_at = NOW(6)
-             WHERE lease_id = ? AND status = 'active' AND expires_at <= NOW(6)",
+             WHERE user_id = ? AND lease_id = ? AND session_id = ?
+               AND device_id = ? AND device_fingerprint = ?
+               AND status = 'active' AND expires_at <= NOW(6)",
         )
+        .bind(&lease.user_id)
         .bind(&lease.lease_id)
+        .bind(&lease.session_id)
+        .bind(&lease.device_id)
+        .bind(&lease.device_fingerprint)
         .execute(pool.get())
         .await?;
         if result.rows_affected() != 1 {
@@ -106,15 +144,19 @@ pub async fn expire_due_device_leases_once(
         .execute(pool.get())
         .await?;
 
-        publish_device_lease_event(serde_json::json!({
-            "type": "device_lease_expired",
-            "lease_id": lease.lease_id,
-            "session_id": lease.session_id,
-            "device_id": lease.device_id,
-            "device_fingerprint": lease.device_fingerprint,
-            "reason": "auto_expire",
-            "ended_at_server": ended_at_server.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        }));
+        publish_device_lease_event(
+            &lease.user_id,
+            &lease.session_id,
+            serde_json::json!({
+                "type": "device_lease_expired",
+                "lease_id": lease.lease_id,
+                "session_id": lease.session_id,
+                "device_id": lease.device_id,
+                "device_fingerprint": lease.device_fingerprint,
+                "reason": "auto_expire",
+                "ended_at_server": ended_at_server.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            }),
+        );
         expired += 1;
     }
 
@@ -264,5 +306,18 @@ mod tests {
     #[test]
     fn sweeper_interval_is_five_minutes() {
         assert_eq!(super::SWEEP_INTERVAL_SECS, 300);
+    }
+
+    #[test]
+    fn live_event_scope_requires_both_owner_and_session() {
+        let event = DeviceLeaseEvent {
+            owner_user_id: "owner-a".to_string(),
+            session_id: "shared-session".to_string(),
+            payload: serde_json::json!({"type": "device_revoked"}),
+        };
+
+        assert!(event.belongs_to("owner-a", "shared-session"));
+        assert!(!event.belongs_to("owner-b", "shared-session"));
+        assert!(!event.belongs_to("owner-a", "other-session"));
     }
 }

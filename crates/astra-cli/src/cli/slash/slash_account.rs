@@ -1,24 +1,12 @@
-use crate::cli::agent_runtime::initialize_multi_agent_runtime;
-use crate::cli::auth_flow::{do_login, do_register};
+use crate::cli::auth_flow::{do_login_for_session, do_register_for_session};
 use crate::cli::cli_config::cli_utils::{
     load_credentials, persist_profile_memoria_api_key, profile_name, prompt_or,
     prompt_password_masked,
 };
-use crate::cli::session::session_runtime::{current_access_token, ensure_state_default_model};
+use crate::cli::session::session_runtime::ensure_state_default_model;
 use crate::cli::session::session_state::SessionState;
 use crate::post_auth_cloud_resync;
 use crate::{cli_dim, cli_err, cli_ok, cli_section, cli_warn};
-
-async fn refresh_auth_runtime(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    state: &mut SessionState,
-) {
-    if let Some(token) = current_access_token(profile) {
-        clear_auth_runtime(state).await;
-        initialize_multi_agent_runtime(state, api, token, profile).await;
-    }
-}
 
 const AUTH_RUNTIME_SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 const AUTH_RUNTIME_REPLACED_REASON: &str = "authentication runtime was replaced";
@@ -34,7 +22,7 @@ async fn clear_auth_runtime(state: &mut SessionState) {
             .await;
     }
     state.delegation_engine = None;
-    state.root_mailbox = None;
+    state.unregister_root_mailbox().await;
 }
 
 async fn clear_local_auth_state(profile: Option<&str>, state: &mut SessionState) {
@@ -58,7 +46,7 @@ pub(crate) async fn handle_account_command(
             let username = prompt_or("Username", None)?;
             let email = prompt_or("Email   ", None)?;
             let password = prompt_password_masked("Password", None)?;
-            match do_register(api, profile, &username, &email, &password).await {
+            match do_register_for_session(api, profile, &username, &email, &password, state).await {
                 Ok(token) => {
                     cli_ok!("Registered and logged in");
                     let sync_report = post_auth_cloud_resync(profile, state).await;
@@ -71,7 +59,6 @@ pub(crate) async fn handle_account_command(
                         ));
                         cli_ok!("Default model: {}", model);
                     }
-                    refresh_auth_runtime(api, profile, state).await;
                 }
                 Err(e) => cli_err!("Register failed: {}", e),
             }
@@ -80,7 +67,7 @@ pub(crate) async fn handle_account_command(
         "/login" => {
             let username = prompt_or("Username", None)?;
             let password = prompt_password_masked("Password", None)?;
-            match do_login(api, profile, &username, &password).await {
+            match do_login_for_session(api, profile, &username, &password, state).await {
                 Ok(token) => {
                     cli_ok!("Logged in");
                     let sync_report = post_auth_cloud_resync(profile, state).await;
@@ -93,7 +80,6 @@ pub(crate) async fn handle_account_command(
                         ));
                         cli_ok!("Default model: {}", model);
                     }
-                    refresh_auth_runtime(api, profile, state).await;
                 }
                 Err(e) => cli_err!("Login failed: {}", e),
             }
@@ -134,46 +120,10 @@ pub(crate) async fn handle_account_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_auth_runtime, clear_local_auth_state, refresh_auth_runtime};
+    use super::{clear_auth_runtime, clear_local_auth_state};
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
     };
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn refresh_auth_runtime_replaces_stale_mailbox_state() {
-        let _creds_dir = crate::tests::isolate_credentials();
-
-        let mut creds = CredentialsFile::default();
-        creds.profiles.insert(
-            "default".to_string(),
-            Profile {
-                access_token: Some("test-token".to_string()),
-                ..Default::default()
-            },
-        );
-        save_credentials(&creds).unwrap();
-
-        let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
-            std::sync::Arc::new(astra_messaging::InProcessTransport::new()),
-            std::sync::Arc::new(
-                astra_runtime::server::delegation::engine::DelegationTracker::new(),
-            ),
-        ));
-        let root_addr = astra_messaging::AgentAddress::new("run-root", "root");
-        state.root_mailbox = Some(router.register(root_addr, None).await.unwrap());
-        assert!(state.delegation_engine.is_none());
-        assert!(state.agent_spawner.is_none());
-        assert!(state.root_mailbox.is_some());
-
-        refresh_auth_runtime(&api, None, &mut state).await;
-
-        assert!(state.delegation_engine.is_some());
-        assert!(state.agent_spawner.is_some());
-        assert!(state.root_mailbox.is_none());
-    }
 
     #[tokio::test]
     async fn clear_auth_runtime_drops_multi_agent_runtime() {

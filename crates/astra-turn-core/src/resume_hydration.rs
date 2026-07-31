@@ -24,6 +24,10 @@ pub fn build_resume_hydration_hint_from_messages(
     messages: &[Value],
 ) -> Result<Option<String>, UserTurnSemanticsError> {
     let objective_context = objective_context_from_messages(messages)?;
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ResumeHintHistoryClone,
+        messages,
+    );
     let prompt_messages = crate::prompt_facing::sanitize_prompt_facing_messages_with_turn_semantics(
         messages.to_vec(),
     );

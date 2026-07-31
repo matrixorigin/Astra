@@ -301,7 +301,7 @@ impl ContractGenerator {
     ///
     /// - `goal`: the user's original goal text
     /// - `plan`: the decomposed plan
-    /// - `scope`: optional explicit scope; if None, inferred from subtask titles
+    /// - `scope`: optional explicit scope; if None, derived only from typed plan structure
     pub fn generate(
         &self,
         goal: &str,
@@ -318,7 +318,7 @@ impl ContractGenerator {
             .map(|sp| self.convert_subtask(sp))
             .collect();
 
-        let scope = scope.unwrap_or_else(|| self.infer_scope(goal, &subtasks));
+        let scope = scope.unwrap_or_else(|| self.default_scope_from_subtasks(&subtasks));
         let global_verification = self.generate_global_criteria();
 
         Ok(TaskContract {
@@ -364,18 +364,13 @@ impl ContractGenerator {
         }
     }
 
-    /// Infer task scope from goal and subtasks.
-    fn infer_scope(&self, goal: &str, subtasks: &[DurableSubtask]) -> TaskScope {
+    /// Build the conservative default scope from typed plan structure.
+    ///
+    /// Natural-language goal text is deliberately not inspected here. Only an
+    /// explicit, upstream-produced [`TaskScope`] may add exclusions; guessing
+    /// them from words in the goal can silently change the execution contract.
+    fn default_scope_from_subtasks(&self, subtasks: &[DurableSubtask]) -> TaskScope {
         let in_scope: Vec<String> = subtasks.iter().map(|s| s.title.clone()).collect();
-
-        let mut out_of_scope = Vec::new();
-        let goal_lower = goal.to_lowercase();
-        if !goal_lower.contains("deploy") {
-            out_of_scope.push("Deployment and CI/CD changes".into());
-        }
-        if !goal_lower.contains("doc") && !goal_lower.contains("readme") {
-            out_of_scope.push("Documentation updates".into());
-        }
 
         let mut assumptions = vec!["Project builds successfully before changes".into()];
         if self.detection.has_cargo_toml {
@@ -387,7 +382,7 @@ impl ContractGenerator {
 
         TaskScope {
             in_scope,
-            out_of_scope,
+            out_of_scope: Vec::new(),
             assumptions,
         }
     }
@@ -731,24 +726,19 @@ mod tests {
         assert!(!c.global_only);
     }
 
-    // ─── Scope inference tests ──────────────────────────────────────────────
+    // ─── Default scope tests ────────────────────────────────────────────────
 
     #[test]
-    fn inferred_scope_excludes_deploy_and_docs() {
+    fn default_scope_uses_plan_structure_without_inferred_exclusions() {
         let cg = ContractGenerator::new(rust_detection());
         let subtasks = vec![DurableSubtask {
             id: "s1".into(),
             title: "Add feature".into(),
             ..Default::default()
         }];
-        let scope = cg.infer_scope("add a feature", &subtasks);
-        assert!(scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
-        assert!(
-            scope
-                .out_of_scope
-                .iter()
-                .any(|s| s.contains("Documentation"))
-        );
+        let scope = cg.default_scope_from_subtasks(&subtasks);
+        assert_eq!(scope.in_scope, vec!["Add feature"]);
+        assert!(scope.out_of_scope.is_empty());
         assert!(
             scope
                 .assumptions
@@ -758,11 +748,25 @@ mod tests {
     }
 
     #[test]
-    fn inferred_scope_includes_deploy_when_goal_mentions_it() {
+    fn default_scope_is_invariant_to_goal_wording() {
         let cg = ContractGenerator::new(rust_detection());
-        let subtasks = vec![];
-        let scope = cg.infer_scope("deploy the service", &subtasks);
-        assert!(!scope.out_of_scope.iter().any(|s| s.contains("Deployment")));
+        let plan = make_plan();
+        let keyword_rich = cg
+            .generate(
+                "Do not deploy; explain why docs and README are out of scope",
+                &plan,
+                None,
+            )
+            .unwrap();
+        let multilingual = cg.generate("部署服务并更新文档", &plan, None).unwrap();
+
+        assert_eq!(keyword_rich.scope.in_scope, multilingual.scope.in_scope);
+        assert_eq!(
+            keyword_rich.scope.assumptions,
+            multilingual.scope.assumptions
+        );
+        assert!(keyword_rich.scope.out_of_scope.is_empty());
+        assert!(multilingual.scope.out_of_scope.is_empty());
     }
 
     // ─── describe_verifier tests ────────────────────────────────────────────

@@ -23,6 +23,8 @@ use super::run_state::{
 pub(super) const DEFAULT_RUN_ADMISSION_TIMEOUT_SECS: u64 = 30;
 pub(super) const METRIC_RUN_ADMISSION_ATTEMPTS_TOTAL: &str = "astra_run_admission_attempts_total";
 pub(super) const METRIC_RUN_ADMISSION_WAIT_MS_TOTAL: &str = "astra_run_admission_wait_ms_total";
+pub(super) const METRIC_RUN_ADMISSION_WEIGHT_UNITS_TOTAL: &str =
+    "astra_run_admission_weight_units_total";
 pub(super) const METRIC_DURABLE_RUN_EVENT_BATCHES_TOTAL: &str =
     "astra_durable_run_event_batches_total";
 pub(super) const METRIC_DURABLE_RUN_EVENT_ROWS_TOTAL: &str = "astra_durable_run_event_rows_total";
@@ -37,6 +39,9 @@ pub(super) const METRIC_SESSION_MEMORY_POST_LOOP_DRAINS_TOTAL: &str =
     "astra_session_memory_post_loop_drains_total";
 pub(super) const DEFAULT_POST_LOOP_MEMORY_CLEANUP_CONCURRENCY: usize = 4;
 pub(super) const DEFAULT_SESSION_MEMORY_POST_LOOP_DRAIN_TIMEOUT_MS: u64 = 1_000;
+/// Phase-0 observed behavior: run admission is count-based and every run
+/// consumes one unit regardless of prompt size.
+pub(super) const CURRENT_RUN_ADMISSION_WEIGHT_UNITS: u64 = 1;
 pub(super) static POST_LOOP_MEMORY_CLEANUP_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn run_admission_timeout() -> Duration {
@@ -223,6 +228,10 @@ pub(super) fn register_run_admission_metrics(
     registry.register_counter(
         METRIC_RUN_ADMISSION_WAIT_MS_TOTAL,
         "Total milliseconds spent waiting for run admission by outcome.",
+    );
+    registry.register_counter(
+        METRIC_RUN_ADMISSION_WEIGHT_UNITS_TOTAL,
+        "Current count-based run-admission units by outcome; Phase 0 records one unit per run regardless of context size.",
     );
 }
 

@@ -209,11 +209,26 @@ fn checkpoint_numeric_prefix(path: &Path) -> Option<u32> {
 
 fn load_messages_from_heavy_path(path: &Path) -> Option<Vec<serde_json::Value>> {
     let content = std::fs::read_to_string(path).ok()?;
+    crate::cli::history_work::record_existing_buffer(
+        astra_core::history_work::HistoryWorkSite::CliDebugCheckpointRead,
+        content.as_bytes(),
+        0,
+    );
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    crate::cli::history_work::record_existing_buffer(
+        astra_core::history_work::HistoryWorkSite::CliDebugCheckpointDeserialization,
+        content.as_bytes(),
+        0,
+    );
     v.get("Heavy")
         .and_then(|h| h.get("messages"))
         .and_then(|m| m.as_array())
-        .cloned()
+        .map(|messages| {
+            crate::cli::history_work::clone_json_history(
+                astra_core::history_work::HistoryWorkSite::CliDebugCheckpointHistoryClone,
+                messages,
+            )
+        })
 }
 
 fn message_delta(
@@ -225,7 +240,15 @@ fn message_delta(
     while i < n && before[i] == after[i] {
         i += 1;
     }
-    after[i..].to_vec()
+    crate::cli::history_work::record_measured_work(
+        astra_core::history_work::HistoryWorkSite::CliDebugHistoryDeltaComparison,
+        0,
+        i.saturating_add(usize::from(i < n)),
+    );
+    crate::cli::history_work::clone_json_history(
+        astra_core::history_work::HistoryWorkSite::CliDebugHistoryDeltaClone,
+        &after[i..],
+    )
 }
 
 fn build_turn_messages_view(turn_n: usize, checkpoints: &[PathBuf]) -> Option<TurnMessagesView> {
@@ -518,6 +541,11 @@ fn dump_turn_json(
     let short = &session_id[..8.min(session_id.len())];
     let suffix = if full_snapshot { "-full" } else { "" };
     let path = std::env::temp_dir().join(format!("debug-{short}-turn{turn_n}{suffix}.json"));
+    let dump_messages = if full_snapshot { &v.full } else { &v.delta };
+    crate::cli::history_work::record_json_history(
+        astra_core::history_work::HistoryWorkSite::CliDebugDumpPayloadClone,
+        dump_messages,
+    );
 
     let payload = if full_snapshot {
         serde_json::json!({
@@ -576,14 +604,21 @@ fn dump_turn_json(
     };
 
     match serde_json::to_string_pretty(&payload) {
-        Ok(s) => match std::fs::write(&path, s) {
-            Ok(()) => eprintln!(
-                "  {} {}",
-                theme::icon_ok(),
-                format!("Written to {}", path.display()).dim()
-            ),
-            Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
-        },
+        Ok(s) => {
+            crate::cli::history_work::record_existing_buffer(
+                astra_core::history_work::HistoryWorkSite::CliDebugDumpSerialization,
+                s.as_bytes(),
+                dump_messages.len(),
+            );
+            match std::fs::write(&path, s) {
+                Ok(()) => eprintln!(
+                    "  {} {}",
+                    theme::icon_ok(),
+                    format!("Written to {}", path.display()).dim()
+                ),
+                Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
+            }
+        }
         Err(e) => eprintln!("  {} {}", theme::icon_err(), e),
     }
 }

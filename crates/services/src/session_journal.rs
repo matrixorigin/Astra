@@ -24,7 +24,9 @@ use std::sync::{
 };
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
-use astra_turn_types::{InferencePurpose, UserIntentDelivery, UserIntentStatus};
+use astra_turn_types::{
+    ConversationCommitV1, InferencePurpose, UserIntentDelivery, UserIntentStatus,
+};
 
 use crate::interaction_contract::{
     InteractionContract, InteractionIdentity, InteractionKind, InteractionStatus,
@@ -181,10 +183,7 @@ pub fn local_sessions_dir() -> PathBuf {
         if let Some(p) = CARGO_TEST_PROCESS_SESSIONS_DIR.as_ref() {
             return p.clone();
         }
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".astra")
-            .join("sessions")
+        astra_runtime_env::local_state_root().join("sessions")
     })
 }
 
@@ -347,6 +346,11 @@ struct LastEventScan {
 fn read_last_event_type(path: &Path) -> std::io::Result<Option<JournalEventType>> {
     let scan = read_last_event_type_with_bytes(path)?;
     debug_assert!(scan.bytes_read <= RECOVERY_TAIL_MAX_BYTES as u64);
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalTailRead,
+        scan.bytes_read.try_into().unwrap_or(usize::MAX),
+        usize::from(scan.event_type.is_some()),
+    );
     Ok(scan.event_type)
 }
 
@@ -536,9 +540,32 @@ fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>>
         let mut line = serde_json::to_vec(event)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         line.push(b'\n');
+        if matches!(
+            event.event_type,
+            JournalEventType::LlmRequestFull | JournalEventType::ContextAssemblyRecorded
+        ) && astra_core::history_work::instrumentation_enabled()
+        {
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::SessionJournalHistorySerialization,
+                line.len().try_into().unwrap_or(u64::MAX),
+                1,
+                0,
+            );
+        }
         buf.extend(line);
     }
     Ok(buf)
+}
+
+fn record_journal_read(site: astra_core::history_work::HistoryWorkSite, bytes: usize, rows: usize) {
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            site,
+            bytes.try_into().unwrap_or(u64::MAX),
+            rows.try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
 }
 
 /// Validate that a session ID is safe for use as a filesystem path component.
@@ -1444,6 +1471,11 @@ pub struct JournalEvent {
     /// Canonical conversation item for a local root or delegated run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_item: Option<JournalTranscriptItem>,
+    /// Canonical conversation delta committed atomically with a completed
+    /// root turn. This is the durability source for prompt continuation;
+    /// CSL and display history are projections of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_commit: Option<ConversationCommitV1>,
     /// Edge policy snapshot for cloud–edge audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_policy: Option<EdgePolicySnapshot>,
@@ -1760,6 +1792,8 @@ impl SessionMemoryExtractionOutcome {
 /// Writer that appends events to a session journal file.
 pub struct JournalWriter {
     path: PathBuf,
+    owner_scope: OwnerScope,
+    session_id: String,
 }
 
 impl JournalWriter {
@@ -1768,22 +1802,30 @@ impl JournalWriter {
     /// Authenticated runtimes must use [`Self::for_user`]; this constructor is
     /// reserved for genuinely local CLI sessions and tests.
     pub fn new(session_id: &str) -> std::io::Result<Self> {
-        Self::from_path(session_id, journal_file_path(session_id))
+        let owner_scope = OwnerScope::local_user();
+        let path = journal_file_path_for_owner(&owner_scope, session_id)?;
+        Self::from_path(owner_scope, session_id, path)
     }
 
     /// Create a writer isolated to an authenticated user owner scope.
     pub fn for_user(user_id: &str, session_id: &str) -> std::io::Result<Self> {
-        let path = journal_file_path_for_user(user_id, session_id)?;
-        Self::from_path(session_id, path)
+        let owner_scope = OwnerScope::user(user_id)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let path = journal_file_path_for_owner(&owner_scope, session_id)?;
+        Self::from_path(owner_scope, session_id, path)
     }
 
     /// Create a writer isolated to an explicit owner scope.
     pub fn for_owner(owner_scope: &OwnerScope, session_id: &str) -> std::io::Result<Self> {
         let path = journal_file_path_for_owner(owner_scope, session_id)?;
-        Self::from_path(session_id, path)
+        Self::from_path(owner_scope.clone(), session_id, path)
     }
 
-    fn from_path(session_id: &str, path: PathBuf) -> std::io::Result<Self> {
+    fn from_path(
+        owner_scope: OwnerScope,
+        session_id: &str,
+        path: PathBuf,
+    ) -> std::io::Result<Self> {
         validate_session_id(session_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         if path.is_dir() {
@@ -1795,7 +1837,11 @@ impl JournalWriter {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            owner_scope,
+            session_id: session_id.to_string(),
+        })
     }
 
     /// Append a single event to the journal file.
@@ -1831,6 +1877,18 @@ impl JournalWriter {
     /// Get the path to this journal file.
     pub fn path(&self) -> &PathBuf {
         &self.path
+    }
+
+    /// Immutable owner captured when this writer was opened.
+    ///
+    /// Keeping ownership on the handle prevents a later process-local profile
+    /// switch from projecting this journal into another account's outbox.
+    pub fn owner_scope(&self) -> &OwnerScope {
+        &self.owner_scope
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     /// Batch-append multiple events in a single write + fsync.
@@ -2247,7 +2305,13 @@ fn read_journal_from_path(path: &Path) -> std::io::Result<Vec<JournalEvent>> {
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(path)?;
-    Ok(parse_journal_text(&content).0)
+    let events = parse_journal_text(&content).0;
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalFullRead,
+        content.len(),
+        events.len(),
+    );
+    Ok(events)
 }
 
 /// Read a session journal in physical append order.
@@ -2264,7 +2328,13 @@ pub fn read_journal_append_order(session_id: &str) -> std::io::Result<Vec<Journa
         return Ok(Vec::new());
     }
     let content = std::fs::read_to_string(&path)?;
-    Ok(parse_journal_text_in_append_order(&content).0)
+    let events = parse_journal_text_in_append_order(&content).0;
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalFullRead,
+        content.len(),
+        events.len(),
+    );
+    Ok(events)
 }
 
 /// Complete append-only journal records available after a durable byte cursor.
@@ -2283,11 +2353,19 @@ pub fn read_durable_journal_append_delta(
     session_id: &str,
     offset: u64,
 ) -> std::io::Result<JournalAppendDelta> {
+    read_durable_journal_append_delta_for_owner(&OwnerScope::local_user(), session_id, offset)
+}
+
+pub fn read_durable_journal_append_delta_for_owner(
+    owner_scope: &OwnerScope,
+    session_id: &str,
+    offset: u64,
+) -> std::io::Result<JournalAppendDelta> {
     use std::io::{Read, Seek, SeekFrom};
 
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let path = journal_file_path(session_id);
+    let path = journal_file_path_for_owner(owner_scope, session_id)?;
     if offset == 0 && !path.exists() {
         return Ok(JournalAppendDelta {
             events: Vec::new(),
@@ -2318,6 +2396,11 @@ pub fn read_durable_journal_append_delta(
         .map(|index| index + 1)
         .unwrap_or(0);
     if complete_len == 0 {
+        record_journal_read(
+            astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
+            suffix.len(),
+            0,
+        );
         return Ok(JournalAppendDelta {
             events: Vec::new(),
             next_offset: offset,
@@ -2346,6 +2429,11 @@ pub fn read_durable_journal_append_delta(
         })?;
         events.push(event);
     }
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
+        suffix.len(),
+        events.len(),
+    );
     Ok(JournalAppendDelta {
         events,
         next_offset: offset.saturating_add(complete_len as u64),
@@ -2905,7 +2993,13 @@ fn read_journal_digest_from_path(
         ));
     }
     let content = std::fs::read_to_string(path)?;
-    Ok(parse_journal_text(&content))
+    let parsed = parse_journal_text(&content);
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
+        content.len(),
+        parsed.0.len(),
+    );
+    Ok(parsed)
 }
 
 /// List all session IDs that have journal files.
@@ -3160,6 +3254,11 @@ fn read_journal_tail_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec
         .map(ToString::to_string)
         .collect();
     lines.reverse();
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalTailRead,
+        bytes.len(),
+        lines.len(),
+    );
     Ok(lines)
 }
 
@@ -3199,6 +3298,11 @@ fn read_journal_tail_lines_exact(path: &Path, max_lines: usize) -> std::io::Resu
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     lines.reverse();
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalTailRead,
+        bytes.len(),
+        lines.len(),
+    );
     Ok(lines)
 }
 
@@ -3733,6 +3837,7 @@ impl JournalEvent {
             session_lineage: None,
             coordination: None,
             transcript_item: None,
+            conversation_commit: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,
@@ -3757,6 +3862,16 @@ impl JournalEvent {
 
     pub fn with_agentic_step(mut self, agentic_step: Option<u32>) -> Self {
         self.agentic_step = agentic_step;
+        self
+    }
+
+    pub fn with_conversation_commit(mut self, commit: ConversationCommitV1) -> Self {
+        // The journal redaction switch is a storage privacy boundary, not
+        // merely formatting for the legacy display fields. Do not introduce a
+        // second raw-content lane when it is enabled.
+        if !journal_content_redact_enabled() {
+            self.conversation_commit = Some(commit);
+        }
         self
     }
 
@@ -6903,6 +7018,8 @@ mod tests {
         let write_path = dir.join("test-sess.jsonl");
         let writer = JournalWriter {
             path: write_path.clone(),
+            owner_scope: OwnerScope::local_user(),
+            session_id: "test-sess".to_string(),
         };
         writer
             .append(&JournalEvent::session_start(Some("test-sess"), None))
@@ -6915,6 +7032,8 @@ mod tests {
         let multi_path = dir.join("multi.jsonl");
         let writer = JournalWriter {
             path: multi_path.clone(),
+            owner_scope: OwnerScope::local_user(),
+            session_id: "multi".to_string(),
         };
         writer
             .append(&JournalEvent::session_start(Some("m"), None))
@@ -7072,7 +7191,11 @@ mod tests {
         let dir = tmp.path().join(".astra").join("sessions");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sel-test.jsonl");
-        let writer = JournalWriter { path: path.clone() };
+        let writer = JournalWriter {
+            path: path.clone(),
+            owner_scope: OwnerScope::local_user(),
+            session_id: "sel-test".to_string(),
+        };
 
         writer
             .append(&JournalEvent::session_start(

@@ -53,7 +53,10 @@ fn take_plan_context(
         plan_goal: state.executing_plan_goal.clone(),
         plan_id: state.executing_plan_id.clone(),
         plan_corrections: std::mem::take(&mut state.plan_execution_corrections),
-        history: state.history.clone(),
+        history: crate::cli::history_work::clone_pair_history(
+            astra_core::history_work::HistoryWorkSite::CliPlanBackgroundHistoryClone,
+            &state.history,
+        ),
         session_id: state.session_id.clone(),
         recent_tools: state.recent_tools.clone(),
         tool_health_entries: state.tool_health_entries.clone(),

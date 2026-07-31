@@ -54,7 +54,7 @@ pub(crate) struct Team {
     pub members: Vec<TeamMember>,
     pub shared_context: HashMap<String, String>,
     pub worktree_mode: WorktreeMode,
-    /// Explicit coordination mode (None = auto-infer from roles).
+    /// Explicit coordination mode (`None` uses the stable fan-out default).
     pub coordination: Option<astra_services::team_persistence::TeamCoordination>,
     pub created_at: String,
 }
@@ -98,6 +98,8 @@ impl TeamRegistry {
     }
 
     fn register_builtins(&mut self) {
+        use astra_services::team_persistence::TeamCoordination;
+
         // Code review team: producer + reviewer
         self.teams.insert(
             "review".to_string(),
@@ -128,7 +130,10 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
-                coordination: None,
+                coordination: Some(TeamCoordination::Adversarial {
+                    max_rounds: 3,
+                    threshold: 0.8,
+                }),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -157,7 +162,7 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Shared,
-                coordination: None,
+                coordination: Some(TeamCoordination::Pipeline),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -194,7 +199,7 @@ impl TeamRegistry {
                 ],
                 shared_context: HashMap::new(),
                 worktree_mode: WorktreeMode::Isolated,
-                coordination: None,
+                coordination: Some(TeamCoordination::Pipeline),
                 created_at: chrono::Utc::now().to_rfc3339(),
             },
         );
@@ -344,18 +349,21 @@ fn git_head_sha() -> Option<String> {
 
 /// Convert a CLI [`Team`] to a runtime [`TeamDefinition`] for the orchestrator.
 ///
-/// Maps the CLI team's built-in coordination heuristic (based on member count
-/// and role names) to the appropriate [`TeamCoordination`] variant.
+/// Uses the explicitly selected coordination mode, or a stable fan-out default.
 fn cli_team_to_definition(
     team: &Team,
     user_id: &str,
 ) -> astra_services::team_persistence::TeamDefinition {
-    use astra_services::team_persistence::{TeamDefinition, TeamMemberDef};
+    use astra_services::team_persistence::{
+        TeamAggregation, TeamCoordination, TeamDefinition, TeamMemberDef,
+    };
 
     let coordination = team
         .coordination
         .clone()
-        .unwrap_or_else(|| infer_coordination(team));
+        .unwrap_or(TeamCoordination::FanOut {
+            aggregation: TeamAggregation::AllResults,
+        });
     let now = chrono::Utc::now().to_rfc3339();
     TeamDefinition {
         team_id: team.team_id.clone(),
@@ -383,47 +391,6 @@ fn cli_team_to_definition(
         max_parallel: 0,
         created_at: now.clone(),
         updated_at: now,
-    }
-}
-
-/// Infer coordination pattern from team structure and member roles.
-fn infer_coordination(team: &Team) -> astra_services::team_persistence::TeamCoordination {
-    use astra_services::team_persistence::TeamCoordination;
-
-    let roles: Vec<&str> = team.members.iter().map(|m| m.role.as_str()).collect();
-
-    // Adversarial: if roles contain producer+reviewer
-    if roles
-        .iter()
-        .any(|r| r.contains("producer") || r.contains("writer"))
-        && roles
-            .iter()
-            .any(|r| r.contains("reviewer") || r.contains("critic"))
-    {
-        return TeamCoordination::Adversarial {
-            max_rounds: 3,
-            threshold: 0.8,
-        };
-    }
-
-    // Pipeline: if members appear to be sequential stages
-    if team.members.len() >= 2
-        && roles.iter().any(|r| {
-            r.contains("analyst")
-                || r.contains("planner")
-                || r.contains("explorer")
-                || r.contains("researcher")
-        })
-        && roles.iter().any(|r| {
-            r.contains("synthesizer") || r.contains("implementer") || r.contains("executor")
-        })
-    {
-        return TeamCoordination::Pipeline;
-    }
-
-    // Default: FanOut for parallel teams
-    TeamCoordination::FanOut {
-        aggregation: astra_services::team_persistence::TeamAggregation::AllResults,
     }
 }
 
@@ -1916,7 +1883,7 @@ mod tests {
     use super::{
         Team, TeamHistoryEntry, TeamMember, TeamRegistry, TeamSnapshotEntry,
         cli_team_to_definition, ensure_team_run_session, format_duration, format_tokens,
-        git_head_sha, infer_coordination, team_subcommands_hint,
+        git_head_sha, team_subcommands_hint,
     };
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -1940,11 +1907,27 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_builtin_teams() {
+    fn registry_has_builtin_teams_with_explicit_coordination() {
+        use astra_services::team_persistence::TeamCoordination;
+
         let reg = TeamRegistry::new();
-        assert!(reg.get("review").is_some());
-        assert!(reg.get("research").is_some());
-        assert!(reg.get("dev").is_some());
+        assert!(matches!(
+            reg.get("review")
+                .and_then(|team| team.coordination.as_ref()),
+            Some(TeamCoordination::Adversarial {
+                max_rounds: 3,
+                threshold: 0.8,
+            })
+        ));
+        assert!(matches!(
+            reg.get("research")
+                .and_then(|team| team.coordination.as_ref()),
+            Some(TeamCoordination::Pipeline)
+        ));
+        assert!(matches!(
+            reg.get("dev").and_then(|team| team.coordination.as_ref()),
+            Some(TeamCoordination::Pipeline)
+        ));
         assert_eq!(reg.list().len(), 3);
     }
 
@@ -2014,7 +1997,7 @@ mod tests {
         assert!(reg.remove("ghost").is_err());
     }
 
-    // ── Coordination inference tests ────────────────────────────────
+    // ── Coordination tests ──────────────────────────────────────────
 
     fn make_team(roles: &[&str]) -> Team {
         Team {
@@ -2038,43 +2021,22 @@ mod tests {
     }
 
     #[test]
-    fn infer_adversarial_from_producer_reviewer() {
+    fn absent_coordination_is_fanout_independent_of_role_text() {
         use astra_services::team_persistence::TeamCoordination;
-        let team = make_team(&["producer", "reviewer"]);
-        let coord = infer_coordination(&team);
-        assert!(matches!(coord, TeamCoordination::Adversarial { .. }));
-    }
 
-    #[test]
-    fn infer_adversarial_from_writer_critic() {
-        use astra_services::team_persistence::TeamCoordination;
-        let team = make_team(&["writer", "critic"]);
-        let coord = infer_coordination(&team);
-        assert!(matches!(coord, TeamCoordination::Adversarial { .. }));
-    }
-
-    #[test]
-    fn infer_pipeline_from_analyst_implementer() {
-        use astra_services::team_persistence::TeamCoordination;
-        let team = make_team(&["analyst", "implementer"]);
-        let coord = infer_coordination(&team);
-        assert!(matches!(coord, TeamCoordination::Pipeline));
-    }
-
-    #[test]
-    fn infer_pipeline_from_explorer_synthesizer() {
-        use astra_services::team_persistence::TeamCoordination;
-        let team = make_team(&["explorer", "synthesizer"]);
-        let coord = infer_coordination(&team);
-        assert!(matches!(coord, TeamCoordination::Pipeline));
-    }
-
-    #[test]
-    fn infer_fanout_for_generic_roles() {
-        use astra_services::team_persistence::TeamCoordination;
-        let team = make_team(&["alpha", "beta", "gamma"]);
-        let coord = infer_coordination(&team);
-        assert!(matches!(coord, TeamCoordination::FanOut { .. }));
+        let keyword_rich = cli_team_to_definition(
+            &make_team(&["producer", "reviewer", "planner", "implementer"]),
+            "u",
+        );
+        let arbitrary = cli_team_to_definition(
+            &make_team(&["orbital-cartographer", "signal-gardener"]),
+            "u",
+        );
+        assert_eq!(keyword_rich.coordination, arbitrary.coordination);
+        assert!(matches!(
+            keyword_rich.coordination,
+            TeamCoordination::FanOut { .. }
+        ));
     }
 
     #[test]
@@ -2439,15 +2401,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_coordination_overrides_inference() {
+    fn explicit_coordination_wins_over_default_regardless_of_role_text() {
         use astra_services::team_persistence::TeamCoordination;
         let mut team = make_team(&["producer", "reviewer"]);
-        // Without explicit coordination, infer_coordination returns Adversarial
-        assert!(matches!(
-            infer_coordination(&team),
-            TeamCoordination::Adversarial { .. }
-        ));
-        // With explicit Pipeline, cli_team_to_definition should use Pipeline
         team.coordination = Some(TeamCoordination::Pipeline);
         let def = cli_team_to_definition(&team, "u");
         assert!(matches!(def.coordination, TeamCoordination::Pipeline));

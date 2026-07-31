@@ -1248,10 +1248,15 @@ pub fn load_overrides(dir: &Path) -> PromptOverrides {
 
 /// Default override directory: `~/.astra/prompts/`.
 pub fn default_overrides_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
-        .join("prompts")
+    let explicit = std::env::var_os("ASTRA_PROMPT_OVERRIDES_DIR");
+    overrides_dir_from(explicit.as_deref(), &astra_runtime_env::local_state_root())
+}
+
+fn overrides_dir_from(explicit: Option<&std::ffi::OsStr>, local_root: &Path) -> PathBuf {
+    explicit
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| local_root.join("prompts"))
 }
 
 /// Apply overrides to built prompt sections.
@@ -1499,6 +1504,20 @@ pub const STALL_NUDGE: &str = "You appear to be repeating the same tool calls. \
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prompt_override_path_prefers_explicit_then_astra_local_root() {
+        let local_root = PathBuf::from("/isolated/astra");
+
+        assert_eq!(
+            overrides_dir_from(Some(std::ffi::OsStr::new("/explicit/prompts")), &local_root),
+            PathBuf::from("/explicit/prompts")
+        );
+        assert_eq!(
+            overrides_dir_from(None, &local_root),
+            local_root.join("prompts")
+        );
+    }
 
     #[test]
     fn core_prompt_requires_evidence_strength_and_fanout_provenance() {

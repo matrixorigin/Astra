@@ -685,8 +685,12 @@ struct CliSseStreamHost<'a> {
     last_context_system_prompt_tokens: Option<u32>,
     /// Last provider-confirmed input occupancy forwarded to observers.
     last_context_window_measured: Option<u64>,
+    /// Last provider-normalized request lanes forwarded to observers.
+    last_request_token_usage: Option<astra_turn_types::RequestTokenUsage>,
     /// Optional direct stream sink for bounded/live paths.
     stream_event_sink: Option<chat_stream::SharedStreamEventSink>,
+    /// Strict per-exchange protocol observer for `stream-json`.
+    stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
     /// Optional channel for async tool approval requests during plan execution.
     approval_request_tx: Option<chat_stream::ApprovalRequestTx>,
     /// Optional channel for native TUI ask_user prompts.
@@ -733,6 +737,19 @@ struct CliSseStreamHost<'a> {
     /// Incremental turn snapshot mirrored live from SSE/tool events.
     incremental_state:
         Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+}
+
+fn request_token_usage_from_accum(
+    accum: &ChatTurnSseAccum,
+) -> Option<astra_turn_types::RequestTokenUsage> {
+    accum
+        .has_usage
+        .then_some(astra_turn_types::RequestTokenUsage {
+            fresh_input_tokens: accum.prompt_tokens,
+            cache_read_tokens: accum.cache_read_tokens,
+            cache_creation_tokens: accum.cache_creation_tokens,
+            output_tokens: accum.completion_tokens,
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -981,7 +998,9 @@ impl<'a> CliSseStreamHost<'a> {
             stream_event_tx: ctx.stream_event_tx,
             last_context_system_prompt_tokens: None,
             last_context_window_measured: None,
+            last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
+            stream_json_exchange: None,
             approval_request_tx: ctx.approval_request_tx,
             ask_user_request_tx: ctx.ask_user_request_tx,
             skill_resolver: ctx.skill_resolver,
@@ -2840,6 +2859,24 @@ fn sync_incremental_tool_result_state(
 
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
+    fn requires_strict_sse_json(&self) -> bool {
+        self.stream_json_exchange.is_some()
+    }
+
+    async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
+        match self.stream_json_exchange.as_mut() {
+            Some(exchange) => exchange.accepted_event(event),
+            None => Ok(()),
+        }
+    }
+
+    async fn on_sse_done(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
+        match self.stream_json_exchange.as_mut() {
+            Some(exchange) => exchange.finish(accum),
+            None => Ok(()),
+        }
+    }
+
     fn on_before_sse_read_loop(&mut self) {
         self.try_emit_stream_event(chat_stream::StreamEvent::WaitingForModel);
         if self.render_policy.is_silent() {
@@ -2886,10 +2923,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let measured = accum
             .has_usage
             .then(|| {
-                accum
-                    .prompt_tokens
-                    .saturating_add(accum.cache_read_tokens)
-                    .saturating_add(accum.cache_creation_tokens)
+                astra_turn_types::NormalizedPromptCacheUsage::new(
+                    accum.prompt_tokens,
+                    accum.cache_read_tokens,
+                    accum.cache_creation_tokens,
+                )
+                .total_input_tokens()
             })
             .filter(|tokens| *tokens > 0);
         if measured != self.last_context_window_measured {
@@ -2897,6 +2936,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowMeasured(tokens));
             }
             self.last_context_window_measured = measured;
+        }
+        let request_usage = request_token_usage_from_accum(accum);
+        if request_usage != self.last_request_token_usage {
+            if let Some(usage) = request_usage {
+                self.try_emit_stream_event(chat_stream::StreamEvent::RequestTokenUsage(usage));
+            }
+            self.last_request_token_usage = request_usage;
         }
     }
 
@@ -6632,6 +6678,7 @@ pub(crate) async fn consume_turn_sse(
     pre_clear_lines: usize,
     auth_profile: Option<&str>,
     cancel_token: Option<&tokio_util::sync::CancellationToken>,
+    stream_json_exchange: Option<crate::cli::stream::stream_json::StreamJsonExchange>,
 ) -> TurnResult {
     // Release the payload/HTTP prep line here so TTFT (`on_before_sse_read_loop`) can take over
     // on the same stderr row without a multi‑hundred‑ms blank gap.
@@ -6661,6 +6708,7 @@ pub(crate) async fn consume_turn_sse(
             render_md && !render_policy.suppress_text(),
             auth_profile,
         );
+        host.stream_json_exchange = stream_json_exchange;
         // pre_clear_lines only applies to non-md fallback path.
         if host.render.md.is_none() {
             host.render.lines_written = pre_clear_lines;
@@ -6683,6 +6731,10 @@ pub(crate) async fn consume_turn_sse(
             refreshed_token,
         )
     } else {
+        debug_assert!(
+            stream_json_exchange.is_none(),
+            "stream-json protocol observation requires the CLI edge SSE host"
+        );
         let mut render = StreamRenderState::with_term_width(
             term_width,
             render_md && !render_policy.suppress_text(),
@@ -6865,10 +6917,11 @@ mod tests {
         edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
         execute_with_metadata_responsive, extract_cli_diff_block, format_terminal_tool_summary,
         format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
-        normalize_sandbox_denied_outcome, path_mtime_ms, reusable_speculative_output,
-        sanitize_final_stream_text, style_tool_description, sync_incremental_accum_state,
-        sync_incremental_tool_result_state, task_preview_from_args, theme, tool_completion_icon,
-        tool_dedup_signature, tool_output_event_text, turn_has_tool_work,
+        normalize_sandbox_denied_outcome, path_mtime_ms, request_token_usage_from_accum,
+        reusable_speculative_output, sanitize_final_stream_text, style_tool_description,
+        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
+        theme, tool_completion_icon, tool_dedup_signature, tool_output_event_text,
+        turn_has_tool_work,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -6896,6 +6949,32 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[test]
+    fn request_token_lanes_come_from_one_physical_sse_exchange() {
+        let usage = request_token_usage_from_accum(&ChatTurnSseAccum {
+            prompt_tokens: 200,
+            cache_read_tokens: 800,
+            cache_creation_tokens: 100,
+            completion_tokens: 50,
+            has_usage: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 200,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+                output_tokens: 50,
+            })
+        );
+        assert_eq!(
+            request_token_usage_from_accum(&ChatTurnSseAccum::default()),
+            None,
+            "missing provider usage must stay unknown rather than becoming a zero request"
+        );
     }
 
     #[test]
@@ -8135,6 +8214,7 @@ mod tests {
         creds.profiles.insert(
             "test".to_string(),
             Profile {
+                account_id: Some("user-id-1".to_string()),
                 access_token: Some("expired-token".to_string()),
                 refresh_token: Some("refresh-token".to_string()),
                 ..Default::default()
@@ -8155,6 +8235,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path(astra_thin_client::paths::AUTH_REFRESH))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "fresh-token",
                 "refresh_token": "fresh-refresh-token"
             })))

@@ -11,16 +11,16 @@ use super::lifecycle::{
 };
 use astra_config::user_profile::Scenario;
 use astra_core::render_compact_status;
-use astra_services::{ContextManifestWrite, DatabaseContextManifestStore};
+use astra_services::{ContextManifestWrite, DatabaseContextManifestStore, SessionArtifactStore};
 use astra_turn_core::agentic_turn_ingest::{
     AgenticIngestIterationControl, AgenticTurnIngestMut, AgenticTurnIngestOutcome,
-    agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
+    AgenticTurnStreamSnapshot, agentic_turn_stream_snapshot_with_kind, ingest_agentic_turn_stream,
     map_ingest_outcome_to_iteration_control,
 };
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::interaction_types::TurnInteractionMode;
 use astra_turn_core::interruption::{InterruptionKind, InterruptionRecord, ResumeAction};
-use astra_turn_core::stall::IntentDrift;
+use astra_turn_types::NormalizedPromptCacheUsage;
 use uuid::Uuid;
 
 use crate::turn::observation_dispatcher::{
@@ -422,12 +422,13 @@ pub(crate) async fn inject_polled_user_intents<H: AgenticLoopHost>(
 }
 
 pub(crate) fn turn_result_tokens_consumed(turn_result: &HostTurnResult) -> u64 {
-    turn_result
-        .accum
-        .prompt_tokens
-        .saturating_add(turn_result.accum.completion_tokens)
-        .saturating_add(turn_result.accum.cache_read_tokens)
-        .saturating_add(turn_result.accum.cache_creation_tokens)
+    NormalizedPromptCacheUsage::new(
+        turn_result.accum.prompt_tokens,
+        turn_result.accum.cache_read_tokens,
+        turn_result.accum.cache_creation_tokens,
+    )
+    .total_input_tokens()
+    .saturating_add(turn_result.accum.completion_tokens)
 }
 
 /// Record an `llm_round` event for an early-exit path (no tool calls).
@@ -486,6 +487,57 @@ pub(crate) enum TurnExecutionControl {
     Proceed(Box<TurnExecutionPhase>),
     ContinueLoop,
     Return(AgenticLoopOutcome),
+}
+
+fn apply_terminal_control_stream_snapshot<H: AgenticLoopHost>(
+    host: &mut H,
+    state: &mut AgenticLoopState,
+    snap: &AgenticTurnStreamSnapshot<'_>,
+    control_outcome: crate::turn::terminal_control::TerminalControlOutcome,
+) -> AgenticLoopOutcome {
+    if state.telemetry.first_ttft_ms.is_none() {
+        state.telemetry.first_ttft_ms = snap.ttft_ms;
+    }
+    if let Some(session_id) = snap.session_id.as_ref() {
+        state.current_session_id = Some(session_id.clone());
+        host.on_session_bound(session_id);
+        if state.context_manifest_user_id.is_some() {
+            state.step_recorder.attach_persistence(session_id);
+        }
+    }
+    if snap.run_id.is_some() {
+        state.current_run_id = snap.run_id.clone();
+    }
+    state.total_prompt += snap.prompt_tokens;
+    state.total_completion += snap.completion_tokens;
+    state.total_cache_read += snap.cache_read_tokens;
+    state.total_cache_creation += snap.cache_creation_tokens;
+    state
+        .step_recorder
+        .record_tokens(snap.prompt_tokens, snap.completion_tokens);
+    state.has_any_usage |= snap.has_usage;
+    let billable_input = NormalizedPromptCacheUsage::new(
+        snap.prompt_tokens,
+        snap.cache_read_tokens,
+        snap.cache_creation_tokens,
+    )
+    .total_input_tokens();
+    if snap.has_usage && billable_input > 0 {
+        state.last_measured_prompt_tokens = Some(billable_input);
+    }
+    state.consecutive_context_window_errors = 0;
+
+    match control_outcome {
+        crate::turn::terminal_control::TerminalControlOutcome::Requested(_) => {
+            AgenticLoopOutcome::Delegated
+        }
+        crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection) => {
+            AgenticLoopOutcome::ControlRejected(rejection)
+        }
+        crate::turn::terminal_control::TerminalControlOutcome::Passthrough => {
+            unreachable!("host must not surface a passthrough terminal-control outcome")
+        }
+    }
 }
 
 fn route_runtime_policy_evidence(
@@ -662,10 +714,12 @@ async fn persist_context_manifest_for_llm_call(
     let schema_tokens = state.pinned_tool_schema_tokens.min(u64::from(u32::MAX)) as u32;
     let result_prompt_tokens = turn_result
         .map(|result| {
-            result
-                .accum
-                .prompt_tokens
-                .saturating_add(result.accum.cache_read_tokens)
+            NormalizedPromptCacheUsage::new(
+                result.accum.prompt_tokens,
+                result.accum.cache_read_tokens,
+                result.accum.cache_creation_tokens,
+            )
+            .total_input_tokens()
         })
         .map(|tokens| tokens.min(u64::from(u32::MAX)) as u32);
     let manifest_id = format!("manifest-{}", Uuid::new_v4());
@@ -750,7 +804,8 @@ fn context_window_tokens_for_context_manifest(state: &AgenticLoopState) -> u32 {
         .unwrap_or(crate::prompts::DEFAULT_CONTEXT_WINDOW_TOKENS as u32)
 }
 
-fn record_bridge_context_compactions(
+pub(crate) fn record_context_compactions<H: AgenticLoopHost>(
+    host: &mut H,
     state: &mut AgenticLoopState,
     observations: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
 ) {
@@ -758,23 +813,62 @@ fn record_bridge_context_compactions(
         return;
     }
 
-    state.context_compression_triggered = true;
     for observation in observations {
+        if !observation.is_consistent() {
+            tracing::warn!(
+                target: "astra_runtime::compaction",
+                observation_id = %observation.id,
+                kind = %observation.kind,
+                "ignoring inconsistent context compaction observation"
+            );
+            continue;
+        }
+        let tokens_freed = observation.tokens_before - observation.tokens_after;
         let compacted_messages = observation
             .messages_before
             .saturating_sub(observation.messages_after)
             .min(u64::from(u32::MAX)) as u32;
         let pressure = if state.max_turn_input_tokens > 0 {
-            observation.tokens_before as f64 / state.max_turn_input_tokens as f64
+            (observation.tokens_before as f64 / state.max_turn_input_tokens as f64).min(1.0)
         } else {
             0.0
         };
+        state.context_compression_triggered = true;
+        state.compact_tier_applied = state.compact_tier_applied.max(observation.tier);
+        state
+            .compaction_effectiveness
+            .record_compaction(tokens_freed);
+        if observation.effectiveness
+            == astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Insufficient
+        {
+            state.compaction_effectiveness.mark_insufficient();
+        }
         state.step_recorder.record_compaction_with_kind(
-            "bridge_context",
+            &observation.kind.to_string(),
             compacted_messages,
-            observation.tokens_saved,
+            tokens_freed,
             pressure,
         );
+        if let Some(ref mut sess) = state.pipeline_session {
+            sess.record_compaction_audit(
+                &observation.kind.to_string(),
+                compacted_messages,
+                tokens_freed.min(u64::from(u32::MAX)) as u32,
+            );
+            sess.stats.record_compaction(tokens_freed);
+        }
+        host.on_compaction(CompactionEvent::new(
+            observation.kind,
+            pressure,
+            tokens_freed,
+            observation.tokens_before,
+            state.max_turn_input_tokens,
+            compacted_messages as usize,
+            observation
+                .messages_after
+                .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX)) as usize,
+            Vec::new(),
+        ));
     }
 }
 
@@ -822,9 +916,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 let mut a = Vec::new();
                 if state.stall.execution_escalation_advisory_emitted {
                     a.push("execution_escalation".to_string());
-                }
-                if state.stall.drift_nudge_count > 0 {
-                    a.push(format!("drift_nudges={}", state.stall.drift_nudge_count));
                 }
                 if state.stall.nudge_count > 0 {
                     a.push(format!("stall_nudges={}", state.stall.nudge_count));
@@ -987,50 +1078,6 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
 
         for evidence in policy_evidence {
             route_runtime_policy_evidence(state, &facts, evidence);
-        }
-    }
-
-    // ── Intent drift detection ─────────────────────────────────────────
-    // Check if the agent has drifted from the user's original intent by
-    // analyzing recent tool calls against the user query. If drift is
-    // detected, surface advisory evidence via the volatile lane so the LLM
-    // refocuses on the original task. Singleton kind ensures only the
-    // latest observation rides the wire, avoiding prompt cache bloat.
-    //
-    // Runs after the guard pipeline so it sees the most recent tool calls
-    // in `state.stall.intent_tool_turns`. Auto mode keeps this model feedback
-    // but omits its corresponding status line.
-    //
-    // One-shot per turn: once intent_drift_advisory_emitted is set, no further
-    // repeated advisories are not injected this turn, preserving prompt-cache prefix.
-    if !state.stall.intent_drift_advisory_emitted && state.llm_rounds_completed > 0 {
-        let drift = host
-            .detect_intent_drift(&state.message, &state.stall.intent_tool_turns)
-            .await;
-        if let IntentDrift::Drifting { correction, .. } = drift {
-            state.stall.intent_drift_advisory_emitted = true;
-            state.stall.drift_nudge_count += 1;
-            state
-                .turn_guard
-                .sync_drift_nudge_count(state.stall.drift_nudge_count);
-            state.stall.last_drift_correction_round = state.llm_rounds_completed as usize;
-            state.push_volatile(super::host::VolatileKind::IntentDrift, correction.clone());
-            tracing::info!(
-                target: "astra::loop_guard",
-                tier = "intent_drift",
-                round = state.llm_rounds_completed,
-                drift_nudge_count = state.stall.drift_nudge_count,
-                "intent drift evidence recorded"
-            );
-            if show_policy_feedback_status && !prep.quiet {
-                host.emit_headless_line(
-                    HeadlessStderrStyle::Yellow,
-                    format!(
-                        "⚠ Intent drift detected — correcting course (nudge #{})",
-                        state.stall.drift_nudge_count
-                    ),
-                );
-            }
         }
     }
 
@@ -1291,6 +1338,10 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     );
 
     let llm_wall_start = Instant::now();
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::AgenticRequestSnapshot,
+        &state.messages,
+    );
     let pre_llm_messages = state.messages.clone();
     let llm_attempt_index = state.llm_rounds_completed;
     state.last_llm_context_manifest_trace = None;
@@ -1335,7 +1386,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     if let Ok(result) = &turn_result
         && !result.accum.context_compactions.is_empty()
     {
-        record_bridge_context_compactions(state, &result.accum.context_compactions);
+        record_context_compactions(host, state, &result.accum.context_compactions);
     }
     // Persist the per-call manifest only after the host returns: the durable
     // record includes observed token usage and the emitted context-manifest
@@ -1396,41 +1447,9 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
     update_turn_trace_collector(state, &turn_result);
 
     if let Some(control_outcome) = host.take_terminal_control_outcome() {
-        if state.telemetry.first_ttft_ms.is_none() {
-            state.telemetry.first_ttft_ms = snap.ttft_ms;
-        }
-        if let Some(session_id) = snap.session_id.as_ref() {
-            state.current_session_id = Some(session_id.clone());
-            host.on_session_bound(session_id);
-            if state.context_manifest_user_id.is_some() {
-                state.step_recorder.attach_persistence(session_id);
-            }
-        }
-        if snap.run_id.is_some() {
-            state.current_run_id = snap.run_id.clone();
-        }
-        state.total_prompt += snap.prompt_tokens;
-        state.total_completion += snap.completion_tokens;
-        state.total_cache_read += snap.cache_read_tokens;
-        state.total_cache_creation += snap.cache_creation_tokens;
-        state
-            .step_recorder
-            .record_tokens(snap.prompt_tokens, snap.completion_tokens);
-        state.has_any_usage |= snap.has_usage;
-        state.last_measured_prompt_tokens = Some(snap.prompt_tokens);
-        state.consecutive_context_window_errors = 0;
-
-        return Ok(TurnExecutionControl::Return(match control_outcome {
-            crate::turn::terminal_control::TerminalControlOutcome::Requested(_) => {
-                AgenticLoopOutcome::Delegated
-            }
-            crate::turn::terminal_control::TerminalControlOutcome::Rejected(rejection) => {
-                AgenticLoopOutcome::ControlRejected(rejection)
-            }
-            crate::turn::terminal_control::TerminalControlOutcome::Passthrough => {
-                unreachable!("host must not surface a passthrough terminal-control outcome")
-            }
-        }));
+        return Ok(TurnExecutionControl::Return(
+            apply_terminal_control_stream_snapshot(host, state, &snap, control_outcome),
+        ));
     }
 
     let edge_len = turn_result.edge_tool_round.len();
@@ -1715,19 +1734,17 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                             tokens_freed,
                             pressure,
                         );
-                        if !prep.quiet {
-                            let event = CompactionEvent::new(
-                                result.tier,
-                                pressure,
-                                tokens_freed,
-                                tokens_before,
-                                state.max_turn_input_tokens,
-                                result.messages_removed,
-                                messages_after,
-                                result.layer_descriptions.clone(),
-                            );
-                            host.on_compaction(event);
-                        }
+                        let event = CompactionEvent::new(
+                            result.tier,
+                            pressure,
+                            tokens_freed,
+                            tokens_before,
+                            state.max_turn_input_tokens,
+                            result.messages_removed,
+                            messages_after,
+                            result.layer_descriptions.clone(),
+                        );
+                        host.on_compaction(event);
 
                         // Emit structured compaction telemetry for observability.
                         if let Some(sid) = state.current_session_id.as_deref() {
@@ -2461,6 +2478,21 @@ pub(crate) fn execution_escalation_message(original_query: &str, read_only_calls
 
 fn update_turn_trace_collector(state: &mut AgenticLoopState, turn_result: &HostTurnResult) {
     if let Some(ref collector) = state.telemetry.turn_trace_collector {
+        if let Some(identity) = turn_result
+            .accum
+            .context_manifest_trace
+            .as_ref()
+            .and_then(|trace| trace.get("request_identity"))
+            .cloned()
+            .and_then(|identity| {
+                serde_json::from_value::<
+                    astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
+                >(identity)
+                .ok()
+            })
+        {
+            collector.record_request_identity(identity);
+        }
         if let Some(spt) = turn_result.accum.system_prompt_tokens {
             collector.set_system_prompt_tokens(spt);
         }
@@ -2669,19 +2701,17 @@ async fn handle_token_budget<H: AgenticLoopHost>(
                 total_freed,
                 pressure,
             );
-            if !prep.quiet {
-                let event = CompactionEvent::new(
-                    CompactionKind::ReactiveBudget,
-                    pressure,
-                    total_freed,
-                    measured,
-                    state.max_turn_input_tokens,
-                    total_messages_removed,
-                    state.messages.len(),
-                    layer_descriptions.clone(),
-                );
-                host.on_compaction(event);
-            }
+            let event = CompactionEvent::new(
+                CompactionKind::ReactiveBudget,
+                pressure,
+                total_freed,
+                measured,
+                state.max_turn_input_tokens,
+                total_messages_removed,
+                state.messages.len(),
+                layer_descriptions.clone(),
+            );
+            host.on_compaction(event);
             if let Some(ref mut sess) = state.pipeline_session {
                 sess.recovery.record_reactive_compact();
                 sess.stats.record_compaction(total_freed);
@@ -3226,27 +3256,32 @@ mod tests {
         let observations = vec![
             astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
                 id: "initial".to_string(),
-                phase: "initial".to_string(),
-                tier: "compact_history".to_string(),
+                kind: CompactionKind::WireAssembly,
+                tier: CompactionTier::CompactHistory,
                 messages_before: 18,
                 messages_after: 10,
                 tokens_before: 15_000,
                 tokens_after: 9_000,
                 tokens_saved: 6_000,
+                post_compaction_target_tokens: None,
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
             },
             astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
                 id: "context_window_retry:1:1".to_string(),
-                phase: "context_window_retry".to_string(),
-                tier: "aggressive_prune".to_string(),
+                kind: CompactionKind::WireContextRetry,
+                tier: CompactionTier::AggressivePrune,
                 messages_before: 12,
                 messages_after: 6,
                 tokens_before: 10_000,
                 tokens_after: 5_000,
                 tokens_saved: 5_000,
+                post_compaction_target_tokens: None,
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Unmeasured,
             },
         ];
 
-        record_bridge_context_compactions(&mut state, &observations);
+        let mut host = MockHost::new(Vec::new());
+        record_context_compactions(&mut host, &mut state, &observations);
 
         assert!(state.context_compression_triggered);
         let compactions: Vec<_> = state
@@ -3270,6 +3305,14 @@ mod tests {
         assert_eq!(
             compactions[1].payload.as_ref().unwrap()["results_compacted"],
             6
+        );
+        assert_eq!(state.compact_tier_applied, CompactionTier::AggressivePrune);
+        assert_eq!(host.compaction_events.len(), 2);
+        assert_eq!(host.compaction_events[0].kind, CompactionKind::WireAssembly);
+        assert_eq!(host.compaction_events[0].tokens_freed, 6_000);
+        assert_eq!(
+            host.compaction_events[1].kind,
+            CompactionKind::WireContextRetry
         );
     }
 
@@ -3697,6 +3740,12 @@ mod tests {
         assert!(
             state.context_compression_triggered,
             "quiet reactive compaction must remain visible to the final context trace"
+        );
+        assert!(
+            host.compaction_events
+                .iter()
+                .any(|event| event.kind == CompactionKind::ReactiveBudget),
+            "quiet reactive compaction must emit the same structured callback as rendered mode"
         );
         assert!(
             state.step_recorder.events().iter().any(|event| {
@@ -4264,6 +4313,398 @@ mod tests {
     // unit tests in `astra_turn_core::loop_circuit_breaker::tests`.
     // The circuit breaker is integration-tested via the full agentic loop
     // E2E tests.
+
+    #[derive(Clone, Copy, Debug)]
+    enum TypedTerminalGateCase {
+        Inference(astra_services::InferenceTerminalStatus),
+        TerminalControl,
+    }
+
+    #[derive(Debug)]
+    struct ProviderUsageGateCase {
+        name: &'static str,
+        dialect: crate::turn::token_usage::UsageDialect,
+        raw_usage: serde_json::Value,
+        expected: Option<crate::turn::token_usage::TokenUsage>,
+    }
+
+    fn provider_usage_gate_cases() -> Vec<ProviderUsageGateCase> {
+        use crate::turn::token_usage::{TokenUsage, UsageDialect};
+
+        vec![
+            ProviderUsageGateCase {
+                name: "openai_inclusive",
+                dialect: UsageDialect::OpenAi,
+                raw_usage: serde_json::json!({
+                    "prompt_tokens": 1_100,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 800,
+                        "cache_creation_input_tokens": 100,
+                    },
+                }),
+                expected: Some(TokenUsage {
+                    input_tokens: 200,
+                    cached_input_tokens: 800,
+                    cache_creation_tokens: 100,
+                    output_tokens: 50,
+                }),
+            },
+            ProviderUsageGateCase {
+                name: "openai_compatible_disjoint_aliases",
+                dialect: UsageDialect::OpenAi,
+                raw_usage: serde_json::json!({
+                    "prompt_tokens": 200,
+                    "completion_tokens": 50,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 100,
+                }),
+                expected: Some(TokenUsage {
+                    input_tokens: 200,
+                    cached_input_tokens: 800,
+                    cache_creation_tokens: 100,
+                    output_tokens: 50,
+                }),
+            },
+            ProviderUsageGateCase {
+                name: "anthropic_disjoint",
+                dialect: UsageDialect::AnthropicMessages,
+                raw_usage: serde_json::json!({
+                    "input_tokens": 200,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 100,
+                }),
+                expected: Some(TokenUsage {
+                    input_tokens: 200,
+                    cached_input_tokens: 800,
+                    cache_creation_tokens: 100,
+                    output_tokens: 50,
+                }),
+            },
+            ProviderUsageGateCase {
+                name: "bedrock_disjoint",
+                dialect: UsageDialect::BedrockConverse,
+                raw_usage: serde_json::json!({
+                    "inputTokens": 200,
+                    "outputTokens": 50,
+                    "cacheReadInputTokens": 800,
+                    "cacheWriteInputTokens": 100,
+                }),
+                expected: Some(TokenUsage {
+                    input_tokens: 200,
+                    cached_input_tokens: 800,
+                    cache_creation_tokens: 100,
+                    output_tokens: 50,
+                }),
+            },
+            ProviderUsageGateCase {
+                name: "missing",
+                dialect: UsageDialect::OpenAi,
+                raw_usage: serde_json::json!({}),
+                expected: None,
+            },
+            ProviderUsageGateCase {
+                name: "contradictory_openai_inclusive",
+                dialect: UsageDialect::OpenAi,
+                raw_usage: serde_json::json!({
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 800,
+                        "cache_creation_input_tokens": 100,
+                    },
+                }),
+                expected: Some(TokenUsage {
+                    input_tokens: 0,
+                    cached_input_tokens: 800,
+                    cache_creation_tokens: 100,
+                    output_tokens: 50,
+                }),
+            },
+        ]
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UsageGateTelemetry {
+        first_ttft_ms: Option<u64>,
+        current_session_id: Option<String>,
+        current_run_id: Option<String>,
+        fresh_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+        output_tokens: u64,
+        has_any_usage: bool,
+        last_measured_prompt_tokens: Option<u64>,
+        consecutive_context_window_errors: u32,
+    }
+
+    impl UsageGateTelemetry {
+        fn from_state(state: &AgenticLoopState) -> Self {
+            Self {
+                first_ttft_ms: state.telemetry.first_ttft_ms,
+                current_session_id: state.current_session_id.clone(),
+                current_run_id: state.current_run_id.clone(),
+                fresh_input_tokens: state.total_prompt,
+                cache_read_tokens: state.total_cache_read,
+                cache_creation_tokens: state.total_cache_creation,
+                output_tokens: state.total_completion,
+                has_any_usage: state.has_any_usage,
+                last_measured_prompt_tokens: state.last_measured_prompt_tokens,
+                consecutive_context_window_errors: state.consecutive_context_window_errors,
+            }
+        }
+
+        fn total_input_tokens(&self) -> u64 {
+            NormalizedPromptCacheUsage::new(
+                self.fresh_input_tokens,
+                self.cache_read_tokens,
+                self.cache_creation_tokens,
+            )
+            .total_input_tokens()
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum UsageGateExecution {
+        Succeeded,
+        Failed(astra_core::ErrorKind),
+        Delegated,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct UsageGateObservation {
+        telemetry: UsageGateTelemetry,
+        execution: UsageGateExecution,
+    }
+
+    fn ingest_usage_gate_snapshot(
+        state: &mut AgenticLoopState,
+        snap: &AgenticTurnStreamSnapshot<'_>,
+        quiet: bool,
+    ) -> AgenticTurnIngestOutcome {
+        let message = state.message.clone();
+        let recent_tools = state.recent_tools.clone();
+        ingest_agentic_turn_stream(
+            snap,
+            0,
+            |_| unreachable!("usage gate has no edge tools"),
+            &message,
+            &recent_tools,
+            quiet,
+            AgenticTurnIngestMut {
+                first_ttft_ms: &mut state.telemetry.first_ttft_ms,
+                current_session_id: &mut state.current_session_id,
+                current_run_id: &mut state.current_run_id,
+                final_text: &mut state.final_text,
+                last_finish_reason: &mut state.last_finish_reason,
+                total_prompt: &mut state.total_prompt,
+                total_completion: &mut state.total_completion,
+                total_cache_read: &mut state.total_cache_read,
+                total_cache_creation: &mut state.total_cache_creation,
+                total_tool_calls: &mut state.total_tool_calls,
+                total_observation_tool_calls: &mut state.total_observation_tool_calls,
+                step_recorder: &mut state.step_recorder,
+                all_tools_used: &mut state.telemetry.all_tools_used,
+                has_any_usage: &mut state.has_any_usage,
+                messages: &mut state.messages,
+                last_measured_prompt_tokens: &mut state.last_measured_prompt_tokens,
+                consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
+            },
+        )
+    }
+
+    fn exercise_usage_gate(
+        usage: Option<crate::turn::token_usage::TokenUsage>,
+        terminal: TypedTerminalGateCase,
+        quiet: bool,
+    ) -> UsageGateObservation {
+        let usage = usage.unwrap_or_default();
+        let error_kind = match terminal {
+            TypedTerminalGateCase::Inference(
+                astra_services::InferenceTerminalStatus::Succeeded,
+            )
+            | TypedTerminalGateCase::TerminalControl => None,
+            TypedTerminalGateCase::Inference(astra_services::InferenceTerminalStatus::Failed) => {
+                Some(astra_core::ErrorKind::ServerError)
+            }
+            TypedTerminalGateCase::Inference(
+                astra_services::InferenceTerminalStatus::DeliveryUnknown,
+            ) => Some(astra_core::ErrorKind::StreamTransport),
+            TypedTerminalGateCase::Inference(
+                astra_services::InferenceTerminalStatus::Cancelled,
+            ) => Some(astra_core::ErrorKind::Cancelled),
+        };
+        let accum = ChatTurnSseAccum {
+            session_id: Some("typed-usage-session".to_string()),
+            run_id: Some("typed-usage-run".to_string()),
+            prompt_tokens: usage.input_tokens,
+            completion_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cached_input_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            has_usage: !usage.is_empty(),
+            error_message: error_kind.map(|_| "typed provider terminal".to_string()),
+            error_kind,
+            ..ChatTurnSseAccum::default()
+        };
+        let snap = agentic_turn_stream_snapshot_with_kind(&accum, Some(17), error_kind);
+        let mut state = make_state();
+
+        let execution = match terminal {
+            TypedTerminalGateCase::TerminalControl => {
+                let mut host = MockHost::new(Vec::new()).with_quiet(quiet);
+                assert_eq!(host.is_quiet(), quiet);
+                let outcome = apply_terminal_control_stream_snapshot(
+                    &mut host,
+                    &mut state,
+                    &snap,
+                    crate::turn::terminal_control::TerminalControlOutcome::Requested(
+                        crate::turn::terminal_control::TerminalHandoffRequest {
+                            handoff_id: "typed-handoff".to_string(),
+                            kind: "agent".to_string(),
+                            target: "typed-target".to_string(),
+                            action: "delegate".to_string(),
+                            terminal: true,
+                            tool_call_id: "typed-tool-call".to_string(),
+                        },
+                    ),
+                );
+                assert!(matches!(outcome, AgenticLoopOutcome::Delegated));
+                UsageGateExecution::Delegated
+            }
+            TypedTerminalGateCase::Inference(status) => {
+                let outcome = ingest_usage_gate_snapshot(&mut state, &snap, quiet);
+                match (status, outcome) {
+                    (
+                        astra_services::InferenceTerminalStatus::Succeeded,
+                        AgenticTurnIngestOutcome::Break,
+                    ) => UsageGateExecution::Succeeded,
+                    (
+                        astra_services::InferenceTerminalStatus::Failed
+                        | astra_services::InferenceTerminalStatus::DeliveryUnknown
+                        | astra_services::InferenceTerminalStatus::Cancelled,
+                        AgenticTurnIngestOutcome::Fatal(error),
+                    ) => UsageGateExecution::Failed(error.kind),
+                    (status, outcome) => {
+                        panic!("unexpected typed terminal outcome: {status:?} -> {outcome:?}")
+                    }
+                }
+            }
+        };
+
+        UsageGateObservation {
+            telemetry: UsageGateTelemetry::from_state(&state),
+            execution,
+        }
+    }
+
+    #[test]
+    fn provider_usage_terminal_quiet_cross_product_preserves_typed_telemetry() {
+        use crate::turn::token_usage::extract_usage;
+        use astra_services::InferenceTerminalStatus;
+
+        let terminal_cases = [
+            TypedTerminalGateCase::Inference(InferenceTerminalStatus::Succeeded),
+            TypedTerminalGateCase::Inference(InferenceTerminalStatus::Failed),
+            TypedTerminalGateCase::Inference(InferenceTerminalStatus::DeliveryUnknown),
+            TypedTerminalGateCase::TerminalControl,
+        ];
+
+        for provider in provider_usage_gate_cases() {
+            let extracted = provider
+                .raw_usage
+                .as_object()
+                .and_then(|usage| extract_usage(provider.dialect, usage));
+            assert_eq!(
+                extracted, provider.expected,
+                "provider usage normalization: {}",
+                provider.name
+            );
+            let expected = extracted.unwrap_or_default();
+            let expected_total_input = expected
+                .normalized_prompt_cache_usage()
+                .total_input_tokens();
+
+            for terminal in terminal_cases {
+                let rendered = exercise_usage_gate(extracted, terminal, false);
+                let quiet = exercise_usage_gate(extracted, terminal, true);
+
+                assert_eq!(
+                    rendered, quiet,
+                    "quiet changed typed telemetry or terminal state: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(
+                    rendered.telemetry.fresh_input_tokens, expected.input_tokens,
+                    "fresh input: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(
+                    rendered.telemetry.cache_read_tokens, expected.cached_input_tokens,
+                    "cache read: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(
+                    rendered.telemetry.cache_creation_tokens, expected.cache_creation_tokens,
+                    "cache create: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(
+                    rendered.telemetry.output_tokens, expected.output_tokens,
+                    "output: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(
+                    rendered.telemetry.total_input_tokens(),
+                    expected_total_input,
+                    "fresh + read + create: {} / {terminal:?}",
+                    provider.name
+                );
+                assert_eq!(rendered.telemetry.has_any_usage, extracted.is_some());
+                assert_eq!(rendered.telemetry.first_ttft_ms, Some(17));
+                assert_eq!(
+                    rendered.telemetry.current_session_id.as_deref(),
+                    Some("typed-usage-session")
+                );
+                assert_eq!(
+                    rendered.telemetry.current_run_id.as_deref(),
+                    Some("typed-usage-run")
+                );
+
+                let expected_execution = match terminal {
+                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::Succeeded) => {
+                        UsageGateExecution::Succeeded
+                    }
+                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::Failed) => {
+                        UsageGateExecution::Failed(astra_core::ErrorKind::ServerError)
+                    }
+                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::DeliveryUnknown) => {
+                        UsageGateExecution::Failed(astra_core::ErrorKind::StreamTransport)
+                    }
+                    TypedTerminalGateCase::TerminalControl => UsageGateExecution::Delegated,
+                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::Cancelled) => {
+                        unreachable!("cancelled is outside this exit-gate matrix")
+                    }
+                };
+                assert_eq!(rendered.execution, expected_execution);
+
+                let expected_calibration = match terminal {
+                    TypedTerminalGateCase::Inference(InferenceTerminalStatus::Succeeded)
+                    | TypedTerminalGateCase::TerminalControl
+                        if extracted.is_some() && expected_total_input > 0 =>
+                    {
+                        Some(expected_total_input)
+                    }
+                    _ => None,
+                };
+                assert_eq!(
+                    rendered.telemetry.last_measured_prompt_tokens, expected_calibration,
+                    "prompt calibration: {} / {terminal:?}",
+                    provider.name
+                );
+            }
+        }
+    }
 
     fn prep(quiet: bool) -> TurnIterationPrep {
         TurnIterationPrep {
@@ -5686,8 +6127,21 @@ fn spill_old_messages_to_disk(
     ));
 
     // Write full transcript to session dir.
-    let spill_dir = astra_services::session_journal::local_sessions_dir().join(session_id);
-    let _ = std::fs::create_dir_all(&spill_dir);
+    let spill_dir = match astra_services::local_session_artifact_store().session_dir(session_id) {
+        Ok(path) => path,
+        Err(_) => {
+            let mut restored = to_spill;
+            restored.append(messages);
+            *messages = restored;
+            return 0;
+        }
+    };
+    if std::fs::create_dir_all(&spill_dir).is_err() {
+        let mut restored = to_spill;
+        restored.append(messages);
+        *messages = restored;
+        return 0;
+    }
     let spill_path = spill_dir.join(format!("spill-round{round}.json"));
     if std::fs::write(&spill_path, &spill_json).is_err() {
         let mut restored = to_spill;

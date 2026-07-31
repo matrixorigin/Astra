@@ -189,6 +189,7 @@ pub(crate) struct LlmContextAssemblyInput<'a> {
     pub provider: &'a str,
     pub model_name: &'a str,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
     pub user_content: &'a str,
     pub query_source: &'a str,
@@ -325,6 +326,7 @@ pub(crate) struct LlmContextManifestTrace {
     pub provider: String,
     pub model_name: String,
     pub model_context_window_tokens: u32,
+    pub context_window_policy: crate::prompts::ContextWindowPolicy,
     pub compaction_tier: String,
     pub system_prompt_tokens: u32,
     pub stable_system_message_count: usize,
@@ -340,6 +342,7 @@ impl LlmContextManifestTrace {
             "provider": self.provider.clone(),
             "model_name": self.model_name.clone(),
             "model_context_window_tokens": self.model_context_window_tokens,
+            "context_window_policy": self.context_window_policy,
             "compaction_tier": self.compaction_tier.clone(),
             "system_prompt_tokens": self.system_prompt_tokens,
             "stable_system_message_count": self.stable_system_message_count,
@@ -348,6 +351,178 @@ impl LlmContextManifestTrace {
             "runtime_manifest": self.runtime_manifest.clone(),
         })
     }
+}
+
+fn manifest_u64(trace: &Value, pointer: &str) -> Option<u64> {
+    trace.pointer(pointer).and_then(Value::as_u64)
+}
+
+fn manifest_string(trace: &Value, pointer: &str) -> Option<String> {
+    trace
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn model_request_rollout_stage() -> astra_services::ModelRequestRolloutStage {
+    use std::sync::OnceLock;
+    static STAGE: OnceLock<astra_services::ModelRequestRolloutStage> = OnceLock::new();
+    *STAGE.get_or_init(|| {
+        match std::env::var("ASTRA_MODEL_REQUEST_CONTEXT_ROLLOUT")
+            .ok()
+            .as_deref()
+        {
+            Some("opt_in") => astra_services::ModelRequestRolloutStage::OptIn,
+            Some("topology_canary") => astra_services::ModelRequestRolloutStage::TopologyCanary,
+            Some("default") => astra_services::ModelRequestRolloutStage::Default,
+            // Missing and invalid configuration both fail closed to shadow.
+            Some("shadow") | None | Some(_) => astra_services::ModelRequestRolloutStage::Shadow,
+        }
+    })
+}
+
+/// Convert the shared assembly manifest into the content-free seed persisted
+/// at the physical provider boundary.
+///
+/// Every lookup is an exact schema path. Unknown facts stay absent; provider
+/// or model names are never interpreted to manufacture lineage or budgets.
+pub(crate) fn model_request_context_seed_from_manifest(
+    topology: astra_services::ModelRequestTopology,
+    trace: Option<&Value>,
+) -> astra_services::ModelRequestContextSeed {
+    let (interaction_owner, loop_owner, execution_binding) = match topology {
+        astra_services::ModelRequestTopology::CliServer => ("cli", "server", "server"),
+        astra_services::ModelRequestTopology::EdgeServer => ("edge", "server", "edge"),
+        astra_services::ModelRequestTopology::ServerOnly => ("server", "server", "server"),
+    };
+    let mut seed = astra_services::ModelRequestContextSeed::server_default();
+    seed.topology = topology;
+    seed.rollout_stage = model_request_rollout_stage();
+    seed.interaction_owner = interaction_owner.to_string();
+    seed.loop_owner = loop_owner.to_string();
+    seed.execution_binding = execution_binding.to_string();
+    let Some(trace) = trace else {
+        return seed;
+    };
+
+    seed.budget.raw_context_window_tokens =
+        manifest_u64(trace, "/context_window_policy/raw_context_window_tokens")
+            .or_else(|| manifest_u64(trace, "/model_context_window_tokens"));
+    seed.budget.usable_input_limit_tokens =
+        manifest_u64(trace, "/context_window_policy/usable_input_limit_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/effective_input_limit"));
+    seed.budget.reserved_output_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_output_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/requested_output_tokens"));
+    seed.budget.reserved_summary_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_summary_tokens");
+    seed.budget.reserved_protocol_tokens =
+        manifest_u64(trace, "/context_window_policy/reserved_protocol_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/reserved_protocol_tokens"));
+    seed.budget.compact_trigger_tokens =
+        manifest_u64(trace, "/context_window_policy/auto_compact_trigger_tokens");
+    seed.budget.hard_limit_tokens =
+        manifest_u64(trace, "/context_window_policy/hard_input_limit_tokens")
+            .or_else(|| manifest_u64(trace, "/wire/budget/model_limit"));
+    seed.budget.estimated_input_tokens = manifest_u64(trace, "/wire/budget/estimated_input_tokens");
+    seed.budget.usage_source = Some("pre_provider_estimate".to_string());
+
+    seed.composition.stable_system_tokens = manifest_u64(trace, "/system_prompt_tokens");
+    seed.cache.layout = manifest_string(
+        trace,
+        "/wire/fingerprint/prompt_cache_identity/cache_layout",
+    );
+    seed.cache.current_identity =
+        manifest_string(trace, "/wire/fingerprint/prompt_cache_identity/content_id");
+    seed.compaction.tier = manifest_string(trace, "/compaction_tier");
+    seed
+}
+
+/// Attach every durably admitted physical request, its exact serialized
+/// provider-body composition, and its complete durable terminal when present.
+///
+/// Each durable attempt is admitted from the same immutable bytes used by its
+/// HTTP body. The complete array is authoritative; `request_identity` is only
+/// a latest-attempt projection for the existing turn-trace summary.
+pub(crate) fn augment_manifest_trace_with_provider_attempts(
+    trace: &mut Value,
+    attempts: &[crate::turn::llm::durable::DurableProviderAttemptFact],
+    round: u32,
+) {
+    let Some(latest) = attempts.last() else {
+        return;
+    };
+    let Some(trace) = trace.as_object_mut() else {
+        return;
+    };
+    let latest_response_id = latest
+        .terminal
+        .as_ref()
+        .and_then(|terminal| terminal.provider_response_id.as_deref());
+    trace.insert(
+        "request_identity".to_string(),
+        json!({
+            "request_id": latest.request.request_id,
+            "request_hash": latest.request.request_hash,
+            "round": round,
+            "attempt": latest.request.attempt,
+            "provider_response_id": latest_response_id,
+        }),
+    );
+    trace.insert(
+        "provider_request_attempts".to_string(),
+        Value::Array(
+            attempts
+                .iter()
+                .map(|attempt| {
+                    let request = &attempt.request;
+                    let terminal = attempt.terminal.as_ref();
+                    json!({
+                        "authority": "exact_serialized_provider_body_v1",
+                        "request_id": request.request_id,
+                        "request_hash": request.request_hash,
+                        "round": round,
+                        "attempt": request.attempt,
+                        "protocol": request.protocol.as_str(),
+                        "provider_response_id": terminal
+                            .and_then(|terminal| terminal.provider_response_id.as_deref()),
+                        "terminal_status": terminal.map(|terminal| terminal.status.as_str()),
+                        "usage": terminal.map(|terminal| json!({
+                            "input_tokens": terminal.usage.input_tokens,
+                            "output_tokens": terminal.usage.output_tokens,
+                            "cache_read_tokens": terminal.usage.cache_read_tokens,
+                            "cache_creation_tokens": terminal.usage.cache_creation_tokens,
+                        })),
+                        "error_kind": terminal
+                            .and_then(|terminal| terminal.error_kind.as_deref()),
+                        "error_message": terminal
+                            .and_then(|terminal| terminal.error_message.as_deref()),
+                        "serialized_bytes": request.provider_wire_bytes,
+                        "composition_bytes": {
+                            "system": request.composition.system_bytes,
+                            "conversation": request.composition.conversation_bytes,
+                            "tool_schema": request.composition.tool_schema_bytes,
+                            "provider_envelope": request.composition.provider_envelope_bytes,
+                            "total": request.composition.total_bytes(),
+                        },
+                        "composition_items": {
+                            "system": request.composition.system_items,
+                            "conversation": request.composition.conversation_items,
+                            "tool_schema": request.composition.tool_schema_items,
+                        },
+                    })
+                })
+                .collect(),
+        ),
+    );
+}
+
+pub(crate) fn clear_manifest_provider_request(trace: &mut Value) {
+    let Some(trace) = trace.as_object_mut() else {
+        return;
+    };
+    trace.remove("request_identity");
+    trace.remove("provider_request_attempts");
 }
 
 fn runtime_manifest_with_memory_context(
@@ -372,6 +547,7 @@ fn runtime_manifest_with_memory_context(
     manifest
 }
 
+#[cfg(test)]
 pub(crate) fn context_meta_event(
     breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
     context_manifest_trace: Option<&Value>,
@@ -390,6 +566,10 @@ pub(crate) fn context_meta_event_with_compactions(
         "system_prompt_breakdown": breakdown,
     });
     if let Some(trace) = context_manifest_trace {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            trace,
+        );
         event["context_manifest_trace"] = trace.clone();
     }
     if !compactions.is_empty() {
@@ -427,6 +607,17 @@ fn canonical_wire_sha256(value: &Value) -> String {
     let canonical = canonical_wire_value(value);
     let bytes =
         serde_json::to_vec(&canonical).expect("serde_json::Value serialization is infallible");
+    if astra_core::history_work::instrumentation_enabled() {
+        let bytes_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+            bytes_len,
+        );
+        astra_core::history_work::record_bytes(
+            astra_core::history_work::HistoryWorkSite::LlmWireTraceHash,
+            bytes_len,
+        );
+    }
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }
@@ -437,14 +628,6 @@ fn message_role(message: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
-}
-
-fn role_counts_json(roles: &[String]) -> Value {
-    let mut counts = BTreeMap::<String, usize>::new();
-    for role in roles {
-        *counts.entry(role.clone()).or_default() += 1;
-    }
-    json!(counts)
 }
 
 /// Bridge-facing context assembly input.
@@ -559,6 +742,7 @@ pub(crate) struct BridgeSessionContextInput<'a> {
     pub session_id: &'a str,
     pub model_id: &'a str,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub provider: &'a str,
     pub edge_profile_cwd: Option<&'a str>,
     pub edge_profile_git_branch: Option<&'a str>,
@@ -586,6 +770,7 @@ impl<'a> BridgeSessionContextInput<'a> {
             session_id,
             model_id,
             context_window: None,
+            max_completion_tokens: None,
             provider,
             edge_profile_cwd,
             edge_profile_git_branch,
@@ -602,6 +787,11 @@ impl<'a> BridgeSessionContextInput<'a> {
 
     pub(crate) fn with_context_window(mut self, context_window: Option<u32>) -> Self {
         self.context_window = context_window;
+        self
+    }
+
+    pub(crate) fn with_max_completion_tokens(mut self, max_completion_tokens: Option<u32>) -> Self {
+        self.max_completion_tokens = max_completion_tokens;
         self
     }
 }
@@ -761,6 +951,23 @@ pub(crate) struct ContextManifestProjection {
     pub items: Vec<astra_services::ContextManifestItemWrite>,
 }
 
+fn is_tool_result_wire_message(message: &Value) -> bool {
+    if matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("tool" | "tool_result")
+    ) {
+        return true;
+    }
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
 /// Build the persisted context-manifest projection for a single LLM call.
 ///
 /// This is deliberately inside `llm_context` so manifest rows are derived by
@@ -772,16 +979,18 @@ pub(crate) fn build_context_manifest_projection(
 ) -> ContextManifestProjection {
     let budget_allocation = astra_services::budget_for_turn_intent(Some(input.turn_intent));
     let budget = budget_allocation.budget.clone();
-    let message_tokens = input
-        .pre_llm_messages
-        .iter()
-        .map(estimate_json_tokens)
-        .fold(0_u32, u32::saturating_add);
-    let tool_result_tokens = input
-        .tool_results
-        .iter()
-        .map(estimate_json_tokens)
-        .fold(0_u32, u32::saturating_add);
+    let (message_tokens, tool_result_tokens) =
+        input
+            .pre_llm_messages
+            .iter()
+            .fold((0_u32, 0_u32), |(messages, tool_results), message| {
+                let tokens = estimate_json_tokens(message);
+                if is_tool_result_wire_message(message) {
+                    (messages, tool_results.saturating_add(tokens))
+                } else {
+                    (messages.saturating_add(tokens), tool_results)
+                }
+            });
     let total_estimated_tokens = input.result_prompt_tokens.unwrap_or_else(|| {
         message_tokens
             .saturating_add(tool_result_tokens)
@@ -897,11 +1106,11 @@ pub(crate) fn build_context_manifest_projection(
         || input.observed_cache_read_tokens.is_some()
         || input.observed_cache_creation_tokens.is_some()
     {
-        Some(astra_turn_types::NormalizedPromptCacheUsage {
-            fresh_input_tokens: input.observed_fresh_input_tokens.unwrap_or_default(),
-            cache_read_tokens: input.observed_cache_read_tokens.unwrap_or_default(),
-            cache_creation_tokens: input.observed_cache_creation_tokens.unwrap_or_default(),
-        })
+        Some(astra_turn_types::NormalizedPromptCacheUsage::new(
+            input.observed_fresh_input_tokens.unwrap_or_default(),
+            input.observed_cache_read_tokens.unwrap_or_default(),
+            input.observed_cache_creation_tokens.unwrap_or_default(),
+        ))
     } else {
         None
     };
@@ -988,6 +1197,12 @@ pub(crate) fn assemble_bridge_context(
         input.tool_surface.required_tools.len(),
         input.tool_surface.restricted_tools.len(),
     );
+    let window_policy = crate::prompts::budget_for_model_with_metadata(
+        Some(input.session.model_id),
+        input.session.context_window,
+        input.session.max_completion_tokens,
+    )
+    .window_policy();
     let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome_with_messages(
         &effective_tool_names,
         &effective_tool_schemas,
@@ -1000,7 +1215,8 @@ pub(crate) fn assemble_bridge_context(
         input.session.cache_capability,
         input.session.session_id,
         input.session.model_id,
-        input.session.context_window,
+        u32::try_from(window_policy.usable_input_limit_tokens).ok(),
+        u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX),
         input.session.provider,
         input.session.edge_profile_cwd,
         input.session.edge_profile_git_branch,
@@ -1021,14 +1237,8 @@ pub(crate) fn assemble_bridge_context(
     let volatile_preamble_count = usize::from(outcome.dynamic_system.is_some());
     let tool_schema_count = outcome.tool_schemas.len();
     let compaction_tier = format!("{:?}", outcome.tier);
-    let model_context_window_tokens = u32::try_from(
-        crate::prompts::budget_for_model_with_override(
-            Some(input.session.model_id),
-            input.session.context_window,
-        )
-        .model_limit,
-    )
-    .unwrap_or(u32::MAX);
+    let model_context_window_tokens =
+        u32::try_from(window_policy.raw_context_window_tokens).unwrap_or(u32::MAX);
     BridgeContextAssemblyOutput {
         primary_system: outcome.primary_system,
         dynamic_system: outcome.dynamic_system,
@@ -1041,6 +1251,7 @@ pub(crate) fn assemble_bridge_context(
             provider: input.session.provider.to_string(),
             model_name: input.session.model_id.to_string(),
             model_context_window_tokens,
+            context_window_policy: window_policy,
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
@@ -1165,14 +1376,14 @@ pub(crate) fn assemble_context_pipeline(
     // cap, and `0` is its legacy "unlimited" sentinel. The pipeline's
     // `SessionContext::model_limit` is different: it must be the concrete
     // model context window used for section budgeting and pressure planning.
-    let model_context_limit = u64::try_from(
-        crate::prompts::budget_for_model_with_override(
-            Some(input.model_name),
-            input.context_window,
-        )
-        .model_limit,
+    let window_policy = crate::prompts::budget_for_model_with_metadata(
+        Some(input.model_name),
+        input.context_window,
+        input.max_completion_tokens,
     )
-    .unwrap_or(u64::MAX);
+    .window_policy();
+    let model_context_limit =
+        u64::try_from(window_policy.usable_input_limit_tokens).unwrap_or(u64::MAX);
     let session_current_date = resolve_pipeline_session_current_date(
         state.pipeline_session.as_ref(),
         state.context_manifest_user_id.as_deref(),
@@ -1190,6 +1401,8 @@ pub(crate) fn assemble_context_pipeline(
         &session_current_date,
         state.context_manifest_user_id.as_deref(),
     );
+    session_ctx.pre_reserved_output_tokens =
+        u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX);
     if !input.tool_surface.deferred_tools_block.is_empty() {
         session_ctx.deferred_tools_block = input.tool_surface.deferred_tools_block.to_string();
     }
@@ -1343,7 +1556,8 @@ pub(crate) fn assemble_context_pipeline(
     let tool_schema_count = pipeline_output.optimized.tool_schemas.len();
     let tier = pipeline_output.plan.compact_tier;
     let compaction_tier = format!("{:?}", tier);
-    let model_context_window_tokens = u32::try_from(model_context_limit).unwrap_or(u32::MAX);
+    let model_context_window_tokens =
+        u32::try_from(window_policy.raw_context_window_tokens).unwrap_or(u32::MAX);
 
     Ok(LlmContextAssemblyOutput {
         system_messages,
@@ -1358,6 +1572,7 @@ pub(crate) fn assemble_context_pipeline(
             provider: input.provider.to_string(),
             model_name: input.model_name.to_string(),
             model_context_window_tokens,
+            context_window_policy: window_policy,
             compaction_tier,
             system_prompt_tokens,
             stable_system_message_count,
@@ -1518,11 +1733,29 @@ fn stabilize_tool_schema_wire_order(
             .cmp(&right_bucket)
             .then_with(|| left_name.unwrap_or("").cmp(right_name.unwrap_or("")))
             .then_with(|| {
-                serde_json::to_string(left)
-                    .unwrap_or_default()
-                    .cmp(&serde_json::to_string(right).unwrap_or_default())
+                serialized_tool_schema_wire_sort_key(left)
+                    .cmp(&serialized_tool_schema_wire_sort_key(right))
             })
     });
+}
+
+fn serialized_tool_schema_wire_sort_key(schema: &Value) -> String {
+    let site = astra_core::history_work::HistoryWorkSite::ToolSchemaWireSortSerialization;
+    match serde_json::to_string(schema) {
+        Ok(serialized) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_bytes(
+                    site,
+                    serialized.len().try_into().unwrap_or(u64::MAX),
+                );
+            }
+            serialized
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            String::new()
+        }
+    }
 }
 
 fn tool_schema_wire_bucket(
@@ -1578,6 +1811,10 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
             astra_turn_core::cache_placement::CacheProtocol::None
         )
     {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            current_tool_schemas,
+        );
         return current_tool_schemas.to_vec();
     }
 
@@ -1599,8 +1836,16 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 
     if stabilized.is_empty() {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            current_tool_schemas,
+        );
         current_tool_schemas.to_vec()
     } else {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ToolSchemaCacheStabilizationClone,
+            &stabilized,
+        );
         stabilized
     }
 }
@@ -1636,7 +1881,7 @@ pub(crate) struct BridgeRetryWireRebuildInput<'a> {
 }
 
 pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> {
-    messages
+    let compactable_history = messages
         .iter()
         .filter(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message))
         .cloned()
@@ -1644,7 +1889,12 @@ pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> 
             crate::turn::wire_assembly::strip_runtime_context_from_tool_message(&mut message);
             message
         })
-        .collect()
+        .collect::<Vec<_>>();
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        &compactable_history,
+    );
+    compactable_history
 }
 
 pub(crate) fn rebuild_bridge_retry_wire_messages(
@@ -1655,7 +1905,12 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         .iter()
         .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
         .count();
-    let mut messages = input.previous_messages[..system_prefix_count].to_vec();
+    let retained_system_prefix = &input.previous_messages[..system_prefix_count];
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        retained_system_prefix,
+    );
+    let mut messages = retained_system_prefix.to_vec();
     let mut compacted_messages = input.compacted_messages;
     crate::turn::wire_assembly::maybe_append_continuation_prompt(
         &mut compacted_messages,
@@ -1677,6 +1932,10 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         synthetic_tail_prefix_end,
         input.cache_cfg,
         input.session_id,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ProviderRetryRetention,
+        &messages,
     );
     messages
 }
@@ -1765,25 +2024,51 @@ pub(crate) fn finalize_bridge_wire_messages(
     synthetic_tail_prefix_end
 }
 
-pub(crate) fn augment_manifest_trace_with_wire(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WireTraceDetail {
+    MetricsOnly,
+    Debug,
+}
+
+#[cfg(test)]
+fn augment_manifest_trace_with_wire(trace: &mut Value, messages: &[Value], tool_schemas: &[Value]) {
+    augment_manifest_trace_with_wire_detail(trace, messages, tool_schemas, WireTraceDetail::Debug);
+}
+
+/// Add final pre-provider request facts without making production
+/// observability another history-sized payload.
+///
+/// The metrics path walks the already-materialized message slice once for
+/// low-cardinality counts and hashes only the stable system/tool prefix.
+/// Per-message hashes and whole-request canonical clones are debug capture:
+/// they are useful diagnostically, but scale with the complete session and
+/// must not be paid on every request in a long-running production session.
+pub(crate) fn augment_manifest_trace_with_wire_detail(
     trace: &mut Value,
     messages: &[Value],
     tool_schemas: &[Value],
+    detail: WireTraceDetail,
 ) {
     let message_cache_control_count = messages.iter().map(cache_control_count).sum::<usize>();
     let tool_cache_control_count = tool_schemas.iter().map(cache_control_count).sum::<usize>();
-    let message_roles: Vec<String> = messages.iter().map(message_role).collect();
-    let conversation_messages: Vec<Value> = messages
-        .iter()
-        .filter(|message| message_role(message) != "system")
-        .cloned()
-        .collect();
-    let conversation_roles: Vec<String> = conversation_messages.iter().map(message_role).collect();
-    let system_messages: Vec<Value> = messages
-        .iter()
-        .filter(|message| message_role(message) == "system")
-        .cloned()
-        .collect();
+    let mut message_role_counts = BTreeMap::<String, usize>::new();
+    let mut conversation_role_counts = BTreeMap::<String, usize>::new();
+    let mut conversation_message_count = 0_usize;
+    let mut system_messages = Vec::new();
+    for message in messages {
+        let role = message_role(message);
+        *message_role_counts.entry(role.clone()).or_default() += 1;
+        if role == "system" {
+            system_messages.push(message.clone());
+        } else {
+            conversation_message_count = conversation_message_count.saturating_add(1);
+            *conversation_role_counts.entry(role).or_default() += 1;
+        }
+    }
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+        &system_messages,
+    );
     let stable_system_prefix = stable_cache_prefix(&system_messages);
     let stable_tool_prefix = stable_cache_prefix(tool_schemas);
     let cache_layout = if message_cache_control_count + tool_cache_control_count > 0 {
@@ -1797,71 +2082,107 @@ pub(crate) fn augment_manifest_trace_with_wire(
         cache_layout,
     )
     .expect("wire prompt cache identity inputs are bounded constants and JSON");
-    let message_hashes: Vec<Value> = messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            json!({
-                "index": index,
-                "role": message_role(message),
-                "sha256": canonical_wire_sha256(message),
-            })
-        })
-        .collect();
-    let estimated_message_tokens: u64 = messages
-        .iter()
-        .map(estimate_json_tokens)
-        .map(u64::from)
-        .sum();
-    let estimated_conversation_tokens: u64 = conversation_messages
-        .iter()
-        .map(estimate_json_tokens)
-        .map(u64::from)
-        .sum();
 
     if let Some(trace_obj) = trace.as_object_mut() {
-        trace_obj.insert(
-            "wire".to_string(),
-            serde_json::json!({
-                "message_count": messages.len(),
-                "tool_schema_count": tool_schemas.len(),
-                "message_roles": message_roles.clone(),
-                "message_role_counts": role_counts_json(&message_roles),
-                "estimated_message_tokens": estimated_message_tokens,
-                "message_cache_control_count": message_cache_control_count,
-                "tool_cache_control_count": tool_cache_control_count,
-                "total_cache_control_count": message_cache_control_count + tool_cache_control_count,
-                "conversation_projection": {
-                    "message_count": conversation_messages.len(),
-                    "message_roles": conversation_roles.clone(),
-                    "role_counts": role_counts_json(&conversation_roles),
-                    "estimated_tokens": estimated_conversation_tokens,
-                },
-                "fingerprint": {
-                    "message_sequence_sha256": canonical_wire_sha256(&Value::Array(messages.to_vec())),
-                    "system_message_sequence_sha256": canonical_wire_sha256(&Value::Array(system_messages.clone())),
-                    "conversation_message_sequence_sha256": canonical_wire_sha256(&Value::Array(conversation_messages)),
-                    "tool_schema_sequence_sha256": canonical_wire_sha256(&Value::Array(tool_schemas.to_vec())),
-                    "system_and_tools_sha256": canonical_wire_sha256(&json!({
-                        "system_messages": system_messages,
-                        "tool_schemas": tool_schemas,
-                    })),
-                    "prompt_cache_identity": prompt_cache_identity,
-                    "message_hashes": message_hashes,
-                },
-            }),
-        );
+        let mut wire = serde_json::json!({
+            "projection_authority": "pre_provider_messages_and_tools_v1",
+            "trace_detail": match detail {
+                WireTraceDetail::MetricsOnly => "metrics_only",
+                WireTraceDetail::Debug => "debug",
+            },
+            "message_count": messages.len(),
+            "tool_schema_count": tool_schemas.len(),
+            "message_role_counts": message_role_counts,
+            "message_cache_control_count": message_cache_control_count,
+            "tool_cache_control_count": tool_cache_control_count,
+            "total_cache_control_count": message_cache_control_count + tool_cache_control_count,
+            "conversation_projection": {
+                "message_count": conversation_message_count,
+                "role_counts": conversation_role_counts,
+            },
+            "fingerprint": {
+                "prompt_cache_identity": prompt_cache_identity,
+            },
+        });
+        if detail == WireTraceDetail::Debug {
+            let message_roles: Vec<String> = messages.iter().map(message_role).collect();
+            let conversation_messages: Vec<Value> = messages
+                .iter()
+                .filter(|message| message_role(message) != "system")
+                .cloned()
+                .collect();
+            let conversation_roles: Vec<String> =
+                conversation_messages.iter().map(message_role).collect();
+            let message_hashes: Vec<Value> = messages
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    json!({
+                        "index": index,
+                        "role": message_role(message),
+                        "sha256": canonical_wire_sha256(message),
+                    })
+                })
+                .collect();
+            let estimated_message_tokens: u64 = messages
+                .iter()
+                .map(estimate_json_tokens)
+                .map(u64::from)
+                .sum();
+            let estimated_conversation_tokens: u64 = conversation_messages
+                .iter()
+                .map(estimate_json_tokens)
+                .map(u64::from)
+                .sum();
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                &conversation_messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+                tool_schemas,
+            );
+            wire["message_roles"] = json!(message_roles);
+            wire["estimated_message_tokens"] = json!(estimated_message_tokens);
+            wire["conversation_projection"]["message_roles"] = json!(conversation_roles);
+            wire["conversation_projection"]["estimated_tokens"] =
+                json!(estimated_conversation_tokens);
+            wire["fingerprint"]["message_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(messages.to_vec())));
+            wire["fingerprint"]["system_message_sequence_sha256"] = json!(canonical_wire_sha256(
+                &Value::Array(system_messages.clone())
+            ));
+            wire["fingerprint"]["conversation_message_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(conversation_messages)));
+            wire["fingerprint"]["tool_schema_sequence_sha256"] =
+                json!(canonical_wire_sha256(&Value::Array(tool_schemas.to_vec())));
+            wire["fingerprint"]["system_and_tools_sha256"] = json!(canonical_wire_sha256(&json!({
+                "system_messages": system_messages,
+                "tool_schemas": tool_schemas,
+            })));
+            wire["fingerprint"]["message_hashes"] = json!(message_hashes);
+        }
+        trace_obj.insert("wire".to_string(), wire);
     }
 }
 
 fn stable_cache_prefix(values: &[Value]) -> Vec<Value> {
-    match values
+    let prefix = match values
         .iter()
         .rposition(|value| cache_control_count(value) > 0)
     {
-        Some(last_marker) => values[..=last_marker].to_vec(),
-        None => values.to_vec(),
-    }
+        Some(last_marker) => &values[..=last_marker],
+        None => values,
+    };
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::LlmWireTraceClone,
+        prefix,
+    );
+    prefix.to_vec()
 }
 
 #[cfg(test)]
@@ -2175,6 +2496,7 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
             context_window: Some(1_000_000),
+            max_completion_tokens: Some(64_000),
             cache_capability: Some(strict_history),
             user_content: "which model are you?",
             query_source: "test",
@@ -2292,6 +2614,7 @@ mod context_cache_contract_tests {
             provider: "openai",
             model_name: "gpt-4",
             context_window: Some(200_000),
+            max_completion_tokens: Some(16_384),
             cache_capability: None,
             user_content: "hello",
             query_source: "test",
@@ -2632,13 +2955,15 @@ mod context_cache_contract_tests {
         let compactions = vec![
             astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation {
                 id: "initial".to_string(),
-                phase: "initial".to_string(),
-                tier: "compact_history".to_string(),
+                kind: astra_turn_core::compaction_types::CompactionKind::WireAssembly,
+                tier: astra_turn_core::compaction_types::CompactionTier::CompactHistory,
                 messages_before: 18,
                 messages_after: 10,
                 tokens_before: 12_000,
                 tokens_after: 7_000,
                 tokens_saved: 5_000,
+                post_compaction_target_tokens: Some(7_000),
+                effectiveness: astra_turn_core::chat_turn_sse_dispatch::ContextCompactionEffectiveness::Sufficient,
             },
         ];
 
@@ -2664,24 +2989,97 @@ mod context_cache_contract_tests {
             pre_llm_messages: &messages,
             tool_results: &[],
             schema_tokens: 7,
-            result_prompt_tokens: Some(500),
-            observed_fresh_input_tokens: Some(100),
-            observed_cache_read_tokens: Some(300),
+            result_prompt_tokens: Some(1_100),
+            observed_fresh_input_tokens: Some(200),
+            observed_cache_read_tokens: Some(800),
             observed_cache_creation_tokens: Some(100),
-            observed_output_tokens: Some(20),
+            observed_output_tokens: Some(50),
             assembly_trace: None,
             turn_intent: "implementation",
             reason: "test",
             context_window_tokens: 64_000,
         });
 
+        let normalized = serde_json::from_value::<astra_turn_types::NormalizedPromptCacheUsage>(
+            projection.manifest_json["normalized_prompt_cache_usage"].clone(),
+        )
+        .expect("manifest usage must retain its typed provider-neutral shape");
         assert_eq!(
-            projection.manifest_json["normalized_prompt_cache_usage"],
+            normalized,
+            astra_turn_types::NormalizedPromptCacheUsage::new(200, 800, 100)
+        );
+        assert_eq!(normalized.cache_creation_tokens, 100);
+        assert_eq!(normalized.total_input_tokens(), 1_100);
+        assert_eq!(projection.total_estimated_tokens, 1_100);
+        assert_eq!(
+            projection.manifest_json["observed_usage"]["output_tokens"],
+            50
+        );
+    }
+
+    #[test]
+    fn context_manifest_estimates_each_final_wire_zone_once() {
+        let messages = vec![
+            json!({"role": "user", "content": "inspect"}),
             json!({
-                "fresh_input_tokens": 100,
-                "cache_read_tokens": 300,
-                "cache_creation_tokens": 100
-            })
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            json!({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "file body"
+                }]
+            }),
+        ];
+        let duplicate_runtime_projection = vec![json!({
+            "name": "read_file",
+            "tool_call_id": "call-1",
+            "result": "file body"
+        })];
+        let schema_tokens = 7;
+        let projection = build_context_manifest_projection(ContextManifestProjectionInput {
+            owner_id: "user-a",
+            session_id: "session-a",
+            run_id: "run-a",
+            turn_index: 3,
+            llm_attempt_index: 2,
+            pre_llm_messages: &messages,
+            tool_results: &duplicate_runtime_projection,
+            schema_tokens,
+            result_prompt_tokens: None,
+            observed_fresh_input_tokens: None,
+            observed_cache_read_tokens: None,
+            observed_cache_creation_tokens: None,
+            observed_output_tokens: None,
+            assembly_trace: None,
+            turn_intent: "implementation",
+            reason: "test",
+            context_window_tokens: 64_000,
+        });
+
+        let expected_wire_tokens = messages
+            .iter()
+            .map(estimate_json_tokens)
+            .fold(schema_tokens, u32::saturating_add);
+        assert_eq!(projection.total_estimated_tokens, expected_wire_tokens);
+        let zone_used_total = projection.manifest_json["zones"]
+            .as_object()
+            .expect("zones must be an object")
+            .values()
+            .filter_map(|zone| zone.get("used_tokens").and_then(Value::as_u64))
+            .sum::<u64>();
+        assert_eq!(
+            zone_used_total,
+            u64::from(expected_wire_tokens),
+            "mutually exclusive manifest zones must reconcile with the final-wire estimate"
         );
     }
 
@@ -2818,6 +3216,155 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn every_physical_request_identity_is_derived_from_its_exact_serialized_bytes() {
+        let messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "task"}),
+        ];
+        let tools = vec![tool("read_file")];
+        let mut attempts = Vec::new();
+        for (attempt, max_tokens, status, response_id, usage, error_kind, error_message) in [
+            (
+                0_u32,
+                4_096_u32,
+                astra_services::InferenceTerminalStatus::DeliveryUnknown,
+                "provider-partial",
+                astra_services::InferenceUsage {
+                    input_tokens: 200,
+                    output_tokens: 50,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 100,
+                },
+                Some("stream_transport"),
+                Some("provider stream ended after partial delivery"),
+            ),
+            (
+                1,
+                2_048,
+                astra_services::InferenceTerminalStatus::Succeeded,
+                "provider-success",
+                astra_services::InferenceUsage {
+                    input_tokens: 120,
+                    output_tokens: 30,
+                    cache_read_tokens: 400,
+                    cache_creation_tokens: 20,
+                },
+                None,
+                None,
+            ),
+        ] {
+            let body = json!({
+                "model": "provider-model",
+                "messages": messages,
+                "tools": tools,
+                "max_tokens": max_tokens,
+                "stream": true,
+            });
+            let prepared = crate::turn::llm::client::PreparedProviderRequest::from_json(
+                &body,
+                crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            )
+            .expect("prepare provider body once");
+            let wire = prepared.identity();
+            attempts.push(crate::turn::llm::durable::DurableProviderAttemptFact {
+                request: crate::turn::llm::durable::DurableProviderRequestIdentity {
+                    request_id: format!("attempt-{attempt}"),
+                    request_hash: wire.provider_wire_hash.clone(),
+                    attempt,
+                    protocol: wire.protocol,
+                    provider_wire_bytes: wire.provider_wire_bytes,
+                    composition: wire.composition.clone(),
+                },
+                terminal: Some(astra_services::InferenceInvocationTerminal {
+                    status,
+                    usage,
+                    provider_response_id: Some(response_id.to_string()),
+                    error_kind: error_kind.map(str::to_string),
+                    error_message: error_message.map(str::to_string),
+                }),
+            });
+        }
+        let mut trace = json!({"source": "llm_context"});
+        augment_manifest_trace_with_wire(&mut trace, &messages, &tools);
+        augment_manifest_trace_with_provider_attempts(&mut trace, &attempts, 3);
+
+        assert_eq!(
+            trace["provider_request_attempts"].as_array().unwrap().len(),
+            2
+        );
+        for (index, attempt) in attempts.iter().enumerate() {
+            let projected = &trace["provider_request_attempts"][index];
+            assert_eq!(
+                projected["composition_bytes"]["total"],
+                projected["serialized_bytes"]
+            );
+            assert_eq!(projected["request_id"], attempt.request.request_id);
+            assert_eq!(projected["request_hash"], attempt.request.request_hash);
+        }
+        assert_ne!(
+            trace["provider_request_attempts"][0]["request_hash"],
+            trace["provider_request_attempts"][1]["request_hash"]
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["terminal_status"],
+            "delivery_unknown"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["provider_response_id"],
+            "provider-partial"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["usage"],
+            json!({
+                "input_tokens": 200,
+                "output_tokens": 50,
+                "cache_read_tokens": 800,
+                "cache_creation_tokens": 100,
+            })
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["error_kind"],
+            "stream_transport"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][0]["error_message"],
+            "provider stream ended after partial delivery"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][1]["terminal_status"],
+            "succeeded"
+        );
+        assert_eq!(
+            trace["provider_request_attempts"][1]["usage"],
+            json!({
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_read_tokens": 400,
+                "cache_creation_tokens": 20,
+            })
+        );
+        assert!(trace["provider_request_attempts"][1]["error_kind"].is_null());
+        assert!(trace["provider_request_attempts"][1]["error_message"].is_null());
+        assert_eq!(
+            trace["request_identity"]["request_id"],
+            attempts[1].request.request_id
+        );
+        assert_eq!(
+            trace["request_identity"]["provider_response_id"],
+            "provider-success"
+        );
+        assert_eq!(
+            trace["wire"]["projection_authority"], "pre_provider_messages_and_tools_v1",
+            "the pre-provider projection remains explicitly distinct from exact body facts"
+        );
+
+        clear_manifest_provider_request(&mut trace);
+        assert!(trace.get("request_identity").is_none());
+        assert!(trace.get("provider_request_attempts").is_none());
+        assert!(trace["wire"].get("projection_authority").is_some());
+    }
+
+    #[test]
     fn augment_manifest_trace_records_final_wire_cache_control_counts() {
         let mut trace = json!({"source": "llm_context"});
         let messages = vec![
@@ -2840,6 +3387,10 @@ mod context_cache_contract_tests {
         augment_manifest_trace_with_wire(&mut trace, &messages, &tools);
 
         assert_eq!(trace["wire"]["message_count"], 2);
+        assert_eq!(
+            trace["wire"]["projection_authority"],
+            "pre_provider_messages_and_tools_v1"
+        );
         assert_eq!(trace["wire"]["tool_schema_count"], 1);
         assert_eq!(trace["wire"]["message_cache_control_count"], 1);
         assert_eq!(trace["wire"]["tool_cache_control_count"], 1);
@@ -2883,6 +3434,95 @@ mod context_cache_contract_tests {
                 .as_str()
                 .unwrap()
                 .starts_with("sha256:")
+        );
+    }
+
+    #[test]
+    fn metrics_wire_trace_is_bounded_and_keeps_only_low_cardinality_facts() {
+        let secret = "message-content-must-not-enter-metrics-trace";
+        let messages = (0..2_048)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("{secret}-{index}"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut trace = json!({"source": "llm_context"});
+
+        augment_manifest_trace_with_wire_detail(
+            &mut trace,
+            &messages,
+            &[],
+            WireTraceDetail::MetricsOnly,
+        );
+
+        assert_eq!(trace["wire"]["trace_detail"], "metrics_only");
+        assert_eq!(trace["wire"]["message_count"], 2_048);
+        assert_eq!(
+            trace["wire"]["message_role_counts"],
+            json!({"assistant": 1024, "user": 1024})
+        );
+        assert!(trace["wire"].get("message_roles").is_none());
+        assert!(trace["wire"].get("estimated_message_tokens").is_none());
+        assert!(
+            trace["wire"]["fingerprint"]
+                .get("message_sequence_sha256")
+                .is_none()
+        );
+        assert!(trace["wire"]["fingerprint"].get("message_hashes").is_none());
+        assert!(!trace.to_string().contains(secret));
+        assert!(
+            trace.to_string().len() < 2_048,
+            "metrics trace size must not grow with message count"
+        );
+    }
+
+    #[test]
+    fn model_request_seed_reads_only_exact_manifest_contract_fields() {
+        let trace = json!({
+            "model_context_window_tokens": 1_000_000,
+            "context_window_policy": {
+                "raw_context_window_tokens": 1_000_000,
+                "usable_input_limit_tokens": 910_000,
+                "reserved_output_tokens": 64_000,
+                "reserved_summary_tokens": 24_000,
+                "reserved_protocol_tokens": 2_000,
+                "auto_compact_trigger_tokens": 728_000,
+                "hard_input_limit_tokens": 934_000
+            },
+            "system_prompt_tokens": 12_000,
+            "compaction_tier": "normal",
+            "wire": {
+                "budget": {
+                    "estimated_input_tokens": 700_000
+                },
+                "fingerprint": {
+                    "prompt_cache_identity": {
+                        "cache_layout": "provider-prefix-v1",
+                        "content_id": "sha256:stable"
+                    }
+                }
+            }
+        });
+
+        let seed = model_request_context_seed_from_manifest(
+            astra_services::ModelRequestTopology::CliServer,
+            Some(&trace),
+        );
+        assert_eq!(
+            seed.topology,
+            astra_services::ModelRequestTopology::CliServer
+        );
+        assert_eq!(seed.interaction_owner, "cli");
+        assert_eq!(seed.loop_owner, "server");
+        assert_eq!(seed.budget.raw_context_window_tokens, Some(1_000_000));
+        assert_eq!(seed.budget.usable_input_limit_tokens, Some(910_000));
+        assert_eq!(seed.budget.estimated_input_tokens, Some(700_000));
+        assert_eq!(seed.composition.stable_system_tokens, Some(12_000));
+        assert_eq!(
+            seed.cache.current_identity.as_deref(),
+            Some("sha256:stable")
         );
     }
 

@@ -16,7 +16,7 @@ use crate::judger::{Judger, evaluate_judger};
 use crate::model_profiles::{ModelReuseSupport, load_profiles};
 use crate::report::{CaseRunReport, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
-use crate::session_capture::{SessionCapture, load_session};
+use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
 
 /// What to do with session journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,24 @@ pub struct DiskSessionLoader;
 impl SessionLoader for DiskSessionLoader {
     fn load(&self, session_id: &str) -> Option<SessionCapture> {
         load_session(session_id)
+    }
+}
+
+/// Disk loader for runs whose local CLI and server artifacts use distinct,
+/// explicitly authorized owner namespaces.
+pub struct ScopedDiskSessionLoader {
+    owner_scopes: Vec<astra_services::OwnerScope>,
+}
+
+impl ScopedDiskSessionLoader {
+    pub fn new(owner_scopes: Vec<astra_services::OwnerScope>) -> Self {
+        Self { owner_scopes }
+    }
+}
+
+impl SessionLoader for ScopedDiskSessionLoader {
+    fn load(&self, session_id: &str) -> Option<SessionCapture> {
+        load_session_for_owners(session_id, &self.owner_scopes)
     }
 }
 

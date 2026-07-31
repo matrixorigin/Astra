@@ -44,8 +44,7 @@ impl LiveRuntimeProvider for LocalSessionProvider<'_> {
     }
 
     fn cache_hit_ratio(&self) -> f64 {
-        let total_in =
-            self.state.total_prompt + self.state.total_cache_read + self.state.total_cache_creation;
+        let total_in = self.state.provider_input_tokens();
         if total_in > 0 {
             self.state.total_cache_read as f64 / total_in as f64
         } else {

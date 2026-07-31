@@ -10,9 +10,8 @@ use crate::agentic_stall_preflight::{
 use crate::headless_tool_assembly::{EdgeToolRoundRow, tool_calls_for_stall_guard};
 use crate::turn_guard::TurnGuard;
 
-/// Build stall-guard tool-call shapes, run CLI stall preflight, return the same slice for post-tool policy.
-#[must_use]
-pub fn agentic_round_stall_preflight_with_tool_calls<T: EdgeToolRoundRow>(
+/// Build the canonical stall-guard tool-call shapes and run CLI stall preflight.
+pub fn agentic_round_stall_preflight<T: EdgeToolRoundRow>(
     turn_index: usize,
     server_tool_calls: &[Value],
     edge_round: &[T],
@@ -20,7 +19,7 @@ pub fn agentic_round_stall_preflight_with_tool_calls<T: EdgeToolRoundRow>(
     turn_tool_names: &mut Vec<HashSet<String>>,
     stall_events: &mut Vec<(String, u32)>,
     turn_guard: &mut TurnGuard,
-) -> Vec<Value> {
+) {
     let tool_calls_for_guard = tool_calls_for_stall_guard(server_tool_calls, edge_round);
     apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
         turn_index: turn_index as u32,
@@ -30,7 +29,6 @@ pub fn agentic_round_stall_preflight_with_tool_calls<T: EdgeToolRoundRow>(
         stall_events,
         turn_guard,
     });
-    tool_calls_for_guard
 }
 
 /// Append server `explain_turn` JSON values into the session accumulator.
@@ -63,14 +61,14 @@ mod tests {
     }
 
     #[test]
-    fn stall_preflight_returns_tool_calls_for_downstream() {
+    fn stall_preflight_records_canonical_tool_calls() {
         let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
         let edge: Vec<Row> = vec![];
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
         let mut stall_events = Vec::new();
         let mut turn_guard = TurnGuard::new();
-        let g = agentic_round_stall_preflight_with_tool_calls(
+        agentic_round_stall_preflight(
             0,
             &server,
             &edge,
@@ -79,9 +77,9 @@ mod tests {
             &mut stall_events,
             &mut turn_guard,
         );
-        assert_eq!(g.len(), 1);
-        assert_eq!(g[0]["name"], "bash");
         assert_eq!(turn_sigs.len(), 1);
+        assert_eq!(turn_sigs[0].len(), 1);
+        assert!(turn_tool_names[0].contains("bash"));
     }
 
     #[test]

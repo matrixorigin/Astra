@@ -109,6 +109,20 @@ fn has_session_id(args: &[String]) -> bool {
         .any(|arg| arg == "--session-id" || arg.starts_with("--session-id="))
 }
 
+fn load_step_event_stats(
+    cfg: &RunnerConfig,
+    session_id: &str,
+) -> Option<crate::session_capture::StepEventStats> {
+    if cfg.artifact_owner_scopes.is_empty() {
+        crate::session_capture::load_step_event_stats(session_id)
+    } else {
+        crate::session_capture::load_step_event_stats_for_owners(
+            session_id,
+            &cfg.artifact_owner_scopes,
+        )
+    }
+}
+
 async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> RunOutcome {
     use std::process::Stdio;
     use std::time::Duration;
@@ -118,7 +132,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
     // must report only the events it added, otherwise SuiteRunner sums the
     // entire prior transcript once per follow-up turn.
     let prior_step_stats = explicit_session_id(&case.extra_cli_args)
-        .and_then(crate::session_capture::load_step_event_stats);
+        .and_then(|session_id| load_step_event_stats(cfg, session_id));
     let start = Instant::now();
     let mut cmd = Command::new(&cfg.astra_bin);
     if let Some(ref profile) = cfg.profile {
@@ -204,7 +218,7 @@ async fn run_case_subprocess(cfg: &RunnerConfig, case: &Case, model: &str) -> Ru
             out.duration_ms = start.elapsed().as_millis() as u64;
             // Extract turn_rounds and cache_hits from step_events if available.
             if let Some(ref sid) = out.session_id
-                && let Some(stats) = crate::session_capture::load_step_event_stats(sid)
+                && let Some(stats) = load_step_event_stats(cfg, sid)
             {
                 let stats = match prior_step_stats.as_ref() {
                     Some(prior) => stats.since(prior),

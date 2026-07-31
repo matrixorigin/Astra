@@ -20,6 +20,66 @@ fn validate_restored_session(
             restored.session_id
         ));
     }
+    if let Some(bundle) = restored.resume_bundle.as_ref() {
+        let expected_owner = cli_utils::cli_user_id();
+        if bundle.schema_version != astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION {
+            return Err(format!(
+                "resume bundle schema {} is unsupported",
+                bundle.schema_version
+            ));
+        }
+        if bundle.cursor.session_id != requested_session_id {
+            return Err(format!(
+                "resume bundle returned mismatched session_id: expected {requested_session_id}, got {}",
+                bundle.cursor.session_id
+            ));
+        }
+        if bundle.cursor.owner_id != expected_owner {
+            return Err(format!(
+                "resume bundle returned mismatched owner: expected {expected_owner}, got {}",
+                bundle.cursor.owner_id
+            ));
+        }
+        if bundle.cursor.schema_version != 0
+            && bundle.cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "resume cursor schema {} is unsupported",
+                bundle.cursor.schema_version
+            ));
+        }
+        if bundle.cursor.schema_version != 0
+            && bundle.cursor.projection_schema
+                != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(format!(
+                "resume projection schema {} is unsupported",
+                bundle.cursor.projection_schema
+            ));
+        }
+        if bundle.cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID {
+            return Err(format!(
+                "resume bundle branch `{}` is unsupported",
+                bundle.cursor.branch_id
+            ));
+        }
+        if bundle.cursor.completed_turn > restored.turn_count {
+            return Err(format!(
+                "resume bundle turn {} is ahead of authoritative session turn {}",
+                bundle.cursor.completed_turn, restored.turn_count
+            ));
+        }
+        if !bundle.validates_root() {
+            return Err("resume bundle conversation root validation failed".to_string());
+        }
+        if !restored.conversation_messages.is_empty()
+            && restored.conversation_messages != bundle.conversation_messages
+        {
+            return Err(
+                "resume response contains divergent legacy messages and resume bundle".to_string(),
+            );
+        }
+    }
     Ok(restored)
 }
 
@@ -123,7 +183,7 @@ pub(crate) async fn restore_session_snapshot(
         .post_bearer_path_empty_json::<RestoredSession>(&token, &path)
         .await
     {
-        Ok(restored) => Ok(Some(restored)),
+        Ok(restored) => Ok(Some(validate_restored_session(session_id, restored)?)),
         Err(astra_thin_client::ThinClientError::Api { status, .. }) if status.as_u16() == 404 => {
             Ok(None)
         }
@@ -162,11 +222,59 @@ pub(crate) async fn list_cloud_resumable_sessions(
 
 #[cfg(test)]
 mod tests {
-    use super::{fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions};
+    use super::{
+        fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
+        validate_restored_session,
+    };
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
     use astra_services::session_restore::{RestoredSession, ResumableSessionsResponse};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    #[serial_test::serial]
+    fn restored_bundle_must_belong_to_the_bound_account() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "owner-validation",
+            Some("account-a"),
+        )
+        .unwrap();
+        let messages = vec![serde_json::json!({"role": "user", "content": "private"})];
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: "account-b".into(),
+            session_id: "shared-session".into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let bundle = astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor,
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            conversation_messages: messages,
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        };
+
+        let error = validate_restored_session(
+            "shared-session",
+            RestoredSession {
+                session_id: "shared-session".into(),
+                turn_count: 1,
+                resume_bundle: Some(bundle),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("mismatched owner"), "{error}");
+    }
 
     async fn mock_cloud_resumable_list(server: &MockServer, sessions: &[RestoredSession]) {
         Mock::given(method("GET"))

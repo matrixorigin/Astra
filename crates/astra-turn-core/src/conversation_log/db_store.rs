@@ -86,6 +86,14 @@ impl DbCslStore {
         let payload: String = row
             .try_get("payload")
             .map_err(|e| CslStoreError::Other(format!("missing payload column: {e}")))?;
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::CslDatabaseRead,
+                payload.len().try_into().unwrap_or(u64::MAX),
+                1,
+                0,
+            );
+        }
         Ok(serde_json::from_str(&payload)?)
     }
 
@@ -164,6 +172,12 @@ impl CslStore for DbCslStore {
         let pool = self.get_pool().await?;
         self.ensure_owner_access(&pool, session_id).await?;
         let payload = serde_json::to_string(entry)?;
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::CslDatabaseSerialization,
+                payload.len().try_into().unwrap_or(u64::MAX),
+            );
+        }
         let entry_type: i8 = if entry.is_snapshot() { 0 } else { 1 };
 
         query(
@@ -182,6 +196,12 @@ impl CslStore for DbCslStore {
         .execute(&pool)
         .await
         .map_err(|e| CslStoreError::Other(format!("insert: {e}")))?;
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_rows(
+                astra_core::history_work::HistoryWorkSite::CslDatabaseRows,
+                1,
+            );
+        }
 
         Ok(())
     }
@@ -338,6 +358,7 @@ impl CslStore for DbCslStore {
 
         // Materialize state at fork point, write as single Snapshot at seq=1.
         let mat = materialize(&entries)?;
+        let prefix_rows = mat.messages.len().try_into().unwrap_or(u64::MAX);
         let fork_snapshot = CslEntry::Snapshot {
             seq: 1,
             turn: mat.last_turn,
@@ -346,6 +367,18 @@ impl CslStore for DbCslStore {
         };
 
         let payload = serde_json::to_string(&fork_snapshot)?;
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::CslDatabaseSerialization,
+                payload.len().try_into().unwrap_or(u64::MAX),
+            );
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::ForkPrefixMaterialization,
+                payload.len().try_into().unwrap_or(u64::MAX),
+                prefix_rows,
+                0,
+            );
+        }
         query(
             "INSERT INTO conversation_log \
              (user_id, session_id, seq, turn, entry_type, payload) \
@@ -362,6 +395,12 @@ impl CslStore for DbCslStore {
         tx.commit()
             .await
             .map_err(|e| CslStoreError::Other(format!("fork commit: {e}")))?;
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_rows(
+                astra_core::history_work::HistoryWorkSite::CslDatabaseRows,
+                1,
+            );
+        }
 
         Ok(1)
     }

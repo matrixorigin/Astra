@@ -471,18 +471,11 @@ impl StepRecorder {
     }
 
     /// Record that memory context was loaded (PERCEIVE phase completion).
-    pub fn record_perceive(
-        &mut self,
-        query: &str,
-        memory_ids: &[String],
-        domain_hints: &[String],
-        boost_terms: &[String],
-    ) {
+    pub fn record_perceive(&mut self, query: &str, memory_ids: &[String], domain_hints: &[String]) {
         if let Some(ref mut step) = self.current_step {
             step.execution.memory_context = Some(MemoryContext {
                 retrieved_memory_ids: memory_ids.to_vec(),
                 domain_hints: domain_hints.to_vec(),
-                boost_terms: boost_terms.to_vec(),
                 provenance: memory_ids.to_vec(),
                 governance_actions: memory_ids
                     .iter()
@@ -518,7 +511,6 @@ impl StepRecorder {
 
         if let Some(ref mut step) = self.current_step {
             step.execution.payload = StepPayload::Plan {
-                intent_signals: vec![],
                 available_tool_count: visible_tools.len(),
                 budget_tokens,
                 restricted_tools: vec![],
@@ -1391,8 +1383,13 @@ impl StepRecorder {
         consecutive_context_window_errors: u32,
     ) -> Option<HeavyCheckpoint> {
         let light = self.build_light_checkpoint()?;
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::PipelineHeavyCheckpointClone,
+            messages,
+        );
         Some(HeavyCheckpoint {
             light,
+            conversation_cursor: None,
             messages: messages.to_vec(),
             budget_remaining_tokens,
             budget_remaining_rounds,
@@ -1637,6 +1634,42 @@ mod tests {
     const TEST_USER_ID: &str = "test-user";
 
     #[test]
+    fn heavy_checkpoint_clone_preserves_structured_history_independently() {
+        let mut recorder = StepRecorder::new(TEST_USER_ID, "session-1", "task-1");
+        recorder.begin_turn(1);
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "run the structured tool round"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "bash", "arguments": "{\"command\":\"true\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call-1", "content": "ok"}),
+        ];
+
+        let checkpoint = recorder
+            .build_heavy_checkpoint(&messages, 20_000, 5, &[], &[])
+            .expect("active recorder should build a heavy checkpoint");
+        messages[0]["content"] = serde_json::json!("mutated after checkpoint");
+        messages.push(serde_json::json!({"role": "assistant", "content": "later"}));
+
+        assert_eq!(checkpoint.messages.len(), 3);
+        assert_eq!(
+            checkpoint.messages[0]["content"],
+            "run the structured tool round"
+        );
+        assert_eq!(
+            checkpoint.messages[1]["tool_calls"][0]["function"]["name"],
+            "bash"
+        );
+        assert_eq!(checkpoint.messages[2]["tool_call_id"], "call-1");
+    }
+
+    #[test]
     fn redact_credentials_redacts_assignments_but_keeps_token_counters() {
         let input = "OPENAI_API_KEY=sk-test-secret\npassword: hunter2\ntoken_count: 3";
         let (redacted, count) = redact_credentials_for_storage(input);
@@ -1765,7 +1798,6 @@ mod tests {
             "show me PRs",
             &["mem-1".into(), "mem-2".into()],
             &["github".into()],
-            &["pr".into(), "pull".into()],
         );
 
         let step = rec.current_step().unwrap();

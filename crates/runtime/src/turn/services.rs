@@ -233,6 +233,48 @@ impl DatabaseTurnObserverWorker {
     }
 }
 
+#[derive(serde::Serialize)]
+struct MemoryExtractionObservePayload<'a> {
+    messages: &'a [serde_json::Map<String, serde_json::Value>],
+    session_id: &'a str,
+}
+
+fn encode_memory_extraction_observe_payload(
+    request: &TurnObserverRequest,
+) -> Result<Vec<u8>, String> {
+    let site = astra_core::history_work::HistoryWorkSite::MemoryExtractionPayloadSerialization;
+    let result = serde_json::to_vec(&MemoryExtractionObservePayload {
+        messages: &request.messages,
+        session_id: &request.session_id,
+    });
+    match result {
+        Ok(payload) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    payload.len().try_into().unwrap_or(u64::MAX),
+                    request.messages.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                );
+            }
+            Ok(payload)
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            Err(format!("serialize memoria observer payload: {error}"))
+        }
+    }
+}
+
+fn reserve_memory_extraction_payload(
+    payload: &[u8],
+) -> astra_core::history_work::QueueBytesReservation {
+    astra_core::history_work::QueueBytesReservation::for_site(
+        astra_core::history_work::HistoryWorkSite::MemoryExtractionQueue,
+        payload.len().try_into().unwrap_or(u64::MAX),
+    )
+}
+
 #[async_trait]
 impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
     async fn persist(&self, plan: TurnCorePersistPlan) -> Result<TurnCorePersistOutcome, String> {
@@ -507,26 +549,30 @@ impl TurnObserverWorker for DatabaseTurnObserverWorker {
         if request.messages.is_empty() {
             return Ok(());
         }
-        let payload = serde_json::json!({
-            "messages": request.messages,
-            "session_id": request.session_id,
-        });
-        let response = reqwest::Client::builder()
+        let client = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        // Serialize exactly once, then retain and send that same byte buffer.
+        // Calling `.json(...)` here as well would hide the queue's actual byte
+        // weight behind a second serializer-owned allocation.
+        let payload = encode_memory_extraction_observe_payload(&request)?;
+        let queue_reservation = reserve_memory_extraction_payload(&payload);
+        let response = client
             .post(format!(
                 "{}/v1/observe",
                 self.base_url.trim_end_matches('/')
             ))
             .header("Authorization", format!("Bearer {master_key}"))
             .header("X-Impersonate-User", request.user_id)
-            .json(&payload)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
             .send()
-            .await
-            .map_err(|error| error.to_string())?;
+            .await;
+        drop(queue_reservation);
+        let response = response.map_err(|error| error.to_string())?;
         if response.status().is_success() {
             Ok(())
         } else {
@@ -753,6 +799,50 @@ mod tests {
     #[test]
     fn metadata_tool_name_none() {
         assert!(metadata_tool_name(None).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(history_work)]
+    fn memory_extraction_queue_uses_the_single_http_body_and_releases_it() {
+        let request = TurnObserverRequest {
+            user_id: "user-1".to_string(),
+            session_id: "session-1".to_string(),
+            messages: vec![
+                json!({"role": "user", "content": "hello"})
+                    .as_object()
+                    .expect("message object")
+                    .clone(),
+            ],
+            turn_count: 1,
+            session_start: None,
+        };
+        let payload =
+            encode_memory_extraction_observe_payload(&request).expect("serialize observer body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&payload).expect("valid JSON body"),
+            json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "session_id": "session-1",
+            })
+        );
+        let expected_bytes = payload.len().try_into().unwrap_or(u64::MAX);
+        let scenario =
+            astra_core::history_work::HistoryWorkScenario::begin("memory-extraction-queue-drop")
+                .expect("exclusive history-work scenario");
+
+        {
+            let reservation = reserve_memory_extraction_payload(&payload);
+            assert_eq!(reservation.bytes(), expected_bytes);
+        }
+
+        let report = scenario.finish().expect("history-work report");
+        let measurement = report
+            .scoped
+            .measurement(astra_core::history_work::HistoryWorkSite::MemoryExtractionQueue);
+        assert_eq!(measurement.events, 1);
+        assert_eq!(measurement.bytes, expected_bytes);
+        assert_eq!(measurement.queue_peak_bytes, expected_bytes);
+        assert_eq!(measurement.queue_current_bytes, 0);
     }
 
     #[test]

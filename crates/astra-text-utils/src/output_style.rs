@@ -205,9 +205,21 @@ fn parse_style_file(content: &str) -> (String, String) {
 
 /// Get the user's output styles directory (~/.astra/output-styles/).
 fn user_styles_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".astra")
+    let local_root = std::env::var_os("ASTRA_LOCAL_STATE_ROOT");
+    user_styles_dir_from(local_root.as_deref(), dirs::home_dir().as_deref())
+}
+
+fn user_styles_dir_from(
+    local_root: Option<&std::ffi::OsStr>,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
+    local_root
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            home.unwrap_or_else(|| std::path::Path::new("."))
+                .join(".astra")
+        })
         .join("output-styles")
 }
 
@@ -288,6 +300,17 @@ pub fn list_styles() -> Vec<(&'static str, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_astra_local_root_isolates_user_output_styles() {
+        assert_eq!(
+            user_styles_dir_from(
+                Some(std::ffi::OsStr::new("/isolated/astra")),
+                Some(std::path::Path::new("/developer/home")),
+            ),
+            PathBuf::from("/isolated/astra/output-styles")
+        );
+    }
 
     #[test]
     fn test_builtin_styles_exist() {

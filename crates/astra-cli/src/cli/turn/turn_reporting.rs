@@ -21,7 +21,12 @@ pub(crate) fn cache_hit_percentage(
     cache_read_tokens: u64,
     cache_creation_tokens: u64,
 ) -> f64 {
-    let total_input = prompt_tokens + cache_read_tokens + cache_creation_tokens;
+    let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        prompt_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+    )
+    .total_input_tokens();
     cache_read_tokens as f64 / total_input.max(1) as f64 * 100.0
 }
 
@@ -106,9 +111,13 @@ pub(crate) fn print_turn_status_line(
         format!("{:.1}s", elapsed.as_secs_f64())
     };
 
-    let total_input =
-        result.prompt_tokens + result.cache_read_tokens + result.cache_creation_tokens;
-    let total_tokens = total_input + result.completion_tokens;
+    let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        result.prompt_tokens,
+        result.cache_read_tokens,
+        result.cache_creation_tokens,
+    );
+    let total_input = normalized_input.total_input_tokens();
+    let total_tokens = normalized_input.total_tokens_with_output(result.completion_tokens);
     let tokens_str = compact_token_count(total_tokens);
     let prompt_short = compact_token_count(total_input);
     let completion_short = compact_token_count(result.completion_tokens);

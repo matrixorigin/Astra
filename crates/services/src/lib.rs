@@ -20,6 +20,7 @@ pub mod edge_context;
 pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
+pub mod execution_grant;
 pub mod harness;
 pub mod inference_execution;
 pub mod interaction_contract;
@@ -29,6 +30,7 @@ pub mod llm_trusted_domains;
 pub mod marketplace;
 pub mod marketplace_stats;
 pub mod mcp_registry;
+pub mod model_request_context;
 pub mod models;
 pub mod multi_agent;
 pub mod pagination;
@@ -48,10 +50,14 @@ pub mod session_analytics;
 pub mod session_artifact_store;
 pub mod session_audit;
 pub mod session_checkpoint;
+pub mod session_context_coordinator;
 pub mod session_fork;
+pub mod session_fork_coordinator;
+pub mod session_handoff;
 pub mod session_journal;
 pub(crate) mod session_lifecycle;
 pub mod session_memory_inventory;
+pub mod session_publish;
 pub mod session_reaper;
 pub mod session_restore;
 pub mod session_workspace;
@@ -70,6 +76,7 @@ pub mod tool_invocation_ledger;
 pub mod triggers;
 pub mod turn_intent_judge;
 pub mod verification;
+pub mod weighted_admission;
 pub mod workflows;
 pub mod workspace_records;
 
@@ -146,7 +153,8 @@ pub use auth::{
     ExternalCatalogResponse, ExternalLoginRequestData, ExternalProviderClient,
     ExternalProviderPublicRecord, ExternalRequestDescriptor, ExternalRuntimeContextRequestData,
     ExternalRuntimeContextResponse, ExternalSessionRecord, FernetTokenEncryptor,
-    HttpExternalProviderClient, ProviderRequestDescriptor, SessionCreateRequestData,
+    HttpExternalProviderClient, ProviderRequestDescriptor, ReauthenticationProofRecord,
+    ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
@@ -194,6 +202,7 @@ pub use events::{
     DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventListFilter,
     EventListRecord, EventRecord, EventService, UnconfiguredEventService,
 };
+pub use execution_grant::{ExecutionGrantError, ExecutionGrantSigner};
 pub use harness::{
     DatabaseHarnessService, HarnessCitationRecord, HarnessDecisionRequest, HarnessItemRecord,
     HarnessNodeCatalogRecord, HarnessRunRecord, HarnessService, HarnessSkillDraftRecord,
@@ -204,10 +213,11 @@ pub use harness::{
 };
 pub use inference_execution::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
-    InferenceProviderAttemptPlan, InferenceTerminalStatus, InferenceUsage,
-    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
-    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
-    plan_inference_provider_attempt, reconcile_inference_settlements,
+    InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
+    InferenceUsage, admit_inference_invocation, begin_inference_provider_attempt,
+    declare_inference_settlement, finish_inference_invocation, finish_inference_provider_attempt,
+    plan_inference_invocation, plan_inference_provider_attempt,
+    plan_inference_provider_attempt_with_context, reconcile_inference_settlements,
 };
 pub use interaction_contract::{
     InteractionContract, InteractionDurableStore, InteractionIdentity, InteractionKind,
@@ -237,6 +247,15 @@ pub use mcp_registry::{
     McpRegisterRequestData, McpRegisteredBindingRecord, McpRegisteredToolRecord,
     McpRegistryService, McpRuntimeBindingRecord, McpServerRequestData,
     UnconfiguredMcpRegistryService, mcp_binding_tool_namespace, mcp_schema_hash,
+};
+pub use model_request_context::{
+    MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestBudget, ModelRequestCache, ModelRequestCompaction,
+    ModelRequestComposition, ModelRequestContextEvent, ModelRequestContextRecord,
+    ModelRequestContextSeed, ModelRequestEventStage, ModelRequestIdentity, ModelRequestLineage,
+    ModelRequestMetricsRow, ModelRequestRolloutStage, ModelRequestTopology,
+    ModelRequestTraceCoverage, ModelRequestUsage, ModelRequestWireComposition,
+    aggregate_model_request_metrics, list_model_request_context_events,
+    model_request_trace_coverage,
 };
 pub use models::{
     AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
@@ -306,12 +325,31 @@ pub use session_artifact_store::{
     MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX, OwnerScope, OwnerScopeKind, SessionArtifactJsonRecord,
     SessionArtifactJsonStore, SessionArtifactListCursor, SessionArtifactListPage,
     SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
-    SessionArtifactStoreError, StoredSessionArtifact, local_owner_user_id,
-    local_session_artifact_store,
+    SessionArtifactStoreError, StoredSessionArtifact, configure_local_owner_scope,
+    local_owner_scope, local_owner_user_id, local_session_artifact_store,
+};
+pub use session_context_coordinator::{
+    AcquireWriterOutcome, CoordinatorClock, DatabaseSessionContextCoordinator,
+    FileSessionContextCoordinator, MaterializedConversationV1, ReserveTurnOutcome,
+    SessionAuthorityEventV1, SessionContextCoordinator, SessionContextCoordinatorError,
+    SystemCoordinatorClock, TransferWriterOutcome, WriterTransferConflictV1,
+    WriterTransferRequestV1,
 };
 pub use session_fork::{
     ForkBasisDimension, ForkBasisDimensionEvidence, ForkBasisEntry, ForkSessionOptions,
     ForkSessionResult, SessionForkBasisEvidenceV1, fork_local_session, verify_local_fork_basis,
+};
+pub use session_fork_coordinator::{
+    DatabaseSessionForkCoordinator, PrepareSessionForkV1, SessionForkCoordinatorError,
+};
+pub use session_handoff::{
+    AttachSessionOutcomeV1, AttachSessionRequestV1, DatabaseSessionHandoffService,
+    FenceSessionWriterOutcomeV1, HandoffTransitionPatchV1, RequestSessionHandoffV1,
+    SessionHandoffError, SessionHandoffEventV1, TransitionSessionHandoffV1,
+};
+pub use session_publish::{
+    DatabaseSessionPublishService, PublishJournalItemV1, PublishSessionOutcomeV1,
+    PublishSessionRequestV1, SessionPublishError,
 };
 pub use skill_auto_route_judge::{
     SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
@@ -370,6 +408,11 @@ pub use turn_intent_judge::{
 };
 pub use verification::{
     SubtaskVerificationReport, VerificationCriterion, VerificationResult, VerifierKind,
+};
+pub use weighted_admission::{
+    AdmissionWork, DatabaseWeightedAdmissionController, DistributedAdmissionError,
+    DistributedAdmissionPermit, DistributedAdmissionReservation, WeightedAdmissionController,
+    WeightedAdmissionError, WeightedAdmissionLimits, WeightedAdmissionPermit,
 };
 pub use workflows::{
     UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,

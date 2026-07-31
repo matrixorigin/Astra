@@ -230,11 +230,12 @@ pub(crate) fn flush_tail_buf_into_llm_forward(
 }
 
 fn capture_provider_response_id(event: &Value, target: &mut Option<String>) {
-    if event.get("type").and_then(Value::as_str) == Some("_inprocess_summary") {
-        *target = event
-            .get("provider_response_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
+    if matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("_provider_response_identity" | "_inprocess_summary")
+    ) && let Some(response_id) = event.get("provider_response_id").and_then(Value::as_str)
+    {
+        *target = Some(response_id.to_string());
     }
 }
 
@@ -369,6 +370,39 @@ mod tests {
         assert!(forwarded.is_empty());
         assert!(saw);
         assert_eq!(provider_response_id.as_deref(), Some("resp-42"));
+    }
+
+    #[test]
+    fn internal_identity_event_is_consumed_without_forwarding() {
+        let block = concat!(
+            "data: {\"type\":\"_provider_response_identity\",",
+            "\"provider_response_id\":\"resp-early-7\"}\n\n",
+        );
+        let mut saw_summary = false;
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut signature = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = Map::new();
+        let mut model = String::new();
+        let mut provider_response_id = None;
+
+        let forwarded = extend_forward_from_validated_sse_block(
+            block,
+            &mut saw_summary,
+            &mut text,
+            &mut reasoning,
+            &mut signature,
+            &mut tool_calls,
+            &mut usage,
+            &mut model,
+            &mut provider_response_id,
+        )
+        .expect("internal identity event is valid");
+
+        assert!(forwarded.is_empty());
+        assert!(!saw_summary);
+        assert_eq!(provider_response_id.as_deref(), Some("resp-early-7"));
     }
 
     #[test]

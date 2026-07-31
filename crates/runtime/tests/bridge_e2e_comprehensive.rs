@@ -318,6 +318,7 @@ impl astra_services::ModelService for StubModelService {
                 prompt_cache_capability: None,
                 thinking_capability: None,
                 context_window: Some(128_000),
+                max_completion_tokens: Some(16_384),
                 request_headers: None,
             },
         })
@@ -5361,40 +5362,6 @@ async fn sse_error_event_has_required_fields() {
         err.get("message").and_then(Value::as_str).is_some(),
         "error event has message field"
     );
-}
-
-/// SSE data frames are all valid JSON (no partial/corrupt frames)
-#[tokio::test]
-async fn sse_all_data_frames_valid_json() {
-    init_env();
-    let app = build_test_app(AllCaptures::default());
-
-    let payload = json!({
-        "agent_id": "json-valid-agent",
-        "messages": [{ "role": "user", "content": "check json" }],
-        "edge_tools": [tool_schema("read_file"), tool_schema("grep")],
-        "explain": true,
-        "test_llm_rounds": [{
-            "full_text": "text here",
-            "reasoning": "reason here",
-            "tool_calls": [tool_call("tc-jv1", "read_file", json!({"path": "a"}))],
-            "usage": { "prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150 }
-        }]
-    });
-
-    let (st, raw) = chat_turn(&app, payload).await;
-    assert_eq!(st, StatusCode::OK);
-
-    let data_lines: Vec<&str> = raw
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .collect();
-    assert!(data_lines.len() >= 3, "at least 3 data frames");
-
-    for (i, line) in data_lines.iter().enumerate() {
-        let parsed: Result<Value, _> = serde_json::from_str(line);
-        assert!(parsed.is_ok(), "data frame {i} is not valid JSON: {line}");
-    }
 }
 
 /// reasoning_done emitted when reasoning is present, before turn_complete

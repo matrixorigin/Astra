@@ -28,6 +28,27 @@ const STEP_EVENT_ARTIFACT_KIND: &str = "step_event";
 const STEP_BREAKPOINT_INDEX_ARTIFACT_KIND: &str = "step_breakpoint_index";
 const STEP_COMPOSITE_INDEX_ARTIFACT_KIND: &str = "step_composite_snapshot_index";
 
+fn observed_text_bytes(content: &str) -> u64 {
+    content.len().try_into().unwrap_or(u64::MAX)
+}
+
+fn record_observed_text(site: astra_core::history_work::HistoryWorkSite, content: &str) {
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_bytes(site, observed_text_bytes(content));
+    }
+}
+
+fn record_event_journal_read(bytes: usize, rows: usize) {
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::PipelineEventJournalRead,
+            bytes.try_into().unwrap_or(u64::MAX),
+            rows.try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
+}
+
 /// Recovery reads a recent tail rather than allowing one long-lived session
 /// to force an unbounded journal scan during resume.
 pub const STEP_EVENT_RECOVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -316,6 +337,10 @@ fn read_checkpoint_entry(
             return Ok(None);
         }
     };
+    record_observed_text(
+        astra_core::history_work::HistoryWorkSite::PipelineCheckpointRead,
+        &content,
+    );
     let envelope: VersionedStepArtifact<StepCheckpoint> = match serde_json::from_str(&content) {
         Ok(envelope) => envelope,
         Err(error) => {
@@ -371,6 +396,10 @@ pub fn write_step_checkpoint(
         session_id,
         checkpoint,
     )?;
+    record_observed_text(
+        astra_core::history_work::HistoryWorkSite::PipelineCheckpointSerialization,
+        &json,
+    );
 
     write_atomic_text(&path, &json, checkpoint_write_durability(checkpoint))?;
 
@@ -692,6 +721,10 @@ pub fn write_composite_snapshot_index(
         session_id,
         index,
     )?;
+    record_observed_text(
+        astra_core::history_work::HistoryWorkSite::PipelineCompositeIndexSerialization,
+        &json,
+    );
     write_atomic_text(&path, &json, WriteDurability::Durable)
 }
 
@@ -705,6 +738,10 @@ pub fn read_composite_snapshot_index(
         return Ok(astra_core::composite_snapshot::CompositeSnapshotIndex::default());
     }
     let content = std::fs::read_to_string(&path)?;
+    record_observed_text(
+        astra_core::history_work::HistoryWorkSite::PipelineCompositeIndexRead,
+        &content,
+    );
     let mut index: astra_core::composite_snapshot::CompositeSnapshotIndex =
         decode_versioned_step_artifact(
             STEP_COMPOSITE_INDEX_ARTIFACT_KIND,
@@ -845,7 +882,15 @@ impl FileBackedEventStore {
                 return events;
             }
         };
+        let observed_bytes = astra_core::history_work::instrumentation_enabled()
+            .then(|| {
+                file.metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.len().try_into().ok())
+            })
+            .flatten();
         let reader = std::io::BufReader::new(file);
+        let mut completed_read = true;
         for line in reader.lines() {
             let line = match line {
                 Ok(line) => line,
@@ -856,6 +901,7 @@ impl FileBackedEventStore {
                         error = %error,
                         "failed to read step event line during lenient replay"
                     );
+                    completed_read = false;
                     break;
                 }
             };
@@ -872,6 +918,9 @@ impl FileBackedEventStore {
                 }
             }
         }
+        if completed_read && let Some(bytes) = observed_bytes {
+            record_event_journal_read(bytes, events.len());
+        }
         events
     }
 
@@ -887,12 +936,24 @@ impl FileBackedEventStore {
         }
         use std::io::BufRead;
         let file = std::fs::File::open(&path)?;
+        let observed_bytes = astra_core::history_work::instrumentation_enabled()
+            .then(|| {
+                file.metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.len().try_into().ok())
+            })
+            .flatten();
         let reader = std::io::BufReader::new(file);
+        let mut observed_rows = 0_usize;
         for line in reader.lines() {
             let line = line?;
             if let Some(event) = Self::parse_event_line(user_id, session_id, &line)? {
                 visit(&event);
+                observed_rows = observed_rows.saturating_add(1);
             }
+        }
+        if let Some(bytes) = observed_bytes {
+            record_event_journal_read(bytes, observed_rows);
         }
         Ok(())
     }
@@ -1014,6 +1075,7 @@ impl FileBackedEventStore {
             events.drain(..events_dropped);
             prefix_truncated = true;
         }
+        record_event_journal_read(bytes_read, events.len());
         Ok(BoundedStepEventWindow {
             events,
             bytes_read,
@@ -1129,6 +1191,20 @@ mod tests {
 
     const TEST_USER_ID: &str = "test-user";
 
+    #[test]
+    fn observed_text_bytes_matches_exact_utf8_artifact_buffer() {
+        let content = r#"{"role":"user","content":"历史🙂"}"#;
+        assert_eq!(
+            observed_text_bytes(content),
+            u64::try_from(content.len()).expect("test buffer length fits u64")
+        );
+        assert!(
+            content.len() > content.chars().count(),
+            "instrumentation must count persisted bytes rather than Unicode scalar values"
+        );
+        assert_eq!(observed_text_bytes(""), 0);
+    }
+
     fn make_light(step_id: &str, progress: f64) -> LightCheckpoint {
         LightCheckpoint {
             protocol_version: PROTOCOL_VERSION,
@@ -1145,6 +1221,7 @@ mod tests {
     fn make_heavy(step_id: &str, messages: Vec<serde_json::Value>) -> HeavyCheckpoint {
         HeavyCheckpoint {
             light: make_light(step_id, 0.5),
+            conversation_cursor: None,
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 8,

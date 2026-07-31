@@ -26,7 +26,6 @@ use astra_runtime::{
         AgenticLoopState, CancellationState, ErrorRecoveryState, MessagingState, SkillState,
         StallTrackingState, StopHookState, TelemetryState, runtime_manifest_for_model,
     },
-    turn::chat_history_openai::openai_messages_from_repl_history,
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::edge_prompt_context::detect_project_languages,
     turn::stop_hooks_yaml::detect_turn_hook_sets,
@@ -281,6 +280,12 @@ pub(crate) async fn stream_chat_sse(
     }
     let effective_max_turn_input_tokens = RuntimeLimits::global()
         .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
+    if let Some(ref tx) = p.stream_event_tx {
+        let _ = tx.try_send(crate::cli::chat_stream::StreamEvent::ContextWindowPolicy {
+            raw_window_tokens: u64::from(context_window_tokens),
+            usable_input_tokens: effective_max_turn_input_tokens,
+        });
+    }
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
@@ -301,7 +306,11 @@ pub(crate) async fn stream_chat_sse(
     //      up the same key)
     // Pre-fix these were different ("ephemeral" vs None), so the
     // parent capture never happened and fork-cache probes were dead.
-    let parent_turn_run_id = format!("run-{}", uuid::Uuid::new_v4());
+    let parent_turn_run_id = p
+        .stream_json_emitter
+        .as_ref()
+        .map(|emitter| emitter.execution_id().to_string())
+        .unwrap_or_else(|| format!("run-{}", uuid::Uuid::new_v4()));
     let term_width = terminal_width_usize();
     // Tool policy and cache behavior follow the resolved model name, never the
     // opaque Offering identity used for admission.
@@ -491,7 +500,15 @@ pub(crate) async fn stream_chat_sse(
             }
         }
     }
-    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message);
+    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message).map_err(
+        |error| crate::TurnFailure {
+            error: error.to_string(),
+            partial: crate::PartialTurnData {
+                session_id: p.session_id.map(str::to_string),
+                ..Default::default()
+            },
+        },
+    )?;
     // Only the fresh user suffix starts this root execution transcript. The
     // preceding prompt history is inherited context, not a new conversation
     // item for this run.
@@ -702,6 +719,7 @@ pub(crate) async fn stream_chat_sse(
         plan_subtask_id: p.plan_subtask_id,
         plan_assemble_line_release: p.plan_assemble_line_release.clone(),
         stream_event_tx: p.stream_event_tx.clone(),
+        stream_json_emitter: p.stream_json_emitter.clone(),
         pending_ordered_stream_events: std::collections::VecDeque::new(),
         agent_live_event_sink: p.agent_live_event_sink.clone(),
         approval_request_tx: p.approval_request_tx,
@@ -842,7 +860,6 @@ pub(crate) async fn stream_chat_sse(
             turn_sigs: Vec::new(),
             turn_tool_names: Vec::new(),
             events: Vec::new(),
-            intent_tool_turns: Vec::new(),
             verdict_events: Vec::new(),
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
@@ -856,9 +873,6 @@ pub(crate) async fn stream_chat_sse(
             exploration_family_advisory_emitted: false,
             stronger_exploration_family_advisory_emitted: false,
             exploration_family_advisory_family: None,
-            intent_drift_advisory_emitted: false,
-            drift_nudge_count: 0,
-            last_drift_correction_round: 0,
             nudge_count: 0,
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
@@ -992,8 +1006,13 @@ pub(crate) async fn stream_chat_sse(
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
         session_turn: current_session_turn,
-        bridge_turn_chain_id: Some(uuid::Uuid::now_v7().to_string()),
-        bridge_user_query_event_id: Some(uuid::Uuid::now_v7().to_string()),
+        bridge_turn_chain_id: Some(parent_turn_run_id.clone()),
+        bridge_user_query_event_id: Some(
+            p.stream_json_emitter
+                .as_ref()
+                .map(|emitter| emitter.user_query_event_id().to_string())
+                .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+        ),
         turn_event_buffer: None,
         harness: {
             #[cfg(feature = "harness")]
@@ -1155,6 +1174,14 @@ pub(crate) async fn stream_chat_sse(
         current_session_id: state.current_session_id.as_deref(),
     });
 
+    // `turn_intent` is populated only by the strict LLM judge. Preserve
+    // unknown as `None`; post-turn consumers must not reclassify user text.
+    let routing_domain_hint = state
+        .turn_intent
+        .as_ref()
+        .and_then(|intent| intent.domain)
+        .map(|domain| domain.as_str().to_string());
+
     // Forward explain / verdict to TUI stream (if wired).
     if let Some(ref tx) = p.stream_event_tx {
         let explain_turns = state.telemetry.explain_turns.clone();
@@ -1189,7 +1216,7 @@ pub(crate) async fn stream_chat_sse(
                 cache_creation_tokens: Some(state.total_cache_creation),
                 tool_count: Some(tool_count),
                 llm_rounds: Some(state.llm_rounds_completed),
-                routing_domain_hint: None,
+                routing_domain_hint: routing_domain_hint.clone(),
                 assistant_output: Some(&state.final_text),
                 tool_call_records: &state.stall.tool_call_records,
                 visible_tools: Vec::new(),
@@ -1251,7 +1278,7 @@ pub(crate) async fn stream_chat_sse(
         ttft_ms: state.telemetry.first_ttft_ms,
         context_ms: state.telemetry.first_context_assembly_ms,
         memoria_ms: state.telemetry.first_memoria_ms,
-        routing_domain_hint: None,
+        routing_domain_hint,
         entity_learn_skipped_no_domain: false,
         pending_context_assembly_trace: state.telemetry.pending_context_assembly_trace,
         turn_observability_events: state
@@ -1357,12 +1384,24 @@ fn missing_model_selection_turn_failure(session_id: Option<&str>) -> crate::Turn
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum TurnMessageLoadError {
+    #[error(
+        "canonical prompt history is unavailable for a non-empty session; repair or resume from the canonical journal instead of using lossy display pairs"
+    )]
+    CanonicalHistoryRequired,
+}
+
 fn load_turn_messages(
     pre_loaded_messages: Option<Vec<serde_json::Value>>,
     history: &[(String, String)],
     current_message: &str,
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, TurnMessageLoadError> {
     if let Some(msgs) = pre_loaded_messages {
+        crate::cli::history_work::record_json_history(
+            astra_core::history_work::HistoryWorkSite::CliPromptContinuationSanitization,
+            &msgs,
+        );
         let (mut msgs, invalid_turn_semantics_dropped) = astra_turn_core::prompt_facing::
             recover_canonical_continuation_messages_with_turn_semantics(msgs);
         if invalid_turn_semantics_dropped > 0 {
@@ -1372,17 +1411,21 @@ fn load_turn_messages(
             );
         }
         msgs.push(json!({"role": "user", "content": current_message}));
-        return msgs;
+        return Ok(msgs);
     }
-    openai_messages_from_repl_history(history, current_message)
+    if !history.is_empty() {
+        return Err(TurnMessageLoadError::CanonicalHistoryRequired);
+    }
+    Ok(vec![json!({"role": "user", "content": current_message})])
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        circuit_breaker_config_from_tool_policy, detect_turn_hook_sets, load_turn_messages,
-        missing_model_selection_journal_event, missing_model_selection_turn_failure,
-        normalize_turn_model, refresh_root_permission_context, require_selected_turn_model,
+        TurnMessageLoadError, circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
+        load_turn_messages, missing_model_selection_journal_event,
+        missing_model_selection_turn_failure, normalize_turn_model,
+        refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
         step_recorder_for_cli_turn,
     };
@@ -1426,7 +1469,8 @@ mod tests {
             json!({"role": "assistant", "content": "明白，不做 review。"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "修复刚才发现的问题");
+        let messages = load_turn_messages(Some(preloaded), &[], "修复刚才发现的问题")
+            .expect("canonical messages");
 
         assert_eq!(messages.last().unwrap()["content"], "修复刚才发现的问题");
         assert!(
@@ -1464,7 +1508,8 @@ mod tests {
             json!({"role": "assistant", "content": "current answer"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "continue safely");
+        let messages = load_turn_messages(Some(preloaded), &[], "continue safely")
+            .expect("canonical messages");
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["content"], "current objective");
@@ -1493,13 +1538,31 @@ mod tests {
             json!({"role": "assistant", "content": "done"}),
         ];
 
-        let messages = load_turn_messages(Some(preloaded), &[], "what did you find?");
+        let messages = load_turn_messages(Some(preloaded), &[], "what did you find?")
+            .expect("canonical messages");
 
         assert_eq!(messages.len(), 5);
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
         assert_eq!(messages[2]["tool_call_id"], "call-1");
         assert_eq!(messages[2]["content"], "canonical evidence");
         assert_eq!(messages[4]["content"], "what did you find?");
+    }
+
+    #[test]
+    fn display_pair_history_cannot_become_a_healthy_prompt_source() {
+        let error = load_turn_messages(
+            None,
+            &[("old user".to_string(), "old assistant".to_string())],
+            "continue",
+        )
+        .expect_err("lossy display pairs must not enter the model prompt");
+        assert_eq!(error, TurnMessageLoadError::CanonicalHistoryRequired);
+
+        let fresh = load_turn_messages(None, &[], "new session").expect("fresh prompt");
+        assert_eq!(
+            fresh,
+            vec![json!({"role": "user", "content": "new session"})]
+        );
     }
 
     #[test]

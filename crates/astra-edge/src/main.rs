@@ -84,7 +84,7 @@ struct Args {
     edge_id: Option<String>,
 
     /// Auto-reconnect on disconnect
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
 }
 
@@ -342,16 +342,24 @@ fn canonical_workspace_dir(workspace_dir: &Path) -> Result<PathBuf, String> {
 }
 
 fn edge_invocation_journal_path(edge_id: &str, workspace_dir: &Path) -> PathBuf {
+    edge_invocation_journal_path_in_root(
+        edge_id,
+        workspace_dir,
+        astra_runtime_env::local_state_root_override(),
+    )
+}
+
+fn edge_invocation_journal_path_in_root(
+    edge_id: &str,
+    workspace_dir: &Path,
+    state_root: Option<PathBuf>,
+) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(edge_id.as_bytes());
     hasher.update([0]);
     hasher.update(workspace_dir.to_string_lossy().as_bytes());
     let key = format!("{:x}", hasher.finalize());
-    let base = CredentialStore::new()
-        .path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(".astra"));
+    let base = state_root.unwrap_or_else(astra_core::local_state::local_state_root);
     base.join("edge-invocations").join(format!("{key}.json"))
 }
 
@@ -1146,6 +1154,16 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
 
 #[tokio::main]
 async fn main() {
+    let process_capture =
+        match astra_core::history_work_baseline::ProductionProcessCaptureGuard::from_env(
+            astra_core::history_work_baseline::ProductionProcessRole::Edge,
+        ) {
+            Ok(process_capture) => process_capture,
+            Err(error) => {
+                eprintln!("Error: cannot start production baseline capture: {error}");
+                std::process::exit(2);
+            }
+        };
     let _ = astra_logging::init_from_env(
         astra_logging::LogInitConfig::new("info").with_service_name("astra-edge"),
     );
@@ -1213,6 +1231,12 @@ async fn main() {
     }
 
     astra_logging::shutdown_otel();
+    if let Some(process_capture) = process_capture
+        && let Err(error) = process_capture.finish()
+    {
+        eprintln!("Error: cannot finish production baseline capture: {error}");
+        exit_with_error = true;
+    }
     if exit_with_error {
         std::process::exit(1);
     }
@@ -1221,6 +1245,29 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_flag_accepts_an_explicit_false_for_bounded_process_runs() {
+        let args = Args::try_parse_from(["astra-edge", "--reconnect=false"])
+            .expect("explicit false must be a valid bounded-run configuration");
+
+        assert!(!args.reconnect);
+    }
+
+    #[test]
+    fn invocation_journal_honors_the_explicit_local_state_root() {
+        let root = std::env::temp_dir().join("astra-edge-isolated-state");
+        let workspace = std::env::temp_dir().join("astra-edge-workspace");
+        let path =
+            edge_invocation_journal_path_in_root("edge-test", &workspace, Some(root.clone()));
+
+        assert_eq!(path.parent().and_then(Path::parent), Some(root.as_path()));
+        assert_eq!(
+            path.parent().and_then(Path::file_name),
+            Some(std::ffi::OsStr::new("edge-invocations"))
+        );
+        assert_eq!(path.extension(), Some(std::ffi::OsStr::new("json")));
+    }
 
     #[test]
     fn invocation_tracker_deduplicates_and_fences_stale_completions() {

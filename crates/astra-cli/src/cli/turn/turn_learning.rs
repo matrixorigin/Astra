@@ -4,13 +4,12 @@ use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
 
 pub(crate) struct TurnLearningSnapshot {
-    pub routing: astra_turn_core::routing_engine::RoutingDecision,
     pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
 }
 
 pub(crate) fn analyze_chat_turn_learning(
     line: &str,
-    turn: u32,
+    _turn: u32,
     recent_tools: &[String],
     result: &StreamResult,
 ) -> TurnLearningSnapshot {
@@ -18,10 +17,7 @@ pub(crate) fn analyze_chat_turn_learning(
         TurnEvaluationTelemetry, current_evaluation_thresholds,
         evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
-    use astra_turn_core::routing_engine::RoutingEngine;
-
     let latest_user_input = result.latest_user_input(line);
-    let routing = RoutingEngine::analyze(&latest_user_input, turn, recent_tools, &[], vec![]);
 
     let has_verdict_warning = result.verdict_events.iter().any(|verdict| {
         verdict.severity.eq_ignore_ascii_case("warning")
@@ -68,7 +64,7 @@ pub(crate) fn analyze_chat_turn_learning(
             max_round_prompt_tokens,
         },
     );
-    TurnLearningSnapshot { routing, eval }
+    TurnLearningSnapshot { eval }
 }
 
 pub(crate) fn turn_quality_feedback_from_eval(

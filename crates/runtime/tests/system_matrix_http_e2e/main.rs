@@ -91,7 +91,7 @@
 //!   observability, plus memory health/metrics.
 //! - **`e2e_matrix_context_decision_chain`** — `POST /events` → `/context` → `/decisions` + `ctx_snapshots` /
 //!   `ctx_decision_audits` SQL.
-//! - **`e2e_matrix_chat_route_models`** — `POST /chat/route` shape + `GET /models`.
+//! - **`e2e_matrix_models`** — `GET /models` and model-access projections.
 //! - **`e2e_matrix_branches_cost_estimate_http`** — `POST /branches/cost-estimate` (JWT, numeric
 //!   estimate fields); 401 without auth (no DDL branch ops).
 //! - **`e2e_matrix_delegate_http_boundaries`** — `POST /chat` → `run_id`; `GET .../delegations`;
@@ -124,7 +124,6 @@ mod harness;
 mod journey_admin_smoke_matrix;
 mod journey_branches_matrix;
 mod journey_bridge_session_state;
-mod journey_chat_route_models_matrix;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_evaluation_reads_matrix;
@@ -132,6 +131,9 @@ mod journey_extended;
 mod journey_full;
 mod journey_full_capture_matrix;
 mod journey_meta_matrix;
+mod journey_models_matrix;
+mod journey_phase0_production_baseline;
+mod journey_phase0_production_topologies;
 mod journey_saas_negative_matrix;
 mod journey_saas_platform_matrix;
 mod journey_session_artifacts_matrix;
@@ -290,6 +292,30 @@ async fn e2e_matrix_stream_context_trace_persistence() {
 async fn e2e_matrix_stream_multi_turn_persistence() {
     require_system_e2e_env();
     journey_stream_persistence::run_stream_multi_turn_persistence().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + three real provider Offerings; dedicated Phase-0 ServerOnly baseline"]
+#[serial_test::serial(phase0_production_baseline)]
+async fn e2e_matrix_phase0_server_only_production_baseline() {
+    require_system_e2e_env();
+    journey_phase0_production_baseline::run_server_only_production_baseline().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + real provider + explicit production binary paths; complete Phase-0 topology baseline"]
+#[serial_test::serial(phase0_production_baseline)]
+async fn e2e_matrix_phase0_external_production_topologies() {
+    require_system_e2e_env();
+    journey_phase0_production_topologies::run_external_production_topologies().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + real provider + explicit production binary paths; exact Edge+Server × 1M diagnostic"]
+#[serial_test::serial(phase0_production_baseline)]
+async fn e2e_matrix_phase0_external_edge_server_m1() {
+    require_system_e2e_env();
+    journey_phase0_production_topologies::run_external_edge_server_m1().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -539,9 +565,9 @@ async fn e2e_matrix_context_decision_chain() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_chat_route_models() {
+async fn e2e_matrix_models() {
     require_system_e2e_env();
-    journey_chat_route_models_matrix::run_chat_route_and_models_smoke().await;
+    journey_models_matrix::run_models_smoke().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

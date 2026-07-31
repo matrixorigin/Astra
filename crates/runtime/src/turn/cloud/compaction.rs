@@ -103,9 +103,24 @@ fn duplicate_read_stub(path: &str) -> String {
 }
 
 fn serialized_value_chars(value: &Value) -> usize {
-    serde_json::to_string(value)
-        .map(|encoded| encoded.chars().count())
-        .unwrap_or(1)
+    let site = astra_core::history_work::HistoryWorkSite::CompactionHistorySerialization;
+    match serde_json::to_string(value) {
+        Ok(encoded) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    encoded.len().try_into().unwrap_or(u64::MAX),
+                    1,
+                    0,
+                );
+            }
+            encoded.chars().count()
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            1
+        }
+    }
 }
 
 fn serialized_message_chars(messages: &[Value]) -> usize {
@@ -122,6 +137,17 @@ fn tool_text_chars(message: &Value) -> usize {
             .sum(),
         _ => 0,
     }
+}
+
+fn truncate_text_with_suffix(text: &str, max_chars: usize, suffix: &str) -> String {
+    let suffix_chars = suffix.chars().count();
+    if suffix_chars >= max_chars {
+        return suffix.chars().take(max_chars).collect();
+    }
+    let retained_chars = max_chars - suffix_chars;
+    let mut truncated = text.chars().take(retained_chars).collect::<String>();
+    truncated.push_str(suffix);
+    truncated
 }
 
 fn truncate_tool_text_content(message: &mut Value, keep_chars: usize, suffix: &str) -> bool {
@@ -481,6 +507,10 @@ pub(crate) fn compact_tiered_impl(
     let messages_before = messages.len();
 
     if tier == CompactionTier::Normal {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         return CompactResult {
             messages: messages.to_vec(),
             boundary: None,
@@ -500,6 +530,10 @@ pub(crate) fn compact_tiered_impl(
     let total_chars = serialized_message_chars(messages);
 
     if total_chars <= budget_chars {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         return CompactResult {
             messages: messages.to_vec(),
             boundary: None,
@@ -510,6 +544,10 @@ pub(crate) fn compact_tiered_impl(
         };
     }
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+        messages,
+    );
     let mut compacted = messages.to_vec();
     let trunc_limit = match tier {
         CompactionTier::Normal => unreachable!(),
@@ -529,6 +567,7 @@ pub(crate) fn compact_tiered_impl(
     } else {
         tool_indices.len() - 1
     };
+    const TOOL_COMPACT_SUFFIX: &str = "\n...[compacted for context budget]";
     for &index in tool_indices.iter().take(compact_limit) {
         let meta = resolve_tool_call_meta(&compacted, index);
         let tool_name_s = meta.as_ref().map(|(n, _)| n.as_str());
@@ -567,13 +606,15 @@ pub(crate) fn compact_tiered_impl(
             && line_count > 5
         {
             let preview: String = content.lines().take(3).collect::<Vec<_>>().join("\n");
-            compacted[index]["content"] = Value::String(format!(
-                "{preview}\n...[{line_count} lines compacted — re-run tool if needed]"
-            ));
-        } else {
-            let truncated: String = content.chars().take(eff_limit).collect();
+            let suffix = format!("\n...[{line_count} lines compacted — re-run tool if needed]");
             compacted[index]["content"] =
-                Value::String(truncated + "\n...[compacted for context budget]");
+                Value::String(truncate_text_with_suffix(&preview, eff_limit, &suffix));
+        } else {
+            compacted[index]["content"] = Value::String(truncate_text_with_suffix(
+                content,
+                eff_limit,
+                TOOL_COMPACT_SUFFIX,
+            ));
         }
     }
 
@@ -589,6 +630,7 @@ pub(crate) fn compact_tiered_impl(
             })
             .collect();
         let asst_limit = trunc_limit * 2;
+        const ASSISTANT_COMPACT_SUFFIX: &str = "\n...[earlier response compacted]";
         if assistant_indices.len() > keep_recent_turns {
             let compact_count = assistant_indices.len() - keep_recent_turns;
             for &index in assistant_indices.iter().take(compact_count) {
@@ -597,9 +639,11 @@ pub(crate) fn compact_tiered_impl(
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if content.chars().count() > asst_limit {
-                    let truncated: String = content.chars().take(asst_limit).collect();
-                    compacted[index]["content"] =
-                        Value::String(truncated + "\n...[earlier response compacted]");
+                    compacted[index]["content"] = Value::String(truncate_text_with_suffix(
+                        content,
+                        asst_limit,
+                        ASSISTANT_COMPACT_SUFFIX,
+                    ));
                 }
             }
         }

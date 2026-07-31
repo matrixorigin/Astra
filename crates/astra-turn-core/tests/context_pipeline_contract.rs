@@ -39,6 +39,7 @@ fn build_sources() -> (
             run_id: "contract-run".into(),
             model_id: "claude-sonnet-4-6".into(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: 100_000,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),
@@ -92,6 +93,7 @@ fn bind_outputs_typed_artifacts_not_raw_string_only() {
     let plan_input = PlanInput {
         tokens: &turn.tokens,
         model_limit: session.model_limit,
+        pre_reserved_output_tokens: 0,
         recovery: &turn.recovery,
         latches: &latches,
         stats: &stats,

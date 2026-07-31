@@ -44,6 +44,10 @@ pub struct ContextPlan {
 pub struct PlanInput<'a> {
     pub tokens: &'a TokenAccounting,
     pub model_limit: u32,
+    /// Output capacity already excluded from `model_limit`. This keeps an
+    /// exact catalog completion reserve from being charged again as a
+    /// historical prediction.
+    pub pre_reserved_output_tokens: u32,
     pub recovery: &'a RecoveryState,
     pub latches: &'a SessionLatches,
     pub stats: &'a PipelineStats,
@@ -63,11 +67,18 @@ pub struct PlanInput<'a> {
 #[must_use]
 pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
     // 1. Compute reserves from historical response data
-    let reserves = input.stats.response_token_estimates.reserve_for(
+    let predicted_reserves = input.stats.response_token_estimates.reserve_for(
         input.model_id,
         input.query_source,
         input.recovery,
     );
+    let reserves = ContextReserves {
+        output_tokens: predicted_reserves
+            .output_tokens
+            .saturating_sub(input.pre_reserved_output_tokens),
+        thinking_tokens: predicted_reserves.thinking_tokens,
+        schema_tokens: predicted_reserves.schema_tokens,
+    };
 
     // 2. Compute raw and predictive pressure
     let pressure = ContextPressure::compute(
@@ -82,9 +93,9 @@ pub fn plan_turn(input: &PlanInput<'_>) -> ContextPlan {
 
     // 4. Allocate token budgets per section
     let section_history = input.stats.section_token_history();
-    // Section budgets describe usable input capacity, not the full
-    // input+output window. Reserve predicted output/thinking/schema growth
-    // exactly once before allocating prompt sections.
+    // Section budgets describe usable input capacity. Apply only risk not
+    // already covered by the runtime policy, exactly once, before allocating
+    // prompt sections.
     let effective_input_limit = input.model_limit.saturating_sub(reserves.total());
     if effective_input_limit == 0 {
         tracing::warn!(
@@ -287,6 +298,7 @@ mod tests {
         PlanInput {
             tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery,
             latches,
             stats,
@@ -434,6 +446,17 @@ mod tests {
             plan.budget.effective_limit,
             "the reserve must not be deducted a second time inside section allocation"
         );
+    }
+
+    #[test]
+    fn catalog_output_reserve_is_not_deducted_twice() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let mut input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        input.pre_reserved_output_tokens = 500;
+        let plan = plan_turn(&input);
+
+        assert_eq!(plan.reserves.output_tokens, 0);
+        assert_eq!(plan.budget.effective_limit, input.model_limit);
     }
 
     #[test]

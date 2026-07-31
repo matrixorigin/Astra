@@ -321,6 +321,14 @@ fn same_recovery_state(left: &StepCheckpoint, right: &StepCheckpoint) -> bool {
     let (StepCheckpoint::Heavy(left), StepCheckpoint::Heavy(right)) = (left, right) else {
         return false;
     };
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::FinalizationRecoveryComparison,
+        left.as_ref(),
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::FinalizationRecoveryComparison,
+        right.as_ref(),
+    );
     let mut left = (**left).clone();
     let mut right = (**right).clone();
     // Wall-clock write time is artifact metadata, not recoverable execution
@@ -354,6 +362,10 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .and_then(|ao| ao.to_json());
 
     let checkpoint_blocked_tools = checkpoint_blocked_tools(&state.restricted_tools);
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::FinalizationCheckpointClone,
+        &state.messages,
+    );
     let checkpoint_messages =
         astra_turn_core::runtime_scaffolding::sanitize_recoverable_runtime_messages(
             state.messages.clone(),
@@ -646,24 +658,6 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
                         error = %error,
                         "failed to append interruption record to session journal"
                     );
-                }
-            }
-        }
-
-        // Carry `UserCancelled` forward so the adaptive profile layer can
-        // skip scenario re-detection on the next turn. Without this gate,
-        // the aborted tool history leaks into ScenarioDetector and can
-        // falsely trigger an `Exploration` scenario (ratcheting the tool
-        // budget). Any non-UserCancelled interruption (timeout, error,
-        // stream_error, …) does NOT set the flag — only an explicit user
-        // cancel invalidates the tool-history-as-evidence signal.
-        if matches!(
-            interruption.kind,
-            astra_turn_core::interruption::InterruptionKind::UserCancelled
-        ) {
-            if let Some(ref session) = state.telemetry.observability_session {
-                if let Ok(mut guard) = session.write() {
-                    guard.previous_turn_user_cancelled = true;
                 }
             }
         }
@@ -977,9 +971,7 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     state.stall.search_fanout_advisory_emitted = false;
     state.stall.exploration_family_advisory_emitted = false;
     state.stall.stronger_exploration_family_advisory_emitted = false;
-    state.stall.intent_drift_advisory_emitted = false;
     state.hooks.completion_settlement = Default::default();
-    // NOTE: drift_nudge_count and last_drift_correction_round persist across turns
     state.stall.exploration_family_advisory_family = None;
     // Hard tool restrictions are owned by capability/permission boundaries.
     // Behavioral advisories no longer add entries here, so finalization must
@@ -1065,6 +1057,10 @@ fn maybe_run_memory_extraction(state: &mut AgenticLoopState) {
     // Total context size the model actually sees — uncached prompt +
     // cache reads + cache creation. Using `total_prompt` alone here
     // was a semantic bug: on prompt-cache-heavy sessions 90% of the
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::MemoryExtractionHistoryClone,
+        &state.messages,
+    );
     let req = crate::session_memory::ExtractionRequest {
         inference_scope: astra_turn_types::InferenceInvocationScope::Session {
             session_id,
@@ -1202,6 +1198,42 @@ mod tests {
 
         assert_eq!(state.final_text, "The code style is consistent.");
         assert!(state.final_text_streamed);
+    }
+
+    #[test]
+    fn recovery_state_comparison_ignores_timestamp_but_detects_structured_history_change() {
+        let mut state = make_state();
+        state.step_recorder.begin_turn(1);
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "inspect the checkpoint"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call-1", "content": "contents"}),
+        ];
+        let left = state
+            .step_recorder
+            .build_heavy_checkpoint(&messages, 10_000, 4, &[], &[])
+            .expect("active step produces heavy checkpoint");
+        let mut right = left.clone();
+        right.light.created_at = right.light.created_at.saturating_add(1);
+        let left = StepCheckpoint::Heavy(Box::new(left));
+        let mut right = StepCheckpoint::Heavy(Box::new(right));
+
+        assert!(same_recovery_state(&left, &right));
+        let StepCheckpoint::Heavy(right_heavy) = &mut right else {
+            unreachable!("test constructed a heavy checkpoint");
+        };
+        right_heavy
+            .messages
+            .push(serde_json::json!({"role": "assistant", "content": "changed"}));
+        assert!(!same_recovery_state(&left, &right));
     }
 
     struct SessionDirGuard(std::path::PathBuf);

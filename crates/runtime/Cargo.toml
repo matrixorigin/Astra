@@ -67,6 +67,7 @@ chrono.workspace = true
 dotenvy.workspace = true
 flate2.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -92,6 +93,7 @@ tempfile = "3"
 astra-core = { workspace = true, features = ["dev-defaults"] }
 criterion = { version = "0.5", default-features = false, features = ["html_reports", "async_tokio"] }
 futures-util.workspace = true
+nix.workspace = true
 serial_test = "3"
 sqlx.workspace = true
 # `test-util` enables `#[tokio::test(start_paused = true)]` and `tokio::time::pause`
@@ -114,4 +116,8 @@ required-features = ["harness"]
 
 [[bench]]
 name = "messaging"
+harness = false
+
+[[bench]]
+name = "context_history"
 harness = false

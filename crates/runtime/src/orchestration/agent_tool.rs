@@ -1037,68 +1037,8 @@ fn validate_agent_fanout_group_shape(
     validate_required_field(object, "group_id", &scope, shape)
 }
 
-fn coerce_fanout_start_input(args: &mut Value) {
-    let Some(object) = args.as_object_mut() else {
-        return;
-    };
-
-    // Coerce target_count from string "5" to integer 5.
-    if let Some(tc) = object.get_mut("target_count") {
-        if let Some(s) = tc.as_str() {
-            if let Ok(n) = s.parse::<u64>() {
-                *tc = Value::Number(n.into());
-            }
-        }
-    }
-
-    // Coerce slots from stringified JSON to array.
-    if let Some(slots_value) = object.get_mut("slots") {
-        if !slots_value.is_array() {
-            if let Some(s) = slots_value.as_str() {
-                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    if parsed.is_array() {
-                        *slots_value = parsed;
-                    }
-                }
-            }
-        }
-    }
-
-    // Coerce integer fields inside slots that may arrive as strings.
-    if let Some(slots) = object.get_mut("slots").and_then(Value::as_array_mut) {
-        for slot in slots {
-            if let Some(obj) = slot.as_object_mut() {
-                for key in &["max_turns", "max_output_tokens"] {
-                    if let Some(v) = obj.get_mut(*key) {
-                        if let Some(s) = v.as_str() {
-                            if let Ok(n) = s.parse::<u64>() {
-                                *v = Value::Number(n.into());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Coerce integer fields inside defaults that may arrive as strings.
-    if let Some(defaults) = object.get_mut("defaults").and_then(Value::as_object_mut) {
-        for key in &["max_turns", "max_output_tokens"] {
-            if let Some(v) = defaults.get_mut(*key) {
-                if let Some(s) = v.as_str() {
-                    if let Ok(n) = s.parse::<u64>() {
-                        *v = Value::Number(n.into());
-                    }
-                }
-            }
-        }
-    }
-}
-
 async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
-    let mut args = args.clone();
-    coerce_fanout_start_input(&mut args);
-    if let Err(e) = validate_agent_fanout_start_shape(&args) {
+    if let Err(e) = validate_agent_fanout_start_shape(args) {
         return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
     let ctx = match ctx {
@@ -3629,6 +3569,30 @@ mod tests {
         assert!(result.contains("unknown field `brief`"), "{result}");
         assert!(result.contains("slots[i].prompt"), "{result}");
         assert!(result.contains("There is no top-level brief"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_rejects_wrong_json_types_without_repairing_them() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("deepseek-chat"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": "1",
+                "slots": "[{\"description\":\"Review\",\"prompt\":\"Review\"}]"
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(
+            result.contains("slots") && result.contains("must be an array"),
+            "{result}"
+        );
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
     }

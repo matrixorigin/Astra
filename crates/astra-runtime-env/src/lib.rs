@@ -16,6 +16,7 @@
 
 mod binding;
 mod capability;
+mod local_state;
 mod policy;
 mod provider;
 mod runtime_environment;
@@ -25,6 +26,7 @@ mod workspace;
 
 pub use binding::*;
 pub use capability::*;
+pub use local_state::*;
 pub use policy::*;
 pub use provider::*;
 pub use runtime_environment::*;

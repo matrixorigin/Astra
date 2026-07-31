@@ -894,7 +894,12 @@ pub fn render_recent_round_history_markdown(rounds: &[RoundSnapshotEntry]) -> St
         } else {
             markdown_cell_or_dash(&r.tool_call_names.join(","))
         };
-        let input_total = r.prompt_tokens + r.cache_read_tokens + r.cache_creation_tokens;
+        let input_total = astra_turn_types::NormalizedPromptCacheUsage::new(
+            r.prompt_tokens,
+            r.cache_read_tokens,
+            r.cache_creation_tokens,
+        )
+        .total_input_tokens();
         let cache_hit = if input_total > 0 {
             (r.cache_read_tokens as f64 / input_total as f64) * 100.0
         } else {
@@ -920,7 +925,12 @@ pub fn render_recent_round_history_markdown(rounds: &[RoundSnapshotEntry]) -> St
     let total_cache_read: u64 = rounds.iter().map(|r| r.cache_read_tokens).sum();
     let total_cache_create: u64 = rounds.iter().map(|r| r.cache_creation_tokens).sum();
     let total_completion: u64 = rounds.iter().map(|r| r.completion_tokens).sum();
-    let total_input = total_prompt + total_cache_read + total_cache_create;
+    let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        total_prompt,
+        total_cache_read,
+        total_cache_create,
+    )
+    .total_input_tokens();
     let cache_hit = if total_input > 0 {
         (total_cache_read as f64 / total_input as f64) * 100.0
     } else {

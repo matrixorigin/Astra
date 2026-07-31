@@ -149,6 +149,7 @@ impl ContextPipeline {
         let preliminary_plan_input = PlanInput {
             tokens: input.tokens,
             model_limit: input.model_limit,
+            pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,
             recovery: input.recovery,
             latches: input.latches,
             stats: input.sources.stats,
@@ -180,6 +181,7 @@ impl ContextPipeline {
         let final_plan_input = PlanInput {
             tokens: &measured,
             model_limit: input.model_limit,
+            pre_reserved_output_tokens: input.sources.session.pre_reserved_output_tokens,
             recovery: input.recovery,
             latches: input.latches,
             stats: input.sources.stats,
@@ -197,6 +199,14 @@ impl ContextPipeline {
         } else {
             bind_sections(&plan, input.sources)
         };
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ContextBinding,
+            &input.sources.turn.messages,
+        );
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::ContextBinding,
+            &input.sources.agent.tool_schemas,
+        );
         let bound = ContextBound {
             sections,
             messages: input.sources.turn.messages.clone(),
@@ -287,14 +297,33 @@ fn estimate_bound_input_tokens(
 }
 
 fn estimate_json_values_tokens(values: &[serde_json::Value]) -> u32 {
-    values
+    let mut serialized_bytes = 0_u64;
+    let tokens = values
         .iter()
-        .map(|value| {
-            serde_json::to_string(value)
-                .map(|encoded| estimate_text_tokens(&encoded).max(1))
-                .unwrap_or(1)
+        .map(|value| match serde_json::to_string(value) {
+            Ok(encoded) => {
+                serialized_bytes = serialized_bytes
+                    .saturating_add(u64::try_from(encoded.len()).unwrap_or(u64::MAX));
+                estimate_text_tokens(&encoded).max(1)
+            }
+            Err(error) => {
+                astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::ContextBinding,
+                    &error,
+                );
+                1
+            }
         })
-        .fold(0_u32, u32::saturating_add)
+        .fold(0_u32, u32::saturating_add);
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ContextBinding,
+            serialized_bytes,
+            u64::try_from(values.len()).unwrap_or(u64::MAX),
+            0,
+        );
+    }
+    tokens
 }
 
 pub struct PipelineRunInput<'a> {

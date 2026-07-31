@@ -31,9 +31,18 @@ use crate::turn::bedrock::stream::{
 use crate::turn::bridge::sse_helpers::render_sse;
 use crate::turn::llm::client::{
     LlmCallResult, LlmCancel, LlmStreamCallback, LlmStreamUpdate, ProviderAttemptObserver,
-    finish_observed_provider_attempt, finish_observed_provider_error,
+    finish_observed_provider_attempt, finish_observed_provider_error_with_partial,
     provider_attempt_terminal_from_result,
 };
+
+fn bedrock_response_id(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get("x-amzn-requestid")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
 
 fn ledger_stream_error(error: &astra_core::ClassifiedError) -> Bytes {
     render_sse(&json!({
@@ -58,11 +67,13 @@ async fn finish_bedrock_attempt_error(
     observer: Option<&Arc<dyn ProviderAttemptObserver>>,
     attempt_index: Option<u32>,
     error: &astra_core::ClassifiedError,
+    partial: &LlmCallResult,
 ) -> Option<Bytes> {
-    finish_observed_provider_error(
+    finish_observed_provider_error_with_partial(
         observer.map(|observer| observer.as_ref()),
         attempt_index,
         error,
+        partial,
     )
     .await
     .err()
@@ -122,24 +133,39 @@ pub(crate) fn bedrock_stream_response_bytes(
     stream! {
         let mut decoder = FrameDecoder::new();
         let mut accum = BedrockStreamAccumulator::new();
+        let provider_response_id = bedrock_response_id(&response);
+        accum.set_provider_response_id(provider_response_id.clone());
         let mut byte_stream = response.bytes_stream();
+        let partial_result = |accum: &BedrockStreamAccumulator| {
+            accum
+                .clone()
+                .into_result(&model_name, started.elapsed().as_millis() as u64)
+        };
+        if let Some(provider_response_id) = provider_response_id {
+            yield render_sse(&json!({
+                "type": "_provider_response_identity",
+                "provider_response_id": provider_response_id,
+            }));
+        }
 
         'body: loop {
             // Cancellation wins over everything.
             if let Some(ct) = cancel.as_ref()
                 && ct.is_cancelled()
             {
-                if accum.has_message_stop() {
+                if accum.has_complete_terminal_facts() {
                     break;
                 }
                 let error = astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::StreamTransport,
                     "Bedrock stream delivery became unknown after client disconnect",
                 );
+                let partial = partial_result(&accum);
                 if let Some(ledger_error) = finish_bedrock_attempt_error(
                     attempt_observer.as_ref(),
                     observed_attempt,
                     &error,
+                    &partial,
                 ).await {
                     yield ledger_error;
                     return;
@@ -163,16 +189,18 @@ pub(crate) fn bedrock_stream_response_bytes(
             let chunk_result = match next {
                 Ok(Some(c)) => c,
                 Ok(None) => break,
-                Err(_elapsed) if accum.has_message_stop() => break,
+                Err(_elapsed) if accum.has_complete_terminal_facts() => break,
                 Err(_elapsed) => {
                     let error = astra_core::ClassifiedError::new(
                         astra_core::ErrorKind::StreamIdle,
                         format!("bedrock stream idle > {}ms", idle.as_millis()),
                     );
+                    let partial = partial_result(&accum);
                     if let Some(ledger_error) = finish_bedrock_attempt_error(
                         attempt_observer.as_ref(),
                         observed_attempt,
                         &error,
+                        &partial,
                     ).await {
                         yield ledger_error;
                         return;
@@ -189,16 +217,18 @@ pub(crate) fn bedrock_stream_response_bytes(
             };
             let chunk = match chunk_result {
                 Ok(b) => b,
-                Err(_error) if accum.has_message_stop() => break,
+                Err(_error) if accum.has_complete_terminal_facts() => break,
                 Err(e) => {
                     let error = astra_core::ClassifiedError::new(
                         astra_core::ErrorKind::StreamTransport,
                         format!("bedrock transport error: {e}"),
                     );
+                    let partial = partial_result(&accum);
                     if let Some(ledger_error) = finish_bedrock_attempt_error(
                         attempt_observer.as_ref(),
                         observed_attempt,
                         &error,
+                        &partial,
                     ).await {
                         yield ledger_error;
                         return;
@@ -224,10 +254,12 @@ pub(crate) fn bedrock_stream_response_bytes(
                                 for ev in events {
                                     if let BedrockStreamEvent::Exception { kind, message } = &ev {
                                         let error = bedrock_exception_error(kind, message);
+                                        let partial = partial_result(&accum);
                                         if let Some(ledger_error) = finish_bedrock_attempt_error(
                                             attempt_observer.as_ref(),
                                             observed_attempt,
                                             &error,
+                                            &partial,
                                         ).await {
                                             yield ledger_error;
                                             return;
@@ -243,17 +275,19 @@ pub(crate) fn bedrock_stream_response_bytes(
                                 }
                             }
                             Err(e) => {
-                                if accum.has_message_stop() {
+                                if accum.has_complete_terminal_facts() {
                                     break 'body;
                                 }
                                 let error = astra_core::ClassifiedError::new(
                                     astra_core::ErrorKind::StreamTransport,
                                     format!("bedrock frame parse: {e}"),
                                 );
+                                let partial = partial_result(&accum);
                                 if let Some(ledger_error) = finish_bedrock_attempt_error(
                                     attempt_observer.as_ref(),
                                     observed_attempt,
                                     &error,
+                                    &partial,
                                 ).await {
                                     yield ledger_error;
                                     return;
@@ -271,17 +305,19 @@ pub(crate) fn bedrock_stream_response_bytes(
                     }
                     Ok(None) => break, // need more bytes
                     Err(e) => {
-                        if accum.has_message_stop() {
+                        if accum.has_complete_terminal_facts() {
                             break 'body;
                         }
                         let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::StreamTransport,
                             format!("bedrock eventstream decode: {e}"),
                         );
+                        let partial = partial_result(&accum);
                         if let Some(ledger_error) = finish_bedrock_attempt_error(
                             attempt_observer.as_ref(),
                             observed_attempt,
                             &error,
+                            &partial,
                         ).await {
                             yield ledger_error;
                             return;
@@ -304,15 +340,22 @@ pub(crate) fn bedrock_stream_response_bytes(
             // a short grace period so a broken keepalive cannot stall finish.
         }
 
-        if !accum.has_message_stop() {
+        if !accum.has_complete_terminal_facts() {
+            let missing_fact = if accum.has_message_stop() {
+                "trailing usage metadata"
+            } else {
+                "messageStop"
+            };
             let error = astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::StreamTransport,
-                "Bedrock stream ended without messageStop",
+                format!("Bedrock stream ended without {missing_fact}"),
             );
+            let partial = partial_result(&accum);
             if let Some(ledger_error) = finish_bedrock_attempt_error(
                 attempt_observer.as_ref(),
                 observed_attempt,
                 &error,
+                &partial,
             ).await {
                 yield ledger_error;
                 return;
@@ -416,6 +459,7 @@ pub(crate) async fn collect_bedrock_stream(
 ) -> Result<LlmCallResult, BedrockStreamError> {
     let mut decoder = FrameDecoder::new();
     let mut accum = BedrockStreamAccumulator::new();
+    accum.set_provider_response_id(bedrock_response_id(&response));
     let mut byte_stream = response.bytes_stream();
     let partial = |accum: &BedrockStreamAccumulator| {
         accum
@@ -425,7 +469,7 @@ pub(crate) async fn collect_bedrock_stream(
 
     'body: loop {
         if cancel.is_triggered() {
-            if accum.has_message_stop() {
+            if accum.has_complete_terminal_facts() {
                 break;
             }
             return Err(BedrockStreamError::Cancelled {
@@ -442,7 +486,7 @@ pub(crate) async fn collect_bedrock_stream(
         let chunk_result = match next {
             Ok(Some(c)) => c,
             Ok(None) => break, // end of stream
-            Err(_elapsed) if accum.has_message_stop() => break,
+            Err(_elapsed) if accum.has_complete_terminal_facts() => break,
             Err(_elapsed) => {
                 return Err(BedrockStreamError::Transport {
                     error: format!("bedrock stream idle > {}ms", idle.as_millis()),
@@ -453,7 +497,7 @@ pub(crate) async fn collect_bedrock_stream(
 
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
-            Err(_error) if accum.has_message_stop() => break,
+            Err(_error) if accum.has_complete_terminal_facts() => break,
             Err(error) => {
                 return Err(BedrockStreamError::Transport {
                     error: error.to_string(),
@@ -467,7 +511,7 @@ pub(crate) async fn collect_bedrock_stream(
             let frame = match decoder.try_next_frame() {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
-                Err(_error) if accum.has_message_stop() => break 'body,
+                Err(_error) if accum.has_complete_terminal_facts() => break 'body,
                 Err(error) => {
                     return Err(BedrockStreamError::Transport {
                         error: error.to_string(),
@@ -477,7 +521,7 @@ pub(crate) async fn collect_bedrock_stream(
             };
             let events = match accum.push_frame(&frame) {
                 Ok(events) => events,
-                Err(_error) if accum.has_message_stop() => break 'body,
+                Err(_error) if accum.has_complete_terminal_facts() => break 'body,
                 Err(error) => {
                     return Err(BedrockStreamError::Transport {
                         error: error.to_string(),
@@ -533,9 +577,14 @@ pub(crate) async fn collect_bedrock_stream(
         // `messageStop`, bounded by the short terminal-tail grace period.
     }
 
-    if !accum.has_message_stop() {
+    if !accum.has_complete_terminal_facts() {
+        let missing_fact = if accum.has_message_stop() {
+            "trailing usage metadata"
+        } else {
+            "messageStop"
+        };
         return Err(BedrockStreamError::Transport {
-            error: "bedrock stream ended without messageStop".to_string(),
+            error: format!("bedrock stream ended without {missing_fact}"),
             partial: partial(&accum),
         });
     }

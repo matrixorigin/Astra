@@ -75,11 +75,10 @@ struct TriggerEntry {
 
 /// Directories to search for agent Markdown files.
 pub fn agent_search_paths(project_root: &Path) -> Vec<PathBuf> {
-    let mut paths = vec![project_root.join(".astra/agents")];
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".astra/agents"));
-    }
-    paths
+    vec![
+        project_root.join(".astra/agents"),
+        astra_runtime_env::local_state_root().join("agents"),
+    ]
 }
 
 /// Load agent profiles from Markdown files found in search paths.

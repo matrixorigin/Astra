@@ -455,8 +455,14 @@ pub struct ResolvedActiveLlmModel {
     /// Probe-determined thinking capability. NULL if unprobed.
     pub thinking_capability: Option<ThinkingCapability>,
     /// Context window size from model config (`.models.yaml` or DB).
-    /// `None` means use the hardcoded fallback table.
+    /// `None` means use the generic documented fallback policy.
     pub context_window: Option<u32>,
+    /// Maximum completion size declared by the model catalog.
+    ///
+    /// This is execution metadata, not a per-request choice. Context-window
+    /// policy uses it to reserve output space without guessing from a model
+    /// name or from the raw window size.
+    pub max_completion_tokens: Option<u32>,
     /// Custom headers to send with every LLM request (not just probes).
     pub request_headers: Option<Map<String, Value>>,
 }
@@ -534,6 +540,7 @@ pub struct AdmittedModelExecution {
     pub cache_capability: Option<PromptCacheCapabilityData>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
+    pub max_completion_tokens: Option<u32>,
     pub header_overrides: HashMap<String, String>,
     pub completions_url_override: Option<String>,
     pub request_timeout_ms: Option<u64>,
@@ -554,6 +561,7 @@ impl AdmittedModelExecution {
             cache_capability: offering.model.prompt_cache_capability,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
+            max_completion_tokens: offering.model.max_completion_tokens,
             header_overrides,
             completions_url_override: None,
             request_timeout_ms: None,
@@ -580,6 +588,7 @@ impl AdmittedModelExecution {
             cache_capability: None,
             request_body_overrides: None,
             context_window: None,
+            max_completion_tokens: None,
             header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
             completions_url_override: Some(endpoint_url),
             request_timeout_ms: timeout_ms,
@@ -605,6 +614,8 @@ impl std::fmt::Debug for AdmittedModelExecution {
                 &self.completions_url_override.is_some(),
             )
             .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
             .finish()
     }
 }
@@ -685,6 +696,7 @@ impl std::fmt::Debug for ResolvedActiveLlmModel {
             .field("prompt_cache_capability", &self.prompt_cache_capability)
             .field("thinking_capability", &self.thinking_capability)
             .field("context_window", &self.context_window)
+            .field("max_completion_tokens", &self.max_completion_tokens)
             .finish()
     }
 }
@@ -963,6 +975,29 @@ fn build_resolved_active_llm_from_row(
         .try_get("context_window")
         .map_err(|e| format!("invalid infra_llm_models.context_window: {e}"))?;
     let context_window = model_context_window_from_db(context_window, &model_name)?;
+    let max_completion_tokens: Option<i32> = row
+        .try_get("max_completion_tokens")
+        .map_err(|e| format!("invalid infra_llm_models.max_completion_tokens: {e}"))?;
+    let max_completion_tokens = max_completion_tokens
+        .map(|tokens| {
+            let tokens = u32::try_from(tokens).map_err(|_| {
+                format!(
+                    "invalid infra_llm_models.max_completion_tokens for model '{model_name}': {tokens}"
+                )
+            })?;
+            if tokens == 0 {
+                return Err(format!(
+                    "invalid infra_llm_models.max_completion_tokens for model '{model_name}': must be positive"
+                ));
+            }
+            Ok(tokens)
+        })
+        .transpose()?;
+    if max_completion_tokens.is_some_and(|tokens| tokens >= context_window) {
+        return Err(format!(
+            "invalid infra_llm_models limits for model '{model_name}': max_completion_tokens must be smaller than context_window"
+        ));
+    }
 
     Ok(ResolvedActiveLlmModel {
         model_name,
@@ -976,6 +1011,7 @@ fn build_resolved_active_llm_from_row(
         prompt_cache_capability,
         thinking_capability,
         context_window: Some(context_window),
+        max_completion_tokens,
         request_headers,
     })
 }
@@ -1188,7 +1224,7 @@ const RESOLVE_COLS: &str = "\
     CAST(quirks AS CHAR) AS quirks_json, \
     CAST(pricing AS CHAR) AS pricing_json, \
     CAST(tags AS CHAR) AS tags_json, \
-    thinking_capability, context_window";
+    thinking_capability, context_window, max_completion_tokens";
 const REQUIRED_MODEL_SELECTION_ERROR: &str =
     astra_core::model_override::MISSING_MODEL_SELECTION_MESSAGE;
 
@@ -3853,6 +3889,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: Some(200_000),
+            max_completion_tokens: Some(16_384),
             request_headers: None,
         }
     }
@@ -4306,6 +4343,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
+            max_completion_tokens: None,
             request_headers: None,
         };
         assert_eq!(r.upstream_model_name(), "deepseek-v4-pro");
@@ -4327,6 +4365,7 @@ mod tests {
             prompt_cache_capability: None,
             thinking_capability: None,
             context_window: None,
+            max_completion_tokens: None,
             request_headers: None,
         };
         assert_eq!(r.upstream_model_name(), "claude-sonnet-4-6");

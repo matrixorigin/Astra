@@ -214,7 +214,7 @@ pub fn project_mcp_json_path() -> Option<PathBuf> {
 }
 
 pub fn global_mcp_json_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".astra").join("mcp.json"))
+    Some(astra_runtime_env::local_state_root().join("mcp.json"))
 }
 
 #[cfg(test)]

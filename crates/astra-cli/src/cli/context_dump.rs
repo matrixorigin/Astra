@@ -378,6 +378,11 @@ fn build_dump_from_journal(session_id: &str) -> Result<ContextDump, String> {
             _ => {}
         }
     }
+    crate::cli::history_work::record_text_payload(
+        astra_core::history_work::HistoryWorkSite::CliContextDumpJournalHistoryMaterialization,
+        chat.len(),
+        chat.iter().map(|turn| turn.text.as_str()),
+    );
 
     Ok(ContextDump {
         schema: SCHEMA_VERSION.to_string(),
@@ -443,6 +448,11 @@ fn write_json(path: &Path, dump: &ContextDump) -> Result<(), String> {
         fs::create_dir_all(parent).map_err(|e| format!("create parent dir: {e}"))?;
     }
     let body = serde_json::to_string_pretty(dump).map_err(|e| format!("serialize: {e}"))?;
+    crate::cli::history_work::record_existing_buffer(
+        astra_core::history_work::HistoryWorkSite::CliContextDumpSerialization,
+        body.as_bytes(),
+        dump.chat_history.len(),
+    );
     fs::write(path, body).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(())
 }
@@ -747,6 +757,7 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 transcript_item: None,
+                conversation_commit: None,
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: None,

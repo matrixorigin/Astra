@@ -16,6 +16,7 @@ async fn do_login_success() {
         "/auth/login",
         post(|| async {
             axum::Json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "tok-abc",
                 "refresh_token": "ref-xyz"
             }))
@@ -65,6 +66,7 @@ async fn do_login_preserves_existing_memoria_api_key() {
         "/auth/login",
         post(|| async {
             axum::Json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "tok-abc",
                 "refresh_token": "ref-xyz"
             }))
@@ -78,6 +80,7 @@ async fn do_login_preserves_existing_memoria_api_key() {
 
     let creds = load_credentials();
     let profile = creds.profiles.get("test-profile").unwrap();
+    assert_eq!(profile.account_id.as_deref(), Some("user-id-1"));
     assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
     assert_eq!(profile.access_token.as_deref(), Some("tok-abc"));
     assert_eq!(profile.refresh_token.as_deref(), Some("ref-xyz"));
@@ -85,13 +88,14 @@ async fn do_login_preserves_existing_memoria_api_key() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn do_login_preserves_last_session_for_same_username() {
+async fn do_login_preserves_last_session_for_same_account() {
     let _creds_dir = isolate_credentials();
     let mut creds = CredentialsFile::default();
     creds.profiles.insert(
         "test-profile".to_string(),
         Profile {
             username: Some("user1".to_string()),
+            account_id: Some("user-id-1".to_string()),
             last_session_id: Some("sess-123".to_string()),
             ..Default::default()
         },
@@ -102,6 +106,7 @@ async fn do_login_preserves_last_session_for_same_username() {
         "/auth/login",
         post(|| async {
             axum::Json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "tok-new",
                 "refresh_token": "ref-new"
             }))
@@ -123,13 +128,14 @@ async fn do_login_preserves_last_session_for_same_username() {
 
 #[serial_test::serial]
 #[tokio::test]
-async fn do_login_clears_last_session_for_different_username() {
+async fn do_login_clears_last_session_for_different_account() {
     let _creds_dir = isolate_credentials();
     let mut creds = CredentialsFile::default();
     creds.profiles.insert(
         "test-profile".to_string(),
         Profile {
             username: Some("user1".to_string()),
+            account_id: Some("user-id-1".to_string()),
             last_session_id: Some("sess-123".to_string()),
             memoria_api_key: Some("mem-key".to_string()),
             ..Default::default()
@@ -141,6 +147,7 @@ async fn do_login_clears_last_session_for_different_username() {
         "/auth/login",
         post(|| async {
             axum::Json(serde_json::json!({
+                "user_id": "user-id-2",
                 "access_token": "tok-new",
                 "refresh_token": "ref-new"
             }))
@@ -155,6 +162,7 @@ async fn do_login_clears_last_session_for_different_username() {
 
     let creds = load_credentials();
     let profile = &creds.profiles["test-profile"];
+    assert_eq!(profile.account_id.as_deref(), Some("user-id-2"));
     assert_eq!(profile.last_session_id, None);
     assert_eq!(profile.memoria_api_key.as_deref(), Some("mem-key"));
 }
@@ -181,6 +189,7 @@ async fn do_login_uses_astra_profile_when_cli_profile_absent() {
         "/auth/login",
         post(|| async {
             axum::Json(serde_json::json!({
+                "user_id": "user-id-1",
                 "access_token": "tok-env",
                 "refresh_token": "ref-env"
             }))
@@ -222,6 +231,7 @@ async fn do_register_success() {
 
     let creds = load_credentials();
     let profile = creds.profiles.get("test-profile").unwrap();
+    assert_eq!(profile.account_id.as_deref(), Some("user-123"));
     assert_eq!(profile.username.as_deref(), Some("newuser"));
     assert_eq!(profile.access_token.as_deref(), Some("tok-new"));
     assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));

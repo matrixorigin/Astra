@@ -86,6 +86,7 @@ impl MockLoopState {
             run_id: "run-1".into(),
             model_id: self.model_id.clone(),
             provider_name: "anthropic".into(),
+            pre_reserved_output_tokens: 0,
             model_limit: self.model_limit,
             provider_policy: ProviderCachePolicy::anthropic(),
             provider_strategy: ProviderCacheStrategy::default(),

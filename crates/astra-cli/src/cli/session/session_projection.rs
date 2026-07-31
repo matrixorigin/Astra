@@ -590,6 +590,14 @@ pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_jso
         .collect()
 }
 
+pub(crate) fn history_as_messages_for(
+    site: astra_core::history_work::HistoryWorkSite,
+    history: &[(String, String)],
+) -> Vec<serde_json::Value> {
+    crate::cli::history_work::record_pair_history(site, history);
+    history_as_messages(history)
+}
+
 /// Checkpoint-derived metadata available to CSL projection.
 ///
 /// This is intentionally empty: the conversation state log is prompt material,
@@ -611,6 +619,10 @@ pub(crate) fn build_full_session_state_compact(
     _prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
+        source_cursor: state
+            .active_conversation
+            .as_ref()
+            .map(|conversation| conversation.cursor().clone()),
         recent_tools: state.recent_tools.clone(),
         activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
         blocked_tools: Vec::new(),

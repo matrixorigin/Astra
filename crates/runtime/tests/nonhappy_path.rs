@@ -102,47 +102,6 @@ mod turn_guard_integration {
         json!({"function": {"name": name, "arguments": args}})
     }
 
-    /// Proves: repeated drift raises advisory evidence strength.
-    #[test]
-    fn drift_escalation_reaches_strong_advisory_after_three_observations() {
-        let mut guard = TurnGuard::new();
-        guard.drift_nudge_count = 3;
-
-        let verdict = guard.evaluate();
-        assert_eq!(verdict.severity, VerdictSeverity::Critical);
-        assert!(
-            verdict.advisory_threshold_reached,
-            "drift count >= 3 must reach the strong-advisory threshold"
-        );
-        assert!(
-            verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("intent drift") && m.contains("Recommendation")),
-            "must provide drift evidence and a recommendation"
-        );
-    }
-
-    /// Proves: drift escalation does NOT trigger below threshold
-    #[test]
-    fn drift_below_threshold_stays_healthy() {
-        let mut guard = TurnGuard::new();
-        guard.drift_nudge_count = 2;
-
-        let verdict = guard.evaluate();
-        assert!(
-            !verdict.advisory_threshold_reached,
-            "drift count < 3 must stay below the strong-advisory threshold"
-        );
-        assert!(
-            !verdict
-                .injections
-                .iter()
-                .any(|m| m.contains("intent drift") && m.contains("Recommendation")),
-            "must not inject strong drift evidence below the threshold"
-        );
-    }
-
     /// Proves: normal session produces no injections
     #[test]
     fn normal_session_stays_healthy() {
@@ -560,79 +519,6 @@ mod multi_file_edit_regression {
         let v4 = guard.evaluate();
         assert_eq!(v4.severity, VerdictSeverity::Healthy);
         assert!(v4.avoid_tools.is_empty());
-    }
-}
-
-// ── Input Guard Integration ─────────────────────────────────────────────────
-
-mod input_guards {
-    use astra_turn_core::tool_registry_state::ConversationState;
-
-    #[test]
-    fn empty_query_is_conversational() {
-        let state = ConversationState::from_message("", 1);
-        assert!(state.is_conversational);
-        assert_eq!(state.signal_count(), 0);
-    }
-
-    #[test]
-    fn whitespace_only_is_conversational() {
-        let state = ConversationState::from_message("   \n\t  ", 1);
-        assert!(state.is_conversational);
-    }
-
-    #[test]
-    fn pure_punctuation_is_conversational() {
-        let state = ConversationState::from_message("!!??...", 1);
-        assert!(state.is_conversational);
-    }
-
-    #[test]
-    fn pure_emoji_is_conversational() {
-        let state = ConversationState::from_message("🎉🎊✨", 1);
-        assert!(state.is_conversational);
-    }
-
-    #[test]
-    fn emoji_with_text_still_processes() {
-        let state = ConversationState::from_message("🔥 show me the commits", 1);
-        assert!(state.is_fetch, "show should trigger is_fetch");
-    }
-
-    #[test]
-    fn very_long_query_doesnt_hang() {
-        // 5000 chars should be truncated to 2000 internally
-        let long_query = "show me the ".repeat(400); // ~4800 chars
-        let start = std::time::Instant::now();
-        let state = ConversationState::from_message(&long_query, 1);
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed.as_millis() < 100,
-            "Should be fast even for long queries: {:?}",
-            elapsed
-        );
-        assert!(state.is_fetch, "Truncated query should still detect 'show'");
-    }
-
-    #[test]
-    fn numbers_only_not_conversational() {
-        // Numbers are alphanumeric → should proceed through normal processing
-        let state = ConversationState::from_message("12345", 1);
-        // Not conversational — numbers pass the has_content check
-        assert!(!state.is_conversational || state.signal_count() == 0);
-    }
-
-    #[test]
-    fn cjk_only_query_processes_normally() {
-        let state = ConversationState::from_message("查看最新的提交", 1);
-        assert!(state.is_fetch);
-        assert!(state.is_git);
-    }
-
-    #[test]
-    fn mixed_emoji_cjk_text() {
-        let state = ConversationState::from_message("📝 创建一个issue", 1);
-        assert!(state.is_mutate, "创建 should fire is_mutate");
     }
 }
 

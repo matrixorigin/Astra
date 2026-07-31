@@ -21,7 +21,10 @@ use crossterm::style::Stylize;
 use crate::cli;
 
 use cli::cli_config::cli_args::Cli;
-use cli::cli_config::cli_utils::{local_resumable_last_session_id, normalize_model_override_owned};
+use cli::cli_config::cli_utils::{
+    CliProfileIdentityAdmission, configure_cli_profile_identity, local_resumable_last_session_id,
+    normalize_model_override_owned,
+};
 use cli::command_router::{execute_cli_command, run_print_mode};
 use cli::exit_code::ExitCode;
 use cli::slash::slash_config;
@@ -40,9 +43,6 @@ pub(crate) use cli::session::session_state::SessionState;
 
 // ═══════════════════════════════════════════════════ Learning Merge ═══════
 // Cloud sync moved to cli/cloud_sync.rs
-
-#[cfg(test)]
-use cli::cloud_sync::try_cloud_push_preferences;
 
 // ═══════════════════════════════════════════════════════ Task Commands ════
 
@@ -114,9 +114,27 @@ mod trace_overlay_tests {
 }
 
 #[tokio::main]
-pub async fn run() {
-    dotenvy::dotenv().ok();
-    let cli = Cli::parse();
+pub async fn run() -> i32 {
+    let explicit_env_config = match astra_core::config::explicit_env_config_requested() {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return 2;
+        }
+    };
+    if !explicit_env_config {
+        dotenvy::dotenv().ok();
+    }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            if let Err(print_error) = error.print() {
+                eprintln!("Error: failed to render command-line diagnostics: {print_error}");
+            }
+            return exit_code;
+        }
+    };
     cli::diagnostic_log::init_cli_observability(&cli);
     let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
     let mut has_cli_overlay = false;
@@ -147,19 +165,19 @@ pub async fn run() {
                         "{}",
                         format!("Error: --settings JSON is invalid: {err}").red()
                     );
-                    std::process::exit(2);
+                    return 2;
                 }
             },
             Err(err) => {
                 eprintln!("{}", format!("Error: --settings: {err}").red());
-                std::process::exit(2);
+                return 2;
             }
         }
     }
     if let Some(turns) = cli.max_turns {
         let Ok(turns) = u32::try_from(turns) else {
             eprintln!("{}", "Error: --max-turns exceeds u32 range".red());
-            std::process::exit(2);
+            return 2;
         };
         cli_overlay.runtime_limits.max_turns = turns;
         has_cli_overlay = true;
@@ -175,7 +193,7 @@ pub async fn run() {
         }
         Err(err) => {
             eprintln!("{}", format!("Error: {err}").red());
-            std::process::exit(2);
+            return 2;
         }
     }
     // Apply safety.trust_mode from runtime config to the global guard.
@@ -200,7 +218,7 @@ pub async fn run() {
                 "{}",
                 format!("Error: failed to resolve API URL: {err}").red()
             );
-            std::process::exit(2);
+            return 2;
         }
     };
     let api = match astra_thin_client::ThinClient::new(&base, None) {
@@ -216,7 +234,7 @@ pub async fn run() {
                 "{}",
                 format!("Error: invalid API URL '{base}': {err}").red()
             );
-            std::process::exit(1);
+            return 1;
         }
     };
 
@@ -252,6 +270,20 @@ pub async fn run() {
         command,
     } = cli;
 
+    let identity_admission = command
+        .as_ref()
+        .map(cli::cli_config::cli_args::Command::profile_identity_admission)
+        .unwrap_or(CliProfileIdentityAdmission::RequireBoundAccount);
+    if let Err(error) = configure_cli_profile_identity(profile.as_deref(), identity_admission) {
+        tracing::error!(
+            target: "astra_cli",
+            %error,
+            "failed to bind the local profile/account identity"
+        );
+        eprintln!("{}", format!("Error: {error}").red());
+        return 1;
+    }
+
     let _ = (startup_trace, bare);
     let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
@@ -267,7 +299,7 @@ pub async fn run() {
         Err(err) => {
             tracing::error!(target: "astra_cli", error = %err, "invalid CLI startup context");
             eprintln!("{}", err.red());
-            std::process::exit(1);
+            return 1;
         }
     };
     // Preserve the historical process-wide signal for call sites that still
@@ -282,14 +314,17 @@ pub async fn run() {
     }
 
     // --system-prompt: support @file syntax to read from file
-    let system_prompt = system_prompt.map(|sp| match resolve_system_prompt(sp) {
-        Ok(content) => content,
-        Err(e) => {
-            tracing::error!(target: "astra_cli", error = %e, "failed to resolve --system-prompt");
-            eprintln!("{}", e.red());
-            std::process::exit(1);
-        }
-    });
+    let system_prompt = match system_prompt {
+        Some(system_prompt) => match resolve_system_prompt(system_prompt) {
+            Ok(content) => Some(content),
+            Err(e) => {
+                tracing::error!(target: "astra_cli", error = %e, "failed to resolve --system-prompt");
+                eprintln!("{}", e.red());
+                return 1;
+            }
+        },
+        None => None,
+    };
 
     // Merge project instructions into system_prompt for inline/print modes.
     // TUI mode handles this separately via the typed input preparation path.
@@ -311,25 +346,29 @@ pub async fn run() {
         if let Err(e) = cli::mcp_config::load_mcp_configs(&mcp_config) {
             tracing::error!(target: "astra_cli", error = %e, "failed to load MCP config");
             eprintln!("{}", format!("Error: failed to load MCP config: {e}").red());
-            std::process::exit(2);
+            return 2;
         }
     }
 
     // Resolve model: --model flag > config default_model > None
-    let config_default_model = match cli::config_manager::read_config_default_model() {
-        Ok(model) => model,
-        Err(err) => {
-            tracing::error!(
-                target: "astra_cli",
-                error = %err,
-                "failed to read default_model from settings"
-            );
-            eprintln!(
-                "{}",
-                format!("Error: failed to read default_model from settings: {err}").red()
-            );
-            std::process::exit(2);
+    let config_default_model = if cli_model.is_none() {
+        match cli::config_manager::read_config_default_model() {
+            Ok(model) => model,
+            Err(err) => {
+                tracing::error!(
+                    target: "astra_cli",
+                    error = %err,
+                    "failed to read default_model from settings"
+                );
+                eprintln!(
+                    "{}",
+                    format!("Error: failed to read default_model from settings: {err}").red()
+                );
+                return 2;
+            }
         }
+    } else {
+        None
     };
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
 
@@ -351,10 +390,10 @@ pub async fn run() {
         )
         .await
         {
-            Ok(code) => std::process::exit(i32::from(code)),
+            Ok(code) => return i32::from(code),
             Err(e) => {
                 eprintln!("{}", format!("Error: {e}").red());
-                std::process::exit(i32::from(ExitCode::ApiError));
+                return i32::from(ExitCode::ApiError);
             }
         }
     }
@@ -395,10 +434,10 @@ pub async fn run() {
                 )
                 .await;
                 match result {
-                    Ok(()) => std::process::exit(0),
+                    Ok(()) => return 0,
                     Err(e) => {
                         eprintln!("{}", format!("Error: {e}").red());
-                        std::process::exit(i32::from(ExitCode::ApiError));
+                        return i32::from(ExitCode::ApiError);
                     }
                 }
             }
@@ -407,7 +446,7 @@ pub async fn run() {
                     "{}",
                     "No previous session to continue. Start a new one with `astra`.".yellow()
                 );
-                std::process::exit(1);
+                return 1;
             }
         }
     }
@@ -425,12 +464,10 @@ pub async fn run() {
     )
     .await
     {
-        Ok(exit_code) => {
-            std::process::exit(i32::from(exit_code));
-        }
+        Ok(exit_code) => i32::from(exit_code),
         Err(e) => {
             eprintln!("{}", format!("Error: {e}").red());
-            std::process::exit(i32::from(ExitCode::ApiError));
+            i32::from(ExitCode::ApiError)
         }
     }
 }
@@ -442,7 +479,6 @@ mod tests {
     use super::{
         Cli, SessionState, cli, execute_cli_command, format_duration_short, format_plan_progress,
         format_project_instructions, handle_slash_command, resolve_system_prompt, session_journal,
-        try_cloud_push_preferences,
     };
     use astra_runtime::prompts;
     use axum::{Router, routing::get, routing::post};
@@ -454,11 +490,6 @@ mod tests {
     };
     use cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
-    };
-    use cli::cloud_sync::{
-        ASTRA_JOURNAL_CLOUD_EMPTY_ACK, CloudPullResult, append_cloud_pull_sync_journal,
-        cloud_pull_warrants_sync_marker, should_append_cloud_pull_journal, try_cloud_pull,
-        try_cloud_pull_preferences,
     };
     use cli::permission_manager;
     use cli::project_instructions::discover_instructions_from_paths;
@@ -509,6 +540,7 @@ mod tests {
             "/auth/login",
             post(|| async {
                 axum::Json(serde_json::json!({
+                    "user_id": "user-id-1",
                     "access_token": "tok-abc",
                     "refresh_token": "ref-xyz"
                 }))
@@ -566,6 +598,7 @@ mod tests {
 
         let creds = load_credentials();
         let profile = creds.profiles.get("test-profile").unwrap();
+        assert_eq!(profile.account_id.as_deref(), Some("user-123"));
         assert_eq!(profile.username.as_deref(), Some("newuser"));
         assert_eq!(profile.access_token.as_deref(), Some("tok-new"));
         assert_eq!(profile.refresh_token.as_deref(), Some("ref-new"));
@@ -898,6 +931,7 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
+                account_id: Some("account-close".to_string()),
                 access_token: Some("tok-default".to_string()),
                 ..Default::default()
             },
@@ -933,7 +967,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        result.expect("bound profile should authorize session close");
         let creds = load_credentials();
         assert_eq!(
             creds.profiles["other"].last_session_id.as_deref(),
@@ -950,6 +984,7 @@ mod tests {
         creds.profiles.insert(
             "default".to_string(),
             Profile {
+                account_id: Some("account-delete".to_string()),
                 access_token: Some("tok-default".to_string()),
                 ..Default::default()
             },
@@ -982,7 +1017,7 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_ok());
+        result.expect("bound profile should authorize session delete");
         let creds = load_credentials();
         assert_eq!(
             creds.profiles["other"].last_session_id.as_deref(),
@@ -1800,207 +1835,6 @@ total_tokens_out: 500
             .await
             .unwrap();
         assert!(!exit);
-    }
-
-    // ── Cloud sync regression tests (block_on panic fix cc6d011) ────
-    // These tests verify the async cloud sync functions don't panic when
-    // called from within a tokio runtime (the original bug was block_on
-    // inside an existing runtime). We unset MATRIXONE_HOST so they take
-    // the graceful-fallback path.
-
-    /// Without `ASTRA_API_URL`, the cloud-pull path returns
-    /// `cloud_reachable: false` instead of attempting any HTTP.
-    /// Verifies graceful offline degradation.
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn try_cloud_pull_returns_unreachable_without_cloud_base() {
-        let _api = crate::test_utils::ProcessEnvGuard::remove("ASTRA_API_URL");
-        let result = cli::cloud_sync::try_cloud_pull("default").await;
-        assert!(
-            !result.cloud_reachable,
-            "Without ASTRA_API_URL, cloud should be unreachable"
-        );
-    }
-
-    #[test]
-    fn cloud_pull_warrants_sync_marker_only_when_reachable_and_nonempty() {
-        let dead = CloudPullResult {
-            cloud_reachable: false,
-        };
-        assert!(!cloud_pull_warrants_sync_marker(&dead, &[]));
-        let online_empty = CloudPullResult {
-            cloud_reachable: true,
-        };
-        assert!(!cloud_pull_warrants_sync_marker(&online_empty, &[]));
-        assert!(cloud_pull_warrants_sync_marker(
-            &online_empty,
-            &["explain_mode".into()]
-        ));
-    }
-
-    #[test]
-    fn should_append_cloud_pull_journal_post_login_reachable_empty() {
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        assert!(should_append_cloud_pull_journal(&pull, &[], "post_login"));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn should_append_cloud_pull_journal_session_startup_empty_without_env() {
-        unsafe {
-            std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
-        }
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        assert!(!should_append_cloud_pull_journal(
-            &pull,
-            &[],
-            "session_startup"
-        ));
-    }
-
-    #[serial_test::serial]
-    #[test]
-    fn should_append_session_startup_when_empty_ack_env_set() {
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        unsafe {
-            std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
-        }
-        assert!(!should_append_cloud_pull_journal(
-            &pull,
-            &[],
-            "session_startup"
-        ));
-        unsafe {
-            std::env::set_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK, "1");
-        }
-        assert!(should_append_cloud_pull_journal(
-            &pull,
-            &[],
-            "session_startup"
-        ));
-        unsafe {
-            std::env::remove_var(ASTRA_JOURNAL_CLOUD_EMPTY_ACK);
-        }
-    }
-
-    #[test]
-    fn append_cloud_pull_sync_journal_skips_without_session_id() {
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        let state = SessionState::default();
-        append_cloud_pull_sync_journal(&state, "default", "session_startup", &pull, &[]);
-    }
-
-    #[test]
-    fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
-        let sid = format!("test-cloud-pull-journal-{}", uuid::Uuid::new_v4());
-        let state = SessionState {
-            session_id: Some(sid.clone()),
-            ..Default::default()
-        };
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        let prefs = vec!["explain_mode".to_string()];
-        append_cloud_pull_sync_journal(&state, "work", "session_startup", &pull, &prefs);
-        let events = session_journal::read_journal(&sid).expect("read journal");
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            session_journal::JournalEventType::SessionStart
-        );
-        let marker = events
-            .iter()
-            .find(|event| event.event_type == session_journal::JournalEventType::SyncMarker)
-            .expect("sync marker");
-        assert_eq!(
-            marker.event_type,
-            session_journal::JournalEventType::SyncMarker
-        );
-        let cp = marker
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("cloud_pull"))
-            .expect("cloud_pull");
-        assert_eq!(cp.get("profile").and_then(|v| v.as_str()), Some("work"));
-        assert_eq!(
-            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
-            Some(false)
-        );
-        std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
-    }
-
-    #[test]
-    fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
-        let sid = format!("test-cloud-pull-empty-{}", uuid::Uuid::new_v4());
-        let state = SessionState {
-            session_id: Some(sid.clone()),
-            ..Default::default()
-        };
-        let pull = CloudPullResult {
-            cloud_reachable: true,
-        };
-        append_cloud_pull_sync_journal(&state, "default", "post_login", &pull, &[]);
-        let events = session_journal::read_journal(&sid).expect("read journal");
-        assert_eq!(events.len(), 2);
-        assert_eq!(
-            events[0].event_type,
-            session_journal::JournalEventType::SessionStart
-        );
-        let marker = events
-            .iter()
-            .find(|event| event.event_type == session_journal::JournalEventType::SyncMarker)
-            .expect("sync marker");
-        let cp = marker
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("cloud_pull"))
-            .expect("cloud_pull");
-        assert_eq!(
-            cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        std::fs::remove_file(session_journal::journal_file_path(&sid)).ok();
-    }
-
-    #[tokio::test]
-    async fn try_cloud_pull_returns_empty_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let result = try_cloud_pull("default").await;
-        assert!(
-            !result.cloud_reachable,
-            "Without MatrixOne, cloud should be unreachable"
-        );
-    }
-
-    #[tokio::test]
-    async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let mut state = SessionState::default();
-        // Should not panic (was the original bug)
-        let keys = try_cloud_pull_preferences(&mut state).await;
-        assert!(keys.is_empty());
-    }
-
-    #[tokio::test]
-    async fn try_cloud_push_preferences_is_noop_without_matrixone() {
-        unsafe {
-            std::env::remove_var("MATRIXONE_HOST");
-        }
-        let state = SessionState::default();
-        // Should not panic (was the original bug)
-        try_cloud_push_preferences(&state).await;
     }
 
     #[test]

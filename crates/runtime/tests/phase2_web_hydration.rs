@@ -114,9 +114,9 @@ async fn insert_device_lease(
 ) {
     let sql = format!(
         "INSERT INTO session_device_leases
-         (lease_id, user_id, session_id, device_id, device_fingerprint, trust_level,
+         (lease_id, user_id, session_id, device_id, device_fingerprint, device_key_hash, trust_level,
           status, last_monotonic_id, expires_at, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 'new_device', 'active', 7, {expires_sql}, NOW(6), NOW(6))"
+         VALUES (?, ?, ?, ?, ?, ?, 'new_device', 'active', 7, {expires_sql}, NOW(6), NOW(6))"
     );
     sqlx::query(&sql)
         .bind(lease_id)
@@ -124,6 +124,7 @@ async fn insert_device_lease(
         .bind(session_id)
         .bind(device_id)
         .bind(fingerprint)
+        .bind(format!("{:x}", Sha256::digest(b"phase2-test-device-key")))
         .execute(pool.get())
         .await
         .unwrap();
@@ -300,7 +301,7 @@ async fn l2_15_revision_hash_changes_when_device_fingerprint_changes() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
-async fn l2_16_new_device_upgrade_requires_step_up_and_write_cas() {
+async fn l2_16_device_trust_transition_is_active_lease_cas_guarded() {
     let pool = setup_pool().await;
     let (session_id, user_id, _, lease_id) = ids();
     insert_session(&pool, &session_id, &user_id).await;
@@ -315,21 +316,17 @@ async fn l2_16_new_device_upgrade_requires_step_up_and_write_cas() {
     )
     .await;
 
-    let step_up_confirmation = true;
-    let updated = if step_up_confirmation {
-        sqlx::query(
-            "UPDATE session_device_leases
-             SET trust_level = 'trusted', updated_at = NOW(6)
-             WHERE lease_id = ? AND trust_level = 'new_device' AND last_monotonic_id = 7",
-        )
-        .bind(&lease_id)
-        .execute(pool.get())
-        .await
-        .unwrap()
-        .rows_affected()
-    } else {
-        0
-    };
+    let updated = sqlx::query(
+        "UPDATE session_device_leases
+         SET trust_level = 'trusted', updated_at = NOW(6)
+         WHERE lease_id = ? AND trust_level = 'new_device' AND status = 'active'
+           AND expires_at > NOW(6) AND last_monotonic_id = 7",
+    )
+    .bind(&lease_id)
+    .execute(pool.get())
+    .await
+    .unwrap()
+    .rows_affected();
     assert_eq!(updated, 1);
 }
 

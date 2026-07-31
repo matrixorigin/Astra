@@ -17,12 +17,14 @@ use uuid::Uuid;
 
 use crate::turn::bridge::sse_helpers::{render_classified_error_sse, render_sse};
 use crate::turn::llm::client::{
-    LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, ProviderAttemptObserver,
-    apply_llm_header_overrides, apply_provider_auth, build_provider_request_body_with_overrides,
-    classify_provider_send_error, finish_observed_provider_attempt, finish_observed_provider_error,
-    llm_request_url, llm_retry_base_ms, parse_openai_sse_json_stream,
-    provider_attempt_terminal_from_result, provider_uses_anthropic_messages,
-    provider_uses_bedrock_converse, sleep_ms_or_llm_cancel, split_think_chunks,
+    LLM_MAX_RETRIES, LlmCall, LlmCancel, LlmExecutionRoute, PreparedProviderRequest,
+    ProviderAttemptObserver, ProviderWireRequestIdentity, apply_llm_header_overrides,
+    apply_provider_auth, build_provider_request_body_with_overrides, classify_provider_send_error,
+    finish_observed_provider_attempt, finish_observed_provider_error,
+    finish_observed_provider_error_with_partial, llm_provider_protocol, llm_request_url,
+    llm_retry_base_ms, parse_openai_sse_json_stream, provider_attempt_terminal_from_result,
+    provider_uses_anthropic_messages, provider_uses_bedrock_converse, sleep_ms_or_llm_cancel,
+    split_think_chunks,
 };
 use astra_turn_core::bridge_rate_limit_cooldown::{
     CooldownReason, PerModelCooldown, RateLimitAction, is_overload_status, is_rate_limit_status,
@@ -43,6 +45,12 @@ fn bridge_retry_backoff_ms(attempt: u32) -> u64 {
         return ms;
     }
     llm_retry_base_ms() * (1 << (attempt - 1))
+}
+
+fn take_bridge_retry_delay_ms(attempt: u32, provider_delay: &mut Option<u64>) -> u64 {
+    provider_delay
+        .take()
+        .unwrap_or_else(|| bridge_retry_backoff_ms(attempt))
 }
 
 /// Returns `true` if `name` looks like a valid tool function name.
@@ -130,9 +138,10 @@ fn bridge_delivery_unknown_error(message: impl Into<String>) -> astra_core::Clas
 
 async fn begin_observed_attempt(
     observer: Option<&SharedAttemptObserver>,
+    wire: &ProviderWireRequestIdentity,
 ) -> Result<Option<u32>, astra_core::ClassifiedError> {
     match observer {
-        Some(observer) => observer.begin_attempt().await.map(Some),
+        Some(observer) => observer.begin_attempt(wire).await.map(Some),
         None => Ok(None),
     }
 }
@@ -156,6 +165,54 @@ async fn finish_stream_error(
     error: &astra_core::ClassifiedError,
 ) -> Result<(), astra_core::ClassifiedError> {
     finish_observed_provider_error(observer.map(AsRef::as_ref), attempt_index, error).await
+}
+
+async fn finish_stream_error_with_partial(
+    observer: Option<&SharedAttemptObserver>,
+    attempt_index: Option<u32>,
+    error: &astra_core::ClassifiedError,
+    partial: &crate::turn::llm::client::LlmCallResult,
+) -> Result<(), astra_core::ClassifiedError> {
+    finish_observed_provider_error_with_partial(
+        observer.map(AsRef::as_ref),
+        attempt_index,
+        error,
+        partial,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bridge_partial_result(
+    provider_response_id: &Option<String>,
+    full_text: &str,
+    reasoning: &str,
+    reasoning_signature: &str,
+    tool_calls_map: &std::collections::HashMap<usize, Map<String, Value>>,
+    usage: &Map<String, Value>,
+    model_name: &str,
+    started: std::time::Instant,
+    finish_reason: Option<&str>,
+) -> crate::turn::llm::client::LlmCallResult {
+    let mut tool_calls = tool_calls_map
+        .iter()
+        .map(|(index, tool_call)| (*index, Value::Object(tool_call.clone())))
+        .collect::<Vec<_>>();
+    tool_calls.sort_by_key(|(index, _)| *index);
+    crate::turn::llm::client::LlmCallResult {
+        response_id: provider_response_id.clone(),
+        full_text: full_text.to_string(),
+        reasoning: reasoning.to_string(),
+        reasoning_signature: reasoning_signature.to_string(),
+        tool_calls: tool_calls
+            .into_iter()
+            .map(|(_, tool_call)| tool_call)
+            .collect(),
+        usage: usage.clone(),
+        model_used: model_name.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        finish_reason: finish_reason.map(ToString::to_string),
+    }
 }
 
 fn classified_stream_error_event(error: &astra_core::ClassifiedError, code: &str) -> Bytes {
@@ -323,6 +380,8 @@ async fn bedrock_stream_with_retry(
         thinking,
         request_body_overrides,
     );
+    let prepared_request =
+        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
     let url = llm_request_url(
         base_url,
         completions_url_override,
@@ -335,6 +394,7 @@ async fn bedrock_stream_with_retry(
     let started = std::time::Instant::now();
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
+    let mut retry_delay_override = None;
 
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 && started.elapsed() > total_budget {
@@ -347,7 +407,7 @@ async fn bedrock_stream_with_retry(
             ));
         }
         if attempt > 0 {
-            let delay = bridge_retry_backoff_ms(attempt);
+            let delay = take_bridge_retry_delay_ms(attempt, &mut retry_delay_override);
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
         }
         if client_cancel
@@ -357,7 +417,8 @@ async fn bedrock_stream_with_retry(
             return Err(bridge_cancelled_error());
         }
 
-        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        let observed_attempt =
+            begin_observed_attempt(attempt_observer.as_ref(), prepared_request.identity()).await?;
         if client_cancel
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
@@ -394,7 +455,7 @@ async fn bedrock_stream_with_retry(
             attempt,
             "sending Bedrock inference request"
         );
-        let response = match req.json(&body).send().await {
+        let response = match req.body(prepared_request.body()).send().await {
             Ok(r) => r,
             Err(e) => {
                 let (error, retry_safe) =
@@ -465,9 +526,7 @@ async fn bedrock_stream_with_retry(
             "bedrock",
         ) {
             RetryDecision::Retry { delay_ms } => {
-                if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
-                }
+                retry_delay_override = delay_ms;
                 continue;
             }
             RetryDecision::UseFallback { reason } => {
@@ -551,6 +610,8 @@ async fn anthropic_stream_with_retry(
         thinking,
         request_body_overrides,
     );
+    let prepared_request =
+        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
     let url = llm_request_url(
         base_url,
         completions_url_override,
@@ -563,6 +624,7 @@ async fn anthropic_stream_with_retry(
     let started = std::time::Instant::now();
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
+    let mut retry_delay_override = None;
 
     for attempt in 0..=LLM_MAX_RETRIES {
         if attempt > 0 && started.elapsed() > total_budget {
@@ -575,7 +637,7 @@ async fn anthropic_stream_with_retry(
             ));
         }
         if attempt > 0 {
-            let delay = bridge_retry_backoff_ms(attempt);
+            let delay = take_bridge_retry_delay_ms(attempt, &mut retry_delay_override);
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
         }
         if client_cancel
@@ -585,7 +647,8 @@ async fn anthropic_stream_with_retry(
             return Err(bridge_cancelled_error());
         }
 
-        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        let observed_attempt =
+            begin_observed_attempt(attempt_observer.as_ref(), prepared_request.identity()).await?;
         if client_cancel
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
@@ -610,7 +673,7 @@ async fn anthropic_stream_with_retry(
             attempt,
             "sending Anthropic inference request"
         );
-        let response = match req.json(&body).send().await {
+        let response = match req.body(prepared_request.body()).send().await {
             Ok(r) => r,
             Err(e) => {
                 let (error, retry_safe) =
@@ -662,10 +725,22 @@ async fn anthropic_stream_with_retry(
                             let error = bridge_delivery_unknown_error(
                                 "Anthropic stream delivery became unknown after client disconnect",
                             );
-                            if let Err(ledger_error) = finish_stream_error(
+                            let partial = bridge_partial_result(
+                                &provider_response_id,
+                                &full_text,
+                                &reasoning,
+                                &reasoning_signature,
+                                &tool_calls_map,
+                                &usage,
+                                &model_name_for_summary,
+                                started,
+                                None,
+                            );
+                            if let Err(ledger_error) = finish_stream_error_with_partial(
                                 attempt_observer_for_stream.as_ref(),
                                 streaming_attempt.take(),
                                 &error,
+                                &partial,
                             ).await {
                                 yield classified_stream_error_event(
                                     &ledger_error,
@@ -691,10 +766,22 @@ async fn anthropic_stream_with_retry(
                                     astra_core::ErrorKind::StreamIdle,
                                     format!("anthropic SSE idle after {}ms", idle.as_millis()),
                                 );
-                                if let Err(ledger_error) = finish_stream_error(
+                                let partial = bridge_partial_result(
+                                    &provider_response_id,
+                                    &full_text,
+                                    &reasoning,
+                                    &reasoning_signature,
+                                    &tool_calls_map,
+                                    &usage,
+                                    &model_name_for_summary,
+                                    started,
+                                    None,
+                                );
+                                if let Err(ledger_error) = finish_stream_error_with_partial(
                                     attempt_observer_for_stream.as_ref(),
                                     streaming_attempt.take(),
                                     &stream_error,
+                                    &partial,
                                 ).await {
                                     yield classified_stream_error_event(
                                         &ledger_error,
@@ -720,10 +807,22 @@ async fn anthropic_stream_with_retry(
                                     let stream_error = bridge_delivery_unknown_error(format!(
                                         "anthropic SSE transport error: {e}"
                                     ));
-                                    if let Err(ledger_error) = finish_stream_error(
+                                    let partial = bridge_partial_result(
+                                        &provider_response_id,
+                                        &full_text,
+                                        &reasoning,
+                                        &reasoning_signature,
+                                        &tool_calls_map,
+                                        &usage,
+                                        &model_name_for_summary,
+                                        started,
+                                        None,
+                                    );
+                                    if let Err(ledger_error) = finish_stream_error_with_partial(
                                         attempt_observer_for_stream.as_ref(),
                                         streaming_attempt.take(),
                                         &stream_error,
+                                        &partial,
                                     ).await {
                                         yield classified_stream_error_event(
                                             &ledger_error,
@@ -740,11 +839,18 @@ async fn anthropic_stream_with_retry(
                                 }
                             };
                             if provider_response_id.is_none() {
-                                provider_response_id = chunk
+                                if let Some(response_id) = chunk
                                     .pointer("/message/id")
                                     .or_else(|| chunk.get("id"))
                                     .and_then(Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(ToString::to_string)
+                                {
+                                    provider_response_id = Some(response_id.clone());
+                                    yield render_sse(&json!({
+                                        "type": "_provider_response_identity",
+                                        "provider_response_id": response_id,
+                                    }));
+                                }
                             }
                             let message_stopped =
                                 chunk.get("type").and_then(Value::as_str) == Some("message_stop");
@@ -776,10 +882,22 @@ async fn anthropic_stream_with_retry(
                     let error = bridge_delivery_unknown_error(
                         "Anthropic SSE ended without message_stop",
                     );
-                    if let Err(ledger_error) = finish_stream_error(
+                    let partial = bridge_partial_result(
+                        &provider_response_id,
+                        &full_text,
+                        &reasoning,
+                        &reasoning_signature,
+                        &tool_calls_map,
+                        &usage,
+                        &model_name_for_summary,
+                        started,
+                        None,
+                    );
+                    if let Err(ledger_error) = finish_stream_error_with_partial(
                         attempt_observer_for_stream.as_ref(),
                         streaming_attempt.take(),
                         &error,
+                        &partial,
                     ).await {
                         yield classified_stream_error_event(
                             &ledger_error,
@@ -869,9 +987,7 @@ async fn anthropic_stream_with_retry(
             "anthropic",
         ) {
             RetryDecision::Retry { delay_ms } => {
-                if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
-                }
+                retry_delay_override = delay_ms;
                 continue;
             }
             RetryDecision::UseFallback { reason } => {
@@ -1195,6 +1311,8 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
         thinking,
         request_body_overrides,
     );
+    let prepared_request =
+        PreparedProviderRequest::from_json(&body, llm_provider_protocol(provider))?;
 
     let url = llm_request_url(
         base_url,
@@ -1203,7 +1321,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
         upstream_name,
         true,
     );
-    let req_bytes = serde_json::to_string(&body).map(|s| s.len()).unwrap_or(0);
+    let req_bytes = prepared_request.identity().provider_wire_bytes;
 
     // Total budget guard: abort if retries + cooldown delays exceed the budget.
     let total_budget = crate::turn::llm::client::llm_total_budget();
@@ -1212,6 +1330,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
     // Retry loop for known failures (429, 5xx, and connect-before-delivery).
     let mut last_err = String::new();
     let mut last_kind = astra_core::ErrorKind::Unknown;
+    let mut retry_delay_override = None;
     for attempt in 0..=LLM_MAX_RETRIES {
         // Check total budget before each attempt
         if attempt > 0 && started.elapsed() > total_budget {
@@ -1225,7 +1344,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
         }
 
         if attempt > 0 {
-            let delay = bridge_retry_backoff_ms(attempt);
+            let delay = take_bridge_retry_delay_ms(attempt, &mut retry_delay_override);
             sleep_ms_or_llm_cancel(delay, bridge_llm_cancel(&client_cancel)).await?;
         }
         if client_cancel
@@ -1235,7 +1354,8 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
             return Err(bridge_cancelled_error());
         }
 
-        let observed_attempt = begin_observed_attempt(attempt_observer.as_ref()).await?;
+        let observed_attempt =
+            begin_observed_attempt(attempt_observer.as_ref(), prepared_request.identity()).await?;
         if client_cancel
             .as_ref()
             .is_some_and(|token| token.is_cancelled())
@@ -1261,7 +1381,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
             attempt,
             "sending inference request"
         );
-        let response = match req.json(&body).send().await {
+        let response = match req.body(prepared_request.body()).send().await {
             Ok(r) => {
                 astra_core::agent_info!(
                     "llm",
@@ -1341,10 +1461,22 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                             let error = bridge_delivery_unknown_error(
                                 "LLM stream delivery became unknown after client disconnect",
                             );
-                            if let Err(ledger_error) = finish_stream_error(
+                            let partial = bridge_partial_result(
+                                &provider_response_id,
+                                &full_text,
+                                &reasoning,
+                                "",
+                                &tool_calls_map,
+                                &usage,
+                                &model_name,
+                                started,
+                                finish_reason.as_deref(),
+                            );
+                            if let Err(ledger_error) = finish_stream_error_with_partial(
                                 attempt_observer_for_stream.as_ref(),
                                 streaming_attempt.take(),
                                 &error,
+                                &partial,
                             ).await {
                                 yield classified_stream_error_event(
                                     &ledger_error,
@@ -1376,10 +1508,22 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                                         astra_core::ErrorKind::StreamIdle,
                                         format!("LLM stream idle after {}ms", idle.as_millis()),
                                     );
-                                    if let Err(ledger_error) = finish_stream_error(
+                                    let partial = bridge_partial_result(
+                                        &provider_response_id,
+                                        &full_text,
+                                        &reasoning,
+                                        "",
+                                        &tool_calls_map,
+                                        &usage,
+                                        &model_name,
+                                        started,
+                                        finish_reason.as_deref(),
+                                    );
+                                    if let Err(ledger_error) = finish_stream_error_with_partial(
                                         attempt_observer_for_stream.as_ref(),
                                         streaming_attempt.take(),
                                         &stream_error,
+                                        &partial,
                                     ).await {
                                         yield classified_stream_error_event(
                                             &ledger_error,
@@ -1409,10 +1553,22 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                                     let stream_error = bridge_delivery_unknown_error(format!(
                                         "LLM stream transport error: {e}"
                                     ));
-                                    if let Err(ledger_error) = finish_stream_error(
+                                    let partial = bridge_partial_result(
+                                        &provider_response_id,
+                                        &full_text,
+                                        &reasoning,
+                                        "",
+                                        &tool_calls_map,
+                                        &usage,
+                                        &model_name,
+                                        started,
+                                        finish_reason.as_deref(),
+                                    );
+                                    if let Err(ledger_error) = finish_stream_error_with_partial(
                                         attempt_observer_for_stream.as_ref(),
                                         streaming_attempt.take(),
                                         &stream_error,
+                                        &partial,
                                     ).await {
                                         yield classified_stream_error_event(
                                             &ledger_error,
@@ -1437,10 +1593,17 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                             // OpenAI-compatible; Bedrock is intercepted earlier.
                             made_progress = true;
                             if provider_response_id.is_none() {
-                                provider_response_id = chunk
+                                if let Some(response_id) = chunk
                                     .get("id")
                                     .and_then(Value::as_str)
-                                    .map(ToString::to_string);
+                                    .map(ToString::to_string)
+                                {
+                                    provider_response_id = Some(response_id.clone());
+                                    yield render_sse(&json!({
+                                        "type": "_provider_response_identity",
+                                        "provider_response_id": response_id,
+                                    }));
+                                }
                             }
                             if let Some(u) = chunk.get("usage").and_then(Value::as_object)
                                 && let Some(extracted) = crate::turn::token_usage::extract_usage(
@@ -1573,10 +1736,22 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                     let error = bridge_delivery_unknown_error(
                         "LLM SSE ended without a terminal marker",
                     );
-                    if let Err(ledger_error) = finish_stream_error(
+                    let partial = bridge_partial_result(
+                        &provider_response_id,
+                        &full_text,
+                        &reasoning,
+                        "",
+                        &tool_calls_map,
+                        &usage,
+                        &model_name,
+                        started,
+                        finish_reason.as_deref(),
+                    );
+                    if let Err(ledger_error) = finish_stream_error_with_partial(
                         attempt_observer_for_stream.as_ref(),
                         streaming_attempt.take(),
                         &error,
+                        &partial,
                     ).await {
                         yield classified_stream_error_event(
                             &ledger_error,
@@ -1682,9 +1857,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
             "openai-stream",
         ) {
             RetryDecision::Retry { delay_ms } => {
-                if let Some(d) = delay_ms {
-                    sleep_ms_or_llm_cancel(d, bridge_llm_cancel(&client_cancel)).await?;
-                }
+                retry_delay_override = delay_ms;
                 continue;
             }
             RetryDecision::UseFallback { reason } => {
@@ -1738,7 +1911,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ProviderAttemptObserver for RecordingAttemptObserver {
-        async fn begin_attempt(&self) -> Result<u32, astra_core::ClassifiedError> {
+        async fn begin_attempt(
+            &self,
+            _wire: &ProviderWireRequestIdentity,
+        ) -> Result<u32, astra_core::ClassifiedError> {
             let attempt = self.next_attempt.fetch_add(1, Ordering::AcqRel);
             self.events
                 .lock()
@@ -2544,7 +2720,18 @@ mod tests {
                         hits.stream_hits.fetch_add(1, Ordering::SeqCst);
                         let partial = format!(
                             "data: {}\n\n",
-                            json!({"choices":[{"delta":{"content":stream_content}}]})
+                            json!({
+                                "id": "chatcmpl-partial-7",
+                                "choices":[{"delta":{"content":stream_content}}],
+                                "usage": {
+                                    "prompt_tokens": 1100,
+                                    "completion_tokens": 50,
+                                    "prompt_tokens_details": {
+                                        "cached_tokens": 800,
+                                        "cache_creation_input_tokens": 100
+                                    }
+                                }
+                            })
                         );
                         let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
                         let response = format!(
@@ -2595,12 +2782,30 @@ mod tests {
                     if is_stream {
                         hits.stream_hits.fetch_add(1, Ordering::SeqCst);
                         let partial = format!(
-                            "event: content_block_delta\ndata: {}\n\n",
+                            "event: message_start\ndata: {}\n\n\
+                             event: content_block_delta\ndata: {}\n\n\
+                             event: message_delta\ndata: {}\n\n",
+                            json!({
+                                "type": "message_start",
+                                "message": {
+                                    "id": "msg_partial_7",
+                                    "usage": {
+                                        "input_tokens": 200,
+                                        "cache_read_input_tokens": 800,
+                                        "cache_creation_input_tokens": 100
+                                    }
+                                }
+                            }),
                             json!({
                                 "type": "content_block_delta",
                                 "index": 0,
                                 "delta": {"type": "text_delta", "text": "partial"},
-                            })
+                            }),
+                            json!({
+                                "type": "message_delta",
+                                "delta": {},
+                                "usage": {"output_tokens": 50}
+                            }),
                         );
                         let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
                         let response = format!(
@@ -2692,16 +2897,26 @@ mod tests {
             "uncertain delivery must close exactly one physical attempt: {events:?}"
         );
         assert_eq!(events[0], RecordedAttemptEvent::Began(0));
-        assert!(matches!(
-            &events[1],
-            RecordedAttemptEvent::Finished(
-                0,
-                astra_services::InferenceInvocationTerminal {
-                    status: astra_services::InferenceTerminalStatus::DeliveryUnknown,
-                    ..
-                }
-            )
-        ));
+        let RecordedAttemptEvent::Finished(0, terminal) = &events[1] else {
+            panic!("expected one physical delivery-unknown terminal: {events:?}");
+        };
+        assert_eq!(
+            terminal.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+        assert_eq!(
+            terminal.provider_response_id.as_deref(),
+            Some("chatcmpl-partial-7")
+        );
+        assert_eq!(
+            terminal.usage,
+            astra_services::InferenceUsage {
+                input_tokens: 200,
+                output_tokens: 50,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2711,6 +2926,7 @@ mod tests {
             nonstream_hits: Arc::new(AtomicU32::new(0)),
         };
         let base = spawn_raw_anthropic_partial_transport_server(hits.clone()).await;
+        let observer = Arc::new(RecordingAttemptObserver::default());
         let stream = call_llm_stream_with_attempt_observer(
             LlmCall {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
@@ -2733,7 +2949,7 @@ mod tests {
                 thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
             },
             None,
-            None,
+            Some(observer.clone()),
         )
         .await
         .expect("anthropic bridge stream");
@@ -2756,6 +2972,29 @@ mod tests {
         assert!(!body.contains("_inprocess_summary"), "{body}");
         assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
         assert_eq!(hits.nonstream_hits.load(Ordering::SeqCst), 0);
+        let events = observer.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0], RecordedAttemptEvent::Began(0));
+        let RecordedAttemptEvent::Finished(0, terminal) = &events[1] else {
+            panic!("expected one physical delivery-unknown terminal: {events:?}");
+        };
+        assert_eq!(
+            terminal.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+        assert_eq!(
+            terminal.provider_response_id.as_deref(),
+            Some("msg_partial_7")
+        );
+        assert_eq!(
+            terminal.usage,
+            astra_services::InferenceUsage {
+                input_tokens: 200,
+                output_tokens: 50,
+                cache_read_tokens: 800,
+                cache_creation_tokens: 100,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2932,6 +3171,31 @@ mod tests {
             }
             RetryDecision::Terminal => panic!("429 must be retryable"),
         }
+    }
+
+    #[test]
+    fn provider_retry_delay_replaces_generic_backoff_instead_of_accumulating() {
+        TEST_BRIDGE_RETRY_BACKOFF_MS.with(|cell| *cell.borrow_mut() = Some(1_000));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_BRIDGE_RETRY_BACKOFF_MS.with(|cell| *cell.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+
+        let mut provider_delay = Some(2_500);
+        assert_eq!(
+            take_bridge_retry_delay_ms(1, &mut provider_delay),
+            2_500,
+            "one retry must consume the provider delay, not provider plus generic backoff"
+        );
+        assert_eq!(provider_delay, None);
+        assert_eq!(
+            take_bridge_retry_delay_ms(2, &mut provider_delay),
+            1_000,
+            "generic backoff applies only when the provider supplied no delay"
+        );
     }
 
     #[test]
@@ -3201,6 +3465,40 @@ mod tests {
         ready_rx.await.expect("bedrock split meta server ready")
     }
 
+    async fn spawn_bedrock_stop_without_metadata_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bedrock truncated-tail listener");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = vec![0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let start = build_bedrock_frame("messageStart", br#"{"role":"assistant"}"#);
+            let delta = build_bedrock_frame(
+                "contentBlockDelta",
+                br#"{"contentBlockIndex":0,"delta":{"text":"partial"}}"#,
+            );
+            let stop = build_bedrock_frame("messageStop", br#"{"stopReason":"end_turn"}"#);
+            let mut body = Vec::new();
+            body.extend_from_slice(&start);
+            body.extend_from_slice(&delta);
+            body.extend_from_slice(&stop);
+            let header = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/vnd.amazon.eventstream\r\n\
+                 x-amzn-requestid: bedrock-tail-7\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.expect("header");
+            socket.write_all(&body).await.expect("body");
+            socket.shutdown().await.expect("shutdown");
+        });
+        format!("http://{addr}")
+    }
+
     #[tokio::test]
     async fn bedrock_stream_drains_metadata_after_message_stop() {
         let base_url = spawn_bedrock_split_meta_server().await;
@@ -3251,5 +3549,67 @@ mod tests {
             body.contains("\"output_tokens\":7"),
             "usage must carry the accounted output_tokens=7 from metadata frame; body:\n{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn bedrock_message_stop_without_metadata_is_partial_delivery_not_success() {
+        let base_url = spawn_bedrock_stop_without_metadata_server().await;
+        let messages = vec![json!({"role":"user","content":"hi"})];
+        let observer = Arc::new(RecordingAttemptObserver::default());
+        let stream = call_llm_stream_with_attempt_observer(
+            LlmCall {
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                messages: &messages,
+                tools: &[],
+                route: LlmExecutionRoute {
+                    model_name: "anthropic.claude-sonnet-4-test",
+                    wire_model_name: None,
+                    api_key: "dummy-key",
+                    base_url: &base_url,
+                    provider: "bedrock",
+                    header_overrides: None,
+                    request_body_overrides: None,
+                    completions_url_override: None,
+                    request_timeout: None,
+                },
+                max_output_tokens: Some(32),
+                temperature: None,
+                has_fallback: false,
+                thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            },
+            None,
+            Some(observer.clone()),
+        )
+        .await
+        .expect("HTTP stream should open");
+
+        let body = stream
+            .fold(Vec::new(), |mut bytes, chunk| async move {
+                bytes.extend_from_slice(&chunk);
+                bytes
+            })
+            .await;
+        let body = String::from_utf8(body).expect("canonical SSE");
+        assert!(body.contains("\"content\":\"partial\""), "{body}");
+        assert!(body.contains("\"code\":\"stream_transport\""), "{body}");
+        assert!(!body.contains("\"type\":\"_inprocess_summary\""), "{body}");
+
+        let terminal = observer
+            .events()
+            .into_iter()
+            .find_map(|event| match event {
+                RecordedAttemptEvent::Finished(_, terminal) => Some(terminal),
+                RecordedAttemptEvent::Began(_) => None,
+            })
+            .expect("physical attempt terminal");
+        assert_eq!(
+            terminal.status,
+            astra_services::InferenceTerminalStatus::DeliveryUnknown
+        );
+        assert_eq!(
+            terminal.provider_response_id.as_deref(),
+            Some("bedrock-tail-7")
+        );
+        assert_eq!(terminal.usage, astra_services::InferenceUsage::default());
     }
 }

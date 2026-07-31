@@ -56,8 +56,9 @@ static SYNC_OUTBOX_RETRY_WAKE_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 /// can be dropped under pressure because the projector also scans canonical
 /// journals on startup and maintains durable source offsets; the fact itself
 /// never lives only in this queue.
-static SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER: LazyLock<Mutex<Option<mpsc::Sender<String>>>> =
-    LazyLock::new(|| Mutex::new(None));
+static SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER: LazyLock<
+    Mutex<Option<mpsc::Sender<JournalIngestHint>>>,
+> = LazyLock::new(|| Mutex::new(None));
 static SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW: LazyLock<Mutex<JournalIngestOverflow>> =
     LazyLock::new(|| Mutex::new(JournalIngestOverflow::default()));
 
@@ -79,19 +80,49 @@ impl JournalIngestScheduleOutcome {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct JournalIngestHint {
+    owner_id: String,
+    session_id: String,
+}
+
+impl JournalIngestHint {
+    fn new(owner_scope: &astra_services::OwnerScope, session_id: impl Into<String>) -> Self {
+        Self {
+            owner_id: owner_scope.id().to_string(),
+            session_id: session_id.into(),
+        }
+    }
+
+    fn owner_scope(&self) -> astra_services::OwnerScope {
+        astra_services::OwnerScope::user(self.owner_id.clone())
+            .expect("journal ingest hints only capture validated owner scopes")
+    }
+}
+
 #[derive(Default)]
 struct JournalIngestOverflow {
-    sessions: BTreeSet<String>,
+    sessions: BTreeSet<JournalIngestHint>,
     reconcile_all: bool,
+    reconcile_owner_ids: BTreeSet<String>,
 }
 
 fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome {
+    let owner_scope = astra_services::local_owner_scope();
+    defer_journal_ingest_hint_for_owner(&owner_scope, session_id)
+}
+
+fn defer_journal_ingest_hint_for_owner(
+    owner_scope: &astra_services::OwnerScope,
+    session_id: String,
+) -> JournalIngestScheduleOutcome {
+    let hint = JournalIngestHint::new(owner_scope, session_id);
     let mut overflow = recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW);
-    if overflow.sessions.contains(&session_id) {
+    if overflow.sessions.contains(&hint) {
         return JournalIngestScheduleOutcome::Coalesced;
     }
     if overflow.sessions.len() < SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW_CAPACITY {
-        overflow.sessions.insert(session_id);
+        overflow.sessions.insert(hint);
         return JournalIngestScheduleOutcome::Coalesced;
     }
 
@@ -99,6 +130,9 @@ fn defer_journal_ingest_hint(session_id: String) -> JournalIngestScheduleOutcome
     // bounded hint set saturates, one full reconciliation marker represents
     // every further session without retaining attacker-controlled IDs.
     overflow.reconcile_all = true;
+    overflow
+        .reconcile_owner_ids
+        .insert(owner_scope.id().to_string());
     JournalIngestScheduleOutcome::RecoveryScanQueued
 }
 
@@ -216,6 +250,14 @@ where
 pub(crate) fn schedule_sync_outbox_journal_ingestion(
     session_id: &str,
 ) -> JournalIngestScheduleOutcome {
+    let owner_scope = astra_services::local_owner_scope();
+    schedule_sync_outbox_journal_ingestion_for_owner(&owner_scope, session_id)
+}
+
+pub(crate) fn schedule_sync_outbox_journal_ingestion_for_owner(
+    owner_scope: &astra_services::OwnerScope,
+    session_id: &str,
+) -> JournalIngestScheduleOutcome {
     if session_id.trim().is_empty() {
         return JournalIngestScheduleOutcome::InvalidSession;
     }
@@ -227,15 +269,18 @@ pub(crate) fn schedule_sync_outbox_journal_ingestion(
         );
         return JournalIngestScheduleOutcome::RuntimeUnavailable;
     };
+    let hint = JournalIngestHint::new(owner_scope, session_id);
     let sender = journal_ingest_sender(&handle);
-    match sender.try_send(session_id.to_string()) {
+    match sender.try_send(hint) {
         Ok(()) => JournalIngestScheduleOutcome::Scheduled,
-        Err(mpsc::error::TrySendError::Full(session_id)) => defer_journal_ingest_hint(session_id),
-        Err(mpsc::error::TrySendError::Closed(session_id)) => {
+        Err(mpsc::error::TrySendError::Full(hint)) => {
+            defer_journal_ingest_hint_for_owner(&hint.owner_scope(), hint.session_id)
+        }
+        Err(mpsc::error::TrySendError::Closed(hint)) => {
             // Runtime teardown can close a previously global sender. Keep the
             // source in the overflow set; the next active runtime recreates
             // the worker and reconciles it from the canonical journal.
-            let outcome = defer_journal_ingest_hint(session_id);
+            let outcome = defer_journal_ingest_hint_for_owner(&hint.owner_scope(), hint.session_id);
             *recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER) = None;
             outcome
         }
@@ -250,8 +295,14 @@ pub(crate) fn schedule_sync_outbox_journal_reconcile_all() {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
+    let owner_scope = astra_services::local_owner_scope();
     spawn_detached_tracked(&handle, async move {
-        let sessions = match tokio::task::spawn_blocking(session_journal::list_sessions).await {
+        let scan_owner = owner_scope.clone();
+        let sessions = match tokio::task::spawn_blocking(move || {
+            session_journal::list_sessions_for_owner(&scan_owner)
+        })
+        .await
+        {
             Ok(Ok(sessions)) => sessions,
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -271,12 +322,12 @@ pub(crate) fn schedule_sync_outbox_journal_reconcile_all() {
             }
         };
         for session_id in sessions {
-            let _ = schedule_sync_outbox_journal_ingestion(&session_id);
+            let _ = schedule_sync_outbox_journal_ingestion_for_owner(&owner_scope, &session_id);
         }
     });
 }
 
-fn journal_ingest_sender(handle: &tokio::runtime::Handle) -> mpsc::Sender<String> {
+fn journal_ingest_sender(handle: &tokio::runtime::Handle) -> mpsc::Sender<JournalIngestHint> {
     let mut slot = recover_mutex_lock(&SYNC_OUTBOX_JOURNAL_INGEST_DISPATCHER);
     if let Some(sender) = slot.as_ref().filter(|sender| !sender.is_closed()) {
         return sender.clone();
@@ -287,29 +338,29 @@ fn journal_ingest_sender(handle: &tokio::runtime::Handle) -> mpsc::Sender<String
     sender
 }
 
-async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<String>) {
+async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<JournalIngestHint>) {
     let mut pending_sessions = BTreeSet::new();
-    let mut delayed_sessions = BTreeMap::<String, tokio::time::Instant>::new();
+    let mut delayed_sessions = BTreeMap::<JournalIngestHint, tokio::time::Instant>::new();
     let mut retry_budget = JournalIngestRetryBudget::default();
     loop {
         let now = tokio::time::Instant::now();
         let ready_after_backoff = delayed_sessions
             .iter()
             .filter(|(_, deadline)| **deadline <= now)
-            .map(|(session_id, _)| session_id.clone())
+            .map(|(hint, _)| hint.clone())
             .collect::<Vec<_>>();
-        for session_id in ready_after_backoff {
-            delayed_sessions.remove(&session_id);
-            pending_sessions.insert(session_id);
+        for hint in ready_after_backoff {
+            delayed_sessions.remove(&hint);
+            pending_sessions.insert(hint);
         }
 
         if pending_sessions.is_empty() {
             if let Some(next_retry) = delayed_sessions.values().min().copied() {
                 tokio::select! {
-                    session_id = receiver.recv() => match session_id {
-                        Some(session_id) => {
-                            if !delayed_sessions.contains_key(&session_id) {
-                                pending_sessions.insert(session_id);
+                    hint = receiver.recv() => match hint {
+                        Some(hint) => {
+                            if !delayed_sessions.contains_key(&hint) {
+                                pending_sessions.insert(hint);
                             }
                         }
                         None => break,
@@ -318,8 +369,8 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
                 }
             } else {
                 match receiver.recv().await {
-                    Some(session_id) => {
-                        pending_sessions.insert(session_id);
+                    Some(hint) => {
+                        pending_sessions.insert(hint);
                     }
                     None => break,
                 }
@@ -330,10 +381,10 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
         tokio::pin!(deadline);
         loop {
             tokio::select! {
-                session_id = receiver.recv() => match session_id {
-                    Some(session_id) => {
-                        if !delayed_sessions.contains_key(&session_id) {
-                            pending_sessions.insert(session_id);
+                hint = receiver.recv() => match hint {
+                    Some(hint) => {
+                        if !delayed_sessions.contains_key(&hint) {
+                            pending_sessions.insert(hint);
                         }
                     }
                     None => break,
@@ -344,79 +395,108 @@ async fn run_sync_outbox_journal_ingest_worker(mut receiver: mpsc::Receiver<Stri
         let overflow = std::mem::take(&mut *recover_mutex_lock(
             &SYNC_OUTBOX_JOURNAL_INGEST_OVERFLOW,
         ));
-        for session_id in overflow.sessions {
-            if !delayed_sessions.contains_key(&session_id) {
-                pending_sessions.insert(session_id);
+        for hint in overflow.sessions {
+            if !delayed_sessions.contains_key(&hint) {
+                pending_sessions.insert(hint);
             }
         }
         if overflow.reconcile_all {
-            match tokio::task::spawn_blocking(session_journal::list_sessions).await {
-                Ok(Ok(sessions)) => {
-                    for session_id in sessions {
-                        if !delayed_sessions.contains_key(&session_id) {
-                            pending_sessions.insert(session_id);
+            for owner_id in overflow.reconcile_owner_ids {
+                let owner_scope = astra_services::OwnerScope::user(owner_id.clone())
+                    .expect("overflow owner ids came from validated owner scopes");
+                let scan_owner = owner_scope.clone();
+                match tokio::task::spawn_blocking(move || {
+                    session_journal::list_sessions_for_owner(&scan_owner)
+                })
+                .await
+                {
+                    Ok(Ok(sessions)) => {
+                        for session_id in sessions {
+                            let hint = JournalIngestHint::new(&owner_scope, session_id);
+                            if !delayed_sessions.contains_key(&hint) {
+                                pending_sessions.insert(hint);
+                            }
                         }
                     }
+                    Ok(Err(error)) => tracing::warn!(
+                        target: "astra_cli::cloud_sync",
+                        owner_id,
+                        ?error,
+                        "bounded journal-ingest overflow recovery scan failed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        target: "astra_cli::cloud_sync",
+                        owner_id,
+                        ?error,
+                        "bounded journal-ingest overflow recovery task stopped"
+                    ),
                 }
-                Ok(Err(error)) => tracing::warn!(
-                    target: "astra_cli::cloud_sync",
-                    ?error,
-                    "bounded journal-ingest overflow recovery scan failed"
-                ),
-                Err(error) => tracing::warn!(
-                    target: "astra_cli::cloud_sync",
-                    ?error,
-                    "bounded journal-ingest overflow recovery task stopped"
-                ),
             }
         }
 
-        let sessions = std::mem::take(&mut pending_sessions)
-            .into_iter()
-            .collect::<Vec<_>>();
-        for batch in sessions.chunks(SYNC_OUTBOX_JOURNAL_RECOVERY_BATCH_SOURCES) {
-            let mut projected_any = false;
-            for (session_id, outcome) in reconcile_sync_outbox_journals(batch).await {
-                match outcome {
-                    Ok(projected) => {
-                        retry_budget.observe_success(&session_id);
-                        projected_any |= projected;
+        let mut sessions_by_owner = BTreeMap::<String, Vec<String>>::new();
+        for hint in std::mem::take(&mut pending_sessions) {
+            sessions_by_owner
+                .entry(hint.owner_id)
+                .or_default()
+                .push(hint.session_id);
+        }
+        for (owner_id, sessions) in sessions_by_owner {
+            let owner_scope = astra_services::OwnerScope::user(owner_id.clone())
+                .expect("pending owner ids came from validated owner scopes");
+            for batch in sessions.chunks(SYNC_OUTBOX_JOURNAL_RECOVERY_BATCH_SOURCES) {
+                let mut projected_any = false;
+                for (session_id, outcome) in
+                    reconcile_sync_outbox_journals_for_owner(&owner_scope, batch).await
+                {
+                    let hint = JournalIngestHint {
+                        owner_id: owner_id.clone(),
+                        session_id,
+                    };
+                    let retry_key = format!("{}\0{}", hint.owner_id, hint.session_id);
+                    match outcome {
+                        Ok(projected) => {
+                            retry_budget.observe_success(&retry_key);
+                            projected_any |= projected;
+                        }
+                        Err(error) => match retry_budget.observe_failure(&retry_key) {
+                            JournalIngestFailureDisposition::RetryAfter(delay) => {
+                                tracing::warn!(
+                                    target: "astra_cli::cloud_sync",
+                                    owner_id = hint.owner_id,
+                                    session_id = hint.session_id,
+                                    ?error,
+                                    retry_after_ms = delay.as_millis(),
+                                    "journal-to-outbox projection failed; retry remains bounded"
+                                );
+                                delayed_sessions.insert(hint, tokio::time::Instant::now() + delay);
+                            }
+                            JournalIngestFailureDisposition::QuarantineUntilNewHint => {
+                                tracing::error!(
+                                    target: "astra_cli::cloud_sync",
+                                    owner_id = hint.owner_id,
+                                    session_id = hint.session_id,
+                                    ?error,
+                                    "journal-to-outbox projection exhausted its retry budget; canonical journal remains durable and a new journal hint or process recovery will retry"
+                                );
+                            }
+                        },
                     }
-                    Err(error) => match retry_budget.observe_failure(&session_id) {
-                        JournalIngestFailureDisposition::RetryAfter(delay) => {
-                            tracing::warn!(
-                                target: "astra_cli::cloud_sync",
-                                session_id,
-                                ?error,
-                                retry_after_ms = delay.as_millis(),
-                                "journal-to-outbox projection failed; retry remains bounded"
-                            );
-                            delayed_sessions
-                                .insert(session_id, tokio::time::Instant::now() + delay);
-                        }
-                        JournalIngestFailureDisposition::QuarantineUntilNewHint => {
-                            tracing::error!(
-                                target: "astra_cli::cloud_sync",
-                                session_id,
-                                ?error,
-                                "journal-to-outbox projection exhausted its retry budget; canonical journal remains durable and a new journal hint or process recovery will retry"
-                            );
-                        }
-                    },
                 }
+                if projected_any && astra_services::local_owner_scope().id() == owner_id {
+                    schedule_sync_outbox_drain();
+                }
+                // A startup recovery with hundreds of sources must remain
+                // cooperative with the foreground turn and TUI runtime.
+                tokio::task::yield_now().await;
             }
-            if projected_any {
-                schedule_sync_outbox_drain();
-            }
-            // A startup recovery with hundreds of sources must remain
-            // cooperative with the foreground turn and TUI runtime.
-            tokio::task::yield_now().await;
         }
     }
 }
 
 async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io::Error> {
-    reconcile_sync_outbox_journals(&[session_id.to_string()])
+    let owner_scope = astra_services::local_owner_scope();
+    reconcile_sync_outbox_journals_for_owner(&owner_scope, &[session_id.to_string()])
         .await
         .into_iter()
         .next()
@@ -428,14 +508,29 @@ async fn reconcile_sync_outbox_journal(session_id: &str) -> Result<bool, std::io
         })
 }
 
-async fn reconcile_sync_outbox_journals(
+async fn reconcile_sync_outbox_journals_for_owner(
+    owner_scope: &astra_services::OwnerScope,
     session_ids: &[String],
 ) -> Vec<(String, Result<bool, std::io::Error>)> {
     const STALE_OFFSET_RETRIES: usize = 3;
     if session_ids.is_empty() {
         return Vec::new();
     }
-    let store = SyncOutboxStore::local();
+    let store = match SyncOutboxStore::for_owner(owner_scope) {
+        Ok(store) => store,
+        Err(error) => {
+            return session_ids
+                .iter()
+                .cloned()
+                .map(|session_id| {
+                    (
+                        session_id,
+                        Err(std::io::Error::new(error.kind(), error.to_string())),
+                    )
+                })
+                .collect();
+        }
+    };
     let mut pending = session_ids.iter().cloned().collect::<BTreeSet<_>>();
     let mut outcomes = BTreeMap::<String, Result<bool, std::io::Error>>::new();
     for attempt in 0..STALE_OFFSET_RETRIES {
@@ -462,13 +557,17 @@ async fn reconcile_sync_outbox_journals(
                 break;
             }
         };
+        let read_owner = owner_scope.clone();
         let read_result = tokio::task::spawn_blocking(move || {
             current_sessions
                 .into_iter()
                 .map(|session_id| {
                     let offset = offsets.get(&session_id).copied().unwrap_or(0);
-                    let delta =
-                        session_journal::read_durable_journal_append_delta(&session_id, offset);
+                    let delta = session_journal::read_durable_journal_append_delta_for_owner(
+                        &read_owner,
+                        &session_id,
+                        offset,
+                    );
                     (session_id, offset, delta)
                 })
                 .collect::<Vec<_>>()
@@ -686,10 +785,12 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
     let Some(schedule_guard) = try_claim_sync_outbox_drain_schedule() else {
         return;
     };
+    let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
     spawn_detached_tracked(&handle, async move {
         let mut blocked = false;
         for _ in 0..SYNC_OUTBOX_DRAIN_BACKGROUND_ROUNDS {
-            let report = try_drain_sync_outbox(SYNC_OUTBOX_DRAIN_LIMIT).await;
+            let report =
+                try_drain_sync_outbox_for_snapshot(SYNC_OUTBOX_DRAIN_LIMIT, &auth_snapshot).await;
             blocked = report.blocker.is_some();
             if report.attempted > 0 && report.is_incomplete() {
                 tracing::warn!(
@@ -716,18 +817,29 @@ fn schedule_sync_outbox_drain_after(delay: Duration) {
         if blocked {
             return;
         }
-        let next_delay =
-            match run_sync_outbox_io(SyncOutboxStore::local(), |store| store.status()).await {
-                Ok(status) => next_sync_outbox_drain_delay(&status),
-                Err(error) => {
-                    tracing::warn!(
-                        target: "astra_cli::cloud_sync",
-                        ?error,
-                        "failed to read sync outbox status while scheduling the next drain"
-                    );
-                    None
-                }
-            };
+        let status_store = match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    owner_id = auth_snapshot.owner_scope.id(),
+                    "failed to resolve owner-scoped sync outbox while scheduling the next drain"
+                );
+                return;
+            }
+        };
+        let next_delay = match run_sync_outbox_io(status_store, |store| store.status()).await {
+            Ok(status) => next_sync_outbox_drain_delay(&status),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::cloud_sync",
+                    ?error,
+                    "failed to read sync outbox status while scheduling the next drain"
+                );
+                None
+            }
+        };
         drop(schedule_guard);
         if let Some(delay) = next_delay {
             schedule_sync_outbox_drain_after(delay);
@@ -1007,6 +1119,14 @@ pub(crate) async fn try_cloud_push_preferences(state: &SessionState) {
 }
 
 pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport {
+    let auth_snapshot = crate::cli::cli_config::cli_utils::cli_owner_auth_snapshot();
+    try_drain_sync_outbox_for_snapshot(limit, &auth_snapshot).await
+}
+
+async fn try_drain_sync_outbox_for_snapshot(
+    limit: usize,
+    auth_snapshot: &crate::cli::cli_config::cli_utils::CliOwnerAuthSnapshot,
+) -> SyncOutboxDrainReport {
     let Some(cloud_base) = resolve_cloud_base() else {
         return SyncOutboxDrainReport::default();
     };
@@ -1014,7 +1134,19 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
         cloud_configured: true,
         ..Default::default()
     };
-    let store = SyncOutboxStore::local();
+    let store = match SyncOutboxStore::for_owner(&auth_snapshot.owner_scope) {
+        Ok(store) => store,
+        Err(error) => {
+            report.blocker = Some(SyncOutboxDrainBlocker::LocalOutboxRead);
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                ?error,
+                owner_id = auth_snapshot.owner_scope.id(),
+                "sync outbox drain skipped because its owner scope is invalid"
+            );
+            return report;
+        }
+    };
     match run_sync_outbox_io(store.clone(), |store| store.status()).await {
         Ok(status) => {
             report.remaining_ready = status.claimable.min(u64::from(u32::MAX)) as u32;
@@ -1033,9 +1165,7 @@ pub(crate) async fn try_drain_sync_outbox(limit: usize) -> SyncOutboxDrainReport
             return report;
         }
     }
-    let Some(token) =
-        session_runtime::current_access_token(None).filter(|token| !token.trim().is_empty())
-    else {
+    let Some(token) = auth_snapshot.access_token.clone() else {
         report.blocker = Some(SyncOutboxDrainBlocker::MissingAccessToken);
         tracing::debug!(
             target: "astra_cli::cloud_sync",
@@ -1316,14 +1446,23 @@ fn append_cloud_pull_sync_journal_with_enqueue(
         pref_keys,
         reachable_empty_ack,
     );
-    let Ok(writer) = session_journal::JournalWriter::new(sid) else {
+    let Some(writer) = state.journal.as_ref() else {
         tracing::warn!(
             session_id = sid,
             context = "cloud_sync:cloud_pull_sync_marker",
-            "failed to open session journal for cloud pull sync marker"
+            "skipping cloud pull sync marker because the live session has no journal"
         );
         return;
     };
+    if writer.session_id() != sid {
+        tracing::error!(
+            session_id = sid,
+            journal_session_id = writer.session_id(),
+            context = "cloud_sync:cloud_pull_sync_marker",
+            "refusing to append a cloud pull marker through another session's journal"
+        );
+        return;
+    }
     if let Err(error) = writer.append(&evt) {
         tracing::warn!(
             session_id = sid,

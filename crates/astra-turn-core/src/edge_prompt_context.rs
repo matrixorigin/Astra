@@ -353,11 +353,33 @@ pub fn build_static_environment_context(project_root: &Path) -> String {
         }
     }
 
-    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+    let local_root = astra_runtime_env::local_state_root_override();
+    let home = std::env::var("HOME").ok();
+    let user_profile = std::env::var("USERPROFILE").ok();
+    if let Some(home) = visible_environment_home(
+        local_root.as_deref(),
+        home.as_deref(),
+        user_profile.as_deref(),
+    ) {
         lines.push(format!("- Home: {home}"));
     }
 
     format!("\n\n## Environment\n{}", lines.join("\n"))
+}
+
+/// A process-local Astra root is an orchestration isolation boundary. In that
+/// mode the host account's unrelated home path must not enter model input.
+fn visible_environment_home<'a>(
+    local_root: Option<&Path>,
+    home: Option<&'a str>,
+    user_profile: Option<&'a str>,
+) -> Option<&'a str> {
+    if local_root.is_some() {
+        None
+    } else {
+        home.filter(|value| !value.is_empty())
+            .or_else(|| user_profile.filter(|value| !value.is_empty()))
+    }
 }
 
 /// Turn-volatile environment facts: branch dirty state, staged/unstaged
@@ -786,6 +808,22 @@ mod tests {
         assert!(
             !ctx.contains("- Staged changes:"),
             "static ctx must not contain staged diff: {ctx}"
+        );
+    }
+
+    #[test]
+    fn isolated_local_root_suppresses_host_home_from_environment_context() {
+        assert_eq!(
+            visible_environment_home(
+                Some(Path::new("/isolated/astra")),
+                Some("/developer/home"),
+                Some("C:\\Users\\developer"),
+            ),
+            None
+        );
+        assert_eq!(
+            visible_environment_home(None, Some("/developer/home"), None),
+            Some("/developer/home")
         );
     }
 

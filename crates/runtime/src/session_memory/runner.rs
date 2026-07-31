@@ -549,6 +549,10 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
 }
 
 fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::MemoryExtractionPromptSanitization,
+        messages,
+    );
     astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages.to_vec())
         .into_iter()
         .filter(|msg| !is_ephemeral_message_for_session_memory(msg))

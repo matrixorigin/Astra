@@ -241,8 +241,6 @@ pub struct MemoryContext {
     pub retrieved_memory_ids: Vec<String>,
     /// Domain hints extracted from memory
     pub domain_hints: Vec<String>,
-    /// Boost terms for tool surface
-    pub boost_terms: Vec<String>,
     /// Provenance: which memories influenced this step
     pub provenance: Vec<String>,
     /// Memory governance actions triggered during this step
@@ -696,6 +694,12 @@ pub struct LightCheckpoint {
 pub struct HeavyCheckpoint {
     /// All fields from light checkpoint
     pub light: LightCheckpoint,
+    /// Canonical conversation boundary projected by this checkpoint.
+    ///
+    /// Legacy checkpoints omit it and are therefore degraded recovery
+    /// candidates until journal replay establishes their ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_cursor: Option<astra_turn_types::SessionCursorV1>,
     /// Full conversation messages (for LLM resume)
     pub messages: Vec<serde_json::Value>,
     /// Recovery diagnostics only. Despite the legacy field names these are
@@ -855,6 +859,7 @@ impl StepCheckpoint {
                 total_tokens: 0,
                 created_at: epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
@@ -996,7 +1001,6 @@ pub enum StepPayload {
         memory_context: Vec<String>,
     },
     Plan {
-        intent_signals: Vec<String>,
         available_tool_count: usize,
         budget_tokens: u64,
         restricted_tools: Vec<String>,
@@ -1023,11 +1027,8 @@ pub enum StepPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StepResult {
     Perceive {
-        intent_signals: Vec<String>,
-        intent_confidence: f64,
         entities: Vec<String>,
         memory_matches: usize,
-        boost_terms: Vec<String>,
     },
     Plan {
         visible_tools: Vec<String>,
@@ -1685,7 +1686,6 @@ mod tests {
         .with_memory_context(MemoryContext {
             retrieved_memory_ids: vec!["mem-1".into()],
             domain_hints: vec!["github".into()],
-            boost_terms: vec!["pr".into()],
             provenance: vec!["mem-1".into()],
             ..Default::default()
         })
@@ -2561,11 +2561,8 @@ mod tests {
     fn step_result_variants_serialize() {
         let results = vec![
             StepResult::Perceive {
-                intent_signals: vec!["is_code_review".into()],
-                intent_confidence: 0.85,
                 entities: vec!["main.rs".into()],
                 memory_matches: 3,
-                boost_terms: vec!["code".into(), "review".into()],
             },
             StepResult::Plan {
                 visible_tools: vec!["grep".into()],
@@ -2593,7 +2590,6 @@ mod tests {
         let mc = MemoryContext::default();
         assert!(mc.retrieved_memory_ids.is_empty());
         assert!(mc.domain_hints.is_empty());
-        assert!(mc.boost_terms.is_empty());
         assert!(mc.provenance.is_empty());
     }
 
@@ -2602,7 +2598,6 @@ mod tests {
         let mc = MemoryContext {
             retrieved_memory_ids: vec!["mem-1".into(), "mem-2".into()],
             domain_hints: vec!["github".into()],
-            boost_terms: vec!["pr".into(), "review".into()],
             provenance: vec!["mem-1".into()],
             ..Default::default()
         };
@@ -2668,7 +2663,6 @@ mod tests {
         let mc = MemoryContext {
             retrieved_memory_ids: vec!["m1".into()],
             domain_hints: vec![],
-            boost_terms: vec![],
             provenance: vec![],
             governance_actions: vec![
                 MemoryGovernanceAction::Retrieved {
@@ -2900,6 +2894,7 @@ mod tests {
                 total_tokens: 500,
                 created_at: 0,
             },
+            conversation_cursor: None,
             messages: vec![], // empty for non-Perceive!
             budget_remaining_tokens: 1000,
             budget_remaining_rounds: 5,
@@ -2936,6 +2931,7 @@ mod tests {
                 total_tokens: 0,
                 created_at: 0,
             },
+            conversation_cursor: None,
             messages: vec![],
             budget_remaining_tokens: 4000,
             budget_remaining_rounds: 10,

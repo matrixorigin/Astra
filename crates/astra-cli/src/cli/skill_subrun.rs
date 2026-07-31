@@ -426,6 +426,10 @@ impl AgenticLoopHost for SubRunHost {
         }
 
         let runtime_decision_user_intent = state.runtime_decision_user_intent();
+        crate::cli::history_work::record_json_history(
+            astra_core::history_work::HistoryWorkSite::CliSubrunPromptPayloadClone,
+            &state.messages,
+        );
         let mut payload = chat_turn_base_payload(ChatTurnBasePayloadInput {
             messages: state.messages.as_slice(),
             user_intent: Some(runtime_decision_user_intent.as_str()),
@@ -543,6 +547,7 @@ impl AgenticLoopHost for SubRunHost {
             0,                                              // pre_clear_lines
             None,                                           // auth_profile
             self.cancel_token.as_ref().map(|t| t.as_ref()), // propagate parent cancel
+            None,                                           // stream_json_exchange
         )
         .await;
         Ok(HostTurnResult {
@@ -560,6 +565,33 @@ impl AgenticLoopHost for SubRunHost {
                 style,
                 line,
             });
+        }
+    }
+
+    fn on_compaction(&mut self, event: astra_turn_core::compaction_types::CompactionEvent) {
+        tracing::info!(
+            target: "astra_cli::skill_subrun",
+            agent_id = %self.agent_id,
+            kind = %event.kind,
+            pressure = event.pressure,
+            tokens_freed = event.tokens_freed,
+            messages_removed = event.messages_removed,
+            "sub-run context compaction"
+        );
+        if !self.is_quiet() {
+            self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        }
+        let stream_event = crate::cli::chat_stream::StreamEvent::Compaction(event);
+        if let Some(sink) = self.stream_event_sink.as_ref() {
+            sink.send(stream_event);
+        } else if let Some(tx) = self.stream_event_tx.as_ref()
+            && let Err(error) = tx.try_send(stream_event)
+        {
+            tracing::warn!(
+                %error,
+                agent_id = %self.agent_id,
+                "sub-run compaction stream event queue unavailable"
+            );
         }
     }
 
@@ -1059,7 +1091,10 @@ fn resolve_subrun_schemas(
 ) -> Vec<Value> {
     match inherited {
         Some(ip) => match &ip.frozen_tool_schemas {
-            Some(schemas) => schemas.clone(),
+            Some(schemas) => crate::cli::history_work::clone_json_history(
+                astra_core::history_work::HistoryWorkSite::CliForkFrozenToolSchemaClone,
+                schemas,
+            ),
             None => {
                 tracing::warn!(
                     target: "astra_cli::skill_subrun",
@@ -1251,6 +1286,68 @@ mod tests {
             fork_cache_sink: None,
             fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
         }
+    }
+
+    fn bare_subrun_host() -> SubRunHost {
+        let root = PathBuf::from(".");
+        SubRunHost {
+            api: astra_thin_client::ThinClient::new("http://unused", None).unwrap(),
+            token: String::new(),
+            model: None,
+            offering_id: "offer-test".to_string(),
+            project_root: root.clone(),
+            executor: std::sync::Arc::new(edge_tools::ToolExecutor::new(&root)),
+            all_schemas: Vec::new(),
+            valid_tool_names: HashSet::new(),
+            perm_manager: PermissionManager::with_project(true, &root),
+            journal: None,
+            journal_identity: None,
+            max_completion_tokens: None,
+            effort: None,
+            agent_type: None,
+            cancel_token: None,
+            skill_resolver: None,
+            progress_tx: None,
+            agent_id: "quiet-subrun".into(),
+            stream_event_tx: None,
+            stream_event_sink: None,
+            tool_cache: crate::cli::stream::stream_render::EdgeToolCache::new(3),
+            inherited_prefix: None,
+            fork_cache_sink: None,
+            fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState::new(),
+        }
+    }
+
+    #[test]
+    fn quiet_subrun_preserves_typed_compaction_stream_event() {
+        use crate::cli::chat_stream::StreamEvent;
+        use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+
+        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
+        let mut host = bare_subrun_host();
+        host.stream_event_tx = Some(tx);
+        assert!(host.is_quiet());
+        let event = CompactionEvent::new(
+            CompactionKind::WireContextRetry,
+            0.9,
+            4_000,
+            10_000,
+            12_000,
+            6,
+            5,
+            Vec::new(),
+        );
+
+        host.on_compaction(event.clone());
+
+        match rx.try_recv().expect("typed compaction stream event") {
+            StreamEvent::Compaction(observed) => assert_eq!(observed, event),
+            other => panic!("unexpected stream event: {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "quiet rendering must not add a status-line event"
+        );
     }
 
     #[test]

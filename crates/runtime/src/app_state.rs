@@ -231,6 +231,17 @@ pub struct AppState {
         Option<Arc<dyn astra_services::team_persistence::TeamPersistenceService>>,
     /// Per-user resource governor for limit checking and usage tracking (Phase 5).
     pub resource_governor: std::sync::Arc<dyn astra_services::resource_governor::ResourceGovernor>,
+    /// Canonical branch authority. Production always wires the database
+    /// adapter; `None` exists only for narrow unit fixtures and cannot
+    /// validate an authority-bearing request.
+    pub(crate) session_context_coordinator:
+        Option<Arc<dyn astra_services::SessionContextCoordinator>>,
+    pub(crate) session_handoff_service: Option<Arc<astra_services::DatabaseSessionHandoffService>>,
+    pub(crate) session_fork_coordinator:
+        Option<Arc<astra_services::DatabaseSessionForkCoordinator>>,
+    pub(crate) session_publish_service: Option<Arc<astra_services::DatabaseSessionPublishService>>,
+    pub(crate) execution_grant_signer: Option<Arc<astra_services::ExecutionGrantSigner>>,
+    pub(crate) session_actor_id: String,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
     pub edge_connection_pool: astra_server_types::edge_connection_pool::EdgeConnectionPool,
     /// Shared ToolExecutionService for admin-controllable disabled_tool_offers.
@@ -339,6 +350,15 @@ impl AppState {
             resource_governor: std::sync::Arc::new(
                 astra_services::resource_governor::InMemoryResourceGovernor::new(),
             ),
+            session_context_coordinator: None,
+            session_handoff_service: None,
+            session_fork_coordinator: None,
+            session_publish_service: None,
+            execution_grant_signer: None,
+            session_actor_id: std::env::var("ASTRA_POD_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("astra-runtime-{}", uuid::Uuid::new_v4())),
             edge_connection_pool,
             tool_execution_service,
             http_client: reqwest::Client::builder()
@@ -358,6 +378,40 @@ impl AppState {
 
     pub fn with_cors_origins(mut self, cors_origins: Option<String>) -> Self {
         self.cors_origins = cors_origins;
+        self
+    }
+
+    pub fn with_session_context_authority(
+        mut self,
+        coordinator: Arc<dyn astra_services::SessionContextCoordinator>,
+        signer: Arc<astra_services::ExecutionGrantSigner>,
+    ) -> Self {
+        self.session_context_coordinator = Some(coordinator);
+        self.execution_grant_signer = Some(signer);
+        self
+    }
+
+    pub fn with_session_handoff_service(
+        mut self,
+        service: Arc<astra_services::DatabaseSessionHandoffService>,
+    ) -> Self {
+        self.session_handoff_service = Some(service);
+        self
+    }
+
+    pub fn with_session_fork_coordinator(
+        mut self,
+        coordinator: Arc<astra_services::DatabaseSessionForkCoordinator>,
+    ) -> Self {
+        self.session_fork_coordinator = Some(coordinator);
+        self
+    }
+
+    pub fn with_session_publish_service(
+        mut self,
+        service: Arc<astra_services::DatabaseSessionPublishService>,
+    ) -> Self {
+        self.session_publish_service = Some(service);
         self
     }
 

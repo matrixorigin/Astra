@@ -16,8 +16,8 @@ use astra_runtime::{
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::host::{
         AgenticLoopHost, AgenticLoopState, ControlToolRecovery, HostTurnResult,
-        SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnInteractionMode,
-        interaction_scoped_tool_restrictions,
+        SkillAutoRouteDecision, SkillAutoRouteJudgeContext, TurnIntentJudgeOutcome,
+        TurnInteractionMode, interaction_scoped_tool_restrictions,
     },
 };
 use astra_turn_core::{
@@ -52,6 +52,7 @@ struct CliServerProxySummaryClient {
     api: astra_thin_client::ThinClient,
     token: String,
     base_scope: astra_turn_types::InferenceInvocationScope,
+    operation: astra_thin_client::CompletionOperation,
     next_logical_attempt: std::sync::atomic::AtomicU32,
 }
 
@@ -62,18 +63,22 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryC
         purpose: astra_turn_types::InferencePurpose,
         messages: &[Value],
     ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
-        if purpose != astra_turn_types::InferencePurpose::Introspection {
+        if purpose != self.operation.purpose() {
             return Err(format!(
-                "skill auto-route proxy received unsupported inference purpose {purpose}"
+                "{} proxy received unsupported inference purpose {purpose}",
+                self.operation.operation_id()
             ));
         }
         let logical_attempt = self
             .next_logical_attempt
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let mut request = astra_thin_client::CompletionRequest::from_session_scope(
-            astra_thin_client::CompletionOperation::SkillAutoRoute,
+            self.operation,
             &self.base_scope.with_logical_attempt(logical_attempt),
-            messages.to_vec(),
+            crate::cli::history_work::clone_json_history(
+                astra_core::history_work::HistoryWorkSite::CliCompletionProxyMessageClone,
+                messages,
+            ),
         )
         .map_err(str::to_string)?;
         request.max_tokens = 256;
@@ -91,6 +96,26 @@ impl astra_turn_core::cloud_summary::SummaryLlmClient for CliServerProxySummaryC
             text,
             is_ptl_error: false,
         })
+    }
+}
+
+struct CliSummaryClientTurnIntentJudge {
+    client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
+}
+
+#[async_trait]
+impl astra_services::TurnIntentJudge for CliSummaryClientTurnIntentJudge {
+    async fn judge(
+        &self,
+        ctx: &astra_services::TurnIntentJudgeContext,
+    ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
+        let messages = astra_services::turn_intent_judge_messages(ctx);
+        let response = self
+            .client
+            .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
+            .await
+            .map_err(astra_services::TurnIntentJudgeError::Transport)?;
+        astra_services::parse_turn_intent_response(response.text.as_str())
     }
 }
 
@@ -256,6 +281,9 @@ pub(crate) struct CliAgenticLoopHost<'a> {
     pub plan_assemble_line_release: Option<Arc<AtomicBool>>,
     /// Optional channel for forwarding fine-grained stream events.
     pub stream_event_tx: Option<crate::cli::chat_stream::StreamEventTx>,
+    /// Strict machine observation stream for one-shot `stream-json`.
+    pub stream_json_emitter:
+        Option<std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
     /// Ordered control-state overflow for synchronous host callbacks. Textual
     /// progress may be sampled under pressure, but lifecycle start/finish
     /// pairs are drained before the terminal output boundary.
@@ -746,6 +774,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     message: self.message,
                     user_intent: self.user_intent,
                     semantic_query_override: self.semantic_query_override,
+                    turn_intent: state.turn_intent.as_ref(),
                     history: self.history,
                     recent_tools: self.recent_tools,
                     project_root: self.project_root.as_path(),
@@ -783,6 +812,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                     cancel_token: state.cancellation.token.as_deref(),
                     plan_assemble_line_release: self.plan_assemble_line_release.clone(),
                     stream_event_tx: self.stream_event_tx.clone(),
+                    stream_json_emitter: self.stream_json_emitter.clone(),
                     approval_request_tx: self.approval_request_tx.clone(),
                     ask_user_request_tx: self.ask_user_request_tx.clone(),
                     skill_resolver: state.skills.resolver.clone(),
@@ -928,6 +958,49 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         })
     }
 
+    async fn judge_turn_intent(&mut self, state: &AgenticLoopState) -> TurnIntentJudgeOutcome {
+        let Some(session_id) = state
+            .current_session_id
+            .as_deref()
+            .filter(|session_id| !session_id.trim().is_empty())
+        else {
+            return TurnIntentJudgeOutcome::Unavailable;
+        };
+        let client = CliServerProxySummaryClient {
+            api: self.api.clone(),
+            token: self.token.clone(),
+            base_scope: astra_turn_types::InferenceInvocationScope::Session {
+                session_id: session_id.to_string(),
+                turn: state.session_turn,
+                round: state.current_round_index,
+                operation_id: "turn_intent".to_string(),
+                logical_attempt: 0,
+            },
+            operation: astra_thin_client::CompletionOperation::TurnIntent,
+            next_logical_attempt: std::sync::atomic::AtomicU32::new(0),
+        };
+        let judge = CliSummaryClientTurnIntentJudge {
+            client: Box::new(client),
+        };
+        let context = astra_services::TurnIntentJudgeContext {
+            message: state.runtime_decision_user_intent(),
+            turn_count: state.session_turn,
+            recent_tools: state.recent_tools.clone(),
+            has_prior_assistant_turn: state.has_prior_assistant_turn,
+        };
+        match astra_services::TurnIntentJudge::judge(&judge, &context).await {
+            Ok(intent) => TurnIntentJudgeOutcome::Intent(intent),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_cli::turn_intent_judge",
+                    error = %error,
+                    "typed turn-intent judge unavailable; preserving unknown intent"
+                );
+                TurnIntentJudgeOutcome::Unavailable
+            }
+        }
+    }
+
     async fn judge_skill_auto_route(
         &mut self,
         state: &AgenticLoopState,
@@ -948,6 +1021,7 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
                 operation_id: "skill_auto_route".to_string(),
                 logical_attempt: 0,
             },
+            operation: astra_thin_client::CompletionOperation::SkillAutoRoute,
             next_logical_attempt: std::sync::atomic::AtomicU32::new(0),
         };
         let judge = CliSummaryClientSkillAutoRouteJudge {
@@ -1022,8 +1096,9 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
     }
 
     fn on_compaction(&mut self, event: CompactionEvent) {
-        // Stderr fallback (always visible).
-        self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        if !self.is_quiet() {
+            self.emit_headless_line(HeadlessStderrStyle::Dim, event.summary.clone());
+        }
         // Structured event for TUI / stream consumers.
         self.try_emit_stream_event(crate::cli::chat_stream::StreamEvent::Compaction(event));
     }
@@ -1376,6 +1451,11 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         let Ok(canonical_prefix_bytes) = serde_json::to_vec(&state.messages) else {
             return;
         };
+        crate::cli::history_work::record_existing_buffer(
+            astra_core::history_work::HistoryWorkSite::CliForkPrefixSerialization,
+            &canonical_prefix_bytes,
+            state.messages.len(),
+        );
         let captured_at_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1389,6 +1469,10 @@ impl AgenticLoopHost for CliAgenticLoopHost<'_> {
         // real bytes exist.
         let tool_schemas =
             astra_turn_core::fork_prefix::build_tool_schema_entries(&self.all_schemas);
+        crate::cli::history_work::record_fork_tool_schema_serialization(
+            astra_core::history_work::HistoryWorkSite::CliForkToolSchemaSerialization,
+            &tool_schemas,
+        );
         let req = astra_turn_core::fork_capture::CaptureRequest {
             parent_run_id,
             parent_turn_seq: self.chat_turn_index,
@@ -1450,9 +1534,9 @@ fn request_allowlist_restriction_names(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSummaryClientSkillAutoRouteJudge, derive_turn_interaction_mode, emit_final_output_ready,
-        permission_mode_change_audit_event, plan_mode_restriction_names,
-        request_allowlist_restriction_names, user_intent_stream_event,
+        CliSummaryClientSkillAutoRouteJudge, CliSummaryClientTurnIntentJudge,
+        derive_turn_interaction_mode, emit_final_output_ready, permission_mode_change_audit_event,
+        plan_mode_restriction_names, request_allowlist_restriction_names, user_intent_stream_event,
     };
     use crate::cli::permission_manager::PermissionMode;
     use astra_runtime::turn::agentic_loop::host::TurnInteractionMode;
@@ -1559,6 +1643,30 @@ mod tests {
             .expect("judge response should parse");
 
         assert_eq!(selected, Some("review-changes".to_string()));
+    }
+
+    #[tokio::test]
+    async fn cli_turn_intent_judge_preserves_typed_llm_domain() {
+        let judge = CliSummaryClientTurnIntentJudge {
+            client: Box::new(ScriptedSummaryClient {
+                text: r#"{"domain":"database","communicative_act":"task","requested_scenario":"debugging","objective_relation":"replace","workspace_mutation":"read_only","browser_verification_required":false}"#.to_string(),
+            }),
+        };
+        let context = astra_services::TurnIntentJudgeContext {
+            message: "arbitrary natural language".to_string(),
+            turn_count: 4,
+            recent_tools: Vec::new(),
+            has_prior_assistant_turn: true,
+        };
+
+        let intent = astra_services::TurnIntentJudge::judge(&judge, &context)
+            .await
+            .expect("strict typed response should parse");
+
+        assert_eq!(
+            intent.domain,
+            Some(astra_config::user_profile::TurnIntentDomain::Database)
+        );
     }
 
     #[test]

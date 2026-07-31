@@ -148,8 +148,7 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
 }
 
 fn classify_legacy_tool_result_path(path: &str) -> Option<InternalPathKind> {
-    let root = dirs::home_dir()?
-        .join(".astra")
+    let root = astra_runtime_env::local_state_root()
         .join("tool-results")
         .canonicalize()
         .ok()?;

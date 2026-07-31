@@ -33,9 +33,17 @@ pub fn bind_all(plan: &ContextPlan, sources: &ContextSources<'_>) -> ContextBoun
     let sections = bind_sections(plan, sources);
 
     // Messages come from TurnState
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextBinding,
+        &sources.turn.messages,
+    );
     let messages = sources.turn.messages.clone();
 
     // Tool schemas from AgentContext
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextBinding,
+        &sources.agent.tool_schemas,
+    );
     let tool_schemas = sources.agent.tool_schemas.clone();
 
     ContextBound {
@@ -455,6 +463,7 @@ mod tests {
                 run_id: "test-run".into(),
                 model_id: "test-model".into(),
                 provider_name: "anthropic".into(),
+                pre_reserved_output_tokens: 0,
                 model_limit: 100_000,
                 provider_policy: ProviderCachePolicy::default(),
                 provider_strategy: ProviderCacheStrategy::default(),
@@ -607,6 +616,7 @@ mod tests {
         let plan_input = crate::context_planner::PlanInput {
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &sources.turn.recovery,
             latches: sources.latches,
             stats: sources.stats,
@@ -1003,6 +1013,7 @@ mod tests {
         let plan_input = crate::context_planner::PlanInput {
             tokens: &sources.turn.tokens,
             model_limit: 100_000,
+            pre_reserved_output_tokens: 0,
             recovery: &sources.turn.recovery,
             latches: sources.latches,
             stats: sources.stats,

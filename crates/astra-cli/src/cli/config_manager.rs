@@ -17,9 +17,7 @@ fn settings_path(override_path: Option<&std::path::PathBuf>) -> Result<std::path
     if let Some(p) = override_path {
         return Ok(p.clone());
     }
-    dirs::home_dir()
-        .map(|h| h.join(".astra").join("settings.json"))
-        .ok_or_else(|| "Cannot determine home directory".to_string())
+    Ok(astra_runtime_env::local_state_root().join("settings.json"))
 }
 
 fn read_settings_from(

@@ -83,7 +83,7 @@ pub async fn cleanup_resource_limits(pool: &sqlx::MySqlPool, user_id: &str) {
 pub fn limits_payload(max_sessions_per_day: u32, max_concurrent_sessions: u32) -> Value {
     json!({
         "max_concurrent_sessions": max_concurrent_sessions,
-        "max_tokens_per_day": 2_000_000,
+        "max_tokens_per_day": 0,
         "max_disk_bytes": 1_073_741_824u64,
         "max_concurrent_bash": 3,
         "max_sessions_per_day": max_sessions_per_day
@@ -137,6 +137,11 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
         lim_j["limits"]["max_concurrent_sessions"].as_u64(),
         Some(5),
         "default concurrent cap: {lim_j}"
+    );
+    assert_eq!(
+        lim_j["limits"]["max_tokens_per_day"].as_u64(),
+        Some(0),
+        "token quota must require an explicit per-user override: {lim_j}"
     );
 
     let (st_use, use_j) = get_json(app, "/resources/usage", Some(auth), &[]).await;

@@ -1,4 +1,8 @@
 use super::*;
+use crate::turn::bridge::{
+    BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES, BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES,
+    is_exact_bridge_identity,
+};
 use astra_turn_types::ModelSelection;
 
 // ─── Typed request body ──────────────────────────────────────────────────────
@@ -40,6 +44,8 @@ pub(super) struct ChatTurnRequestBody {
     turn_chain_id: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_query_event_id: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_authority: Option<serde_json::Value>,
     /// Forward-compatible: preserves unknown fields through round-trip.
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
@@ -114,21 +120,24 @@ impl ChatTurnRequestBody {
     }
 
     fn explicit_turn_chain_id(&self) -> Option<&str> {
-        self.turn_chain_id
-            .as_ref()?
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
+        self.turn_chain_id.as_ref()?.as_str()
     }
 
     fn explicit_user_query_event_id(&self) -> Option<&str> {
-        self.user_query_event_id
-            .as_ref()?
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
+        self.user_query_event_id.as_ref()?.as_str()
     }
 
     fn user_query(&self) -> String {
         extract_latest_user_query(self.messages_slice())
+    }
+
+    fn conversation_authority(
+        &self,
+    ) -> Result<Option<astra_turn_types::ConversationAuthorityEnvelopeV1>, serde_json::Error> {
+        self.conversation_authority
+            .clone()
+            .map(serde_json::from_value)
+            .transpose()
     }
 }
 
@@ -157,7 +166,6 @@ pub(super) struct PreparedChatTurnBridgeRequest {
     pub(super) tools_changed: Option<bool>,
     pub(super) user_query_b64: Option<String>,
     pub(super) routing_meta_b64: Option<String>,
-    pub(super) force_intent: Option<String>,
     pub(super) execution_state_b64: Option<String>,
 }
 
@@ -174,7 +182,6 @@ impl PreparedChatTurnBridgeRequest {
             tools_changed: None,
             user_query_b64: None,
             routing_meta_b64: None,
-            force_intent: None,
             execution_state_b64: None,
         }
     }
@@ -319,6 +326,16 @@ fn validate_bridge_payload_fields(
             "bridge payload field `edge_profile` must be an object",
         ));
     }
+    if payload
+        .get("conversation_authority")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "bridge payload field `conversation_authority` must be an object",
+            "conversation_authority_invalid",
+        ));
+    }
 
     Ok(())
 }
@@ -328,6 +345,28 @@ struct ExplicitBridgeTurnIdentity {
     session_turn: u32,
     turn_chain_id: String,
     user_query_event_id: String,
+}
+
+fn validate_exact_bridge_identity<'a>(
+    value: Option<&'a str>,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<&'a str, (StatusCode, Json<ErrorResponse>)> {
+    let Some(value) = value else {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{field} must be a string when explicit bridge identity is provided"),
+        ));
+    };
+    if !is_exact_bridge_identity(value, max_bytes) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{field} must be an exact non-empty identity of at most {max_bytes} bytes without leading/trailing whitespace or control characters"
+            ),
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_explicit_turn_identity(
@@ -345,27 +384,21 @@ fn validate_explicit_turn_identity(
             "session_turn must be a positive integer when explicit bridge identity is provided",
         ));
     };
-    let Some(turn_chain_id) = request.explicit_turn_chain_id() else {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "turn_chain_id must be a non-empty string when explicit bridge identity is provided",
-        ));
-    };
-    let Some(user_query_event_id) = request.explicit_user_query_event_id() else {
-        return Err(error_response(
-            StatusCode::BAD_REQUEST,
-            "user_query_event_id must be a non-empty string when explicit bridge identity is provided",
-        ));
-    };
+    let turn_chain_id = validate_exact_bridge_identity(
+        request.explicit_turn_chain_id(),
+        "turn_chain_id",
+        BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES,
+    )?;
+    let user_query_event_id = validate_exact_bridge_identity(
+        request.explicit_user_query_event_id(),
+        "user_query_event_id",
+        BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES,
+    )?;
     Ok(Some(ExplicitBridgeTurnIdentity {
         session_turn,
         turn_chain_id: turn_chain_id.to_string(),
         user_query_event_id: user_query_event_id.to_string(),
     }))
-}
-
-fn inferred_force_intent_for_bridge_user_query(_user_query: &str) -> Option<String> {
-    None
 }
 
 pub(super) async fn prepare_chat_turn_bridge_body(
@@ -449,6 +482,29 @@ pub(super) async fn prepare_chat_turn_bridge_body(
     ) {
         seed_bridge_session_created_at(state, &user.user_id, session_id, created_at).await;
     }
+    let conversation_authority = request.conversation_authority().map_err(|error| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("invalid conversation authority envelope: {error}"),
+            "conversation_authority_invalid",
+        )
+    })?;
+    super::chat_handlers::validate_conversation_authority(
+        state,
+        &user.user_id,
+        trusted_session_id.as_deref(),
+        conversation_authority.as_ref(),
+    )
+    .await?;
+    if let Some(authority) = &conversation_authority
+        && request.round_index != Some(authority.round)
+    {
+        return Err(error_response_coded(
+            StatusCode::CONFLICT,
+            "conversation authority round does not match the bridge request",
+            "conversation_authority_round_mismatch",
+        ));
+    }
     // ── Turn identifiers ────────────────────────────────────────────────
     let (turn_chain_id, user_query_event_id, session_turn) =
         if let Some(session_id) = trusted_session_id.as_deref() {
@@ -492,7 +548,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
         let meta = serde_json::Value::Object(build_skipped_routing_metadata("model_selection"));
         URL_SAFE.encode(serde_json::to_string(&meta).unwrap_or_default().as_bytes())
     });
-    let force_intent = inferred_force_intent_for_bridge_user_query(&user_query);
     let execution_state_b64 = request
         .execution_state_obj()
         .map(normalize_execution_state)
@@ -512,7 +567,6 @@ pub(super) async fn prepare_chat_turn_bridge_body(
             tools_changed,
             user_query_b64,
             routing_meta_b64,
-            force_intent,
             execution_state_b64,
         })
         .map_err(internal_error)
@@ -1656,6 +1710,47 @@ mod tests {
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
     }
 
+    #[test]
+    fn explicit_turn_identity_requires_exact_bounded_values() {
+        let valid = ChatTurnRequestBody {
+            session_turn: Some(json!(1)),
+            turn_chain_id: Some(json!("c".repeat(BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES))),
+            user_query_event_id: Some(json!("q".repeat(BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES))),
+            ..Default::default()
+        };
+        validate_explicit_turn_identity(&valid).expect("bounded exact identities should validate");
+
+        for invalid_turn_chain_id in [
+            String::new(),
+            " chain".to_string(),
+            "chain ".to_string(),
+            "chain\u{0007}id".to_string(),
+            "c".repeat(BRIDGE_TRANSPORT_RUN_ID_MAX_BYTES + 1),
+        ] {
+            let request = ChatTurnRequestBody {
+                session_turn: Some(json!(1)),
+                turn_chain_id: Some(json!(invalid_turn_chain_id)),
+                user_query_event_id: Some(json!("query-1")),
+                ..Default::default()
+            };
+            let Err(error) = validate_explicit_turn_identity(&request) else {
+                panic!("non-exact turn chain identity must be rejected");
+            };
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        }
+
+        let overlong_event_id = ChatTurnRequestBody {
+            session_turn: Some(json!(1)),
+            turn_chain_id: Some(json!("chain-1")),
+            user_query_event_id: Some(json!("q".repeat(BRIDGE_USER_QUERY_EVENT_ID_MAX_BYTES + 1))),
+            ..Default::default()
+        };
+        let Err(error) = validate_explicit_turn_identity(&overlong_event_id) else {
+            panic!("overlong event identity must be rejected");
+        };
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn prepare_body_propagates_full_capture_flag_from_session_metadata() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
@@ -1790,17 +1885,6 @@ mod tests {
         );
         assert_eq!(state.get("history"), Some(&json!(["turn1", "turn2"])));
         assert_eq!(state.get("turn_count"), Some(&json!(0)));
-    }
-
-    #[test]
-    fn bridge_prep_does_not_infer_force_intent_from_correction_text() {
-        for query in [
-            "wrong, that's not what I meant",
-            "不对，你搞错了",
-            "actually, I meant the runtime branch",
-        ] {
-            assert_eq!(inferred_force_intent_for_bridge_user_query(query), None);
-        }
     }
 
     // ── trim_edge_tools_for_result_turn ─────────────────────────────
@@ -2177,7 +2261,6 @@ mod tests {
         assert!(result.tools_changed.is_none());
         assert!(result.user_query_b64.is_none());
         assert!(result.routing_meta_b64.is_none());
-        assert!(result.force_intent.is_none());
         assert!(result.execution_state_b64.is_none());
     }
 }

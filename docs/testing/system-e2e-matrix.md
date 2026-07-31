@@ -70,7 +70,7 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
 | `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability |
 | `e2e_matrix_context_decision_chain` | `journey_context_decision_chain_matrix.rs` | Event → context → decision chain + `ctx_snapshots` / `ctx_decision_audits` SQL |
-| `e2e_matrix_chat_route_models` | `journey_chat_route_models_matrix.rs` | `POST /chat/route`, `GET /models` |
+| `e2e_matrix_models` | `journey_models_matrix.rs` | `GET /models`, `GET /model-access` |
 | `e2e_matrix_branches_cost_estimate_http` | `journey_branches_matrix.rs` | `POST /branches/cost-estimate` (+ 401 without auth); no DDL branch/create |
 | `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
 | `e2e_matrix_admin_tokens_smoke` | `journey_admin_smoke_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
@@ -95,7 +95,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` + `e2e_matrix_session_http_db` |
 | Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | `agent_events` + HTTP cross-check | `product_matrix_*`; `e2e_matrix_cli_bridge_session_views_remain_consistent` (summary/turn counts and token totals); `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
-| Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_chat_route_models` (list); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
+| Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_models` (list/access); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
 | Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |

@@ -38,6 +38,13 @@ pub struct ContextAssemblyTrace {
     /// Session identifier.
     pub session_id: String,
 
+    /// Identity of the latest concrete model request represented by this
+    /// assembly. A turn may issue several rounds and provider retries; the
+    /// durable per-request manifest retains the sequence while this
+    /// turn-level view deliberately points at the latest active request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_identity: Option<ModelRequestTraceIdentity>,
+
     /// Breakdown of system prompt components.
     pub system_prompt: SystemPromptBreakdown,
 
@@ -78,6 +85,7 @@ impl Default for ContextAssemblyTrace {
             turn_id: String::new(),
             timestamp: SystemTime::now(),
             session_id: String::new(),
+            request_identity: None,
             system_prompt: SystemPromptBreakdown::default(),
             history: HistorySelectionTrace::default(),
             memory: MemoryRetrievalTrace::default(),
@@ -86,6 +94,22 @@ impl Default for ContextAssemblyTrace {
             explanations: Vec::new(),
         }
     }
+}
+
+/// Stable identity for one concrete provider-bound request.
+///
+/// `round` identifies the logical model round and `attempt` identifies a
+/// retry of that exact round. The request ID and hash are generated from the
+/// final wire plan, so tracing never invents identity from mutable counters
+/// after the fact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestTraceIdentity {
+    pub request_id: String,
+    pub request_hash: String,
+    pub round: u32,
+    pub attempt: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_response_id: Option<String>,
 }
 
 /// Normalize arbitrary memory content into a one-line preview suitable for
@@ -445,6 +469,11 @@ impl ContextAssemblyTraceBuilder {
 
     pub fn with_system_prompt(mut self, breakdown: SystemPromptBreakdown) -> Self {
         self.trace.system_prompt = breakdown;
+        self
+    }
+
+    pub fn with_request_identity(mut self, identity: ModelRequestTraceIdentity) -> Self {
+        self.trace.request_identity = Some(identity);
         self
     }
 

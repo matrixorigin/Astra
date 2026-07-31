@@ -124,6 +124,10 @@ pub(crate) fn build_child_messages(
     if let Some(prefix) = prefix_messages {
         // Fork mode: reuse parent prefix verbatim for cache alignment.
         let mut messages = Vec::with_capacity(prefix.len() + 2);
+        crate::cli::history_work::record_json_history(
+            astra_core::history_work::HistoryWorkSite::CliForkChildHistoryMaterialization,
+            prefix,
+        );
         messages.extend(prefix.iter().cloned());
         if force_reasoning_field {
             ensure_assistant_reasoning_fields(&mut messages);
@@ -410,9 +414,11 @@ fn stream_event_to_agent_live_kind(
                 bytes,
             }))
         }
-        StreamEvent::ContextWindowEstimated(_)
+        StreamEvent::ContextWindowPolicy { .. }
+        | StreamEvent::ContextWindowEstimated(_)
         | StreamEvent::ContextSystemPromptTokens(_)
         | StreamEvent::ContextWindowMeasured(_)
+        | StreamEvent::RequestTokenUsage(_)
         | StreamEvent::Thinking(_)
         | StreamEvent::AgentLive(_)
         | StreamEvent::AgentLiveGap(_)

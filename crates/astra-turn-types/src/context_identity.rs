@@ -293,18 +293,47 @@ pub struct NormalizedPromptCacheUsage {
 }
 
 impl NormalizedPromptCacheUsage {
+    pub const fn new(
+        fresh_input_tokens: u64,
+        cache_read_tokens: u64,
+        cache_creation_tokens: u64,
+    ) -> Self {
+        Self {
+            fresh_input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        }
+    }
+
     pub fn total_input_tokens(self) -> u64 {
         self.fresh_input_tokens
             .saturating_add(self.cache_read_tokens)
             .saturating_add(self.cache_creation_tokens)
     }
 
+    pub fn checked_total_input_tokens(self) -> Option<u64> {
+        self.fresh_input_tokens
+            .checked_add(self.cache_read_tokens)?
+            .checked_add(self.cache_creation_tokens)
+    }
+
+    pub fn total_tokens_with_output(self, output_tokens: u64) -> u64 {
+        self.total_input_tokens().saturating_add(output_tokens)
+    }
+
+    pub fn checked_total_tokens_with_output(self, output_tokens: u64) -> Option<u64> {
+        self.checked_total_input_tokens()?
+            .checked_add(output_tokens)
+    }
+
     pub fn read_share_basis_points(self) -> u16 {
-        let total = self.total_input_tokens();
+        let total = u128::from(self.fresh_input_tokens)
+            + u128::from(self.cache_read_tokens)
+            + u128::from(self.cache_creation_tokens);
         if total == 0 {
             return 0;
         }
-        ((self.cache_read_tokens.saturating_mul(10_000) / total).min(10_000)) as u16
+        ((u128::from(self.cache_read_tokens) * 10_000 / total).min(10_000)) as u16
     }
 }
 
@@ -506,12 +535,18 @@ mod tests {
 
     #[test]
     fn normalized_usage_is_provider_neutral_and_saturating() {
-        let usage = NormalizedPromptCacheUsage {
-            fresh_input_tokens: 100,
-            cache_read_tokens: 300,
-            cache_creation_tokens: 100,
-        };
+        let usage = NormalizedPromptCacheUsage::new(100, 300, 100);
         assert_eq!(usage.total_input_tokens(), 500);
+        assert_eq!(usage.total_tokens_with_output(20), 520);
         assert_eq!(usage.read_share_basis_points(), 6_000);
+
+        let saturated = NormalizedPromptCacheUsage::new(u64::MAX, 1, 1);
+        assert_eq!(saturated.total_input_tokens(), u64::MAX);
+        assert_eq!(saturated.total_tokens_with_output(1), u64::MAX);
+        assert_eq!(saturated.checked_total_input_tokens(), None);
+        assert_eq!(saturated.checked_total_tokens_with_output(1), None);
+
+        let all_cache_read = NormalizedPromptCacheUsage::new(0, u64::MAX, 0);
+        assert_eq!(all_cache_read.read_share_basis_points(), 10_000);
     }
 }

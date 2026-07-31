@@ -2,8 +2,8 @@ use crate::cli::cli_config::cli_utils::{
     SessionResumePreflight, local_resumable_last_session_id, preflight_remote_resume_session,
 };
 use crate::cli::session::session_continuation::{
-    SessionContinuation, continuation_activation_names, load_csl_continuation,
-    load_session_continuation_for_recovery, sanitize_continuation_messages,
+    SessionContinuation, continuation_from_resume_bundle, load_session_continuation_for_recovery,
+    portable_resume_descriptor, sanitize_continuation_messages,
 };
 use crate::cli::session::session_restore_client::{
     fetch_cloud_session_snapshot_with_client, list_cloud_resumable_sessions,
@@ -16,7 +16,7 @@ pub(crate) struct OneShotSessionResumeMetadata {
     pub(crate) model: Option<String>,
     pub(crate) permission_mode: Option<String>,
     pub(crate) continuation_messages: Vec<serde_json::Value>,
-    pub(crate) activated_deferred_tool_names: Vec<String>,
+    pub(crate) resume_bundle: Option<astra_turn_types::ResumeBundleV1>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -27,73 +27,102 @@ pub(crate) struct OneShotSessionRouting {
 }
 
 impl OneShotSessionRouting {
-    fn local_csl_continuation(&self) -> Option<SessionContinuation> {
-        let session_id = self.history_source_session_id.as_deref()?;
-        match load_csl_continuation(session_id) {
-            Ok(Some(local)) => {
-                let restored_is_causally_newer =
-                    !self.resume_metadata.continuation_messages.is_empty()
-                        && self.resume_metadata.completed_turn_count
-                            > local.completed_turn_count.unwrap_or_default();
-                if restored_is_causally_newer {
-                    tracing::info!(
-                        %session_id,
-                        local_completed_turns = local.completed_turn_count.unwrap_or_default(),
-                        restored_completed_turns = self.resume_metadata.completed_turn_count,
-                        "using restored continuation because the local CSL projection is behind"
-                    );
-                    None
-                } else {
-                    Some(local)
-                }
-            }
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(
-                    %session_id,
-                    %error,
-                    "failed to read canonical local continuation; trying restore projection"
-                );
-                None
-            }
-        }
-    }
-
-    pub(crate) fn continuation(&self) -> Option<SessionContinuation> {
-        if let Some(local) = self.local_csl_continuation() {
-            return Some(local);
-        }
-        if !self.resume_metadata.continuation_messages.is_empty() {
-            let messages = self.resume_metadata.continuation_messages.clone();
-            return Some(SessionContinuation {
-                completed_turn_count: Some(self.resume_metadata.completed_turn_count),
-                activated_deferred_tool_names: continuation_activation_names(
-                    &messages,
-                    self.resume_metadata
-                        .activated_deferred_tool_names
-                        .iter()
-                        .cloned(),
-                ),
-                messages,
-            });
-        }
-        let continuation = self
+    fn take_continuation(&mut self) -> Result<Option<SessionContinuation>, String> {
+        let local = self
             .history_source_session_id
             .as_deref()
-            .and_then(load_session_continuation_for_recovery)?;
-        Some(continuation)
+            .and_then(load_session_continuation_for_recovery);
+        let remote_bundle = self.resume_metadata.resume_bundle.take().or_else(|| {
+            let messages = std::mem::take(&mut self.resume_metadata.continuation_messages);
+            if messages.is_empty() {
+                return None;
+            }
+            let session_id = self
+                .history_source_session_id
+                .as_deref()
+                .or(self.server_session_id.as_deref())
+                .unwrap_or("remote-continuation");
+            let cursor = astra_turn_types::legacy_resume_cursor(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                session_id,
+                self.resume_metadata.completed_turn_count,
+                &messages,
+            );
+            astra_turn_types::select_resume_bundle(
+                None,
+                [astra_turn_types::ResumeCandidateV1 {
+                    source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                    cursor,
+                    conversation_messages: messages,
+                    degraded_reasons: vec![
+                        astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+                        astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
+                        astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback,
+                    ],
+                    repair_actions: vec![
+                        astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
+                    ],
+                    projections: astra_turn_types::ResumeProjectionSetV1::default(),
+                }],
+            )
+            .ok()
+        });
+
+        let mut candidates = Vec::with_capacity(2);
+        if let Some(local) = local.as_ref() {
+            candidates.push(portable_resume_descriptor(local.resume.clone()));
+        }
+        if let Some(remote) = remote_bundle.as_ref() {
+            if !remote.validates_root() {
+                tracing::warn!(
+                    "remote one-shot resume bundle does not materialize its declared root"
+                );
+                return Err(
+                    "remote one-shot resume bundle failed canonical root validation".to_string(),
+                );
+            }
+            candidates.push(portable_resume_descriptor(remote.descriptor()));
+        }
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let selected = astra_turn_types::select_resume_candidate_index(None, &candidates).map_err(
+            |error| {
+                tracing::warn!(
+                    %error,
+                    "one-shot resume candidates do not share one causal generation"
+                );
+                format!("one-shot resume candidates are causally inconsistent: {error}")
+            },
+        )?;
+        if selected == 0 && local.is_some() {
+            return Ok(local);
+        }
+        let had_remote_bundle = remote_bundle.is_some();
+        let continuation = remote_bundle.and_then(continuation_from_resume_bundle);
+        if had_remote_bundle && continuation.is_none() {
+            return Err("remote ResumeBundle failed causal validation".to_string());
+        }
+        Ok(continuation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn continuation(&self) -> Result<Option<SessionContinuation>, String> {
+        self.clone().take_continuation()
     }
 
     /// Resolve continuation once, then keep its prompt messages and durable
     /// tool-surface state on the same causal path.
-    pub(crate) fn continuation_turn_inputs(&self) -> (Option<Vec<serde_json::Value>>, Vec<String>) {
-        match self.continuation() {
+    pub(crate) fn continuation_turn_inputs(
+        &mut self,
+    ) -> Result<(Option<Vec<serde_json::Value>>, Vec<String>), String> {
+        Ok(match self.take_continuation()? {
             Some(continuation) => (
                 Some(continuation.messages),
                 continuation.activated_deferred_tool_names,
             ),
             None => (None, Vec::new()),
-        }
+        })
     }
 
     pub(crate) fn task_scope_session_id(&self) -> Option<&str> {
@@ -183,31 +212,20 @@ async fn load_one_shot_resume_metadata(
         match fetch_cloud_session_snapshot_with_client(profile, api, session_id).await {
             Ok(Some(remote)) => {
                 if let Ok(Some(local)) = restored.as_mut() {
-                    let remote_is_newer = remote.turn_count > local.turn_count;
-                    // Restore sources are independently persisted and can be
-                    // briefly out of sync. A completed-turn clock is
-                    // monotonic: observing an older remote projection must
-                    // never roll a valid local clock backwards.
-                    local.turn_count = local.turn_count.max(remote.turn_count);
-                    if remote.model.is_some() {
-                        local.model = remote.model;
-                    }
-                    if remote.permission_mode.is_some() {
-                        local.permission_mode = remote.permission_mode;
-                    }
-                    if !remote.conversation_messages.is_empty()
-                        && (remote_is_newer || local.conversation_messages.is_empty())
-                    {
-                        local.conversation_messages = remote.conversation_messages;
-                    }
-                    local.activated_deferred_tool_names = continuation_activation_names(
-                        &[],
-                        local
-                            .activated_deferred_tool_names
-                            .iter()
-                            .chain(remote.activated_deferred_tool_names.iter())
-                            .cloned(),
-                    );
+                    // The Server turn clock is authoritative for a networked
+                    // session. Conversation selection remains cursor/root
+                    // based in `continuation`; do not splice remote messages
+                    // into a local snapshot based on turn counts.
+                    local.turn_count = remote.turn_count;
+                    // Conversation-sensitive provider state must come from
+                    // the same server-selected generation. An absent value is
+                    // meaningful; retaining a richer local value would splice
+                    // stale provider state into the remote conversation.
+                    local.model = remote.model.clone();
+                    local.permission_mode = remote.permission_mode.clone();
+                    local.conversation_messages = remote.conversation_messages;
+                    local.activated_deferred_tool_names = remote.activated_deferred_tool_names;
+                    local.resume_bundle = remote.resume_bundle;
                 }
             }
             Ok(None) => {}
@@ -223,14 +241,20 @@ async fn load_one_shot_resume_metadata(
 
     match restored {
         Ok(Some(restored)) => {
-            let continuation_messages =
-                sanitize_continuation_messages(restored.conversation_messages);
+            let continuation_messages = if restored.resume_bundle.is_some() {
+                Vec::new()
+            } else {
+                sanitize_continuation_messages(restored.conversation_messages)
+            };
             OneShotSessionResumeMetadata {
+                // Server turn admission and conversation hydration are
+                // separate deterministic planes. A checkpoint may lag the
+                // Server head; it must not roll back the next turn index.
                 completed_turn_count: restored.turn_count,
                 model: restored.model,
                 permission_mode: restored.permission_mode,
                 continuation_messages,
-                activated_deferred_tool_names: restored.activated_deferred_tool_names,
+                resume_bundle: restored.resume_bundle,
             }
         }
         Ok(None) => OneShotSessionResumeMetadata::default(),
@@ -345,6 +369,7 @@ mod tests {
                 total_tokens: 42,
                 created_at: epoch_ms(),
             },
+            conversation_cursor: None,
             messages: vec![
                 serde_json::json!({"role": "user", "content": "previous question"}),
                 serde_json::json!({"role": "assistant", "content": "previous answer"}),
@@ -373,6 +398,48 @@ mod tests {
             &StepCheckpoint::Heavy(Box::new(heavy)),
         )
         .unwrap();
+    }
+
+    fn typed_resume_bundle(
+        session_id: &str,
+        sequence: u64,
+        messages: Vec<serde_json::Value>,
+        activated_deferred_tool_names: Vec<String>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: sequence as u32,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let activation = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+            cursor.clone(),
+            astra_turn_types::ResumeActivationProjectionV1 {
+                deferred_tool_names: activated_deferred_tool_names,
+            },
+        );
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: astra_turn_types::ResumeProjectionSetV1 {
+                    activation: Some(activation),
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap()
     }
 
     async fn mock_empty_cloud_resumable_list(server: &MockServer) {
@@ -503,7 +570,10 @@ mod tests {
             },
         };
 
-        let continuation = routing.continuation().expect("continuation");
+        let continuation = routing
+            .continuation()
+            .expect("causal selection")
+            .expect("continuation");
         assert_eq!(
             continuation.activated_deferred_tool_names,
             vec!["github"],
@@ -522,7 +592,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn continuation_prefers_the_projection_with_the_newer_completed_turn() {
+    fn continuation_prefers_the_newer_typed_causal_projection() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("routing-causal-{}", uuid::Uuid::new_v4());
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
@@ -535,38 +605,47 @@ mod tests {
             &astra_turn_core::conversation_log::SessionStateCompact::default(),
         )
         .unwrap();
+        let remote_messages = vec![
+            serde_json::json!({"role": "user", "content": "current restored question"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "search-1",
+                    "function": {"name": "tool_search", "arguments": "{\"query\":\"select:github\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "search-1",
+                "content": serde_json::json!({
+                    "mode": "select",
+                    "query": "select:github",
+                    "requested": ["github"],
+                    "matches": [{"name": "github"}],
+                    "missing": []
+                }).to_string()
+            }),
+            serde_json::json!({"role": "assistant", "content": "current restored answer"}),
+        ];
         let routing = OneShotSessionRouting {
             server_session_id: Some(session_id.clone()),
-            history_source_session_id: Some(session_id),
+            history_source_session_id: Some(session_id.clone()),
             resume_metadata: OneShotSessionResumeMetadata {
                 completed_turn_count: 3,
-                continuation_messages: vec![
-                    serde_json::json!({"role": "user", "content": "current restored question"}),
-                    serde_json::json!({
-                        "role": "assistant",
-                        "tool_calls": [{
-                            "id": "search-1",
-                            "function": {"name": "tool_search", "arguments": "{\"query\":\"select:github\"}"}
-                        }]
-                    }),
-                    serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": "search-1",
-                        "content": serde_json::json!({
-                            "mode": "select",
-                            "query": "select:github",
-                            "requested": ["github"],
-                            "matches": [{"name": "github"}],
-                            "missing": []
-                        }).to_string()
-                    }),
-                    serde_json::json!({"role": "assistant", "content": "current restored answer"}),
-                ],
+                resume_bundle: Some(typed_resume_bundle(
+                    &session_id,
+                    3,
+                    remote_messages,
+                    Vec::new(),
+                )),
                 ..Default::default()
             },
         };
 
-        let continuation = routing.continuation().expect("continuation");
+        let continuation = routing
+            .continuation()
+            .expect("causal selection")
+            .expect("continuation");
 
         assert!(
             continuation
@@ -587,6 +666,54 @@ mod tests {
             vec!["github"],
             "a newer restored projection must reconstruct activation from its own durable tool-search evidence"
         );
+    }
+
+    #[test]
+    fn one_shot_consumes_remote_history_instead_of_retaining_an_extra_copy() {
+        let session_id = "long-one-shot";
+        let messages = (0..2_048)
+            .map(|index| serde_json::json!({"role": "user", "content": format!("message-{index}")}))
+            .collect::<Vec<_>>();
+        let mut routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.into()),
+            history_source_session_id: None,
+            resume_metadata: OneShotSessionResumeMetadata {
+                completed_turn_count: 1_024,
+                resume_bundle: Some(typed_resume_bundle(session_id, 1_024, messages, Vec::new())),
+                ..Default::default()
+            },
+        };
+
+        let continuation = routing.take_continuation().unwrap().unwrap();
+        assert_eq!(continuation.messages.len(), 2_048);
+        assert!(
+            routing.resume_metadata.resume_bundle.is_none(),
+            "routing must release its large wire payload once continuation owns it"
+        );
+        assert!(routing.resume_metadata.continuation_messages.is_empty());
+    }
+
+    #[test]
+    fn one_shot_surfaces_typed_identity_conflicts_instead_of_starting_with_empty_history() {
+        let session_id = "identity-conflict";
+        let mut bundle = typed_resume_bundle(
+            session_id,
+            1,
+            vec![serde_json::json!({"role": "user", "content": "private"})],
+            Vec::new(),
+        );
+        bundle.cursor.owner_id = "another-account".into();
+        let mut routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.into()),
+            history_source_session_id: None,
+            resume_metadata: OneShotSessionResumeMetadata {
+                resume_bundle: Some(bundle),
+                ..Default::default()
+            },
+        };
+
+        let error = routing.take_continuation().unwrap_err();
+        assert!(error.contains("failed causal validation"), "{error}");
     }
 
     #[test]
@@ -646,6 +773,7 @@ mod tests {
 
         let continuation = routing
             .continuation()
+            .expect("causal selection")
             .expect("local checkpoint should provide continuation messages")
             .messages;
         assert_eq!(continuation.len(), 2);
@@ -680,12 +808,12 @@ mod tests {
         assert_eq!(routing.server_session_id, None);
         assert_eq!(routing.history_source_session_id, None);
         assert_eq!(routing.task_scope_session_id(), None);
-        assert!(routing.continuation().is_none());
+        assert!(routing.continuation().unwrap().is_none());
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resolve_one_shot_session_routing_restores_explicit_local_model_and_mode() {
+    async fn networked_resume_does_not_splice_stale_local_provider_state() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
@@ -714,17 +842,22 @@ mod tests {
 
         let server = MockServer::start().await;
         mock_existing_session(&server, &session_id).await;
+        let remote_messages = vec![
+            serde_json::json!({"role": "user", "content": "question from another device"}),
+            serde_json::json!({"role": "assistant", "content": "latest cloud answer"}),
+        ];
         mock_cloud_resume(
             &server,
             &session_id,
             astra_services::session_restore::RestoredSession {
                 session_id: session_id.clone(),
                 turn_count: 4,
-                conversation_messages: vec![
-                    serde_json::json!({"role": "user", "content": "question from another device"}),
-                    serde_json::json!({"role": "assistant", "content": "latest cloud answer"}),
-                ],
-                activated_deferred_tool_names: vec!["github".to_string()],
+                resume_bundle: Some(typed_resume_bundle(
+                    &session_id,
+                    4,
+                    remote_messages,
+                    vec!["github".to_string()],
+                )),
                 restored_from_cloud: true,
                 ..Default::default()
             },
@@ -741,15 +874,16 @@ mod tests {
             routing.server_session_id.as_deref(),
             Some(session_id.as_str())
         );
-        assert_eq!(routing.restored_model(), Some("gpt-5"));
-        assert_eq!(routing.restored_permission_mode(), Some("plan"));
+        assert_eq!(routing.restored_model(), None);
+        assert_eq!(routing.restored_permission_mode(), None);
         assert_eq!(
             routing.next_server_turn_index(),
             5,
-            "remote causal sequence must override a stale local checkpoint without replacing its richer metadata"
+            "the selected remote generation owns the next Server turn"
         );
         let continuation = routing
             .continuation()
+            .expect("causal selection")
             .expect("the fresher remote conversation should be resumable")
             .messages;
         assert!(
@@ -768,7 +902,7 @@ mod tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn resolve_one_shot_session_routing_never_regresses_the_completed_turn_clock() {
+    async fn networked_resume_uses_server_clock_instead_of_unacked_local_clock() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let _home_guard = crate::tests::HomeGuard::temp();
@@ -812,8 +946,8 @@ mod tests {
 
         assert_eq!(
             routing.next_server_turn_index(),
-            4,
-            "an eventually consistent restore projection must never roll the local causal clock backwards"
+            1,
+            "a local-only turn clock is not proof that the Server accepted those turns"
         );
     }
 
@@ -838,6 +972,10 @@ mod tests {
 
         let server = MockServer::start().await;
         mock_existing_session(&server, &session_id).await;
+        let cloud_messages = vec![
+            serde_json::json!({"role": "user", "content": "cloud question"}),
+            serde_json::json!({"role": "assistant", "content": "cloud answer"}),
+        ];
         mock_cloud_resume(
             &server,
             &session_id,
@@ -846,11 +984,12 @@ mod tests {
                 turn_count: 6,
                 model: Some("gpt-5-cloud".to_string()),
                 permission_mode: Some("accept_edits".to_string()),
-                conversation_messages: vec![
-                    serde_json::json!({"role": "user", "content": "cloud question"}),
-                    serde_json::json!({"role": "assistant", "content": "cloud answer"}),
-                ],
-                activated_deferred_tool_names: vec!["github".to_string()],
+                resume_bundle: Some(typed_resume_bundle(
+                    &session_id,
+                    5,
+                    cloud_messages,
+                    vec!["github".to_string()],
+                )),
                 restored_from_cloud: true,
                 ..Default::default()
             },
@@ -868,10 +1007,11 @@ mod tests {
         assert_eq!(
             routing.next_server_turn_index(),
             7,
-            "causal scopes for auxiliary inference must use the restored server turn before the main turn starts"
+            "a lagging checkpoint cursor must not roll back the authoritative Server turn"
         );
         let continuation = routing
             .continuation()
+            .expect("causal selection")
             .expect("cloud resume messages should feed one-shot continuation");
         assert_eq!(
             continuation.activated_deferred_tool_names,

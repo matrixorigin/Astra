@@ -214,7 +214,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     let wall_secs = wall_ms / 1000;
 
-    let total_billable_input = total_prompt + total_cache_read + total_cache_create;
+    let total_billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        total_prompt,
+        total_cache_read,
+        total_cache_create,
+    )
+    .total_input_tokens();
     let cache_ratio_pct = if total_cache_read > 0 {
         format!(
             " cache-read={:.0}%",

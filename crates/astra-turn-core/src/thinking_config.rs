@@ -277,52 +277,22 @@ impl fmt::Display for ThinkingConfig {
 pub struct TurnComplexitySignals {
     /// Length of the user's input in characters. Shorter = lower complexity prior.
     pub input_char_len: usize,
-    /// True when the user's message indicates a workspace modification intent —
-    /// "implement / fix / refactor / 修复 / 实现" etc. Modification implies
-    /// multi-step reasoning, so we do NOT dampen in that case.
-    pub has_modification_intent: bool,
-    /// True when an upstream structured intent judge has identified this turn
-    /// as a mid-task continuation. `from_message` deliberately leaves this
-    /// false; continuation semantics are not inferred with phrase matching.
-    pub is_continuation: bool,
+    /// True only when the typed LLM intent judge classified the turn as a
+    /// lightweight, read-only request. Judge absence stays false.
+    pub typed_lightweight: bool,
+    /// True when the typed objective relation keeps working on the current
+    /// objective. Natural-language phrases are never inspected here.
+    pub continues_current_objective: bool,
 }
 
 impl TurnComplexitySignals {
-    /// Heuristic factory from a raw user message. Callers needing more precise
-    /// signals (e.g. plan executor) can construct the struct directly.
-    pub fn from_message(message: &str) -> Self {
-        let trimmed = message.trim();
-        let lower = trimmed.to_lowercase();
-        let has_modification_intent = [
-            "implement",
-            "fix",
-            "refactor",
-            "optimize",
-            "build",
-            "rewrite",
-            "修复",
-            "实现",
-            "重构",
-            "优化",
-            "修改",
-            "重写",
-        ]
-        .iter()
-        .any(|kw| lower.contains(kw));
-        Self {
-            input_char_len: trimmed.chars().count(),
-            has_modification_intent,
-            is_continuation: false,
-        }
-    }
-
     /// Returns true when the turn is short, read-only, and not a continuation —
     /// the profile where full high/max thinking budget is almost always wasted.
     fn is_lightweight(&self) -> bool {
         self.input_char_len > 0
             && self.input_char_len <= 120
-            && !self.has_modification_intent
-            && !self.is_continuation
+            && self.typed_lightweight
+            && !self.continues_current_objective
     }
 }
 
@@ -1085,12 +1055,24 @@ mod tests {
 
     // ─── Dynamic budget scaling ─────────────────────────────────────────
 
+    fn complexity_signals(
+        message: &str,
+        typed_lightweight: bool,
+        continues_current_objective: bool,
+    ) -> TurnComplexitySignals {
+        TurnComplexitySignals {
+            input_char_len: message.trim().chars().count(),
+            typed_lightweight,
+            continues_current_objective,
+        }
+    }
+
     #[test]
     fn scale_for_turn_short_conceptual_question_drops_high_to_medium() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
-        let sig = TurnComplexitySignals::from_message("why does the circuit breaker abort?");
+        let sig = complexity_signals("why does the circuit breaker abort?", true, false);
         assert!(sig.is_lightweight());
         let scaled = cfg.scale_for_turn(sig);
         assert_eq!(
@@ -1107,7 +1089,7 @@ mod tests {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::Max,
         };
-        let sig = TurnComplexitySignals::from_message("为啥其他model看不到thinking和不thinking?");
+        let sig = complexity_signals("为啥其他model看不到thinking和不thinking?", true, false);
         let scaled = cfg.scale_for_turn(sig);
         assert_eq!(
             scaled,
@@ -1118,26 +1100,39 @@ mod tests {
     }
 
     #[test]
-    fn scale_for_turn_modification_intent_not_dampened() {
+    fn scale_for_turn_non_lightweight_typed_intent_is_not_dampened() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
-        let sig = TurnComplexitySignals::from_message("fix the bug in auth.rs");
+        let sig = complexity_signals("arbitrary short input", false, false);
         assert!(!sig.is_lightweight());
         let scaled = cfg.scale_for_turn(sig);
-        assert_eq!(scaled, cfg, "modification intent should not dampen");
+        assert_eq!(
+            scaled, cfg,
+            "non-lightweight typed intent should not dampen"
+        );
     }
 
     #[test]
-    fn scale_for_turn_does_not_infer_continuation_from_phrase() {
+    fn scale_for_turn_typed_continuation_is_not_dampened() {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::High,
         };
-        let sig = TurnComplexitySignals::from_message("继续");
-        assert!(!sig.is_continuation);
-        assert!(sig.is_lightweight());
+        let sig = complexity_signals("arbitrary short input", true, true);
+        assert!(sig.continues_current_objective);
+        assert!(!sig.is_lightweight());
         let scaled = cfg.scale_for_turn(sig);
-        assert_ne!(scaled, cfg, "phrase-matched continuation should not exist");
+        assert_eq!(scaled, cfg, "typed continuation should retain the ceiling");
+    }
+
+    #[test]
+    fn scale_for_turn_unjudged_short_input_fails_safe_without_dampening() {
+        let cfg = ThinkingConfig::Adaptive {
+            effort: ThinkingEffort::High,
+        };
+        let sig = complexity_signals("fix explain continue 修复 为什么", false, false);
+        assert!(!sig.is_lightweight());
+        assert_eq!(cfg.scale_for_turn(sig), cfg);
     }
 
     #[test]
@@ -1146,7 +1141,7 @@ mod tests {
             effort: ThinkingEffort::High,
         };
         let long = "why is this happening? ".repeat(20); // > 120 chars
-        let sig = TurnComplexitySignals::from_message(&long);
+        let sig = complexity_signals(&long, true, false);
         let scaled = cfg.scale_for_turn(sig);
         assert_eq!(scaled, cfg, "long message should not dampen");
     }
@@ -1156,7 +1151,7 @@ mod tests {
         let cfg = ThinkingConfig::Enabled {
             budget_tokens: 10_000,
         };
-        let sig = TurnComplexitySignals::from_message("what is a session id?");
+        let sig = complexity_signals("what is a session id?", true, false);
         let scaled = cfg.scale_for_turn(sig);
         assert_eq!(
             scaled,
@@ -1168,7 +1163,7 @@ mod tests {
 
     #[test]
     fn scale_for_turn_off_stays_off() {
-        let sig = TurnComplexitySignals::from_message("why?");
+        let sig = complexity_signals("why?", true, false);
         assert_eq!(ThinkingConfig::Off.scale_for_turn(sig), ThinkingConfig::Off);
     }
 
@@ -1177,7 +1172,7 @@ mod tests {
         let cfg = ThinkingConfig::Adaptive {
             effort: ThinkingEffort::Low,
         };
-        let sig = TurnComplexitySignals::from_message("why?");
+        let sig = complexity_signals("why?", true, false);
         let scaled = cfg.scale_for_turn(sig);
         assert_eq!(
             scaled,

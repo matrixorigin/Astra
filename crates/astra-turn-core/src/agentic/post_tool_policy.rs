@@ -13,7 +13,6 @@ use serde_json::Value;
 use crate::guardrails::turn_guard::{TurnGuard, VerdictSeverity};
 use crate::guardrails::verdict_audit::AgenticVerdictAuditEvent;
 use crate::interaction_types::TurnInteractionMode;
-use crate::tool::args::shape::{tool_call_arguments_value, tool_call_name};
 use astra_pipeline::step_checkpoint;
 use astra_pipeline::step_protocol::StepCheckpoint;
 use astra_pipeline::step_recorder::StepRecorder;
@@ -42,8 +41,6 @@ pub fn policy_advisory_bundle_value(advisories: &[PolicyAdvisory]) -> Option<Val
 
 pub struct AgenticPostToolPolicyRequest<'a> {
     pub turn_index: u32,
-    pub tool_calls_for_guard: &'a [Value],
-    pub intent_tool_turns: &'a mut Vec<(Vec<String>, String)>,
     pub messages: &'a mut Vec<Value>,
     pub turn_guard: &'a mut TurnGuard,
     pub verdict_events: &'a mut Vec<AgenticVerdictAuditEvent>,
@@ -85,8 +82,6 @@ pub fn apply_agentic_post_tool_policy(
 ) -> AgenticPostToolPolicyOutcome {
     let AgenticPostToolPolicyRequest {
         turn_index,
-        tool_calls_for_guard,
-        intent_tool_turns,
         messages,
         turn_guard,
         verdict_events,
@@ -101,19 +96,6 @@ pub fn apply_agentic_post_tool_policy(
         interaction_mode,
     } = ctx;
     let mut advisories = Vec::new();
-
-    {
-        let turn_names: Vec<String> = tool_calls_for_guard
-            .iter()
-            .filter_map(|tc| tool_call_name(tc).map(String::from))
-            .collect();
-        let turn_args_text: String = tool_calls_for_guard
-            .iter()
-            .map(|tc| serde_json::to_string(&tool_call_arguments_value(tc)).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(" ");
-        intent_tool_turns.push((turn_names, turn_args_text));
-    }
 
     {
         let verdict = turn_guard.evaluate();
@@ -293,7 +275,6 @@ mod tests {
 
     #[test]
     fn healthy_guard_proceeds_end_turn() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -301,12 +282,9 @@ mod tests {
         let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
-        let tool_calls: Vec<Value> = Vec::new();
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -322,7 +300,6 @@ mod tests {
         });
 
         assert!(proceed_advisories(out).is_empty());
-        assert_eq!(intent_tool_turns.len(), 1);
     }
 
     #[test]
@@ -375,7 +352,6 @@ mod tests {
 
     #[test]
     fn reward_hacking_warning_records_without_retry_or_schema_restriction() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -393,8 +369,6 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -428,7 +402,6 @@ mod tests {
 
     #[test]
     fn warning_checkpoint_preserves_configured_remaining_turns() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = vec![json!({"role": "user", "content": "inspect the code"})];
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -453,8 +426,6 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -487,7 +458,6 @@ mod tests {
 
     #[test]
     fn cache_waste_info_records_without_retry_or_restriction() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -495,15 +465,12 @@ mod tests {
         let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
-        let tool_calls = vec![json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}})];
         turn_guard.record_cache_hit("read_file");
         turn_guard.record_cache_hit("read_file");
         turn_guard.record_cache_hit("read_file");
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -535,7 +502,6 @@ mod tests {
 
     #[test]
     fn advisory_avoid_tools_do_not_remove_visible_tool_schema() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -552,8 +518,6 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -596,7 +560,6 @@ mod tests {
         // First-Critical verdict remains below the strong-advisory threshold.
         // can still name tools in retry guidance, but it must not remove them
         // from the schema. A failure does not prove the tool is unusable.
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -618,8 +581,6 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -657,7 +618,6 @@ mod tests {
 
     #[test]
     fn health_deprioritized_tools_remain_same_turn_advisory() {
-        let mut intent_tool_turns = Vec::new();
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -671,8 +631,6 @@ mod tests {
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
-            tool_calls_for_guard: &[],
-            intent_tool_turns: &mut intent_tool_turns,
             messages: &mut messages,
             turn_guard: &mut turn_guard,
             verdict_events: &mut verdict_events,
@@ -719,48 +677,5 @@ mod tests {
             !blocked.contains(&"flaky_soft_tool".to_string()),
             "soft tool-health deprioritization must not persist as hard checkpoint blocked_tools"
         );
-    }
-
-    #[test]
-    fn canonical_tool_call_shape_feeds_intent_tracking() {
-        let mut intent_tool_turns = Vec::new();
-        let mut messages = Vec::new();
-        let mut verdict_events = Vec::new();
-        let mut restricted_tools = HashSet::new();
-        let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
-        let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
-        let mut turn_guard = TurnGuard::new();
-        let tool_calls = vec![json!({
-            "id": "call_1",
-            "type": "function",
-            "function": {
-                "name": "bash",
-                "arguments": "{\"command\":\"ls\"}"
-            }
-        })];
-
-        let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
-            turn_index: 0,
-            tool_calls_for_guard: &tool_calls,
-            intent_tool_turns: &mut intent_tool_turns,
-            messages: &mut messages,
-            turn_guard: &mut turn_guard,
-            verdict_events: &mut verdict_events,
-            restricted_tools: &mut restricted_tools,
-            remaining_turns: &mut remaining_turns,
-            step_recorder: &mut step_recorder,
-            current_user_id: None,
-            current_session_id: None,
-            max_turns: 8,
-            recent_tools: &[],
-            last_heavy_checkpoint: &mut last_heavy_checkpoint,
-            interaction_mode: TurnInteractionMode::Prompt,
-        });
-
-        assert!(proceed_advisories(out).is_empty());
-        assert_eq!(intent_tool_turns.len(), 1);
-        assert_eq!(intent_tool_turns[0].0, vec!["bash".to_string()]);
-        assert!(intent_tool_turns[0].1.contains("\"command\":\"ls\""));
     }
 }

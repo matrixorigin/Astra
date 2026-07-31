@@ -1,12 +1,18 @@
 use std::fs;
 
+use crate::cli::auth_flow::{
+    parse_auth_tokens, save_profile_auth_tokens, save_refreshed_profile_tokens,
+};
+use crate::cli::cli_config::cli_utils::{
+    bound_profile_access_token, credential_store, get_profile_and_token, load_credentials,
+    profile_name,
+};
 use astra_thin_client::ThinClient;
 use astra_thin_client::paths;
 use clap::Parser;
 
 pub mod cli_args;
 mod config;
-mod credentials;
 mod http_helpers;
 mod input;
 mod interactive;
@@ -14,7 +20,6 @@ mod interactive;
 pub use cli_args::AdminArgs;
 use cli_args::*;
 use config::resolve_api_url;
-use credentials::*;
 use http_helpers::*;
 use input::*;
 use interactive::run_interactive;
@@ -284,34 +289,8 @@ pub async fn run(
                 }))
                 .await
                 .map_err(map_thin_err)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let access = value
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?
-                .to_string();
-            let refresh = value
-                .get("refresh_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?
-                .to_string();
-            let cli_profile = profile.clone();
-            credentials::store()
-                .mutate(|creds| {
-                    let name = profile_name(cli_profile.as_deref(), creds);
-                    creds.current_profile = Some(name.clone());
-                    creds.profiles.insert(
-                        name,
-                        Profile {
-                            username: Some(username),
-                            access_token: Some(access),
-                            refresh_token: Some(refresh),
-                            ..Default::default()
-                        },
-                    );
-                })
-                .map_err(|e| e.to_string())?;
+            let tokens = parse_auth_tokens(&body)?;
+            save_profile_auth_tokens(profile.as_deref(), &username, &tokens)?;
             println!("logged in");
             Ok(())
         }
@@ -326,7 +305,7 @@ pub async fn run(
             let existing_token = existing_token
                 .profiles
                 .get(&existing_profile_name)
-                .and_then(|profile| profile.access_token.as_deref());
+                .and_then(bound_profile_access_token);
             let had_existing_token = existing_token.is_some();
             let body = api
                 .post_path_json_text(
@@ -342,16 +321,7 @@ pub async fn run(
                 .map_err(map_thin_err)?;
             let value: serde_json::Value =
                 serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let access = value
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?
-                .to_string();
-            let refresh = value
-                .get("refresh_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?
-                .to_string();
+            let tokens = parse_auth_tokens(&body)?;
             let is_admin = value
                 .get("is_admin")
                 .and_then(serde_json::Value::as_bool)
@@ -359,22 +329,7 @@ pub async fn run(
             if !is_admin {
                 return Err("admin registration did not return an admin account".to_string());
             }
-            let cli_profile = profile.clone();
-            credentials::store()
-                .mutate(|creds| {
-                    let name = profile_name(cli_profile.as_deref(), creds);
-                    creds.current_profile = Some(name.clone());
-                    creds.profiles.insert(
-                        name,
-                        Profile {
-                            username: Some(username),
-                            access_token: Some(access),
-                            refresh_token: Some(refresh),
-                            ..Default::default()
-                        },
-                    );
-                })
-                .map_err(|e| e.to_string())?;
+            save_profile_auth_tokens(profile.as_deref(), &username, &tokens)?;
             if had_existing_token {
                 println!("registered and logged in (admin)");
             } else {
@@ -403,27 +358,8 @@ pub async fn run(
                 .post_auth_refresh_json(&serde_json::json!({ "refresh_token": refresh_token }))
                 .await
                 .map_err(map_thin_err)?;
-            let value: serde_json::Value =
-                serde_json::from_str(&body).map_err(|e| e.to_string())?;
-            let new_access = value
-                .get("access_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing access_token".to_string())?
-                .to_string();
-            let new_refresh = value
-                .get("refresh_token")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "missing refresh_token".to_string())?
-                .to_string();
-            let cli_profile = profile.clone();
-            credentials::store()
-                .mutate(|creds| {
-                    let name = profile_name(cli_profile.as_deref(), creds);
-                    let entry = creds.profiles.entry(name).or_default();
-                    entry.access_token = Some(new_access.clone());
-                    entry.refresh_token = Some(new_refresh.clone());
-                })
-                .map_err(|e| e.to_string())?;
+            let tokens = parse_auth_tokens(&body)?;
+            save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
             println!("token refreshed");
             Ok(())
         }
@@ -443,7 +379,7 @@ pub async fn run(
                 .await
                 .map_err(map_thin_err)?;
             let cli_profile = profile.clone();
-            credentials::store()
+            credential_store()
                 .mutate(|creds| {
                     let name = profile_name(cli_profile.as_deref(), creds);
                     if let Some(entry) = creds.profiles.get_mut(&name) {

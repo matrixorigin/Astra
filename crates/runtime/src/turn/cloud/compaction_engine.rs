@@ -90,6 +90,10 @@ impl CompactionEngine {
         // Convert to typed Messages. We clone Values into Messages
         // so the caller's original Vec<Value> survives any panic in
         // Message::from or in the layer loop below.
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            messages,
+        );
         let mut typed: Vec<Message> = messages.iter().map(|v| Message::from(v.clone())).collect();
 
         let outcome = self.compress_typed(&mut typed, budget);
@@ -284,6 +288,10 @@ impl CompactionEngine {
     ) -> CompactResult {
         let result =
             compact_tiered_impl(messages, budget_chars, keep_chars, tier, keep_recent_turns);
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
+            &result.messages,
+        );
         *messages = result.messages.clone();
         result
     }

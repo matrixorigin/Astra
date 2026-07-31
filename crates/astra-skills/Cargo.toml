@@ -42,6 +42,7 @@ axum = { workspace = true }
 # Service integration
 astra-services.workspace = true
 astra-core.workspace = true
+astra-runtime-env.workspace = true
 
 # Crash recovery (optional)
 astra-pipeline = { workspace = true, optional = true }

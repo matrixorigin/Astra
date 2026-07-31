@@ -36,11 +36,14 @@ pub fn serialize_provider_request(
 ) -> SerializedProviderRequest {
     let mut section_to_block = vec![None; optimized.sections.len()];
     let mut system_blocks = Vec::new();
+    let mut copied_system_bytes = 0_u64;
     for (idx, section) in optimized.sections.iter().enumerate() {
         let text = match section.text() {
             Some(t) if !t.is_empty() => t,
             _ => continue,
         };
+        copied_system_bytes =
+            copied_system_bytes.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
         section_to_block[idx] = Some(system_blocks.len());
         system_blocks.push(SerializedSystemBlock {
             kind: section.plan.kind,
@@ -57,6 +60,22 @@ pub fn serialize_provider_request(
         policy,
     );
 
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ContextSerialization,
+            copied_system_bytes,
+            u64::try_from(system_blocks.len()).unwrap_or(u64::MAX),
+            0,
+        );
+    }
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextSerialization,
+        &optimized.messages,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::ContextSerialization,
+        &optimized.tool_schemas,
+    );
     SerializedProviderRequest {
         system_blocks,
         messages: optimized.messages.clone(),
@@ -99,12 +118,21 @@ pub fn serialize_prompt_sections(
 /// Flatten all system blocks into a single concatenated string (for OpenAI-style providers).
 #[must_use]
 pub fn flatten_serialized_system_blocks(request: &SerializedProviderRequest) -> String {
-    request
+    let flattened = request
         .system_blocks
         .iter()
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
-        .join("")
+        .join("");
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::ContextSerialization,
+            u64::try_from(flattened.len()).unwrap_or(u64::MAX),
+            u64::try_from(request.system_blocks.len()).unwrap_or(u64::MAX),
+            0,
+        );
+    }
+    flattened
 }
 
 /// Convert system blocks into the Anthropic multi-block format:

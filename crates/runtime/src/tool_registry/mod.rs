@@ -27,6 +27,7 @@ pub const DEFAULT_TOOL_SCHEMA_BUDGET_TOKENS: u32 = 800;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_config::user_profile::{TurnCommunicativeAct, TurnIntent, TurnIntentDomain};
     use astra_turn_core::tool::schema::tool_schema_name;
     use astra_turn_core::tool_registry_report::ToolSelectionReport;
     use serde_json::Value;
@@ -127,9 +128,12 @@ mod tests {
     }
 
     #[test]
-    fn code_intel_query_leaves_lsp_deferred() {
+    fn typed_code_task_leaves_lsp_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("find references for this symbol with lsp");
+        let intent = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Task)
+            .with_domain(TurnIntentDomain::Code);
+        let selected = registry.build_turn_surface(Some(&intent));
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"lsp".to_string()),
@@ -139,18 +143,18 @@ mod tests {
     }
 
     #[test]
-    fn non_conversational_zero_budget_includes_always_load() {
+    fn typed_task_zero_budget_includes_always_load() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (result, _report) =
-            registry.build_initial_surface_with_report("inspect the repository files", 0);
+        let intent = TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Task);
+        let (result, _report) = registry.build_turn_surface_with_report(Some(&intent), 0);
         let names = ToolRegistry::visible_names(&result);
         assert!(
             names.contains(&"bash".to_string()),
-            "non-conversational zero-budget query must still include always_load bash"
+            "typed task with zero budget must still include always_load bash"
         );
         assert!(
             names.contains(&"read_file".to_string()),
-            "non-conversational zero-budget query must still include always_load read_file"
+            "typed task with zero budget must still include always_load read_file"
         );
         assert_eq!(names.len(), registry.always_load_tool_names_sorted().len());
     }
@@ -158,42 +162,55 @@ mod tests {
     #[test]
     fn budget_does_not_add_deferred_tools() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (result, _report) = registry.build_initial_surface_with_report("最新的pr?", 50);
+        let (result, _report) = registry.build_turn_surface_with_report(None, 50);
         let names = ToolRegistry::visible_names(&result);
         assert_eq!(names, registry.always_load_tool_names_sorted());
     }
 
     #[test]
-    fn non_conversational_text_does_not_change_prompt_visible_surface() {
+    fn tool_capable_acts_and_domains_share_one_stable_surface() {
         let registry = ToolRegistry::new(mock_schemas());
-        let baseline = registry.build_initial_surface("inspect the repository files");
+        let baseline = registry.build_turn_surface(None);
         let baseline_bytes =
             serde_json::to_vec(&baseline).expect("baseline surface must serialize");
 
-        for query in [
-            "please use mo_query and powershell to inspect the database",
-            "fetch https://example.com with web_fetch and summarize it",
-            "open the latest GitHub PR and inspect the CI failure",
-            "find references for this symbol with lsp",
-            "git status and then read the changed files",
-            "我关注 matrixorigin, 请分析相关仓库状态",
+        for act in [
+            TurnCommunicativeAct::Task,
+            TurnCommunicativeAct::Question,
+            TurnCommunicativeAct::Unknown,
         ] {
-            let selected = registry.build_initial_surface(query);
-            let selected_bytes =
-                serde_json::to_vec(&selected).expect("selected surface must serialize");
-            assert_eq!(
-                selected_bytes, baseline_bytes,
-                "non-conversational query text must not change the prompt-visible tool surface: {query}"
-            );
+            for domain in [
+                TurnIntentDomain::GitHub,
+                TurnIntentDomain::Git,
+                TurnIntentDomain::Code,
+                TurnIntentDomain::Memory,
+                TurnIntentDomain::Web,
+                TurnIntentDomain::System,
+                TurnIntentDomain::Database,
+            ] {
+                let intent = TurnIntent::default()
+                    .with_communicative_act(act)
+                    .with_domain(domain);
+                let selected = registry.build_turn_surface(Some(&intent));
+                let selected_bytes =
+                    serde_json::to_vec(&selected).expect("selected surface must serialize");
+                assert_eq!(
+                    selected_bytes, baseline_bytes,
+                    "{act:?}/{domain:?} must not promote domain-specific deferred tools"
+                );
+            }
         }
     }
 
     // ── ToolRegistry integration ──
 
     #[test]
-    fn pr_query_leaves_github_deferred() {
+    fn typed_github_domain_leaves_github_tool_deferred() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("matrixorigin memoria 最新的pr?");
+        let intent = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Question)
+            .with_domain(TurnIntentDomain::GitHub);
+        let selected = registry.build_turn_surface(Some(&intent));
         let names = ToolRegistry::visible_names(&selected);
         assert!(
             !names.contains(&"github".to_string()),
@@ -211,10 +228,10 @@ mod tests {
             mock_schemas(),
             &astra_config::ToolSurfaceConfig::default(),
         );
-        let (selected, _report) = registry.build_initial_surface_with_report(
-            "fetch the contents of https://example.com and summarize the web page",
-            800,
-        );
+        let intent = TurnIntent::default()
+            .with_communicative_act(TurnCommunicativeAct::Question)
+            .with_domain(TurnIntentDomain::Web);
+        let (selected, _report) = registry.build_turn_surface_with_report(Some(&intent), 800);
         let names = ToolRegistry::visible_names(&selected);
 
         assert!(
@@ -226,21 +243,32 @@ mod tests {
         );
         assert!(
             !names.contains(&"web_fetch".to_string()),
-            "runtime tool surface must not add deferred catalog tools from query text alone; got: {names:?}"
+            "runtime tool surface must not add deferred catalog tools from a typed domain alone; got: {names:?}"
         );
     }
 
     #[test]
-    fn conversational_query_uses_no_tools() {
+    fn explicit_non_work_acts_use_no_tools_across_domains() {
         let registry = ToolRegistry::new(mock_schemas());
-        let selected = registry.build_initial_surface("你好");
-        let names = ToolRegistry::visible_names(&selected);
-        assert_eq!(
-            names.len(),
-            0,
-            "pure conversational query should not spend schema tokens, got: {:?}",
-            names
-        );
+        for act in [
+            TurnCommunicativeAct::Acknowledgement,
+            TurnCommunicativeAct::Social,
+        ] {
+            for domain in [
+                None,
+                Some(TurnIntentDomain::GitHub),
+                Some(TurnIntentDomain::Code),
+                Some(TurnIntentDomain::Database),
+            ] {
+                let mut intent = TurnIntent::default().with_communicative_act(act);
+                intent.domain = domain;
+                let selected = registry.build_turn_surface(Some(&intent));
+                assert!(
+                    selected.is_empty(),
+                    "{act:?}/{domain:?} must not spend schema tokens"
+                );
+            }
+        }
     }
 
     // ── Schema-budget report assembly ──
@@ -249,10 +277,8 @@ mod tests {
     fn report_schema_budget_total_does_not_change_visible_tools() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let (small, small_report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 500);
-        let (large, large_report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 6000);
+        let (small, small_report) = registry.build_turn_surface_with_report(None, 500);
+        let (large, large_report) = registry.build_turn_surface_with_report(None, 6000);
         assert_eq!(
             ToolRegistry::visible_names(&large),
             ToolRegistry::visible_names(&small)
@@ -265,8 +291,7 @@ mod tests {
     fn report_budget_zero_still_returns_always_load() {
         let schemas = mock_schemas();
         let registry = ToolRegistry::new(schemas);
-        let (selected, report) =
-            registry.build_initial_surface_with_report("matrixorigin memoria 最新的pr?", 0);
+        let (selected, report) = registry.build_turn_surface_with_report(None, 0);
         // AlwaysLoad tools are budget-exempt, always included
         assert_eq!(
             selected.len(),
@@ -342,21 +367,22 @@ mod tests {
     #[test]
     fn build_surface_with_report_returns_consistent_data() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (schemas, report) =
-            registry.build_initial_surface_with_report("matrixorigin 最新的pr?", 3000);
+        let (schemas, report) = registry.build_turn_surface_with_report(None, 3000);
         assert_eq!(schemas.len(), report.visible_count as usize);
         assert_eq!(ToolRegistry::visible_names(&schemas), report.visible_tools);
         assert_eq!(report.schema_budget_total, 3000);
     }
 
     #[test]
-    fn build_surface_with_report_conversational_zero_budget() {
+    fn build_surface_with_report_non_work_act_is_empty() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (_schemas, report) = registry.build_initial_surface_with_report("你好", 3000);
+        let intent = TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Social);
+        let (schemas, report) = registry.build_turn_surface_with_report(Some(&intent), 3000);
         assert_eq!(
             report.schema_budget_used, 0,
-            "conversational query should use 0 budget"
+            "non-work act should use 0 budget"
         );
+        assert!(schemas.is_empty());
         assert_eq!(report.visible_count, 0);
     }
 
@@ -423,7 +449,7 @@ mod tests {
         // Phase 6.2: schema-budget exhaustion boundary
         let reg = ToolRegistry::new(mock_schemas());
         // Use a very small schema budget — always_load tools remain budget-exempt.
-        let (schemas, report) = reg.build_initial_surface_with_report("list PRs", 1);
+        let (schemas, report) = reg.build_turn_surface_with_report(None, 1);
         assert!(
             schemas.len() >= reg.always_load_tool_names_sorted().len(),
             "should always include always_load tools even with tiny budget"
@@ -432,12 +458,14 @@ mod tests {
     }
 
     #[test]
-    fn conversational_query_returns_no_tools() {
+    fn acknowledgement_returns_no_tools() {
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, _) = reg.build_initial_surface_with_report("hello there", 2000);
+        let intent =
+            TurnIntent::default().with_communicative_act(TurnCommunicativeAct::Acknowledgement);
+        let (schemas, _) = reg.build_turn_surface_with_report(Some(&intent), 2000);
         assert!(
             schemas.is_empty(),
-            "conversational turns should be tool-free"
+            "typed acknowledgement should be tool-free"
         );
     }
 
@@ -445,8 +473,7 @@ mod tests {
     fn surface_report_schemas_and_names_consistent() {
         // Phase 6: Data consistency check
         let reg = ToolRegistry::new(mock_schemas());
-        let (schemas, report) =
-            reg.build_initial_surface_with_report("show me open PRs in matrixone", 800);
+        let (schemas, report) = reg.build_turn_surface_with_report(None, 800);
         assert_eq!(
             schemas.len(),
             report.visible_count as usize,
@@ -462,8 +489,7 @@ mod tests {
     #[test]
     fn surface_report_schema_budget_used_excludes_deferred_discovery_entries() {
         let registry = ToolRegistry::new(mock_schemas());
-        let (_schemas, report) =
-            registry.build_initial_surface_with_report("analyze everything", 800);
+        let (_schemas, report) = registry.build_turn_surface_with_report(None, 800);
         assert_eq!(report.schema_budget_used, 0);
     }
 }

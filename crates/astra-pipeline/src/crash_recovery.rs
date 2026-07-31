@@ -165,6 +165,23 @@ fn build_restored_from_scan(
     use crate::step_protocol::persisted_cache_key_is_context_bound;
     use std::collections::HashMap;
 
+    if let Some(cursor) = heavy.conversation_cursor.as_ref() {
+        if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
+            || cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(RecoveryError::CorruptedCheckpoint(
+                "conversation cursor schema is unsupported".to_string(),
+            ));
+        }
+        if astra_turn_types::canonical_conversation_root(&heavy.messages)
+            != cursor.canonical_root_hash
+        {
+            return Err(RecoveryError::CorruptedCheckpoint(
+                "checkpoint messages do not match the conversation cursor root".to_string(),
+            ));
+        }
+    }
+
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
     let mut cache_restore_report = CacheRestoreReport::default();
 
@@ -193,7 +210,12 @@ fn build_restored_from_scan(
         );
     }
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+        &heavy.messages,
+    );
     Ok(RestoredSession {
+        conversation_cursor: heavy.conversation_cursor.clone(),
         messages: heavy.messages.clone(),
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
@@ -418,7 +440,7 @@ impl RecoveryContext {
 // ---------------------------------------------------------------------------
 
 /// Result of scanning the journal for recovery data.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct JournalScanResult {
     pub last_checkpoint: StepCheckpoint,
     pub checkpoint_turn: u32,
@@ -488,13 +510,17 @@ pub fn classify_tool(tool_name: &str) -> ToolSafetyClass {
 // ---------------------------------------------------------------------------
 
 /// Compute a Merkle root from a list of string IDs for tamper detection.
-fn compute_merkle_root(ids: &[String]) -> String {
+fn compute_merkle_root(ids: &[String]) -> (String, u64) {
     if ids.is_empty() {
-        return "empty".to_string();
+        return ("empty".to_string(), 0);
     }
+    let mut hashed_bytes = 0_u64;
     let mut hashes: Vec<Vec<u8>> = ids
         .iter()
-        .map(|id| Sha256::digest(id.as_bytes()).to_vec())
+        .map(|id| {
+            hashed_bytes = hashed_bytes.saturating_add(id.len().try_into().unwrap_or(u64::MAX));
+            Sha256::digest(id.as_bytes()).to_vec()
+        })
         .collect();
     while hashes.len() > 1 {
         if !hashes.len().is_multiple_of(2) {
@@ -505,11 +531,15 @@ fn compute_merkle_root(ids: &[String]) -> String {
             let mut h = Sha256::new();
             h.update(&chunk[0]);
             h.update(&chunk[1]);
+            hashed_bytes = hashed_bytes.saturating_add(64);
             next.push(h.finalize().to_vec());
         }
         hashes = next;
     }
-    hashes[0].iter().map(|b| format!("{:02x}", b)).collect()
+    (
+        hashes[0].iter().map(|b| format!("{:02x}", b)).collect(),
+        hashed_bytes,
+    )
 }
 
 /// Compute a SHA-256 hash of recovery-critical data for tamper detection.
@@ -527,8 +557,25 @@ pub fn compute_recovery_hash(
     hasher.update(b"|");
     hasher.update(event_count.to_le_bytes());
     hasher.update(b"|");
-    let merkle = compute_merkle_root(event_ids);
+    let (merkle, merkle_hashed_bytes) = compute_merkle_root(event_ids);
     hasher.update(merkle.as_bytes());
+    if astra_core::history_work::instrumentation_enabled() {
+        let recovery_hashed_bytes = session_id
+            .len()
+            .saturating_add(1)
+            .saturating_add(checkpoint_json.len())
+            .saturating_add(1)
+            .saturating_add(std::mem::size_of::<u64>())
+            .saturating_add(1)
+            .saturating_add(merkle.len());
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::PipelineRecoveryHash,
+            merkle_hashed_bytes
+                .saturating_add(recovery_hashed_bytes.try_into().unwrap_or(u64::MAX)),
+            event_ids.len().try_into().unwrap_or(u64::MAX),
+            0,
+        );
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -745,11 +792,33 @@ impl CrashRecoveryManager {
 
         // Compute recovery hash for tamper detection
         let cp_json = serde_json::to_string(&result.last_checkpoint).unwrap_or_default();
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_operation(
+                astra_core::history_work::HistoryWorkSite::PipelineRecoverySerialization,
+                cp_json.len().try_into().unwrap_or(u64::MAX),
+                1,
+                0,
+            );
+        }
         let event_ids: Vec<String> = result
             .events_after
             .iter()
             .map(|e| e.event_id.clone())
             .collect();
+        if astra_core::history_work::instrumentation_enabled() {
+            match astra_core::history_work::serialized_bytes(&event_ids) {
+                Ok(bytes) => astra_core::history_work::record_operation(
+                    astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+                    bytes,
+                    event_ids.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                ),
+                Err(error) => astra_core::history_work::record_serialization_failure(
+                    astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+                    &error,
+                ),
+            }
+        }
         self.recovery_hash = Some(compute_recovery_hash(
             session_id,
             &cp_json,
@@ -757,11 +826,23 @@ impl CrashRecoveryManager {
             &event_ids,
         ));
 
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+            &result,
+        );
         self.scan_result = Some(result.clone());
 
         let mut ctx = RecoveryContext::new(session_id.to_string(), crash_turn);
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+            &result.last_checkpoint,
+        );
         ctx.last_checkpoint = Some(result.last_checkpoint.clone());
         ctx.checkpoint_turn = checkpoint_turn;
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::PipelineRecoveryClone,
+            &result.events_after,
+        );
         ctx.events_after_checkpoint = result.events_after.clone();
         ctx.journal_gap = result.gap_detected.clone();
         self.context = Some(ctx);
@@ -1343,6 +1424,36 @@ mod tests {
     }
 
     #[test]
+    fn scan_journal_internal_recovery_copies_do_not_alias_returned_history() {
+        let mut mgr = CrashRecoveryManager::new();
+        mgr.begin_recovery().unwrap();
+        let events = vec![make_event(
+            "event-original",
+            "step-1",
+            StepEventType::StepCompleted,
+            1_000,
+        )];
+
+        let json = checkpoint_json();
+        let mut returned = mgr
+            .scan_journal("sess-1", 5, Some(&json), 3, events)
+            .expect("scan succeeds");
+        returned.events_after[0].event_id = "event-mutated".to_string();
+
+        assert_eq!(
+            mgr.scan_result().expect("manager scan result").events_after[0].event_id,
+            "event-original"
+        );
+        assert_eq!(
+            mgr.context()
+                .expect("recovery context")
+                .events_after_checkpoint[0]
+                .event_id,
+            "event-original"
+        );
+    }
+
+    #[test]
     fn scan_journal_extracts_tool_calls() {
         let mut mgr = CrashRecoveryManager::new();
         mgr.begin_recovery().unwrap();
@@ -1443,6 +1554,45 @@ mod tests {
             restored.completed_tool_results.get("read_file"),
             Some(&vec!["module contents".to_string()])
         );
+    }
+
+    #[test]
+    fn restored_session_owns_independent_structured_history_copy() {
+        let scan = JournalScanResult {
+            last_checkpoint: make_test_checkpoint(),
+            checkpoint_turn: 3,
+            events_after: Vec::new(),
+            tool_calls_found: Vec::new(),
+            gap_detected: None,
+        };
+        let mut heavy = make_test_heavy_checkpoint();
+        heavy.messages = vec![
+            serde_json::json!({"role": "user", "content": "recover this turn"}),
+            serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+                }]
+            }),
+            serde_json::json!({"role": "tool", "tool_call_id": "call-1", "content": "contents"}),
+        ];
+
+        let restored = build_restored_from_scan(&scan, &heavy).expect("restore succeeds");
+        heavy.messages[0]["content"] = serde_json::json!("mutated checkpoint");
+        heavy
+            .messages
+            .push(serde_json::json!({"role": "assistant", "content": "later"}));
+
+        assert_eq!(restored.messages.len(), 3);
+        assert_eq!(restored.messages[0]["content"], "recover this turn");
+        assert_eq!(
+            restored.messages[1]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+        assert_eq!(restored.messages[2]["tool_call_id"], "call-1");
     }
 
     #[test]

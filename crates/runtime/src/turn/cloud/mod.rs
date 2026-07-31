@@ -9,8 +9,8 @@
 //! | 3        | TieredCompaction          | Tier × 0.9375      | Drop middle turns; insert boundary marker |
 //! | 4        | ReactiveCompact           | 0.95                | Emergency: keep only last 4 messages |
 //!
-//! Triggers derive from `CompactionTier::pre_turn_trigger(max_window_tokens)`
-//! — a window-adaptive baseline.
+//! Triggers derive from `CompactionTier::pre_turn_trigger(usable_input_tokens)`
+//! — one resolved-policy baseline after catalog reserves are applied.
 //!
 //! ## Design
 //!

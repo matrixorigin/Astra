@@ -600,55 +600,19 @@ fn truncate_one_line(s: &str, max: usize) -> String {
     }
 }
 
-const BROWSER_VERIFICATION_CRITERION_ID: &str = "browser_verification_evidence";
-
-fn merge_verification_reports(
-    primary: Option<astra_services::verification::SubtaskVerificationReport>,
-    secondary: Option<astra_services::verification::SubtaskVerificationReport>,
-) -> Option<astra_services::verification::SubtaskVerificationReport> {
-    match (primary, secondary) {
-        (None, None) => None,
-        (Some(report), None) | (None, Some(report)) => Some(report),
-        (Some(mut left), Some(right)) => {
-            left.all_required_passed &= right.all_required_passed;
-            left.results.extend(right.results);
-            if left.timestamp.is_empty() {
-                left.timestamp = right.timestamp;
-            }
-            Some(left)
-        }
-    }
-}
-
-fn report_contains_browser_verification_gap(
-    report: &astra_services::verification::SubtaskVerificationReport,
-) -> bool {
-    report
-        .results
-        .iter()
-        .any(|r| !r.passed && r.criterion_id == BROWSER_VERIFICATION_CRITERION_ID)
-}
-
 fn failed_verification_status(
     durable: Option<&durable_bridge::DurableTaskState>,
     subtask_id: &str,
-    browser_verification_gap: bool,
 ) -> (TaskStatus, bool, bool) {
     match durable {
         Some(durable) => {
             let retries_exhausted = durable_bridge::subtask_retries_exhausted(durable, subtask_id);
             if retries_exhausted {
-                let status = if browser_verification_gap {
-                    TaskStatus::Failed
-                } else {
-                    TaskStatus::Completed
-                };
-                (status, true, false)
+                (TaskStatus::Completed, true, false)
             } else {
                 (TaskStatus::Pending, false, true)
             }
         }
-        None if browser_verification_gap => (TaskStatus::Failed, true, false),
         None => (TaskStatus::Pending, false, true),
     }
 }
@@ -696,213 +660,6 @@ fn compact_subtask_history_entry(
         }
     }
     (user_msg, assistant_msg)
-}
-
-fn final_text_claims_acceptance_checks_pass(text: &str) -> bool {
-    use regex::Regex;
-    use std::sync::OnceLock;
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(?i)acceptance\s+(checks?|criteria|tests?)\s+.{0,20}(pass|satisfied|met|succeed|verified|complete)").unwrap()
-    });
-    re.is_match(text)
-}
-
-fn tool_record_has_verificationish_evidence(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.ok || record.is_synthetic_placeholder() {
-        return false;
-    }
-    match record.name.as_str() {
-        "read_file" | "grep" | "rg" | "view" | "glob" => true,
-        "bash" => {
-            let command = extract_bash_command(record.args_full.as_deref())
-                .or_else(|| extract_bash_command(record.args_preview.as_deref()))
-                .or_else(|| record.args_preview.clone())
-                .unwrap_or_default()
-                .to_lowercase();
-            [
-                "grep ", "grep -", "cat ", "head ", "tail ", "wc ", "test ", "curl ", "ls ",
-            ]
-            .iter()
-            .any(|needle| command.contains(needle))
-        }
-        _ => false,
-    }
-}
-
-fn sanitize_unverified_acceptance_claims(
-    assistant_text: &str,
-    tool_call_records: &[astra_services::session_journal::ToolCallRecord],
-) -> String {
-    if !final_text_claims_acceptance_checks_pass(assistant_text)
-        || tool_call_records
-            .iter()
-            .any(tool_record_has_verificationish_evidence)
-    {
-        return assistant_text.to_string();
-    }
-
-    let implementation_summary = ["**Implementation summary:**", "**Implemented:**"]
-        .iter()
-        .find_map(|marker| {
-            assistant_text
-                .find(marker)
-                .map(|idx| assistant_text[idx..].trim())
-        })
-        .filter(|summary| !summary.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| truncate_one_line(assistant_text.trim(), 320));
-
-    format!(
-        "Implementation completed. Automated verification will determine whether the acceptance checks pass.\n\n{implementation_summary}"
-    )
-}
-
-fn browser_verification_gap_report(
-    subtask: &astra_services::task_orchestrator::SubtaskPlan,
-    result: &StreamResult,
-) -> Option<astra_services::verification::SubtaskVerificationReport> {
-    use astra_services::verification::{SubtaskVerificationReport, VerificationResult};
-
-    if !astra_runtime::plan::subtask_requires_browser_verification(subtask) {
-        return None;
-    }
-    if result
-        .tool_call_records
-        .iter()
-        .any(tool_record_has_browser_verification_evidence)
-    {
-        return None;
-    }
-
-    Some(SubtaskVerificationReport {
-        subtask_id: subtask.id.clone(),
-        all_required_passed: false,
-        results: vec![VerificationResult {
-            criterion_id: BROWSER_VERIFICATION_CRITERION_ID.into(),
-            passed: false,
-            evidence: format!(
-                "Browser/UI verification was required, but no browser-capable evidence was recorded. {}",
-                summarize_browser_verification_observed_evidence(&result.tool_call_records)
-            ),
-            expected: "real browser-capable verification evidence (for example Playwright/Selenium/Puppeteer/Cypress, browser screenshot, or browser DOM dump after page execution)".into(),
-            duration_ms: 0,
-            error: None,
-        }],
-        timestamp: String::new(),
-    })
-}
-
-fn summarize_browser_verification_observed_evidence(
-    records: &[astra_services::session_journal::ToolCallRecord],
-) -> String {
-    let snippets: Vec<String> = records
-        .iter()
-        .filter(|record| !record.is_synthetic_placeholder())
-        .take(5)
-        .map(|record| {
-            if record.name == "bash" {
-                let command = extract_bash_command(record.args_full.as_deref())
-                    .or_else(|| extract_bash_command(record.args_preview.as_deref()))
-                    .or_else(|| record.args_preview.clone())
-                    .unwrap_or_else(|| "<missing bash command>".into());
-                truncate_one_line(&command, 48)
-            } else if let Some(args) = record.args_preview.as_deref() {
-                format!("{} {}", record.name, truncate_one_line(args, 48))
-            } else {
-                record.name.clone()
-            }
-        })
-        .collect();
-
-    if snippets.is_empty() {
-        "No tool evidence was recorded for this turn.".into()
-    } else {
-        format!(
-            "Observed only non-browser evidence: {}",
-            snippets.join("; ")
-        )
-    }
-}
-
-fn tool_record_has_browser_verification_evidence(
-    record: &astra_services::session_journal::ToolCallRecord,
-) -> bool {
-    if !record.ok || record.is_synthetic_placeholder() {
-        return false;
-    }
-
-    let name = record.name.to_lowercase();
-    if [
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-        "chromedriver",
-        "geckodriver",
-        "webdriver",
-    ]
-    .iter()
-    .any(|needle| name.contains(needle))
-    {
-        return true;
-    }
-
-    if record.name == "bash" {
-        let command = extract_bash_command(record.args_full.as_deref())
-            .or_else(|| extract_bash_command(record.args_preview.as_deref()));
-        if command
-            .as_deref()
-            .is_some_and(bash_command_has_browser_verification_evidence)
-        {
-            return true;
-        }
-    }
-
-    [
-        record.args_full.as_deref(),
-        record.args_preview.as_deref(),
-        record.result_full.as_deref(),
-        record.result_preview.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .any(text_has_browser_verification_evidence)
-}
-
-fn extract_bash_command(args: Option<&str>) -> Option<String> {
-    let args = args?;
-    let value = serde_json::from_str::<serde_json::Value>(args).ok()?;
-    let command = value.get("command").and_then(serde_json::Value::as_str)?;
-    Some(command.to_string())
-}
-
-fn bash_command_has_browser_verification_evidence(command: &str) -> bool {
-    text_has_browser_verification_evidence(command)
-}
-
-fn text_has_browser_verification_evidence(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    [
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-        "chromium",
-        "google-chrome",
-        "chrome --headless",
-        "chrome-headless",
-        "firefox --headless",
-        "webkit",
-        "chromedriver",
-        "geckodriver",
-        "--screenshot",
-        "--dump-dom",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
 }
 
 /// - `handle` goes to the plan monitor loop
@@ -1147,8 +904,13 @@ pub(crate) struct BackgroundPlanContext {
 pub(crate) fn spawn_plan_executor(ctx: BackgroundPlanContext) -> PlanExecutorHandle {
     let (handle, update_tx, cmd_rx) = create_plan_channels();
     let execution_cancel = handle.execution_cancel.clone();
+    let history_queue_reservation = crate::cli::history_work::reserve_pair_history_queue(
+        astra_core::history_work::HistoryWorkSite::CliPlanBackgroundHistoryQueue,
+        &ctx.history,
+    );
 
     tokio::spawn(async move {
+        let _history_queue_reservation = history_queue_reservation;
         let mut ctx = ctx;
         plan_executor_task(&mut ctx, update_tx, cmd_rx, execution_cancel).await;
         cleanup_plan_root_mailbox(&mut ctx).await;
@@ -1599,6 +1361,7 @@ async fn plan_executor_task(
                     incremental_state: None,
                     plan_assemble_line_release: None,
                     stream_event_tx: Some(stream_tx),
+                    stream_json_emitter: None,
                     agent_live_event_sink: None,
                     approval_request_tx: Some(approval_tx),
                     ask_user_request_tx: None,
@@ -1688,10 +1451,10 @@ async fn plan_executor_task(
             match turn_result {
                 Ok(result) => {
                     ctx.turn += 1;
-                    let assistant_text = sanitize_unverified_acceptance_claims(
-                        &result.full_text,
-                        &result.tool_call_records,
-                    );
+                    // Preserve model text as presentation only. Structured
+                    // verifier reports below are the sole pass/fail authority;
+                    // never parse prose or tool-output strings as evidence.
+                    let assistant_text = result.full_text.clone();
 
                     // Flush turn observability events (llm_round, tool timing)
                     // so plan executor turns are visible in the journal.
@@ -1801,27 +1564,12 @@ async fn plan_executor_task(
                     }
 
                     // Run verification
-                    let browser_guard_report = ctx
-                        .plan
-                        .subtasks
-                        .iter()
-                        .find(|subtask| subtask.id == *next_id)
-                        .and_then(|subtask| browser_verification_gap_report(subtask, &result));
-                    let (durable_verification_passed, durable_verification_report) =
+                    let (verification_passed, verification_report) =
                         if let Some(ref mut durable) = ctx.durable_task_state {
                             durable_bridge::on_subtask_complete(durable, next_id).await
                         } else {
                             (true, None)
                         };
-                    let verification_report = merge_verification_reports(
-                        durable_verification_report,
-                        browser_guard_report,
-                    );
-                    let verification_passed = verification_report
-                        .as_ref()
-                        .map_or(durable_verification_passed, |report| {
-                            report.all_required_passed
-                        });
                     // Capture a structured retry hint from the report before we
                     // forward it on the channel — surfaces *which* acceptance
                     // check failed (criterion id + expected vs evidence) to the
@@ -1834,9 +1582,6 @@ async fn plan_executor_task(
                         None
                     };
                     let mut verifier_retry_pending = false;
-                    let browser_verification_gap = verification_report
-                        .as_ref()
-                        .is_some_and(report_contains_browser_verification_gap);
                     if let Some(report) = verification_report.clone() {
                         let _ = update_tx.send(PlanUpdate::VerificationReport(report));
                     }
@@ -1949,7 +1694,6 @@ async fn plan_executor_task(
                                 failed_verification_status(
                                     ctx.durable_task_state.as_ref(),
                                     next_id,
-                                    browser_verification_gap,
                                 );
                             if retries_exhausted {
                                 sink.subtask_verification_failed(
@@ -1988,7 +1732,7 @@ async fn plan_executor_task(
                             emit_event(&update_tx, event);
                         } else {
                             let (failure_status, retries_exhausted, _) =
-                                failed_verification_status(None, next_id, browser_verification_gap);
+                                failed_verification_status(None, next_id);
                             let failure_hint = verifier_retry_hint.clone();
                             sink.subtask_verification_failed(
                                 next_id,
@@ -2163,11 +1907,9 @@ mod tests {
     use super::{
         BackgroundPlanContext, ChannelSink, CloudStepRunPersistence, PlanCommand,
         PlanExecutorHandle, PlanOutputSink, PlanUpdate, StderrSink, annotate_plan_subtask_event,
-        browser_verification_gap_report, compact_subtask_history_entry, create_plan_channels,
-        failed_verification_status, has_any_unresolved_verification_failure,
-        high_failure_tool_evidence, is_credential_error, plan_completion_action,
-        record_cloud_step_run, render_verifier_failure_hint,
-        report_contains_browser_verification_gap, sanitize_unverified_acceptance_claims,
+        compact_subtask_history_entry, create_plan_channels, failed_verification_status,
+        has_any_unresolved_verification_failure, high_failure_tool_evidence, is_credential_error,
+        plan_completion_action, record_cloud_step_run, render_verifier_failure_hint,
         spawn_plan_executor,
     };
     use crate::cli::durable_bridge;
@@ -2672,141 +2414,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sanitize_unverified_acceptance_claims_rewrites_write_only_claims() {
-        let assistant_text = "\
-All acceptance checks pass:
-
-| Check | Result |
-|---|---|
-| `Particle` in effects.js | ✅ 3 matches |
-
-**Implementation summary:**
-- Added particles.
-";
-        let sanitized = sanitize_unverified_acceptance_claims(
-            assistant_text,
-            &[astra_services::session_journal::ToolCallRecord {
-                name: "write_file".into(),
-                ok: true,
-                ..Default::default()
-            }],
-        );
-
-        assert!(
-            sanitized.contains(
-                "Automated verification will determine whether the acceptance checks pass"
-            ),
-            "write-only turns should not keep self-reported acceptance-check success: {sanitized}"
-        );
-        assert!(
-            sanitized.contains("**Implementation summary:**"),
-            "sanitization should preserve the implementation summary: {sanitized}"
-        );
-        assert!(
-            !sanitized.starts_with("All acceptance checks pass"),
-            "sanitization should strip the fabricated acceptance-check lead: {sanitized}"
-        );
-    }
-
-    #[test]
-    fn sanitize_unverified_acceptance_claims_preserves_verified_text() {
-        let assistant_text = "All acceptance checks pass after grep verification.";
-        let sanitized = sanitize_unverified_acceptance_claims(
-            assistant_text,
-            &[astra_services::session_journal::ToolCallRecord {
-                name: "grep".into(),
-                ok: true,
-                ..Default::default()
-            }],
-        );
-        assert_eq!(sanitized, assistant_text);
-    }
-
-    #[test]
-    fn sanitize_unverified_acceptance_claims_catches_synonym_evasion() {
-        let write_only = &[astra_services::session_journal::ToolCallRecord {
-            name: "write_file".into(),
-            ok: true,
-            ..Default::default()
-        }];
-        for phrase in [
-            "All acceptance criteria satisfied.",
-            "Acceptance tests all passed.",
-            "The acceptance check has been verified.",
-            "Acceptance criteria met.",
-            "Acceptance checks succeeded.",
-        ] {
-            let sanitized = sanitize_unverified_acceptance_claims(phrase, write_only);
-            assert!(
-                sanitized.contains("Automated verification"),
-                "should catch evasion phrase: {phrase}"
-            );
-        }
-    }
-
-    fn bash_tool_record(command: &str) -> astra_services::session_journal::ToolCallRecord {
-        astra_services::session_journal::ToolCallRecord {
-            name: "bash".into(),
-            ok: true,
-            args_full: Some(serde_json::json!({ "command": command }).to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn browser_verification_gap_report_rejects_curl_only_checks() {
-        let subtask = astra_services::task_orchestrator::SubtaskPlan {
-            id: "browser-check".into(),
-            title: "Test game in browser".into(),
-            description: Some("Open the page and verify movement works in the browser.".into()),
-            ..Default::default()
-        };
-        let result = stub_stream_result_with_records(
-            "Tested the game and it is fully functional.",
-            vec![
-                bash_tool_record("python3 -m http.server 8000"),
-                bash_tool_record("curl --noproxy '*' http://127.0.0.1:8000"),
-                bash_tool_record("ps -ef | grep http.server"),
-            ],
-        );
-
-        let report = browser_verification_gap_report(&subtask, &result)
-            .expect("browser-only verification gap should fail");
-        assert!(
-            report_contains_browser_verification_gap(&report),
-            "report should tag the browser-verification criterion: {report:?}"
-        );
-        let hint = render_verifier_failure_hint(&report).expect("retry hint");
-        assert!(
-            hint.contains("browser_verification_evidence"),
-            "hint should surface the synthetic criterion id: {hint}"
-        );
-        assert!(
-            hint.contains("curl --nop"),
-            "hint should include the observed non-browser evidence from the real failure shape: {hint}"
-        );
-    }
-
-    #[test]
-    fn browser_verification_gap_report_accepts_playwright_evidence() {
-        let subtask = astra_services::task_orchestrator::SubtaskPlan {
-            id: "browser-check".into(),
-            title: "Test game in browser".into(),
-            description: Some("Open the page and verify movement works in the browser.".into()),
-            ..Default::default()
-        };
-        let result = stub_stream_result_with_records(
-            "Verified in browser with Playwright.",
-            vec![bash_tool_record("npx playwright test tests/game.spec.ts")],
-        );
-
-        assert!(
-            browser_verification_gap_report(&subtask, &result).is_none(),
-            "real browser-capable evidence should satisfy the guard"
-        );
-    }
-
     fn stub_durable_task_state(
         subtask_id: &str,
         retry_count: u32,
@@ -2979,29 +2586,10 @@ All acceptance checks pass:
     }
 
     #[test]
-    fn failed_verification_status_fails_browser_gap_without_durable() {
-        let (status, retries_exhausted, retry_pending) =
-            failed_verification_status(None, "browser-check", true);
-        assert_eq!(status, TaskStatus::Failed);
-        assert!(retries_exhausted);
-        assert!(!retry_pending);
-    }
-
-    #[test]
-    fn failed_verification_status_fails_browser_gap_after_durable_retries_exhausted() {
-        let durable = stub_durable_task_state("browser-check", 2, 2);
-        let (status, retries_exhausted, retry_pending) =
-            failed_verification_status(Some(&durable), "browser-check", true);
-        assert_eq!(status, TaskStatus::Failed);
-        assert!(retries_exhausted);
-        assert!(!retry_pending);
-    }
-
-    #[test]
-    fn failed_verification_status_preserves_existing_force_complete_for_non_browser_failures() {
+    fn failed_verification_status_preserves_existing_force_complete_after_retries() {
         let durable = stub_durable_task_state("subtask-1", 2, 2);
         let (status, retries_exhausted, retry_pending) =
-            failed_verification_status(Some(&durable), "subtask-1", false);
+            failed_verification_status(Some(&durable), "subtask-1");
         assert_eq!(status, TaskStatus::Completed);
         assert!(retries_exhausted);
         assert!(!retry_pending);
@@ -3009,16 +2597,16 @@ All acceptance checks pass:
 
     #[test]
     fn failed_verification_status_retries_when_budget_remains() {
-        let durable = stub_durable_task_state("browser-check", 1, 2);
+        let durable = stub_durable_task_state("subtask-1", 1, 2);
         let (status, retries_exhausted, retry_pending) =
-            failed_verification_status(Some(&durable), "browser-check", true);
+            failed_verification_status(Some(&durable), "subtask-1");
         assert_eq!(status, TaskStatus::Pending);
         assert!(!retries_exhausted);
         assert!(retry_pending);
     }
 
     #[tokio::test]
-    async fn spawn_plan_executor_marks_browser_subtask_failed_in_real_turn_flow() {
+    async fn spawn_plan_executor_does_not_infer_verification_from_subtask_wording() {
         let mock = crate::cli::mock_llm::MockLlmServer::start(
             crate::cli::mock_llm::MockScenario::TextOnly,
         )
@@ -3040,21 +2628,13 @@ All acceptance checks pass:
         };
 
         let mut handle = spawn_plan_executor(ctx);
-        let mut saw_browser_report = false;
-        let mut saw_failed_status = false;
+        let mut saw_verification_report = false;
         let mut saw_completed_status = false;
 
         let _ = recv_plan_update_until(&mut handle, REAL_TURN_TEST_TIMEOUT, |update| {
             match update {
-                PlanUpdate::VerificationReport(report)
-                    if report_contains_browser_verification_gap(&report) =>
-                {
-                    saw_browser_report = true;
-                }
+                PlanUpdate::VerificationReport(_) => saw_verification_report = true,
                 PlanUpdate::SubtaskStatusSync { id, status } if id == "browser-check" => {
-                    if status == TaskStatus::Failed {
-                        saw_failed_status = true;
-                    }
                     if status == TaskStatus::Completed {
                         saw_completed_status = true;
                     }
@@ -3064,26 +2644,18 @@ All acceptance checks pass:
                 }
                 _ => {}
             }
-            if saw_browser_report && saw_failed_status {
-                Some(())
-            } else {
-                None
-            }
+            saw_completed_status.then_some(())
         })
         .await;
         let _ = handle.send_command(PlanCommand::Cancel);
 
         assert!(
-            saw_browser_report,
-            "real plan executor flow should surface a browser verification failure report"
+            !saw_verification_report,
+            "free-form subtask wording must not manufacture a verification criterion"
         );
         assert!(
-            saw_failed_status,
-            "real plan executor flow should mark the browser subtask failed"
-        );
-        assert!(
-            !saw_completed_status,
-            "browser-only verification gap must not surface as completed"
+            saw_completed_status,
+            "a subtask without typed acceptance checks should follow the ordinary completion path"
         );
     }
 

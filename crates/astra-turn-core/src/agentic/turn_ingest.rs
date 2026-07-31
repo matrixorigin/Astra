@@ -14,6 +14,7 @@ use crate::interaction_types::tool_counts_as_external_observation;
 use crate::response_guard::{RESPONSE_GUARD_REDACTED_FINISH_REASON, apply_response_guards};
 use crate::tool::args::shape::tool_call_name;
 use astra_pipeline::step_recorder::StepRecorder;
+use astra_turn_types::NormalizedPromptCacheUsage;
 
 /// Read-only slice of [`crate::chat_turn_sse_dispatch::ChatTurnSseAccum`] fields needed for ingest.
 #[derive(Debug, Clone)]
@@ -282,10 +283,12 @@ fn record_prompt_calibration_success(
     st: &mut AgenticTurnIngestMut<'_>,
 ) {
     *st.consecutive_context_window_errors = 0;
-    let billable_input = snap
-        .prompt_tokens
-        .saturating_add(snap.cache_read_tokens)
-        .saturating_add(snap.cache_creation_tokens);
+    let billable_input = NormalizedPromptCacheUsage::new(
+        snap.prompt_tokens,
+        snap.cache_read_tokens,
+        snap.cache_creation_tokens,
+    )
+    .total_input_tokens();
     if snap.has_usage && billable_input > 0 {
         *st.last_measured_prompt_tokens = Some(billable_input);
     }

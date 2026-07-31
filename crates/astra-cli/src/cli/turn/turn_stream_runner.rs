@@ -103,6 +103,24 @@ fn build_turn_stream_params<'a>(
     input: TurnExecutionInput<'a>,
     prepared: &'a PreparedTurnStreamState,
 ) -> ChatTurnParams<'a> {
+    if state.active_conversation.is_none()
+        && let Some(session_id) = state
+            .session_id
+            .as_deref()
+            .or(input.session_id)
+            .map(str::to_owned)
+    {
+        match crate::cli::session::session_continuation::recover_or_initialize_active_conversation(
+            &session_id,
+        ) {
+            Ok(active) => state.active_conversation = Some(active),
+            Err(error) => tracing::warn!(
+                session_id = %session_id,
+                error = %error,
+                "canonical conversation could not be recovered at the live turn boundary"
+            ),
+        }
+    }
     ChatTurnParams {
         api: input.api,
         token: input.token,
@@ -143,6 +161,7 @@ fn build_turn_stream_params<'a>(
         incremental_state: Some(prepared.incremental_state.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: state.tui_stream_event_tx.clone(),
+        stream_json_emitter: None,
         agent_live_event_sink: state.tui_agent_live_event_sink.clone(),
         approval_request_tx: state.tui_approval_request_tx.clone(),
         ask_user_request_tx: state.tui_ask_user_request_tx.clone(),
@@ -175,7 +194,10 @@ fn build_turn_stream_params<'a>(
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
-        pre_loaded_messages: None,
+        pre_loaded_messages: state
+            .active_conversation
+            .as_ref()
+            .map(|conversation| conversation.materialize()),
         append_system_prompt: prepared.append_system_prompt.clone(),
         session_memory_extractor: state.session_memory_extractor.clone(),
         #[cfg(feature = "harness")]
@@ -330,6 +352,60 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn failed_first_turn_recovers_explicit_empty_canonical_state_not_display_pairs() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("failed-first-turn-{}", uuid::Uuid::new_v4());
+        let writer = astra_services::session_journal::JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&astra_services::session_journal::JournalEvent::turn_error(
+                Some(&session_id),
+                1,
+                Some("mock-model"),
+                "launch work",
+                "foreground ownership moved to the background",
+                0,
+            ))
+            .unwrap();
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            journal: Some(writer),
+            history: vec![(
+                "launch work".into(),
+                "display-only interrupted result".into(),
+            )],
+            ..SessionState::default()
+        };
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let prepared = prepare_turn_stream_state(&state).await;
+
+        let params = build_turn_stream_params(
+            &mut state,
+            TurnExecutionInput {
+                api: &api,
+                profile: None,
+                token: "token",
+                message: "what work is running?",
+                user_intent: "what work is running?",
+                input_runtime_required_texts: &[],
+                input_active_system_skills: &[],
+                input_runtime_volatile_texts: &[],
+                session_id: Some(&session_id),
+                semantic_query_override: None,
+            },
+            &prepared,
+        );
+
+        assert_eq!(params.pre_loaded_messages.as_deref(), Some([].as_slice()));
+        assert!(
+            state
+                .active_conversation
+                .as_ref()
+                .is_some_and(|active| active.messages().is_empty())
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_turn_stream_state_captures_canonical_active_fanout_truth() {
         let transport = Arc::new(astra_messaging::InProcessTransport::new());
         let tracker = Arc::new(astra_runtime::server::delegation::engine::DelegationTracker::new());
@@ -373,6 +449,10 @@ mod tests {
 
     #[test]
     fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
+        let canonical_messages = vec![
+            serde_json::json!({"role": "user", "content": "canonical question"}),
+            serde_json::json!({"role": "assistant", "content": "canonical answer"}),
+        ];
         let mut state = SessionState {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
             current_plan_subtask_id: Some("subtask-1".into()),
@@ -386,6 +466,17 @@ mod tests {
                 "consecutive_futile_attempts": 1,
             })),
             runtime_consecutive_context_window_errors: 2,
+            history: vec![("display-only question".into(), "display-only answer".into())],
+            active_conversation: Some(
+                astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                    astra_services::local_owner_scope().id(),
+                    "sess-1",
+                    canonical_messages.clone(),
+                    1,
+                    astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+                )
+                .unwrap(),
+            ),
             ..SessionState::default()
         };
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -448,5 +539,10 @@ mod tests {
         );
         assert!(params.cancel_token.is_some());
         assert!(params.incremental_state.is_some());
+        assert_eq!(
+            params.pre_loaded_messages,
+            Some(canonical_messages),
+            "the model boundary must consume canonical typed history, never the display pairs"
+        );
     }
 }

@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-21-v10";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v23";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1929,6 +1929,239 @@ async fn fail_if_required_columns_missing_or_nullable(
     fail_if_required_column_nullability_mismatches(pool, database, table, &requirements).await
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedColumnShape {
+    data_type: String,
+    character_maximum_length: Option<i64>,
+    nullable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ObservedIndexShape {
+    columns: Vec<String>,
+    non_unique: bool,
+}
+
+fn inference_provider_attempt_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+    indexes: &BTreeMap<String, ObservedIndexShape>,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (name, expected_type, expected_width) in [
+        ("admission_token", "char", Some(32_i64)),
+        ("provider_protocol", "varchar", Some(32_i64)),
+        ("provider_wire_hash", "char", Some(64_i64)),
+        ("provider_wire_bytes", "bigint", None),
+    ] {
+        let Some(column) = columns.get(name) else {
+            reasons.push(format!("missing NOT NULL column {name}"));
+            continue;
+        };
+        if column.nullable {
+            reasons.push(format!("nullable column {name}"));
+        }
+        if !column.data_type.eq_ignore_ascii_case(expected_type) {
+            reasons.push(format!(
+                "column {name} has type {}, expected {expected_type}",
+                column.data_type
+            ));
+        }
+        if let Some(expected_width) = expected_width
+            && column.character_maximum_length != Some(expected_width)
+        {
+            reasons.push(format!(
+                "column {name} has width {:?}, expected {expected_width}",
+                column.character_maximum_length
+            ));
+        }
+    }
+
+    for (name, expected_columns) in [
+        ("PRIMARY", &["user_id", "attempt_id"][..]),
+        (
+            "uq_inference_provider_attempt",
+            &["user_id", "invocation_id", "attempt_index"][..],
+        ),
+    ] {
+        let Some(index) = indexes.get(name) else {
+            reasons.push(format!("missing unique constraint {name}"));
+            continue;
+        };
+        if index.non_unique {
+            reasons.push(format!("constraint {name} is not unique"));
+        }
+        if !index
+            .columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            reasons.push(format!(
+                "constraint {name} has columns ({}), expected ({})",
+                index.columns.join(", "),
+                expected_columns.join(", ")
+            ));
+        }
+    }
+    reasons
+}
+
+fn inference_invocation_schema_mismatches(
+    columns: &BTreeMap<String, ObservedColumnShape>,
+) -> Vec<String> {
+    let Some(column) = columns.get("admission_token") else {
+        return vec!["missing NOT NULL column admission_token".to_string()];
+    };
+    let mut reasons = Vec::new();
+    if column.nullable {
+        reasons.push("nullable column admission_token".to_string());
+    }
+    if !column.data_type.eq_ignore_ascii_case("char") {
+        reasons.push(format!(
+            "column admission_token has type {}, expected char",
+            column.data_type
+        ));
+    }
+    if column.character_maximum_length != Some(32) {
+        reasons.push(format!(
+            "column admission_token has width {:?}, expected 32",
+            column.character_maximum_length
+        ));
+    }
+    reasons
+}
+
+async fn verify_inference_invocation_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_invocations";
+    let rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = 'admission_token'",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+    let reasons = inference_invocation_schema_mismatches(&columns);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
+async fn verify_inference_provider_attempt_schema_contract(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_identifier(database, "matrixone database")?;
+    let table = "inference_provider_attempts";
+    let column_rows = query(
+        "SELECT COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
+         FROM information_schema.COLUMNS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut columns = BTreeMap::new();
+    for row in column_rows {
+        let name: String = row.try_get("COLUMN_NAME")?;
+        let nullable = match row.try_get::<String, _>("IS_NULLABLE")?.as_str() {
+            "YES" => true,
+            "NO" => false,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema column {table}.{name} has invalid IS_NULLABLE value {value}"
+                )));
+            }
+        };
+        columns.insert(
+            name,
+            ObservedColumnShape {
+                data_type: row.try_get("DATA_TYPE")?,
+                character_maximum_length: row.try_get("CHARACTER_MAXIMUM_LENGTH")?,
+                nullable,
+            },
+        );
+    }
+
+    let index_rows = query(
+        "SELECT INDEX_NAME, NON_UNIQUE, COLUMN_NAME
+         FROM information_schema.STATISTICS
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+           AND INDEX_NAME IN ('PRIMARY', 'uq_inference_provider_attempt')
+         ORDER BY INDEX_NAME, SEQ_IN_INDEX",
+    )
+    .bind(database)
+    .bind(table)
+    .fetch_all(pool)
+    .await?;
+    let mut indexes = BTreeMap::<String, ObservedIndexShape>::new();
+    for row in index_rows {
+        let name: String = row.try_get("INDEX_NAME")?;
+        let non_unique = match row.try_get::<i64, _>("NON_UNIQUE")? {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "schema constraint {table}.{name} has invalid NON_UNIQUE value {value}"
+                )));
+            }
+        };
+        let column: String = row.try_get("COLUMN_NAME")?;
+        let index = indexes
+            .entry(name.clone())
+            .or_insert_with(|| ObservedIndexShape {
+                columns: Vec::new(),
+                non_unique,
+            });
+        if index.non_unique != non_unique {
+            return Err(sqlx::Error::Protocol(format!(
+                "schema constraint {table}.{name} reports inconsistent uniqueness"
+            )));
+        }
+        index.columns.push(column);
+    }
+
+    let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
+    if reasons.is_empty() {
+        return Ok(());
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "obsolete core schema table {table} requires manual migration before startup: {}",
+        reasons.join(", ")
+    )))
+}
+
 async fn fail_if_required_columns_missing_or_not_nullable(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2232,7 +2465,9 @@ async fn ensure_core_schema_while_leased(
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
     if core_schema_contract_is_current(&pool).await? {
-        return verify_core_schema_catalog(&pool, &settings.database).await;
+        verify_core_schema_catalog(&pool, &settings.database).await?;
+        verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
+        return verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await;
     }
 
     // Existing deployments may still have UUID-sized identity columns. Widen
@@ -2349,6 +2584,26 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_auth_refresh_tokens_user_expires (user_id, expires_at),
             INDEX idx_auth_refresh_tokens_expires_at (expires_at),
             INDEX idx_auth_refresh_tokens_prefix (token_prefix)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "auth_reauthentication_proofs",
+        "CREATE TABLE IF NOT EXISTS auth_reauthentication_proofs (
+            proof_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            purpose VARCHAR(32) NOT NULL,
+            proof_hash CHAR(64) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            consumed_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, proof_id),
+            UNIQUE KEY uq_auth_reauthentication_proof_hash (proof_hash),
+            INDEX idx_auth_reauthentication_user_expiry (user_id, expires_at),
+            INDEX idx_auth_reauthentication_expiry (expires_at, consumed_at)
         )",
     )
     .execute(&pool)
@@ -2768,6 +3023,463 @@ async fn ensure_core_schema_while_leased(
         &["updated_at"],
         "ALTER TABLE agent_session_execution_slots ADD INDEX idx_session_execution_slots_updated (updated_at)",
     )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_heads",
+        "CREATE TABLE IF NOT EXISTS session_context_heads (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            head_json LONGTEXT NULL,
+            canonical_root_hash CHAR(64) NULL,
+            latest_manifest_root CHAR(64) NULL,
+            total_canonical_bytes BIGINT NOT NULL DEFAULT 0,
+            total_message_count BIGINT NOT NULL DEFAULT 0,
+            completed_turn BIGINT NOT NULL DEFAULT 0,
+            journal_event_seq BIGINT NOT NULL DEFAULT 0,
+            conversation_seq BIGINT NOT NULL DEFAULT 0,
+            projection_schema INT NOT NULL DEFAULT 0,
+            compaction_generation BIGINT NOT NULL DEFAULT 0,
+            writer_epoch BIGINT NOT NULL DEFAULT 0,
+            authorization_epoch BIGINT NOT NULL DEFAULT 0,
+            device_trust_epoch BIGINT NOT NULL DEFAULT 0,
+            permission_epoch BIGINT NOT NULL DEFAULT 0,
+            active_writer_json LONGTEXT NULL,
+            active_writer_expires_at_ms BIGINT NULL,
+            active_reservation_json LONGTEXT NULL,
+            active_reservation_expires_at_ms BIGINT NULL,
+            last_commit_json LONGTEXT NULL,
+            fork_base_json LONGTEXT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id),
+            INDEX idx_session_context_heads_owner_session (owner_user_id, session_id, branch_id),
+            INDEX idx_session_context_heads_writer_expiry (active_writer_expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "session_context_heads",
+        "fork_base_json",
+        "ALTER TABLE session_context_heads ADD COLUMN fork_base_json LONGTEXT NULL",
+    )
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_segments",
+        "CREATE TABLE IF NOT EXISTS conversation_segments (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            segment_hash CHAR(64) NOT NULL,
+            canonical_root_hash CHAR(64) NOT NULL,
+            canonical_bytes BIGINT NOT NULL,
+            message_count BIGINT NOT NULL,
+            segment_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, segment_hash),
+            INDEX idx_conversation_segments_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_forks",
+        "CREATE TABLE IF NOT EXISTS session_forks (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            fork_id VARCHAR(128) NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            parent_branch_id VARCHAR(128) NOT NULL,
+            child_session_id VARCHAR(128) NOT NULL,
+            child_branch_id VARCHAR(128) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            manifest_json LONGTEXT NOT NULL,
+            activated_at_ms BIGINT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, fork_id),
+            UNIQUE KEY uq_session_forks_child
+                (isolation_domain, owner_user_id, child_session_id, child_branch_id),
+            UNIQUE KEY uq_session_forks_parent_idempotency
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, idempotency_hash),
+            INDEX idx_session_forks_parent_state
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, state),
+            INDEX idx_session_forks_child_state
+                (isolation_domain, owner_user_id, child_session_id, child_branch_id, state)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_fork_events",
+        "CREATE TABLE IF NOT EXISTS session_fork_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            fork_id VARCHAR(128) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            child_session_id VARCHAR(128) NOT NULL,
+            from_state VARCHAR(32) NULL,
+            to_state VARCHAR(32) NOT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, fork_id, transition_seq),
+            INDEX idx_session_fork_events_parent
+                (isolation_domain, owner_user_id, parent_session_id, created_at),
+            INDEX idx_session_fork_events_child
+                (isolation_domain, owner_user_id, child_session_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_manifest_pins",
+        "CREATE TABLE IF NOT EXISTS conversation_manifest_pins (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            pin_id VARCHAR(128) NOT NULL,
+            parent_session_id VARCHAR(128) NOT NULL,
+            parent_branch_id VARCHAR(128) NOT NULL,
+            manifest_root CHAR(64) NOT NULL,
+            pin_state VARCHAR(32) NOT NULL,
+            grace_expires_at_ms BIGINT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, pin_id),
+            INDEX idx_manifest_pins_parent
+                (isolation_domain, owner_user_id, parent_session_id, parent_branch_id, pin_state),
+            INDEX idx_manifest_pins_grace
+                (pin_state, grace_expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_manifest_nodes",
+        "CREATE TABLE IF NOT EXISTS conversation_manifest_nodes (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            manifest_root CHAR(64) NOT NULL,
+            parent_manifest_root CHAR(64) NULL,
+            completed_turn BIGINT NOT NULL,
+            conversation_seq BIGINT NOT NULL,
+            canonical_segment_bytes BIGINT NOT NULL,
+            total_canonical_bytes BIGINT NOT NULL,
+            total_message_count BIGINT NOT NULL,
+            reachable TINYINT NOT NULL DEFAULT 0,
+            manifest_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
+            INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
+            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    for (column, ddl) in [
+        (
+            "total_canonical_bytes",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_canonical_bytes BIGINT NOT NULL DEFAULT 0",
+        ),
+        (
+            "total_message_count",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN total_message_count BIGINT NOT NULL DEFAULT 0",
+        ),
+        (
+            "reachable",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN reachable TINYINT NOT NULL DEFAULT 0",
+        ),
+    ] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            "conversation_manifest_nodes",
+            column,
+            ddl,
+        )
+        .await?;
+    }
+    query(
+        "UPDATE conversation_manifest_nodes n
+         INNER JOIN session_context_heads h
+           ON h.isolation_domain = n.isolation_domain
+          AND h.owner_user_id = n.owner_user_id
+          AND h.session_id = n.session_id
+          AND h.branch_id = n.branch_id
+          AND h.latest_manifest_root = n.manifest_root
+         SET n.reachable = 1
+         WHERE n.reachable = 0",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_operation_receipts",
+        "CREATE TABLE IF NOT EXISTS session_context_operation_receipts (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            operation_kind VARCHAR(32) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            receipt_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, operation_kind, idempotency_hash),
+            INDEX idx_session_context_receipts_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_context_authority_events",
+        "CREATE TABLE IF NOT EXISTS session_context_authority_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            event_id CHAR(36) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            operation_kind VARCHAR(32) NOT NULL,
+            outcome VARCHAR(32) NOT NULL,
+            writer_epoch BIGINT NOT NULL,
+            actor_id VARCHAR(512) NULL,
+            device_id VARCHAR(512) NULL,
+            lease_id CHAR(36) NULL,
+            reservation_id CHAR(36) NULL,
+            expected_root CHAR(64) NULL,
+            observed_root CHAR(64) NULL,
+            authorization_epoch BIGINT NOT NULL,
+            device_trust_epoch BIGINT NOT NULL,
+            permission_epoch BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, event_id),
+            INDEX idx_context_authority_session_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at),
+            INDEX idx_context_authority_outcome_created
+                (operation_kind, outcome, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_attachment_quarantines",
+        "CREATE TABLE IF NOT EXISTS session_attachment_quarantines (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            quarantine_id CHAR(36) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            observed_manifest_root CHAR(64) NOT NULL,
+            current_manifest_root CHAR(64) NULL,
+            reason VARCHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, quarantine_id),
+            UNIQUE KEY uq_session_attachment_quarantine_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_attachment_quarantine_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_publish_receipts",
+        "CREATE TABLE IF NOT EXISTS session_publish_receipts (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            local_event_id VARCHAR(128) NOT NULL,
+            payload_hash VARCHAR(80) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            local_base_root CHAR(64) NOT NULL,
+            local_cursor_root CHAR(64) NOT NULL,
+            local_cursor_json LONGTEXT NOT NULL,
+            server_base_manifest_root CHAR(64) NULL,
+            server_manifest_root CHAR(64) NOT NULL,
+            server_cursor_json LONGTEXT NOT NULL,
+            segment_hashes_json LONGTEXT NOT NULL,
+            publish_state VARCHAR(16) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (
+                isolation_domain, owner_user_id, session_id, branch_id, local_event_id
+            ),
+            INDEX idx_session_publish_local_root (
+                isolation_domain, owner_user_id, session_id, branch_id, local_cursor_root
+            ),
+            INDEX idx_session_publish_server_root (
+                isolation_domain, owner_user_id, session_id, branch_id, server_manifest_root
+            )
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoff_slots",
+        "CREATE TABLE IF NOT EXISTS session_handoff_slots (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            active_handoff_id CHAR(36) NULL,
+            next_attachment_epoch BIGINT NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_attachments",
+        "CREATE TABLE IF NOT EXISTS session_attachments (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            attachment_id CHAR(36) NOT NULL,
+            attachment_epoch BIGINT NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            actor_id VARCHAR(512) NOT NULL,
+            mode VARCHAR(32) NOT NULL,
+            placement VARCHAR(32) NOT NULL,
+            observed_manifest_root CHAR(64) NULL,
+            attachment_json LONGTEXT NOT NULL,
+            expires_at_ms BIGINT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, attachment_id),
+            UNIQUE KEY uq_session_attachment_epoch
+                (isolation_domain, owner_user_id, session_id, branch_id, attachment_epoch),
+            UNIQUE KEY uq_session_attachment_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_attachments_expiry (expires_at_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoffs",
+        "CREATE TABLE IF NOT EXISTS session_handoffs (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            handoff_id CHAR(36) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            state VARCHAR(32) NOT NULL,
+            mode VARCHAR(32) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            deadline_ms BIGINT NOT NULL,
+            record_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, handoff_id),
+            UNIQUE KEY uq_session_handoff_idempotency
+                (isolation_domain, owner_user_id, session_id, branch_id, idempotency_hash),
+            INDEX idx_session_handoffs_state_deadline (state, deadline_ms)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_handoff_events",
+        "CREATE TABLE IF NOT EXISTS session_handoff_events (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            handoff_id CHAR(36) NOT NULL,
+            transition_seq BIGINT NOT NULL,
+            request_hash CHAR(64) NOT NULL,
+            from_state VARCHAR(32) NULL,
+            to_state VARCHAR(32) NOT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, handoff_id, transition_seq),
+            INDEX idx_session_handoff_events_created
+                (isolation_domain, owner_user_id, session_id, branch_id, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_weighted_admission_gates",
+        "CREATE TABLE IF NOT EXISTS session_weighted_admission_gates (
+            scope_name VARCHAR(64) NOT NULL,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (scope_name)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "session_weighted_admission_reservations",
+        "CREATE TABLE IF NOT EXISTS session_weighted_admission_reservations (
+            scope_name VARCHAR(64) NOT NULL,
+            reservation_id CHAR(36) NOT NULL,
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            idempotency_hash CHAR(64) NOT NULL,
+            resident_bytes BIGINT NOT NULL,
+            context_tokens BIGINT NOT NULL,
+            provider_slots BIGINT NOT NULL,
+            cpu_units BIGINT NOT NULL,
+            io_bytes BIGINT NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (scope_name, reservation_id),
+            UNIQUE KEY uq_weighted_admission_idempotency
+                (scope_name, isolation_domain, owner_user_id, idempotency_hash),
+            INDEX idx_weighted_admission_expiry (scope_name, expires_at),
+            INDEX idx_weighted_admission_owner_expiry
+                (scope_name, isolation_domain, owner_user_id, expires_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
 
     core_schema_create!(pool, "agent_run_events",
@@ -3566,9 +4278,14 @@ async fn ensure_core_schema_while_leased(
             chunk_kind VARCHAR(32) NOT NULL,
             position INT NOT NULL,
             op VARCHAR(16) NOT NULL,
+            reuse_count INT NULL,
             chunk_id VARCHAR(80) NULL,
             chunk_hash VARCHAR(64) NULL,
             previous_chunk_hash VARCHAR(64) NULL,
+            chunk_tokens BIGINT NULL,
+            chunk_bytes BIGINT NULL,
+            previous_chunk_tokens BIGINT NULL,
+            previous_chunk_bytes BIGINT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, session_id, request_id, delta_seq),
             INDEX idx_prompt_deltas_owner_request_position (user_id, session_id, request_id, position, delta_seq)
@@ -3576,6 +4293,30 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    for (column, ddl) in [
+        (
+            "reuse_count",
+            "ALTER TABLE prompt_deltas ADD COLUMN reuse_count INT NULL",
+        ),
+        (
+            "chunk_tokens",
+            "ALTER TABLE prompt_deltas ADD COLUMN chunk_tokens BIGINT NULL",
+        ),
+        (
+            "chunk_bytes",
+            "ALTER TABLE prompt_deltas ADD COLUMN chunk_bytes BIGINT NULL",
+        ),
+        (
+            "previous_chunk_tokens",
+            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_tokens BIGINT NULL",
+        ),
+        (
+            "previous_chunk_bytes",
+            "ALTER TABLE prompt_deltas ADD COLUMN previous_chunk_bytes BIGINT NULL",
+        ),
+    ] {
+        add_column_if_missing(&pool, &settings.database, "prompt_deltas", column, ddl).await?;
+    }
     core_schema_create!(
         pool,
         "session_state_revisions",
@@ -3613,6 +4354,7 @@ async fn ensure_core_schema_while_leased(
             session_id VARCHAR(128) NOT NULL,
             device_id VARCHAR(128) NOT NULL,
             device_fingerprint VARCHAR(128) NOT NULL,
+            device_key_hash CHAR(64) NOT NULL,
             trust_level VARCHAR(32) NOT NULL DEFAULT 'new_device',
             status VARCHAR(32) NOT NULL DEFAULT 'active',
             last_monotonic_id BIGINT NOT NULL DEFAULT 0,
@@ -3631,6 +4373,26 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+    fail_if_obsolete_shape(
+        &pool,
+        &settings.database,
+        "session_device_leases",
+        &[
+            "lease_id",
+            "user_id",
+            "session_id",
+            "device_id",
+            "device_fingerprint",
+            "device_key_hash",
+            "trust_level",
+            "status",
+            "last_monotonic_id",
+            "expires_at",
+        ],
+        &[],
+        &[],
+    )
+    .await?;
     ensure_primary_key_shape(
         &pool,
         &settings.database,
@@ -3638,6 +4400,28 @@ async fn ensure_core_schema_while_leased(
         &["user_id", "lease_id"],
         "ALTER TABLE session_device_leases ADD PRIMARY KEY (user_id, lease_id)",
     )
+    .await?;
+    core_schema_create!(
+        pool,
+        "session_device_challenges",
+        "CREATE TABLE IF NOT EXISTS session_device_challenges (
+            challenge_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            device_id VARCHAR(128) NOT NULL,
+            device_fingerprint VARCHAR(128) NOT NULL,
+            purpose VARCHAR(32) NOT NULL,
+            challenge_digest CHAR(64) NOT NULL,
+            expires_at DATETIME(6) NOT NULL,
+            consumed_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, challenge_id),
+            INDEX idx_device_challenges_owner_device
+                (user_id, session_id, device_id, created_at),
+            INDEX idx_device_challenges_expiry (expires_at, consumed_at)
+        )",
+    )
+    .execute(&pool)
     .await?;
     core_schema_create!(pool, "session_device_lease_events",
         "CREATE TABLE IF NOT EXISTS session_device_lease_events (
@@ -4879,6 +5663,7 @@ async fn ensure_core_schema_while_leased(
             scope_kind VARCHAR(16) NOT NULL,
             run_id VARCHAR(64) NULL,
             harness_run_id VARCHAR(128) NULL,
+            admission_token CHAR(32) NOT NULL,
             turn_index BIGINT NULL,
             round_index BIGINT NULL,
             operation_id VARCHAR(64) NOT NULL,
@@ -4929,6 +5714,10 @@ async fn ensure_core_schema_while_leased(
             harness_run_id VARCHAR(128) NULL,
             attempt_index BIGINT NOT NULL,
             provider VARCHAR(64) NOT NULL,
+            admission_token CHAR(32) NOT NULL,
+            provider_protocol VARCHAR(32) NOT NULL,
+            provider_wire_hash CHAR(64) NOT NULL,
+            provider_wire_bytes BIGINT NOT NULL,
             status VARCHAR(32) NOT NULL,
             terminal_fingerprint CHAR(64) NULL,
             input_tokens BIGINT NOT NULL DEFAULT 0,
@@ -4947,10 +5736,90 @@ async fn ensure_core_schema_while_leased(
                         AND harness_run_id IS NOT NULL)),
             CONSTRAINT chk_inference_provider_attempts_status
                 CHECK (status IN ('started', 'succeeded', 'failed', 'cancelled', 'delivery_unknown')),
+            CONSTRAINT chk_inference_provider_attempts_wire
+                CHECK (provider_protocol IN ('openai_compatible', 'anthropic_messages', 'bedrock_converse')
+                    AND provider_wire_bytes > 0),
             UNIQUE KEY uq_inference_provider_attempt (user_id, invocation_id, attempt_index),
             INDEX idx_inference_attempts_owner_session_started (user_id, session_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_run_started (user_id, run_id, started_at, attempt_id),
             INDEX idx_inference_attempts_owner_harness_started (user_id, harness_run_id, started_at, attempt_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    core_schema_create!(
+        pool,
+        "model_request_context_events",
+        "CREATE TABLE IF NOT EXISTS model_request_context_events (
+            event_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            attempt_id VARCHAR(64) NOT NULL,
+            invocation_id VARCHAR(64) NOT NULL,
+            session_id VARCHAR(64) NULL,
+            run_id VARCHAR(64) NULL,
+            harness_run_id VARCHAR(128) NULL,
+            event_stage VARCHAR(16) NOT NULL,
+            terminal_status VARCHAR(32) NULL,
+            topology VARCHAR(32) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            model_family VARCHAR(128) NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            input_tokens BIGINT NULL,
+            output_tokens BIGINT NULL,
+            cache_read_tokens BIGINT NULL,
+            cache_creation_tokens BIGINT NULL,
+            event_json LONGTEXT NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, event_id),
+            CONSTRAINT chk_model_request_context_stage
+                CHECK (event_stage IN ('accepted', 'terminal')),
+            CONSTRAINT chk_model_request_context_terminal
+                CHECK ((event_stage = 'accepted' AND terminal_status IS NULL)
+                    OR (event_stage = 'terminal' AND terminal_status IN
+                        ('succeeded', 'failed', 'cancelled', 'delivery_unknown'))),
+            UNIQUE KEY uq_model_request_context_attempt_stage
+                (user_id, attempt_id, event_stage),
+            INDEX idx_model_request_context_owner_session_created
+                (user_id, session_id, created_at, event_id),
+            INDEX idx_model_request_context_metrics
+                (topology, provider, model_family, purpose, created_at),
+            INDEX idx_model_request_context_terminal_status
+                (terminal_status, created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    // Terminal request metrics are accumulated transactionally with their
+    // append-only event. Scrapers read this bounded low-cardinality
+    // projection instead of repeatedly scanning every historical request.
+    core_schema_create!(
+        pool,
+        "model_request_metric_shards",
+        "CREATE TABLE IF NOT EXISTS model_request_metric_shards (
+            metric_shard SMALLINT NOT NULL,
+            topology VARCHAR(32) NOT NULL,
+            provider VARCHAR(64) NOT NULL,
+            model_family VARCHAR(128) NOT NULL,
+            purpose VARCHAR(64) NOT NULL,
+            terminal_status VARCHAR(32) NOT NULL,
+            requests BIGINT NOT NULL DEFAULT 0,
+            input_tokens BIGINT NOT NULL DEFAULT 0,
+            output_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_read_tokens BIGINT NOT NULL DEFAULT 0,
+            cache_creation_tokens BIGINT NOT NULL DEFAULT 0,
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY
+                (metric_shard, topology, provider, model_family, purpose, terminal_status),
+            CONSTRAINT chk_model_request_metric_shard
+                CHECK (metric_shard >= 0 AND metric_shard < 64),
+            CONSTRAINT chk_model_request_metric_terminal
+                CHECK (terminal_status IN
+                    ('succeeded', 'failed', 'cancelled', 'delivery_unknown')),
+            CONSTRAINT chk_model_request_metric_nonnegative
+                CHECK (requests >= 0 AND input_tokens >= 0 AND output_tokens >= 0
+                    AND cache_read_tokens >= 0 AND cache_creation_tokens >= 0)
         )",
     )
     .execute(&pool)
@@ -5064,6 +5933,8 @@ async fn ensure_core_schema_while_leased(
         &["scope_kind", "operation_id"],
     )
     .await?;
+    verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
+    verify_inference_provider_attempt_schema_contract(&pool, &settings.database).await?;
     for (table, nullable_columns) in [
         (
             "inference_routes",
@@ -7096,6 +7967,8 @@ pub async fn cleanup_expired_data(
     policy: &RetentionPolicy,
 ) -> Result<Vec<CleanupResult>, String> {
     const AUTH_REFRESH_TOKEN_BATCH_LIMIT: u32 = 1000;
+    const AUTH_PROOF_BATCH_LIMIT: u32 = 1000;
+    const DEVICE_CHALLENGE_BATCH_LIMIT: u32 = 1000;
     const AUTH_TOKEN_BATCH_LIMIT: u32 = 1000;
     const AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
@@ -7123,6 +7996,38 @@ pub async fn cleanup_expired_data(
     .map_err(|e| format!("cleanup auth_refresh_tokens: {e}"))?;
     results.push(CleanupResult {
         table: "auth_refresh_tokens",
+        rows_deleted: deleted,
+    });
+
+    let deleted = sqlx::query(
+        "DELETE FROM auth_reauthentication_proofs
+         WHERE expires_at < NOW(6) OR consumed_at IS NOT NULL
+         ORDER BY created_at ASC, proof_id ASC
+         LIMIT ?",
+    )
+    .bind(AUTH_PROOF_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("cleanup auth_reauthentication_proofs: {error}"))?;
+    results.push(CleanupResult {
+        table: "auth_reauthentication_proofs",
+        rows_deleted: deleted,
+    });
+
+    let deleted = sqlx::query(
+        "DELETE FROM session_device_challenges
+         WHERE expires_at < NOW(6) OR consumed_at IS NOT NULL
+         ORDER BY created_at ASC, challenge_id ASC
+         LIMIT ?",
+    )
+    .bind(DEVICE_CHALLENGE_BATCH_LIMIT)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(|error| format!("cleanup session_device_challenges: {error}"))?;
+    results.push(CleanupResult {
+        table: "session_device_challenges",
         rows_deleted: deleted,
     });
 
@@ -7738,6 +8643,83 @@ mod tests {
         );
     }
 
+    fn canonical_provider_attempt_columns() -> BTreeMap<String, ObservedColumnShape> {
+        [
+            (
+                "admission_token",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(32),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_protocol",
+                ObservedColumnShape {
+                    data_type: "varchar".to_string(),
+                    character_maximum_length: Some(32),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_wire_hash",
+                ObservedColumnShape {
+                    data_type: "char".to_string(),
+                    character_maximum_length: Some(64),
+                    nullable: false,
+                },
+            ),
+            (
+                "provider_wire_bytes",
+                ObservedColumnShape {
+                    data_type: "bigint".to_string(),
+                    character_maximum_length: None,
+                    nullable: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, shape)| (name.to_string(), shape))
+        .collect()
+    }
+
+    fn canonical_provider_attempt_indexes() -> BTreeMap<String, ObservedIndexShape> {
+        [
+            (
+                "PRIMARY",
+                ObservedIndexShape {
+                    columns: vec!["user_id".to_string(), "attempt_id".to_string()],
+                    non_unique: false,
+                },
+            ),
+            (
+                "uq_inference_provider_attempt",
+                ObservedIndexShape {
+                    columns: vec![
+                        "user_id".to_string(),
+                        "invocation_id".to_string(),
+                        "attempt_index".to_string(),
+                    ],
+                    non_unique: false,
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(name, shape)| (name.to_string(), shape))
+        .collect()
+    }
+
+    #[test]
+    fn provider_attempt_schema_contract_accepts_the_exact_wire_shape() {
+        assert!(
+            inference_provider_attempt_schema_mismatches(
+                &canonical_provider_attempt_columns(),
+                &canonical_provider_attempt_indexes(),
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn agent_runs_shadow_ddl_reuses_the_canonical_schema() {
         let shadow = agent_runs_shadow_create_sql().unwrap();
@@ -7763,6 +8745,129 @@ mod tests {
         assert!(sql.contains("NULL, `selected_model_name`, NULL"));
         assert!(!sql.contains("`selected_model_json`"));
         assert!(!sql.contains("`selected_model_gateway`"));
+    }
+
+    #[test]
+    fn invocation_schema_contract_requires_an_exact_admission_fence() {
+        let exact = [(
+            "admission_token".to_string(),
+            ObservedColumnShape {
+                data_type: "char".to_string(),
+                character_maximum_length: Some(32),
+                nullable: false,
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(inference_invocation_schema_mismatches(&exact).is_empty());
+
+        let mut nullable = exact.clone();
+        nullable.get_mut("admission_token").unwrap().nullable = true;
+        assert!(!inference_invocation_schema_mismatches(&nullable).is_empty());
+
+        let mut wrong_width = exact;
+        wrong_width
+            .get_mut("admission_token")
+            .unwrap()
+            .character_maximum_length = Some(36);
+        assert!(!inference_invocation_schema_mismatches(&wrong_width).is_empty());
+    }
+
+    #[test]
+    fn provider_attempt_schema_contract_rejects_independent_column_and_key_drift() {
+        let exact_columns = canonical_provider_attempt_columns();
+        let exact_indexes = canonical_provider_attempt_indexes();
+        let mut cases = Vec::new();
+
+        let mut columns = exact_columns.clone();
+        columns.remove("admission_token");
+        cases.push((
+            "missing NOT NULL column admission_token",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.remove("provider_protocol");
+        cases.push((
+            "missing NOT NULL column provider_protocol",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_protocol").unwrap().nullable = true;
+        cases.push((
+            "nullable column provider_protocol",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_wire_hash").unwrap().data_type = "varchar".to_string();
+        cases.push((
+            "provider_wire_hash has type varchar",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns
+            .get_mut("provider_wire_hash")
+            .unwrap()
+            .character_maximum_length = Some(32);
+        cases.push((
+            "provider_wire_hash has width Some(32)",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut columns = exact_columns.clone();
+        columns.get_mut("provider_wire_bytes").unwrap().data_type = "int".to_string();
+        cases.push((
+            "provider_wire_bytes has type int",
+            columns,
+            exact_indexes.clone(),
+        ));
+
+        let mut indexes = exact_indexes.clone();
+        indexes.remove("PRIMARY");
+        cases.push((
+            "missing unique constraint PRIMARY",
+            exact_columns.clone(),
+            indexes,
+        ));
+
+        let mut indexes = exact_indexes.clone();
+        indexes
+            .get_mut("uq_inference_provider_attempt")
+            .unwrap()
+            .non_unique = true;
+        cases.push((
+            "constraint uq_inference_provider_attempt is not unique",
+            exact_columns.clone(),
+            indexes,
+        ));
+
+        let mut indexes = exact_indexes;
+        indexes
+            .get_mut("uq_inference_provider_attempt")
+            .unwrap()
+            .columns
+            .swap(1, 2);
+        cases.push((
+            "constraint uq_inference_provider_attempt has columns",
+            exact_columns,
+            indexes,
+        ));
+
+        for (expected, columns, indexes) in cases {
+            let reasons = inference_provider_attempt_schema_mismatches(&columns, &indexes);
+            assert!(
+                reasons.iter().any(|reason| reason.contains(expected)),
+                "expected `{expected}` in {reasons:?}"
+            );
+        }
     }
 
     #[test]

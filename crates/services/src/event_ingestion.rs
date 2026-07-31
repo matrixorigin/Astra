@@ -124,7 +124,28 @@ fn stable_event_id(parts: &[&str]) -> String {
 
 fn stable_json_digest<T: Serialize>(value: &T) -> Result<String, String> {
     let bytes = serde_json::to_vec(value).map_err(|e| format!("serialize event identity: {e}"))?;
+    if astra_core::history_work::instrumentation_enabled() {
+        astra_core::history_work::record_operation(
+            astra_core::history_work::HistoryWorkSite::EventIngestionJournalHash,
+            bytes.len().try_into().unwrap_or(u64::MAX),
+            1,
+            0,
+        );
+    }
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct IngestionQueueReservation(Arc<astra_core::history_work::QueueBytesReservation>);
+
+impl std::fmt::Debug for IngestionQueueReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IngestionQueueReservation")
+            .field("owners", &Arc::strong_count(&self.0))
+            .finish_non_exhaustive()
+    }
 }
 
 /// A journal event prepared for cloud ingestion.
@@ -149,6 +170,32 @@ pub struct IngestionEvent {
     pub parent_event_ids: Vec<String>,
     /// Causal chain root ID for grouping related events.
     pub causal_chain_id: Option<String>,
+    /// Keeps full-payload queue residency accounted until the worker releases
+    /// the event. It is process-local instrumentation, never wire data.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub history_work_queue_reservation: Option<IngestionQueueReservation>,
+}
+
+fn ingestion_queue_reservation(event: &IngestionEvent) -> Option<IngestionQueueReservation> {
+    if !astra_core::history_work::instrumentation_enabled() {
+        return None;
+    }
+    match astra_core::history_work::serialized_bytes(event) {
+        Ok(bytes) => Some(IngestionQueueReservation(Arc::new(
+            astra_core::history_work::QueueBytesReservation::for_site(
+                astra_core::history_work::HistoryWorkSite::EventIngestionQueue,
+                bytes,
+            ),
+        ))),
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::EventIngestionQueue,
+                &error,
+            );
+            None
+        }
+    }
 }
 
 /// Backpressure priority for cloud ingestion events.
@@ -251,7 +298,18 @@ fn merged_metadata_from_journal_event(
     {
         obj.insert("tool_outcomes".to_string(), value);
     }
-    Some(serde_json::Value::Object(obj))
+    let merged = serde_json::Value::Object(obj);
+    if matches!(
+        event.event_type,
+        crate::session_journal::JournalEventType::LlmRequestFull
+            | crate::session_journal::JournalEventType::ContextAssemblyRecorded
+    ) {
+        astra_core::history_work::record_serialized_value(
+            astra_core::history_work::HistoryWorkSite::EventIngestionHistoryClone,
+            &merged,
+        );
+    }
+    Some(merged)
 }
 
 impl IngestionEvent {
@@ -306,6 +364,7 @@ impl IngestionEvent {
             parent_event_id: None,
             parent_event_ids: Vec::new(),
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         })
     }
 
@@ -402,6 +461,7 @@ impl IngestionEvent {
             parent_event_id,
             parent_event_ids,
             causal_chain_id,
+            history_work_queue_reservation: None,
         })
     }
 
@@ -540,6 +600,7 @@ impl IngestionEvent {
                     parent_event_id: Some(main_event_id.clone()),
                     parent_event_ids: vec![main_event_id.clone()],
                     causal_chain_id: Some(main_event_id.clone()),
+                    history_work_queue_reservation: None,
                 });
             }
         }
@@ -620,7 +681,8 @@ impl IngestionSender {
     /// async send task so the event waits for capacity instead of being dropped.
     /// `overflow_count` tracks these backpressure deferrals and hard
     /// closed-channel drops.
-    pub fn enqueue(&self, event: IngestionEvent) {
+    pub fn enqueue(&self, mut event: IngestionEvent) {
+        event.history_work_queue_reservation = ingestion_queue_reservation(&event);
         let priority = event.priority();
         if priority == IngestionEventPriority::Telemetry {
             let reserve_slots = telemetry_channel_reserve_slots(self.tx.max_capacity());
@@ -765,7 +827,8 @@ impl IngestionSender {
     }
 
     /// Enqueue with backpressure (waits if channel full).
-    pub async fn enqueue_async(&self, event: IngestionEvent) {
+    pub async fn enqueue_async(&self, mut event: IngestionEvent) {
+        event.history_work_queue_reservation = ingestion_queue_reservation(&event);
         let priority = event.priority();
         if self.tx.send(event).await.is_err() {
             self.overflow_count.fetch_add(1, Ordering::Relaxed);
@@ -853,9 +916,13 @@ impl CanonicalTokenUsage {
         let output_tokens = event
             .tokens_out
             .ok_or_else(|| "token_usage canonicalization: missing tokens_out".to_string())?;
-        let billable_input = input_tokens
-            .checked_add(cached_input_tokens)
-            .and_then(|value| value.checked_add(cache_creation_tokens))
+        let normalized_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+            input_tokens,
+            cached_input_tokens,
+            cache_creation_tokens,
+        );
+        let billable_input = normalized_input
+            .checked_total_input_tokens()
             .ok_or_else(|| "token_usage canonicalization: input token overflow".to_string())?;
         let total_tokens = billable_input
             .checked_add(output_tokens)
@@ -898,12 +965,13 @@ impl CanonicalTokenUsage {
             output_tokens: read_required("output_tokens")?,
             total_tokens: read_required("total_tokens")?,
         };
-        let expected_total = usage
-            .input_tokens
-            .checked_add(usage.cached_input_tokens)
-            .and_then(|value| value.checked_add(usage.cache_creation_tokens))
-            .and_then(|value| value.checked_add(usage.output_tokens))
-            .ok_or_else(|| "token_usage total overflow".to_string())?;
+        let expected_total = astra_turn_types::NormalizedPromptCacheUsage::new(
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_tokens,
+        )
+        .checked_total_tokens_with_output(usage.output_tokens)
+        .ok_or_else(|| "token_usage total overflow".to_string())?;
         if usage.total_tokens != expected_total {
             return Err(format!(
                 "token_usage total_tokens mismatch: expected {expected_total}, got {}",
@@ -914,10 +982,12 @@ impl CanonicalTokenUsage {
     }
 
     fn to_json(self) -> Value {
-        let billable_input = self
-            .input_tokens
-            .saturating_add(self.cached_input_tokens)
-            .saturating_add(self.cache_creation_tokens);
+        let billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_creation_tokens,
+        )
+        .total_input_tokens();
         serde_json::json!({
             "input_tokens": self.input_tokens,
             "cached_input_tokens": self.cached_input_tokens,
@@ -933,11 +1003,13 @@ impl CanonicalTokenUsage {
     }
 
     fn input_column(self) -> Result<i64, String> {
-        let billable_input = self
-            .input_tokens
-            .checked_add(self.cached_input_tokens)
-            .and_then(|value| value.checked_add(self.cache_creation_tokens))
-            .ok_or_else(|| "token_usage input column overflow".to_string())?;
+        let billable_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.cache_creation_tokens,
+        )
+        .checked_total_input_tokens()
+        .ok_or_else(|| "token_usage input column overflow".to_string())?;
         i64::try_from(billable_input)
             .map_err(|_| format!("token_usage input column exceeds i64::MAX: {billable_input}"))
     }
@@ -1658,6 +1730,7 @@ mod tests {
             parent_event_id: None,
             parent_event_ids: vec![],
             causal_chain_id: None,
+            history_work_queue_reservation: None,
         }
     }
 
@@ -2015,6 +2088,7 @@ mod tests {
             session_lineage: None,
             coordination: None,
             transcript_item: None,
+            conversation_commit: None,
             edge_policy: None,
             context_assembly_trace: None,
             routing_domain_hint: None,

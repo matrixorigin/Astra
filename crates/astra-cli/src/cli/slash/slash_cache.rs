@@ -164,7 +164,12 @@ fn render_cache_summary(
     let total_completion: u64 = turns.iter().map(|turn| turn.completion_tokens).sum();
     let total_cache_read: u64 = turns.iter().map(|turn| turn.cache_read_tokens).sum();
     let total_cache_creation: u64 = turns.iter().map(|turn| turn.cache_creation_tokens).sum();
-    let total_input = total_fresh + total_cache_read + total_cache_creation;
+    let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+        total_fresh,
+        total_cache_read,
+        total_cache_creation,
+    )
+    .total_input_tokens();
     let cache_read_pct = if total_input > 0 {
         total_cache_read as f64 / total_input as f64 * 100.0
     } else {
@@ -242,8 +247,12 @@ fn render_cache_summary(
             .into_iter()
             .rev()
         {
-            let total_input =
-                turn.fresh_prompt_tokens + turn.cache_read_tokens + turn.cache_creation_tokens;
+            let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
+                turn.fresh_prompt_tokens,
+                turn.cache_read_tokens,
+                turn.cache_creation_tokens,
+            )
+            .total_input_tokens();
             let pct = if total_input > 0 {
                 Some(turn.cache_read_tokens as f64 / total_input as f64 * 100.0)
             } else {

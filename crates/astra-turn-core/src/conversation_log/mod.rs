@@ -73,6 +73,12 @@ impl CslEntry {
 /// restore authoritative runtime state from explicit runtime records.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStateCompact {
+    /// Canonical journal cursor projected by this CSL materialization.
+    ///
+    /// Absent in legacy logs. CSL never invents or advances this cursor; the
+    /// primary journal commit supplies it to the asynchronous projector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_cursor: Option<astra_turn_types::SessionCursorV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -131,6 +137,8 @@ pub struct DelegationCompact {
 /// - `Some(Some(v))` = set to value `v`
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionStatePatch {
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    pub source_cursor: Option<Option<astra_turn_types::SessionCursorV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +203,9 @@ mod nullable {
 impl SessionStateCompact {
     /// Apply an incremental patch, updating only the fields present in `patch`.
     pub fn apply_patch(&mut self, patch: &SessionStatePatch) {
+        if let Some(cursor) = &patch.source_cursor {
+            self.source_cursor = cursor.clone();
+        }
         if let Some(bt) = &patch.blocked_tools {
             self.blocked_tools = bt.clone();
         }
@@ -272,7 +283,13 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
             turn,
             messages,
             session_state,
-        } => (messages.clone(), session_state.clone(), *seq, *turn),
+        } => {
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                messages,
+            );
+            (messages.clone(), session_state.clone(), *seq, *turn)
+        }
         _ => unreachable!(),
     };
 
@@ -287,6 +304,10 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
                 appended,
                 state_patch,
             } => {
+                astra_core::history_work::record_serialized_value(
+                    astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                    appended,
+                );
                 messages.extend(appended.iter().cloned());
                 if let Some(patch) = state_patch {
                     state.apply_patch(patch);
@@ -301,6 +322,10 @@ pub fn materialize(entries: &[CslEntry]) -> Result<MaterializedState, Materializ
                 session_state,
             } => {
                 // A later snapshot resets everything.
+                astra_core::history_work::record_serialized_value(
+                    astra_core::history_work::HistoryWorkSite::CslMaterializedStateClone,
+                    snap_messages,
+                );
                 messages = snap_messages.clone();
                 state = session_state.clone();
                 last_seq = *seq;
@@ -400,6 +425,8 @@ pub enum CslStoreError {
     Serde(#[from] serde_json::Error),
     #[error("materialize error: {0}")]
     Materialize(#[from] MaterializeError),
+    #[error("causal projection error: {0}")]
+    CausalProjection(String),
     #[error("{0}")]
     InvalidSessionId(String),
     #[error("{0}")]
@@ -812,6 +839,7 @@ mod tests {
     #[test]
     fn serde_snapshot_with_full_state_roundtrip() {
         let state = SessionStateCompact {
+            source_cursor: None,
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read_file".into()],
             activated_deferred_tool_names: vec!["write_file".into()],

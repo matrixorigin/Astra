@@ -148,6 +148,68 @@ const SESSION_DELETE_DERIVED_PARENT_TABLES: &[SessionDeleteStatement] = &[
 
 const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
+        label: "session_publish_receipts",
+        sql: "DELETE FROM session_publish_receipts WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_attachment_quarantines",
+        sql: "DELETE FROM session_attachment_quarantines WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoff_events",
+        sql: "DELETE FROM session_handoff_events WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoffs",
+        sql: "DELETE FROM session_handoffs WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_attachments",
+        sql: "DELETE FROM session_attachments WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_handoff_slots",
+        sql: "DELETE FROM session_handoff_slots WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_context_authority_events",
+        sql: "DELETE FROM session_context_authority_events WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_weighted_admission_reservations",
+        sql: "DELETE FROM session_weighted_admission_reservations WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_context_operation_receipts",
+        sql: "DELETE FROM session_context_operation_receipts WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "conversation_manifest_nodes",
+        sql: "DELETE FROM conversation_manifest_nodes
+              WHERE session_id = ? AND owner_user_id = ?
+                AND NOT EXISTS (
+                    SELECT 1 FROM conversation_manifest_pins
+                    WHERE conversation_manifest_pins.isolation_domain =
+                              conversation_manifest_nodes.isolation_domain
+                      AND conversation_manifest_pins.owner_user_id =
+                              conversation_manifest_nodes.owner_user_id
+                      AND conversation_manifest_pins.parent_session_id =
+                              conversation_manifest_nodes.session_id
+                      AND (
+                          conversation_manifest_pins.pin_state IN ('prepared', 'active')
+                          OR (
+                              conversation_manifest_pins.pin_state = 'grace'
+                              AND conversation_manifest_pins.grace_expires_at_ms >
+                                  CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+                          )
+                      )
+                )",
+    },
+    SessionDeleteStatement {
+        label: "session_context_heads",
+        sql: "DELETE FROM session_context_heads WHERE session_id = ? AND owner_user_id = ?",
+    },
+    SessionDeleteStatement {
         label: "agent_session_execution_slots",
         sql: "DELETE FROM agent_session_execution_slots WHERE session_id = ? AND user_id = ?",
     },
@@ -182,6 +244,10 @@ const SESSION_DELETE_DIRECT_TABLES: &[SessionDeleteStatement] = &[
     SessionDeleteStatement {
         label: "session_device_lease_events",
         sql: "DELETE FROM session_device_lease_events WHERE session_id = ? AND user_id = ?",
+    },
+    SessionDeleteStatement {
+        label: "session_device_challenges",
+        sql: "DELETE FROM session_device_challenges WHERE session_id = ? AND user_id = ?",
     },
     SessionDeleteStatement {
         label: "session_device_leases",
@@ -388,15 +454,25 @@ const SESSION_DELETE_TERMINAL_TABLES: &[SessionDeleteStatement] = &[
     },
 ];
 
-const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[&str] = &[
-    "agent_sessions",
-    "agent_session_execution_slots",
-    "agent_events",
-    "agent_event_edges",
-    "agent_runs",
-    "agent_tasks",
-    "inference_invocation_settlement_debts",
-    "task_contracts",
+const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
+    ("agent_sessions", "user_id"),
+    ("agent_session_execution_slots", "user_id"),
+    ("session_context_heads", "owner_user_id"),
+    ("session_context_operation_receipts", "owner_user_id"),
+    ("session_context_authority_events", "owner_user_id"),
+    ("session_handoff_events", "owner_user_id"),
+    ("session_handoffs", "owner_user_id"),
+    ("session_attachments", "owner_user_id"),
+    ("session_handoff_slots", "owner_user_id"),
+    ("session_attachment_quarantines", "owner_user_id"),
+    ("session_publish_receipts", "owner_user_id"),
+    ("session_weighted_admission_reservations", "owner_user_id"),
+    ("agent_events", "user_id"),
+    ("agent_event_edges", "user_id"),
+    ("agent_runs", "user_id"),
+    ("agent_tasks", "user_id"),
+    ("inference_invocation_settlement_debts", "user_id"),
+    ("task_contracts", "user_id"),
 ];
 
 async fn delete_session_rows_session_user(
@@ -502,10 +578,11 @@ async fn verify_core_session_tables_deleted(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
-    for table in SESSION_DELETE_CORE_RESIDUAL_TABLES {
+    for (table, owner_column) in SESSION_DELETE_CORE_RESIDUAL_TABLES {
         let sql = format!(
-            "SELECT COUNT(*) FROM {} WHERE session_id = ? AND user_id = ?",
-            crate::snapshot_sql::quote_mysql_identifier(table)
+            "SELECT COUNT(*) FROM {} WHERE session_id = ? AND {} = ?",
+            crate::snapshot_sql::quote_mysql_identifier(table),
+            crate::snapshot_sql::quote_mysql_identifier(owner_column),
         );
         let remaining: i64 = sqlx::query_scalar(&sql)
             .bind(session_id)
@@ -518,6 +595,37 @@ async fn verify_core_session_tables_deleted(
                 "delete_session.verify.{table}: {remaining} rows remain for session/user after delete"
             ));
         }
+    }
+    let unpinned_manifests: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_manifest_nodes
+         WHERE session_id = ? AND owner_user_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM conversation_manifest_pins
+               WHERE conversation_manifest_pins.isolation_domain =
+                         conversation_manifest_nodes.isolation_domain
+                 AND conversation_manifest_pins.owner_user_id =
+                         conversation_manifest_nodes.owner_user_id
+                 AND conversation_manifest_pins.parent_session_id =
+                         conversation_manifest_nodes.session_id
+                 AND (
+                     conversation_manifest_pins.pin_state IN ('prepared', 'active')
+                     OR (
+                         conversation_manifest_pins.pin_state = 'grace'
+                         AND conversation_manifest_pins.grace_expires_at_ms >
+                             CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+                     )
+                 )
+           )",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.verify.conversation_manifest_nodes: {source}"))?;
+    if unpinned_manifests > 0 {
+        return Err(format!(
+            "delete_session.verify.conversation_manifest_nodes: {unpinned_manifests} unpinned rows remain after delete"
+        ));
     }
     Ok(())
 }
@@ -1283,7 +1391,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(" ");
                 let session_owner_scoped = normalized.contains("session_id = ? AND user_id = ?")
-                    || normalized.contains("session_id = ? AND owner_id = ?");
+                    || normalized.contains("session_id = ? AND owner_id = ?")
+                    || normalized.contains("session_id = ? AND owner_user_id = ?");
                 let session_quality_scoped = statement.label == "eval_quality_assessments"
                     && normalized.contains("target_id = ? AND user_id = ?")
                     && normalized.contains("level = 'session'");

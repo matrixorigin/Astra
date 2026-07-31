@@ -5,55 +5,6 @@ use astra_services::{
     task_orchestrator::{SubtaskPlan, TaskPlan},
 };
 
-/// Returns true when a subtask explicitly calls for real browser/UI verification.
-pub fn subtask_requires_browser_verification(subtask: &SubtaskPlan) -> bool {
-    let mut text = subtask.title.to_lowercase();
-    if let Some(desc) = &subtask.description {
-        text.push('\n');
-        text.push_str(&desc.to_lowercase());
-    }
-
-    let strong_browser = [
-        "browser",
-        "in browser",
-        "浏览器",
-        "playwright",
-        "selenium",
-        "puppeteer",
-        "cypress",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle));
-
-    let weak_browser = !strong_browser
-        && [" web page", "web ui", "in the dom", "html canvas", "页面"]
-            .iter()
-            .any(|needle| text.contains(needle));
-
-    let mentions_browser = strong_browser || weak_browser;
-    let mentions_verification = [
-        "test in browser",
-        "verify in browser",
-        "test",
-        "verify",
-        "validation",
-        "validate",
-        "check",
-        "qa",
-        "smoke",
-        "open in",
-        "测试",
-        "验证",
-        "检查",
-        "打开",
-        "试玩",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle));
-
-    mentions_browser && mentions_verification
-}
-
 /// Build the executor prompt for a subtask, optionally prefixed with stacked
 /// operator guidance from prior pause/correction turns.
 pub fn format_subtask_prompt_with_operator_notes(
@@ -123,19 +74,6 @@ pub fn format_subtask_prompt_with_operator_notes(
          - Do not invoke `github_create_pr` (or any PR-creation skill) before you \
          have actually written and committed the changes this subtask requires.",
     );
-
-    if subtask_requires_browser_verification(subtask) {
-        body.push_str(
-            "\n\
-             IMPORTANT — this subtask explicitly requires browser/UI verification:\n\
-             - `curl`, `grep`, `head`, `ps`, or starting a local HTTP server do NOT count as browser verification.\n\
-             - Only mark the subtask done after collecting evidence from a real browser-capable tool or workflow \
-               (for example: Playwright, Selenium, Puppeteer, Cypress, a browser headless screenshot, \
-               or a browser DOM dump after real page execution).\n\
-             - If no browser-capable tool is available in this environment, say that plainly instead of claiming \
-               the browser behavior was verified.\n",
-        );
-    }
 
     if operator_notes.is_empty() {
         return body;
@@ -290,72 +228,40 @@ mod tests {
     }
 
     #[test]
-    fn browser_verification_subtask_prompt_requires_real_browser_evidence() {
-        let st = SubtaskPlan {
-            id: "t4".into(),
-            title: "Test game in browser".into(),
-            description: Some(
-                "Open the page, play a round, and verify keyboard input works.".into(),
+    fn prompt_policy_is_invariant_to_untyped_subtask_wording() {
+        fn policy_suffix(prompt: &str) -> &str {
+            prompt
+                .split_once("\nPlease implement this change.")
+                .map(|(_, suffix)| suffix)
+                .expect("common executor policy")
+        }
+
+        let wordings = [
+            ("arbitrary task", "arbitrary details"),
+            (
+                "Test game in browser",
+                "Open the page and verify keyboard input works.",
             ),
-            ..Default::default()
-        };
-        let prompt = format_subtask_prompt_with_operator_notes(&st, &[]);
-        assert!(
-            prompt.contains("requires browser/UI verification"),
-            "prompt should surface explicit browser-verification guidance: {prompt}"
-        );
-        assert!(
-            prompt.contains("curl") && prompt.contains("do NOT count as browser verification"),
-            "prompt should explicitly reject curl-style checks as sufficient evidence: {prompt}"
-        );
-        assert!(
-            prompt.contains("Playwright") || prompt.contains("browser headless screenshot"),
-            "prompt should name acceptable browser-capable evidence: {prompt}"
-        );
-    }
+            ("用浏览器测试页面", "打开页面并检查交互。"),
+        ];
+        let suffixes: Vec<String> = wordings
+            .iter()
+            .map(|(title, description)| {
+                let subtask = SubtaskPlan {
+                    id: "wording-invariant".into(),
+                    title: (*title).into(),
+                    description: Some((*description).into()),
+                    ..Default::default()
+                };
+                let prompt = format_subtask_prompt_with_operator_notes(&subtask, &[]);
+                policy_suffix(&prompt).to_string()
+            })
+            .collect();
 
-    #[test]
-    fn browser_verification_no_false_positive_on_non_browser_tasks() {
-        for title in [
-            "Run database migration for user page",
-            "Build UI component library",
-            "Run unit tests for the pagination module",
-            "Check DOM manipulation in JSDOM tests",
-            "Run canvas rendering benchmark",
-        ] {
-            let st = SubtaskPlan {
-                id: "t1".into(),
-                title: title.into(),
-                description: None,
-                ..Default::default()
-            };
-            assert!(
-                !subtask_requires_browser_verification(&st),
-                "should NOT trigger browser verification for: {title}"
-            );
-        }
-    }
-
-    #[test]
-    fn browser_verification_true_positive_on_real_browser_tasks() {
-        for title in [
-            "Test game in browser",
-            "Verify the web page renders correctly",
-            "Open in browser and check layout",
-            "用浏览器测试页面",
-            "Run Playwright tests for login flow",
-        ] {
-            let st = SubtaskPlan {
-                id: "t1".into(),
-                title: title.into(),
-                description: None,
-                ..Default::default()
-            };
-            assert!(
-                subtask_requires_browser_verification(&st),
-                "should trigger browser verification for: {title}"
-            );
-        }
+        assert!(
+            suffixes.windows(2).all(|pair| pair[0] == pair[1]),
+            "free-form title/description wording must not infer execution or verification policy"
+        );
     }
 
     #[test]

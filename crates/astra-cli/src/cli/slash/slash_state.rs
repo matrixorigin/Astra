@@ -159,6 +159,7 @@ impl<'a> CompactCtx<'a> {
             incremental_state: self.incremental_state.clone(),
             plan_assemble_line_release: None,
             stream_event_tx: None,
+            stream_json_emitter: None,
             agent_live_event_sink: None,
             approval_request_tx: None,
             ask_user_request_tx: None,
@@ -269,6 +270,11 @@ fn build_swap_memory_body(
             swap_lines.push(format!("A: {preview}"));
         }
     }
+    crate::cli::history_work::record_text_payload(
+        astra_core::history_work::HistoryWorkSite::CliManualCompactionSwapProjection,
+        swapped_turns.len(),
+        swap_lines.iter().map(String::as_str),
+    );
     if swap_lines.is_empty() {
         return None;
     }
@@ -306,7 +312,10 @@ fn compact_mem_note(
 impl HistoryEditSnapshot {
     fn capture(state: &SessionState) -> Self {
         Self {
-            history: state.history.clone(),
+            history: crate::cli::history_work::clone_pair_history(
+                astra_core::history_work::HistoryWorkSite::CliHistoryEditRollbackSnapshot,
+                &state.history,
+            ),
             redo_stack: state.redo_stack.clone(),
             turn: state.turn,
             last_response: state.last_response.clone(),
@@ -382,7 +391,10 @@ async fn persist_history_edit_state(
                 operation_id: "memory_extraction_history_edit".to_string(),
                 logical_attempt: 0,
             },
-            messages: crate::cli::session::session_projection::history_as_messages(&state.history),
+            messages: crate::cli::session::session_projection::history_as_messages_for(
+                astra_core::history_work::HistoryWorkSite::CliHistoryEditMemoryMaterialization,
+                &state.history,
+            ),
             session_facts: crate::cli::session::session_cleanup::shutdown_session_facts(state),
             had_error,
             reanchors_current_objective: matches!(action, "/undo" | "/redo"),
@@ -854,8 +866,10 @@ pub(crate) async fn handle_state_command(
 
             // ── Micro-compact: reduce input tokens before LLM summary call ──
             let pre_messages = {
-                let mut msgs =
-                    crate::cli::session::session_projection::history_as_messages(&state.history);
+                let mut msgs = crate::cli::session::session_projection::history_as_messages_for(
+                    astra_core::history_work::HistoryWorkSite::CliManualCompactionHistoryMaterialization,
+                    &state.history,
+                );
                 let limit = state.context_budget.effective_input_limit() as u64;
                 let budget = TokenBudget {
                     max_prompt_tokens: limit,
@@ -1050,6 +1064,10 @@ pub(crate) async fn handle_state_command(
                 ManualCompactPlan::PrefixTurns { trimmed_count } => {
                     let context_entry = (String::new(), assistant_text);
                     let mut new_hist = vec![context_entry];
+                    crate::cli::history_work::record_pair_history(
+                        astra_core::history_work::HistoryWorkSite::CliManualCompactionRetainedHistoryClone,
+                        &state.history[trimmed_count..],
+                    );
                     new_hist.extend_from_slice(&state.history[trimmed_count..]);
                     state.history = new_hist;
                 }

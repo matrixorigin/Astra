@@ -61,6 +61,26 @@ async fn schema_rationalization_runtime_contract() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
 
+    let reauthentication = column_names(&pool, &schema, "auth_reauthentication_proofs").await;
+    for expected in [
+        "proof_id",
+        "user_id",
+        "purpose",
+        "proof_hash",
+        "expires_at",
+        "consumed_at",
+    ] {
+        assert!(
+            reauthentication.iter().any(|column| column == expected),
+            "auth_reauthentication_proofs missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "auth_reauthentication_proofs").await,
+        ["user_id", "proof_id"],
+        "reauthentication proofs must be owner-bound"
+    );
+
     for removed in [
         "prompt_chunks",
         "harness_sources",
@@ -78,7 +98,17 @@ async fn schema_rationalization_runtime_contract() {
     }
 
     let prompt_deltas = column_names(&pool, &schema, "prompt_deltas").await;
-    for expected in ["user_id", "session_id", "request_id", "delta_seq"] {
+    for expected in [
+        "user_id",
+        "session_id",
+        "request_id",
+        "delta_seq",
+        "reuse_count",
+        "chunk_tokens",
+        "chunk_bytes",
+        "previous_chunk_tokens",
+        "previous_chunk_bytes",
+    ] {
         assert!(
             prompt_deltas.iter().any(|column| column == expected),
             "prompt_deltas missing explicit owner-bound key column {expected}"
@@ -96,6 +126,63 @@ async fn schema_rationalization_runtime_contract() {
         primary_key_columns(&pool, &schema, "prompt_deltas").await,
         ["user_id", "session_id", "request_id", "delta_seq"],
         "prompt_deltas primary key must carry the owner/session boundary"
+    );
+
+    let request_context = column_names(&pool, &schema, "model_request_context_events").await;
+    for expected in [
+        "event_id",
+        "user_id",
+        "attempt_id",
+        "invocation_id",
+        "event_stage",
+        "topology",
+        "provider",
+        "model_family",
+        "purpose",
+        "event_json",
+    ] {
+        assert!(
+            request_context.iter().any(|column| column == expected),
+            "model_request_context_events missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "model_request_context_events").await,
+        ["user_id", "event_id"],
+        "model request context events must remain owner scoped"
+    );
+    let request_metric_totals = column_names(&pool, &schema, "model_request_metric_shards").await;
+    for expected in [
+        "metric_shard",
+        "topology",
+        "provider",
+        "model_family",
+        "purpose",
+        "terminal_status",
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_tokens",
+    ] {
+        assert!(
+            request_metric_totals
+                .iter()
+                .any(|column| column == expected),
+            "model_request_metric_shards missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "model_request_metric_shards").await,
+        [
+            "metric_shard",
+            "topology",
+            "provider",
+            "model_family",
+            "purpose",
+            "terminal_status"
+        ],
+        "model request metric totals must remain bounded to explicit low-cardinality dimensions"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "eval_calibration_assessments").await,
@@ -1125,6 +1212,200 @@ async fn phase1_run_durability_schema_contract() {
         ["updated_at"],
         "stale slot cleanup must not require scanning the slot table"
     );
+    let context_heads = column_names(&pool, &schema, "session_context_heads").await;
+    for expected in [
+        "head_json",
+        "canonical_root_hash",
+        "latest_manifest_root",
+        "total_canonical_bytes",
+        "total_message_count",
+        "writer_epoch",
+        "authorization_epoch",
+        "device_trust_epoch",
+        "permission_epoch",
+        "active_writer_json",
+        "active_reservation_json",
+        "fork_base_json",
+    ] {
+        assert!(
+            context_heads.iter().any(|column| column == expected),
+            "session_context_heads missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_heads").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "canonical head serialization must be scoped by the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_segments").await,
+        ["isolation_domain", "owner_user_id", "segment_hash"],
+        "immutable segment deduplication must stop at the owner boundary"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_manifest_nodes").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "manifest_root"
+        ],
+        "manifest lookup must carry complete owner/session/branch identity"
+    );
+    let manifest_nodes = column_names(&pool, &schema, "conversation_manifest_nodes").await;
+    for expected in ["total_canonical_bytes", "total_message_count", "reachable"] {
+        assert!(
+            manifest_nodes.iter().any(|column| column == expected),
+            "conversation_manifest_nodes missing O(1) retained-fork coordinate {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_forks").await,
+        ["isolation_domain", "owner_user_id", "fork_id"],
+        "fork lifecycle identity must remain inside the owner isolation domain"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_fork_events").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "fork_id",
+            "transition_seq"
+        ],
+        "fork transitions must be owner-scoped and monotonically ordered"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_manifest_pins").await,
+        ["isolation_domain", "owner_user_id", "pin_id"],
+        "retention pins must not be reusable across owners"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_operation_receipts").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "operation_kind",
+            "idempotency_hash"
+        ],
+        "idempotent coordinator replay must never cross a SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_weighted_admission_reservations").await,
+        ["scope_name", "reservation_id"],
+        "distributed admission reservations need one cross-pod physical identity"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_context_authority_events").await,
+        ["isolation_domain", "owner_user_id", "event_id"],
+        "authority audit identity must remain inside the owner isolation domain"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoff_slots").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id"
+        ],
+        "one active handoff slot must be serialized by the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_attachment_quarantines").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "quarantine_id"
+        ],
+        "divergent local roots must be quarantined inside the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_publish_receipts").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "local_event_id"
+        ],
+        "publish receipts must map local and Server roots inside the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_attachments").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "attachment_id"
+        ],
+        "attachments must never cross owner or branch boundaries"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoffs").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "handoff_id"
+        ],
+        "handoff records must carry the complete SessionKey"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_handoff_events").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "handoff_id",
+            "transition_seq"
+        ],
+        "handoff transitions require an owner-scoped monotonic identity"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_context_authority_events",
+            "idx_context_authority_session_created"
+        )
+        .await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "created_at"
+        ],
+        "authority history queries must carry the complete SessionKey prefix"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "session_weighted_admission_reservations",
+            "idx_weighted_admission_owner_expiry"
+        )
+        .await,
+        [
+            "scope_name",
+            "isolation_domain",
+            "owner_user_id",
+            "expires_at"
+        ],
+        "per-owner distributed admission must not require a global table scan"
+    );
     assert!(
         index_columns(
             &pool,
@@ -1318,6 +1599,7 @@ async fn phase2_web_hydration_schema_contract() {
         "session_id",
         "device_id",
         "device_fingerprint",
+        "device_key_hash",
         "trust_level",
         "status",
         "last_monotonic_id",
@@ -1339,6 +1621,29 @@ async fn phase2_web_hydration_schema_contract() {
         unique_key_columns(&pool, &schema, "session_device_leases", "uq_session_device").await,
         ["user_id", "session_id", "device_id"],
         "device leases must enforce owner/session/device uniqueness"
+    );
+
+    let challenges = column_names(&pool, &schema, "session_device_challenges").await;
+    for expected in [
+        "challenge_id",
+        "user_id",
+        "session_id",
+        "device_id",
+        "device_fingerprint",
+        "purpose",
+        "challenge_digest",
+        "expires_at",
+        "consumed_at",
+    ] {
+        assert!(
+            challenges.iter().any(|column| column == expected),
+            "session_device_challenges missing {expected}"
+        );
+    }
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "session_device_challenges").await,
+        ["user_id", "challenge_id"],
+        "device challenges must be owner-bound"
     );
 
     let lease_events = column_names(&pool, &schema, "session_device_lease_events").await;

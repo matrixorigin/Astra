@@ -60,6 +60,12 @@ impl FileCslStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::CslFileRead,
+                content.len().try_into().unwrap_or(u64::MAX),
+            );
+        }
         let mut entries = Vec::new();
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
@@ -103,18 +109,25 @@ impl FileCslStore {
             .open(path)?;
         let mut line = serde_json::to_string(entry)?;
         line.push('\n');
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::CslFileAppendSerialization,
+                line.len().try_into().unwrap_or(u64::MAX),
+            );
+        }
         file.write_all(line.as_bytes())?;
         file.sync_data()?;
         Ok(())
     }
 
     /// Rewrite the JSONL file with only the given entries (for truncation/GC).
-    fn rewrite(path: &Path, entries: &[CslEntry]) -> Result<(), CslStoreError> {
+    fn rewrite(path: &Path, entries: &[CslEntry]) -> Result<u64, CslStoreError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Atomic: write to temp file, then rename.
         let tmp = path.with_extension("jsonl.tmp");
+        let mut serialized_bytes = 0_u64;
         {
             let mut file = std::fs::File::create(&tmp)?;
             // Copy permissions from the original BEFORE writing payload so the
@@ -125,12 +138,20 @@ impl FileCslStore {
             for entry in entries {
                 let mut line = serde_json::to_string(entry)?;
                 line.push('\n');
+                serialized_bytes =
+                    serialized_bytes.saturating_add(line.len().try_into().unwrap_or(u64::MAX));
                 file.write_all(line.as_bytes())?;
             }
             file.sync_data()?;
         }
         std::fs::rename(&tmp, path)?;
-        Ok(())
+        if astra_core::history_work::instrumentation_enabled() {
+            astra_core::history_work::record_bytes(
+                astra_core::history_work::HistoryWorkSite::CslFileRewriteSerialization,
+                serialized_bytes,
+            );
+        }
+        Ok(serialized_bytes)
     }
 }
 
@@ -228,7 +249,7 @@ impl CslStore for FileCslStore {
                 .collect();
             let removed = entries.len() as u64 - kept.len() as u64;
             if removed > 0 {
-                Self::rewrite(&path, &kept)?;
+                let _ = Self::rewrite(&path, &kept)?;
             }
             Ok::<u64, CslStoreError>(removed)
         })
@@ -266,6 +287,7 @@ impl CslStore for FileCslStore {
 
             // Materialize state at fork point, then write as a single Snapshot.
             let mat = materialize(&relevant)?;
+            let prefix_rows = mat.messages.len().try_into().unwrap_or(u64::MAX);
             let fork_snapshot = CslEntry::Snapshot {
                 seq: 1,
                 turn: mat.last_turn,
@@ -273,7 +295,15 @@ impl CslStore for FileCslStore {
                 session_state: mat.session_state,
             };
 
-            Self::rewrite(&new_path, &[fork_snapshot])?;
+            let serialized_bytes = Self::rewrite(&new_path, &[fork_snapshot])?;
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    astra_core::history_work::HistoryWorkSite::ForkPrefixMaterialization,
+                    serialized_bytes,
+                    prefix_rows,
+                    0,
+                );
+            }
             Ok::<u64, CslStoreError>(1)
         })
         .await
@@ -367,6 +397,24 @@ mod tests {
         assert_eq!(materialized.messages.len(), 2);
         assert_eq!(materialized.messages[0]["content"], "first");
         assert_eq!(materialized.messages[1]["content"], "second");
+    }
+
+    #[test]
+    fn rewrite_returns_the_exact_bytes_already_written() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("rewrite-bytes.jsonl");
+        let entries = [
+            make_snapshot(1, 1, vec![user_msg("first")]),
+            make_delta(2, 2, vec![assistant_msg("second")]),
+        ];
+
+        let serialized_bytes = FileCslStore::rewrite(&path, &entries).unwrap();
+
+        assert_eq!(
+            serialized_bytes,
+            std::fs::metadata(path).unwrap().len(),
+            "fork instrumentation must reuse rewrite's existing byte count"
+        );
     }
 
     #[tokio::test]

@@ -201,12 +201,6 @@ pub struct StallSnapshotSummary {
     /// "parallel_batching_force", "cache_waste_corrective", …).
     #[serde(default)]
     pub advisory_signals: Vec<String>,
-    /// How many drift nudges injected this session (persists across turns).
-    #[serde(default)]
-    pub drift_nudge_count: usize,
-    /// Round index of last drift correction.
-    #[serde(default)]
-    pub last_drift_correction_round: usize,
 }
 
 /// Per-tool health entry.

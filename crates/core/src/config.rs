@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, error::Error, fmt, path::Path};
+use std::{collections::HashMap, env, error::Error, ffi::OsStr, fmt, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +12,29 @@ pub const DEFAULT_API_PORT: u16 = 17001;
 
 /// Default client-facing HTTP API URL.
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:17001";
+
+/// Select the process-wide configuration source contract.
+pub const ASTRA_CONFIG_SOURCE_ENV: &str = "ASTRA_CONFIG_SOURCE";
+/// Resolve configuration only from built-in defaults plus exported env vars.
+pub const ASTRA_CONFIG_SOURCE_EXPLICIT_ENV: &str = "explicit-env";
+
+/// Whether this process must avoid dotenv and host configuration files.
+///
+/// Unknown values fail closed instead of silently falling back to host state.
+pub fn explicit_env_config_requested() -> Result<bool, ConfigError> {
+    explicit_env_config_requested_from(std::env::var_os(ASTRA_CONFIG_SOURCE_ENV).as_deref())
+}
+
+fn explicit_env_config_requested_from(value: Option<&OsStr>) -> Result<bool, ConfigError> {
+    match value {
+        None => Ok(false),
+        Some(value) if value.is_empty() => Ok(false),
+        Some(value) if value == OsStr::new(ASTRA_CONFIG_SOURCE_EXPLICIT_ENV) => Ok(true),
+        Some(value) => Err(ConfigError::InvalidValue(format!(
+            "{ASTRA_CONFIG_SOURCE_ENV} must be `{ASTRA_CONFIG_SOURCE_EXPLICIT_ENV}` or unset, got {value:?}"
+        ))),
+    }
+}
 
 /// Default max connections for the shared DB pool.
 /// Sized for 50 concurrent runs + sweepers + HTTP handlers + WS overhead.
@@ -662,6 +685,17 @@ impl ServerRuntimeConfig {
 }
 
 impl ServerConfig {
+    /// Build configuration from defaults plus explicit process environment.
+    ///
+    /// Unlike [`Self::load`], this does not read dotenv, system, user, or
+    /// project files. External orchestrators use it for hermetic processes.
+    pub fn from_explicit_env() -> Result<Self, ConfigError> {
+        let mut config = Self::default();
+        config.apply_env_overrides();
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Load configuration from standard locations.
     ///
     /// Checks `/etc/astra/server.toml` (system-level), then
@@ -669,6 +703,9 @@ impl ServerConfig {
     /// User overrides system. Environment variables take highest precedence.
     /// Returns defaults if no file exists.
     pub fn load() -> Result<Self, ConfigError> {
+        if explicit_env_config_requested()? {
+            return Self::from_explicit_env();
+        }
         let mut config = Self::default();
 
         // System-level: /etc/astra/server.toml
@@ -686,21 +723,17 @@ impl ServerConfig {
             }
         }
 
-        // User-level: ~/.astra/server.toml
-        if let Ok(home) = std::env::var("HOME") {
-            let user_path = std::path::PathBuf::from(home)
-                .join(".astra")
-                .join("server.toml");
-            if user_path.exists() {
-                match Self::from_file(&user_path) {
-                    Ok(user_config) => config.merge(user_config),
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to load {path}: {err}; continuing with defaults",
-                            path = user_path.display(),
-                            err = e
-                        );
-                    }
+        // User-level: the Astra-local root (normally ~/.astra).
+        let user_path = crate::local_state::local_state_root().join("server.toml");
+        if user_path.exists() {
+            match Self::from_file(&user_path) {
+                Ok(user_config) => config.merge(user_config),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to load {path}: {err}; continuing with defaults",
+                        path = user_path.display(),
+                        err = e
+                    );
                 }
             }
         }
@@ -708,24 +741,19 @@ impl ServerConfig {
         // Apply environment variable overrides
         config.apply_env_overrides();
 
-        // Validate database config after all overrides are applied.
-        config
-            .database
-            .validate()
-            .map_err(ConfigError::InvalidValue)?;
-        config.auth.validate().map_err(ConfigError::InvalidValue)?;
-
-        // Validate runtime config after all overrides are applied.
-        config
-            .runtime
-            .validate()
-            .map_err(ConfigError::InvalidValue)?;
-        config
-            .deployment
-            .validate()
-            .map_err(ConfigError::InvalidValue)?;
-
+        config.validate()?;
         Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.database
+            .validate()
+            .map_err(ConfigError::InvalidValue)?;
+        self.auth.validate().map_err(ConfigError::InvalidValue)?;
+        self.runtime.validate().map_err(ConfigError::InvalidValue)?;
+        self.deployment
+            .validate()
+            .map_err(ConfigError::InvalidValue)
     }
 
     /// Load configuration from a specific file path.
@@ -838,9 +866,16 @@ impl fmt::Debug for AppSettings {
 
 impl AppSettings {
     pub fn from_env() -> Result<Self, ConfigError> {
-        dotenvy::dotenv().ok();
+        if !explicit_env_config_requested()? {
+            dotenvy::dotenv().ok();
+        }
         let server_config = ServerConfig::load()?;
         Self::from_server_config(&server_config)
+    }
+
+    /// Resolve settings from defaults plus already-exported environment only.
+    pub fn from_explicit_env() -> Result<Self, ConfigError> {
+        Self::from_server_config(&ServerConfig::from_explicit_env()?)
     }
 
     pub fn from_server_config(sc: &ServerConfig) -> Result<Self, ConfigError> {
@@ -1478,6 +1513,17 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn explicit_env_config_source_is_exact_and_fail_closed() {
+        assert!(!explicit_env_config_requested_from(None).unwrap());
+        assert!(!explicit_env_config_requested_from(Some(OsStr::new(""))).unwrap());
+        assert!(explicit_env_config_requested_from(Some(OsStr::new("explicit-env"))).unwrap());
+        assert!(
+            explicit_env_config_requested_from(Some(OsStr::new("true"))).is_err(),
+            "configuration source aliases must not silently select a different contract"
+        );
+    }
 
     #[test]
     fn matrixone_settings_build_mysql_url() {

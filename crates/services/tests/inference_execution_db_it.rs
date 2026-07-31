@@ -7,16 +7,33 @@
 mod common;
 
 use astra_services::{
-    InferenceInvocationInput, InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage,
-    ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind, admit_inference_invocation,
-    begin_inference_provider_attempt, declare_inference_settlement, finish_inference_invocation,
-    finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
-    reconcile_inference_settlements,
+    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
+    InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
+    InferenceUsage, ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind,
+    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
+    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlements,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
+
+fn provider_attempt(
+    plan: &InferenceInvocationPlan,
+    attempt_index: u32,
+) -> InferenceProviderAttemptPlan {
+    plan_inference_provider_attempt(
+        plan,
+        attempt_index,
+        InferenceProviderWireIdentity::new(
+            "openai_compatible",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            2,
+        )
+        .expect("test provider wire identity"),
+    )
+}
 
 async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     sqlx::query(
@@ -85,7 +102,7 @@ async fn bounded_settlement_recovery_processes_only_one_batch() {
         admit_inference_invocation(&shared_pool, &plan)
             .await
             .expect("admit targeted recovery invocation");
-        let attempt = plan_inference_provider_attempt(&plan, 0);
+        let attempt = provider_attempt(&plan, 0);
         begin_inference_provider_attempt(&shared_pool, &attempt)
             .await
             .expect("begin targeted recovery attempt");
@@ -276,7 +293,7 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
     admit_inference_invocation(&shared_pool, &plan)
         .await
         .expect("admit orphan-attempt invocation");
-    let attempt = plan_inference_provider_attempt(&plan, 0);
+    let attempt = provider_attempt(&plan, 0);
     begin_inference_provider_attempt(&shared_pool, &attempt)
         .await
         .expect("begin orphaned physical attempt");
@@ -295,7 +312,7 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
     .await
     .expect("seed authoritative settlement decision");
     assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &plan_inference_provider_attempt(&plan, 1))
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&plan, 1))
             .await
             .expect_err("a durable settlement decision must fence provider redelivery")
             .kind,
@@ -346,6 +363,10 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str, run_id: &str) {
     for (statement, identity) in [
         (
+            "DELETE FROM model_request_context_events WHERE user_id = ? AND session_id = ?",
+            session_id,
+        ),
+        (
             "DELETE FROM inference_invocation_settlement_debts WHERE user_id = ? AND session_id = ?",
             session_id,
         ),
@@ -377,6 +398,89 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
             .await
             .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn provider_attempt_terminal_fails_closed_on_durable_wire_identity_drift() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("wire-drift-user-{suffix}");
+    let session_id = format!("wire-drift-session-{suffix}");
+    let run_id = format!("wire-drift-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "provider_wire_drift".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "wire-drift-offering".to_string(),
+        resolved_model_name: "wire-drift-model".to_string(),
+        upstream_model_name: "wire-drift-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan wire-drift invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit wire-drift invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin exact physical attempt");
+
+    sqlx::query(
+        "UPDATE inference_provider_attempts
+         SET provider_wire_hash = REPEAT('b', 64)
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("simulate durable wire identity drift");
+
+    let error = finish_inference_provider_attempt(
+        &shared_pool,
+        &attempt,
+        &InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::DeliveryUnknown,
+            usage: InferenceUsage::default(),
+            provider_response_id: None,
+            error_kind: Some("stream_transport".to_string()),
+            error_message: Some("partial delivery".to_string()),
+        },
+    )
+    .await
+    .expect_err("a terminal writer must not accept a row for different wire bytes");
+    assert_eq!(error.kind, ServiceErrorKind::Conflict);
+    assert!(
+        error.message.contains("provider_wire_hash"),
+        "conflict must identify the immutable field: {error}"
+    );
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load drifted attempt");
+    assert_eq!(status, "started", "conflicting facts must not terminalize");
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]
@@ -482,6 +586,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     let user_id = format!("inf-user-{suffix}");
     let session_id = format!("inf-session-{suffix}");
     let run_id = format!("inf-run-{suffix}");
+    let provider = format!("test-provider-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
     let input = InferenceInvocationInput {
@@ -497,7 +602,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         offering_id: "offer-online".to_string(),
         resolved_model_name: "wire-model".to_string(),
         upstream_model_name: "provider-wire-model".to_string(),
-        provider: "openai".to_string(),
+        provider: provider.clone(),
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
@@ -558,7 +663,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         ServiceErrorKind::Conflict
     );
 
-    let first_attempt = plan_inference_provider_attempt(&plan, 0);
+    let first_attempt = provider_attempt(&plan, 0);
     begin_inference_provider_attempt(&shared_pool, &first_attempt)
         .await
         .expect("begin first physical request");
@@ -608,7 +713,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         ServiceErrorKind::Conflict
     );
 
-    let second_attempt = plan_inference_provider_attempt(&plan, 1);
+    let second_attempt = provider_attempt(&plan, 1);
     begin_inference_provider_attempt(&shared_pool, &second_attempt)
         .await
         .expect("begin retry as a distinct physical request");
@@ -649,7 +754,8 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         .expect("an exact provider terminal replay remains idempotent after logical settlement");
 
     let attempts = sqlx::query(
-        "SELECT attempt_index, status, input_tokens, output_tokens,
+        "SELECT attempt_id, attempt_index, admission_token, provider_protocol, provider_wire_hash,
+                provider_wire_bytes, status, input_tokens, output_tokens,
                 cache_read_tokens, cache_creation_tokens
          FROM inference_provider_attempts
          WHERE user_id = ? AND invocation_id = ? ORDER BY attempt_index",
@@ -660,6 +766,36 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     .await
     .expect("load physical provider attempts");
     assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].get::<String, _>("attempt_id"),
+        first_attempt.request_id()
+    );
+    assert_eq!(
+        attempts[1].get::<String, _>("attempt_id"),
+        second_attempt.request_id()
+    );
+    assert_ne!(
+        attempts[0].get::<String, _>("attempt_id"),
+        attempts[1].get::<String, _>("attempt_id"),
+        "each physical provider request needs a distinct durable identity"
+    );
+    assert_ne!(
+        attempts[0].get::<String, _>("admission_token"),
+        attempts[1].get::<String, _>("admission_token"),
+        "each admission owner needs an independent fencing token"
+    );
+    for attempt in &attempts {
+        assert_eq!(attempt.get::<String, _>("admission_token").len(), 32);
+        assert_eq!(
+            attempt.get::<String, _>("provider_protocol"),
+            "openai_compatible"
+        );
+        assert_eq!(
+            attempt.get::<String, _>("provider_wire_hash"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(attempt.get::<i64, _>("provider_wire_bytes"), 2);
+    }
     assert_eq!(attempts[0].get::<i64, _>("attempt_index"), 0);
     assert_eq!(attempts[0].get::<String, _>("status"), "failed");
     assert_eq!(attempts[1].get::<i64, _>("attempt_index"), 1);
@@ -669,8 +805,73 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     assert_eq!(attempts[1].get::<i64, _>("cache_read_tokens"), 80);
     assert_eq!(attempts[1].get::<i64, _>("cache_creation_tokens"), 10);
 
+    let context_events =
+        astra_services::list_model_request_context_events(&shared_pool, &user_id, &session_id, 10)
+            .await
+            .expect("list model request context events");
+    assert_eq!(
+        context_events.len(),
+        4,
+        "two accepted physical requests must each have accepted and terminal facts"
+    );
+    let accepted = context_events
+        .iter()
+        .filter(|event| event.stage == astra_services::ModelRequestEventStage::Accepted)
+        .count();
+    let terminal = context_events
+        .iter()
+        .filter(|event| event.stage == astra_services::ModelRequestEventStage::Terminal)
+        .count();
+    assert_eq!((accepted, terminal), (2, 2));
+    let successful_context = context_events
+        .iter()
+        .find(|event| event.terminal_status.as_deref() == Some("succeeded"))
+        .expect("successful request context");
+    assert_eq!(
+        successful_context
+            .event
+            .usage
+            .as_ref()
+            .expect("terminal usage")
+            .fresh_input_tokens,
+        30
+    );
+    assert_eq!(
+        astra_services::model_request_trace_coverage(&shared_pool, &user_id, &session_id,)
+            .await
+            .expect("request trace coverage"),
+        astra_services::ModelRequestTraceCoverage {
+            accepted_requests: 2,
+            terminal_requests: 2,
+            open_requests: 0,
+        }
+    );
+    let metric_rows = astra_services::aggregate_model_request_metrics(&shared_pool)
+        .await
+        .expect("aggregate durable model request metrics");
+    let metric_totals = metric_rows
+        .iter()
+        .filter(|row| {
+            row.topology == "server_only"
+                && row.provider == provider
+                && row.purpose == "primary_agent"
+        })
+        .fold([0_u64; 5], |mut totals, row| {
+            totals[0] += row.requests;
+            totals[1] += row.input_tokens;
+            totals[2] += row.output_tokens;
+            totals[3] += row.cache_read_tokens;
+            totals[4] += row.cache_creation_tokens;
+            totals
+        });
+    assert_eq!(
+        metric_totals,
+        [2, 120, 24, 80, 10],
+        "aggregate metrics must decode MatrixOne count/sum values and reconcile all outcomes: {metric_rows:?}"
+    );
+
     let invocation = sqlx::query(
-        "SELECT status, input_tokens, output_tokens, cache_read_tokens,
+        "SELECT admission_token, status, input_tokens, output_tokens, cache_read_tokens,
                 cache_creation_tokens, provider_response_id
          FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
     )
@@ -679,6 +880,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     .fetch_one(pool)
     .await
     .expect("load terminal invocation");
+    assert_eq!(invocation.get::<String, _>("admission_token").len(), 32);
     assert_eq!(invocation.get::<String, _>("status"), "succeeded");
     assert_eq!(invocation.get::<i64, _>("input_tokens"), 120);
     assert_eq!(invocation.get::<i64, _>("output_tokens"), 24);
@@ -770,7 +972,7 @@ async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
     admit_inference_invocation(&shared_pool, &plan)
         .await
         .expect("admit race invocation");
-    let first_attempt = plan_inference_provider_attempt(&plan, 0);
+    let first_attempt = provider_attempt(&plan, 0);
     begin_inference_provider_attempt(&shared_pool, &first_attempt)
         .await
         .expect("begin first attempt");
@@ -785,7 +987,7 @@ async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
         .await
         .expect("finish first physical attempt");
 
-    let retry_attempt = plan_inference_provider_attempt(&plan, 1);
+    let retry_attempt = provider_attempt(&plan, 1);
     let (settlement, retry) = tokio::join!(
         finish_inference_invocation(&shared_pool, &plan, &failure),
         begin_inference_provider_attempt(&shared_pool, &retry_attempt)
@@ -855,7 +1057,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
     admit_inference_invocation(&shared_pool, &plan)
         .await
         .expect("admit reconciliation invocation");
-    let attempt = plan_inference_provider_attempt(&plan, 0);
+    let attempt = provider_attempt(&plan, 0);
     begin_inference_provider_attempt(&shared_pool, &attempt)
         .await
         .expect("begin successful provider attempt");
@@ -893,7 +1095,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         "session recovery evidence must not fabricate a harness owner"
     );
     assert_eq!(
-        begin_inference_provider_attempt(&shared_pool, &plan_inference_provider_attempt(&plan, 1))
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&plan, 1))
             .await
             .expect_err("a successful delivery must fence duplicate provider requests")
             .kind,
@@ -922,7 +1124,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
     admit_inference_invocation(&shared_pool, &failed_plan)
         .await
         .expect("admit failed reconciliation invocation");
-    let failed_attempt = plan_inference_provider_attempt(&failed_plan, 0);
+    let failed_attempt = provider_attempt(&failed_plan, 0);
     begin_inference_provider_attempt(&shared_pool, &failed_attempt)
         .await
         .expect("begin failed provider attempt");
@@ -999,7 +1201,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         "a retryable attempt must not enqueue settlement"
     );
 
-    let retry_attempt = plan_inference_provider_attempt(&failed_plan, 1);
+    let retry_attempt = provider_attempt(&failed_plan, 1);
     begin_inference_provider_attempt(&shared_pool, &retry_attempt)
         .await
         .expect("background recovery must not prevent the caller's retry");
@@ -1071,7 +1273,7 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
     assert_eq!(route.get::<String, _>("scope_kind"), "session");
     assert_eq!(route.get::<Option<String>, _>("run_id"), None);
 
-    let attempt = plan_inference_provider_attempt(&plan, 0);
+    let attempt = provider_attempt(&plan, 0);
     begin_inference_provider_attempt(&shared_pool, &attempt)
         .await
         .expect("begin provider attempt");
@@ -1154,6 +1356,7 @@ async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
     );
 
     for table in [
+        "model_request_context_events",
         "inference_invocation_settlement_debts",
         "inference_provider_attempts",
         "inference_invocations",

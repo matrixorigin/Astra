@@ -988,7 +988,7 @@ fn restored_recent_turn_previews(
     let mut pending_user: Option<String> = None;
     let mut turn = 0u32;
 
-    for message in &restored.conversation_messages {
+    for message in restored.resume_messages() {
         let role = message.get("role").and_then(serde_json::Value::as_str);
         match role {
             Some("user") => {
@@ -1834,6 +1834,7 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 transcript_item: None,
+                conversation_commit: None,
                 edge_policy: None,
                 context_assembly_trace: Some(serde_json::json!({"tokens": 7000})),
                 routing_domain_hint: Some("code".to_string()),
@@ -1920,6 +1921,7 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 transcript_item: None,
+                conversation_commit: None,
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),
@@ -2029,6 +2031,7 @@ mod tests {
                 session_lineage: None,
                 coordination: None,
                 transcript_item: None,
+                conversation_commit: None,
                 edge_policy: None,
                 context_assembly_trace: None,
                 routing_domain_hint: Some("code".to_string()),

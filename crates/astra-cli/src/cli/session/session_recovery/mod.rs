@@ -438,6 +438,7 @@ mod tests {
                 total_tokens: 52,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
@@ -447,7 +448,6 @@ mod tests {
             memory_context: Some(astra_pipeline::step_protocol::MemoryContext {
                 retrieved_memory_ids: vec!["m-1".to_string()],
                 domain_hints: vec!["rust".to_string()],
-                boost_terms: vec!["resume".to_string()],
                 provenance: vec!["memoria".to_string()],
                 governance_actions: Vec::new(),
                 cluster_insights: Vec::new(),
@@ -485,7 +485,6 @@ mod tests {
         let memory_context = heavy.memory_context.expect("memory context");
         assert_eq!(memory_context.retrieved_memory_ids, vec!["m-1".to_string()]);
         assert_eq!(memory_context.domain_hints, vec!["rust".to_string()]);
-        assert_eq!(memory_context.boost_terms, vec!["resume".to_string()]);
         assert_eq!(memory_context.provenance, vec!["memoria".to_string()]);
         assert_eq!(memory_context.snapshot_id.as_deref(), Some("snapshot-1"));
         assert!(heavy.interruption.is_none());
@@ -521,6 +520,7 @@ mod tests {
                 total_tokens: 52,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
@@ -805,6 +805,7 @@ mod tests {
                 total_tokens: 12,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 321,
             budget_remaining_rounds: 7,
@@ -863,6 +864,7 @@ mod tests {
                 total_tokens: 12,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
@@ -951,6 +953,7 @@ mod tests {
                 total_tokens: 100,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: vec![serde_json::json!({"role": "user", "content": "stale"})],
             budget_remaining_tokens: 1234,
             budget_remaining_rounds: 9,

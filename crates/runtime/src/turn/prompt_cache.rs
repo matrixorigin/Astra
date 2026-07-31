@@ -386,6 +386,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
         session_id,
         model_id,
         context_window,
+        0,
         provider,
         edge_profile_cwd,
         edge_profile_git_branch,
@@ -415,6 +416,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     session_id: &str,
     model_id: &str,
     context_window: Option<u32>,
+    pre_reserved_output_tokens: u32,
     provider: &str,
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
@@ -429,6 +431,15 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     };
     use astra_turn_core::pipeline_config::PipelineConfig;
     use astra_turn_core::pipeline_session::{AdaptiveTurnInput, PipelineSession};
+
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        conversation_messages,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        tool_schemas,
+    );
 
     // Build ExternalSources from bridge-side signals. Guidance derived from
     // the exact visible surface is rebuilt every turn but remains cacheable
@@ -531,6 +542,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         run_id: String::new(),
         model_id: model_id.to_string(),
         provider_name: provider.to_string(),
+        pre_reserved_output_tokens,
         model_limit: saturating_usize_to_u32(
             crate::prompts::budget_for_model_with_override(Some(model_id), context_window)
                 .model_limit,
@@ -550,6 +562,14 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         user_id: None,
     };
 
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        tool_schemas,
+    );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        conversation_messages,
+    );
     let agent = AgentContext {
         tool_schemas: tool_schemas.to_vec(),
         ..Default::default()
@@ -593,6 +613,14 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
                 error = ?abort,
                 "bridge pipeline abort during system assembly — returning empty system"
             );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+                conversation_messages,
+            );
+            astra_core::history_work::record_serialized_value(
+                astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+                tool_schemas,
+            );
             return BridgePipelineOutcome {
                 primary_system: json!({"role": "system", "content": ""}),
                 dynamic_system: None,
@@ -621,6 +649,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     sections.extend(trace_extra_sections);
 
     let tier = output.plan.compact_tier;
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
+        &output.optimized.tool_schemas,
+    );
     let pruned_tool_schemas = output.optimized.tool_schemas.clone();
 
     let (primary_system, dynamic_system) = if uses_anthropic_protocol {
@@ -1194,6 +1226,7 @@ mod tests {
             "sid-long-running-bridge",
             "model-with-explicit-window",
             Some(8_000),
+            0,
             "openai",
             None,
             None,
