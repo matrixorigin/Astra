@@ -41,6 +41,10 @@ pub struct PublishSessionRequestV1 {
     pub idempotency_key: String,
     pub key: SessionKeyV1,
     pub actor: ActorContextV1,
+    /// A controller lease obtained from attach, fork, handoff, or a prior
+    /// publish. When present it must still be the exact active lease.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer_lease: Option<ConversationWriterLeaseV1>,
     pub items: Vec<PublishJournalItemV1>,
 }
 
@@ -255,29 +259,33 @@ impl DatabaseSessionPublishService {
         }
 
         let expected_cursor = actual_head.as_ref().map(|head| &head.cursor);
-        let acquire_idempotency_key = format!("publish:{}", request.idempotency_key);
         let active = self.coordinator.load_active_writer(&request.key).await?;
-        let lease = match active.filter(|lease| {
-            lease.actor == request.actor && lease.idempotency_key == acquire_idempotency_key
-        }) {
+        let lease = match reusable_publish_lease(
+            request.writer_lease.as_ref(),
+            active.as_ref(),
+            &request.actor,
+        )? {
             Some(lease) => lease,
-            None => match self
-                .coordinator
-                .acquire_writer(
-                    &request.key,
-                    expected_cursor,
-                    &request.actor,
-                    writer_ttl,
-                    &acquire_idempotency_key,
-                )
-                .await?
-            {
-                AcquireWriterOutcome::Acquired(lease)
-                | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-                AcquireWriterOutcome::Conflict { .. } => {
-                    return Err(SessionPublishError::Conflict);
+            None => {
+                let acquire_idempotency_key = format!("publish:{}", request.idempotency_key);
+                match self
+                    .coordinator
+                    .acquire_writer(
+                        &request.key,
+                        expected_cursor,
+                        &request.actor,
+                        writer_ttl,
+                        &acquire_idempotency_key,
+                    )
+                    .await?
+                {
+                    AcquireWriterOutcome::Acquired(lease)
+                    | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+                    AcquireWriterOutcome::Conflict { .. } => {
+                        return Err(SessionPublishError::Conflict);
+                    }
                 }
-            },
+            }
         };
 
         let mut current_cursor = expected_cursor.cloned();
@@ -527,6 +535,21 @@ impl DatabaseSessionPublishService {
     }
 }
 
+fn reusable_publish_lease(
+    presented: Option<&ConversationWriterLeaseV1>,
+    active: Option<&ConversationWriterLeaseV1>,
+    actor: &ActorContextV1,
+) -> Result<Option<ConversationWriterLeaseV1>, SessionPublishError> {
+    match (presented, active) {
+        (Some(presented), Some(active)) if presented == active && &active.actor == actor => {
+            Ok(Some(active.clone()))
+        }
+        (Some(_), _) => Err(SessionPublishError::Conflict),
+        (None, Some(active)) if &active.actor == actor => Ok(Some(active.clone())),
+        (None, _) => Ok(None),
+    }
+}
+
 #[derive(Clone)]
 struct VerifiedItem {
     request: PublishJournalItemV1,
@@ -649,6 +672,17 @@ fn validate_request(
         .actor
         .validate_for(&request.key)
         .map_err(|error| SessionPublishError::Invalid(error.to_string()))?;
+    if request.writer_lease.as_ref().is_some_and(|lease| {
+        lease.schema_version != astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION
+            || lease.key != request.key
+            || lease.actor != request.actor
+            || lease.lease_id.is_empty()
+            || lease.lease_id.len() > 512
+    }) {
+        return Err(SessionPublishError::Invalid(
+            "presented writer lease does not match the publish actor and branch".into(),
+        ));
+    }
     if request.idempotency_key.is_empty()
         || request.idempotency_key.len() > 384
         || request.idempotency_key.chars().any(char::is_control)
@@ -831,6 +865,58 @@ mod tests {
         assert_eq!(suffix_start(&[first, second], Some(&equal)).unwrap(), 2);
     }
 
+    fn controller_lease(actor: ActorContextV1, lease_id: &str) -> ConversationWriterLeaseV1 {
+        ConversationWriterLeaseV1 {
+            schema_version: astra_turn_types::SESSION_COORDINATION_SCHEMA_VERSION,
+            key: SessionKeyV1::owner_session("server", "owner-a", "session-a", "main"),
+            lease_id: lease_id.into(),
+            writer_epoch: 3,
+            actor,
+            expected_cursor: None,
+            acquired_at_unix_ms: 1_000,
+            expires_at_unix_ms: 60_000,
+            idempotency_key: "original-operation".into(),
+        }
+    }
+
+    #[test]
+    fn controller_lease_is_reused_across_distinct_publish_operations() {
+        let actor = ActorContextV1::owner_user(
+            "owner-a",
+            "device-a",
+            ActorKindV1::Cli,
+            SessionSurfaceV1::Cli,
+            Some("device-a".into()),
+            AuthorityEpochsV1::default(),
+        );
+        let active = controller_lease(actor.clone(), "lease-current");
+
+        assert_eq!(
+            reusable_publish_lease(None, Some(&active), &actor).unwrap(),
+            Some(active)
+        );
+    }
+
+    #[test]
+    fn stale_presented_lease_fails_closed_after_handoff() {
+        let actor = ActorContextV1::owner_user(
+            "owner-a",
+            "device-a",
+            ActorKindV1::Cli,
+            SessionSurfaceV1::Cli,
+            Some("device-a".into()),
+            AuthorityEpochsV1::default(),
+        );
+        let stale = controller_lease(actor.clone(), "lease-before-handoff");
+        let mut active = controller_lease(actor.clone(), "lease-after-handoff");
+        active.writer_epoch += 1;
+
+        assert!(matches!(
+            reusable_publish_lease(Some(&stale), Some(&active), &actor),
+            Err(SessionPublishError::Conflict)
+        ));
+    }
+
     async fn setup_publish_db_it() -> (SharedPool, astra_core::MatrixOneSettings) {
         assert_eq!(
             std::env::var("ASTRA_TEST_DB_IT").as_deref(),
@@ -949,6 +1035,7 @@ mod tests {
                 Some("device-a".into()),
                 AuthorityEpochsV1::default(),
             ),
+            writer_lease: None,
             items: vec![PublishJournalItemV1 {
                 event_id: event_id.clone(),
                 payload_hash: payload_hash.clone(),

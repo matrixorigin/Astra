@@ -2711,6 +2711,9 @@ struct CanonicalTurnAdmission {
     prior_messages: Vec<Value>,
     prior_message_count: usize,
     had_canonical_head: bool,
+    /// Leases supplied as an explicit controller capability outlive one run;
+    /// only leases acquired internally by this run are released here.
+    release_writer_on_finish: bool,
     release_started: Arc<AtomicBool>,
     renewal_cancel: CancellationToken,
     _weighted_permit: astra_services::WeightedAdmissionPermit,
@@ -2723,6 +2726,9 @@ impl Drop for CanonicalTurnAdmission {
             return;
         }
         self.renewal_cancel.cancel();
+        if !self.release_writer_on_finish {
+            return;
+        }
         let coordinator = Arc::clone(&self.coordinator);
         let lease = self.lease.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -2969,51 +2975,84 @@ impl AgenticRunLifecycleService {
                 })?,
             None => Vec::new(),
         };
-        let authority_epochs = coordinator
-            .load_authority_epochs(&key)
-            .await
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to load canonical authority epochs: {error}"),
-                    "session_authority_unavailable",
-                )
-            })?
-            .unwrap_or_default();
-        let actor = astra_turn_types::ActorContextV1::owner_user(
-            user_id,
-            format!("server-run:{run_id}"),
-            astra_turn_types::ActorKindV1::Server,
-            astra_turn_types::SessionSurfaceV1::Server,
-            None,
-            authority_epochs,
-        );
-        let lease = match coordinator
-            .acquire_writer(
-                &key,
-                head.as_ref().map(|head| &head.cursor),
-                &actor,
-                Duration::from_secs(15 * 60),
-                &format!("server-run:{run_id}:writer"),
-            )
-            .await
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to acquire canonical writer: {error}"),
-                    "session_writer_unavailable",
-                )
-            })? {
-            astra_services::AcquireWriterOutcome::Acquired(lease)
-            | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-            astra_services::AcquireWriterOutcome::Conflict { .. } => {
-                return Err(error_response_coded(
-                    StatusCode::CONFLICT,
-                    "another controller owns this canonical session branch",
-                    "session_writer_conflict",
-                ));
-            }
-        };
+        let (lease, release_writer_on_finish) =
+            if let Some(authority) = request.conversation_authority.as_ref() {
+                let active = coordinator
+                    .load_active_writer(&key)
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to load canonical writer: {error}"),
+                            "session_writer_unavailable",
+                        )
+                    })?
+                    .filter(|lease| {
+                        lease.key == key
+                            && lease.lease_id == authority.execution_grant.claims.lease_id
+                            && lease.writer_epoch == authority.writer_epoch
+                            && lease.actor.actor_id == authority.actor_id
+                            && authority.run_id == run_id
+                            && authority.expected_cursor
+                                == head.as_ref().map(|head| head.cursor.clone())
+                    })
+                    .ok_or_else(|| {
+                        error_response_coded(
+                            StatusCode::CONFLICT,
+                            "conversation authority no longer owns the active writer lease",
+                            "conversation_authority_fenced",
+                        )
+                    })?;
+                (active, false)
+            } else {
+                let authority_epochs = coordinator
+                    .load_authority_epochs(&key)
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to load canonical authority epochs: {error}"),
+                            "session_authority_unavailable",
+                        )
+                    })?
+                    .unwrap_or_default();
+                let actor = astra_turn_types::ActorContextV1::owner_user(
+                    user_id,
+                    format!("server-run:{run_id}"),
+                    astra_turn_types::ActorKindV1::Server,
+                    astra_turn_types::SessionSurfaceV1::Server,
+                    None,
+                    authority_epochs,
+                );
+                let acquired = coordinator
+                    .acquire_writer(
+                        &key,
+                        head.as_ref().map(|head| &head.cursor),
+                        &actor,
+                        Duration::from_secs(15 * 60),
+                        &format!("server-run:{run_id}:writer"),
+                    )
+                    .await
+                    .map_err(|error| {
+                        error_response_coded(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            format!("failed to acquire canonical writer: {error}"),
+                            "session_writer_unavailable",
+                        )
+                    })?;
+                let lease = match acquired {
+                    astra_services::AcquireWriterOutcome::Acquired(lease)
+                    | astra_services::AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+                    astra_services::AcquireWriterOutcome::Conflict { .. } => {
+                        return Err(error_response_coded(
+                            StatusCode::CONFLICT,
+                            "another controller owns this canonical session branch",
+                            "session_writer_conflict",
+                        ));
+                    }
+                };
+                (lease, true)
+            };
         let reservation = match coordinator
             .reserve_turn(
                 &lease,
@@ -3032,7 +3071,9 @@ impl AgenticRunLifecycleService {
             astra_services::ReserveTurnOutcome::Reserved(reservation)
             | astra_services::ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
             astra_services::ReserveTurnOutcome::Conflict { .. } => {
-                let _ = coordinator.release_writer(&lease).await;
+                if release_writer_on_finish {
+                    let _ = coordinator.release_writer(&lease).await;
+                }
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,
                     "canonical session cursor changed before turn reservation",
@@ -3115,6 +3156,7 @@ impl AgenticRunLifecycleService {
             prior_messages,
             prior_message_count,
             had_canonical_head: head.is_some(),
+            release_writer_on_finish,
             release_started: Arc::new(AtomicBool::new(false)),
             renewal_cancel,
             _weighted_permit: weighted_permit,
@@ -3186,7 +3228,9 @@ impl AgenticRunLifecycleService {
             }
         }
         .await;
-        let _ = admission.coordinator.release_writer(&admission.lease).await;
+        if admission.release_writer_on_finish {
+            let _ = admission.coordinator.release_writer(&admission.lease).await;
+        }
         let _ = admission.distributed_permit.release().await;
         admission.release_started.store(true, Ordering::Release);
         result.map_err(|message| {
@@ -8247,7 +8291,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             }
         }
 
-        let run_id = Uuid::new_v4().to_string();
+        let run_id = request
+            .conversation_authority
+            .as_ref()
+            .map(|authority| authority.run_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id
             .clone()
@@ -9387,9 +9435,27 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         }
 
         let provider_idempotent_start = provider_identity.is_some();
-        let run_id = provider_identity
+        let authority_run_id = request
+            .conversation_authority
             .as_ref()
-            .map(|identity| identity.run_id.clone())
+            .map(|authority| authority.run_id.as_str());
+        if let (Some(identity), Some(authority_run_id)) =
+            (provider_identity.as_ref(), authority_run_id)
+            && identity.run_id != authority_run_id
+        {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "provider and conversation authority identify different runs",
+                "conversation_authority_run_conflict",
+            ));
+        }
+        let run_id = authority_run_id
+            .map(str::to_owned)
+            .or_else(|| {
+                provider_identity
+                    .as_ref()
+                    .map(|identity| identity.run_id.clone())
+            })
             .unwrap_or_else(|| Uuid::new_v4().to_string());
         let session_id = request
             .session_id

@@ -64,8 +64,8 @@ pub(super) async fn validate_conversation_authority(
             "execution_grant_verifier_unavailable",
         )
     })?;
-    let current_epochs = coordinator
-        .load_authority_epochs(&authority.key)
+    let active_lease = coordinator
+        .load_active_writer(&authority.key)
         .await
         .map_err(|error| {
             error_response_coded(
@@ -77,16 +77,15 @@ pub(super) async fn validate_conversation_authority(
         .ok_or_else(|| {
             error_response_coded(
                 StatusCode::CONFLICT,
-                "conversation authority references an uninitialized branch",
-                "conversation_authority_missing",
+                "conversation authority no longer owns the active writer lease",
+                "conversation_authority_fenced",
             )
         })?;
     let now_unix_ms = chrono::Utc::now().timestamp_millis();
     let claims = signer
         .verify(
             &authority.execution_grant,
-            &authority.key,
-            current_epochs,
+            &active_lease,
             &authority.run_id,
             authority.run_generation,
             authority.provider_binding_id.as_deref(),
@@ -100,7 +99,10 @@ pub(super) async fn validate_conversation_authority(
                 "conversation_authority_fenced",
             )
         })?;
-    if claims.writer_epoch != authority.writer_epoch || claims.actor_id != authority.actor_id {
+    if claims.writer_epoch != authority.writer_epoch
+        || claims.actor_id != authority.actor_id
+        || authority.execution_grant.claims.lease_id != active_lease.lease_id
+    {
         return Err(error_response_coded(
             StatusCode::CONFLICT,
             "conversation authority generations do not match the signed grant",

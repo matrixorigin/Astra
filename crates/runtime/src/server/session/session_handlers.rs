@@ -1934,9 +1934,31 @@ pub(crate) struct SessionSegmentUploadResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionPublishRequest {
     pub idempotency_key: String,
+    #[serde(default)]
+    pub writer_lease: Option<astra_turn_types::ConversationWriterLeaseV1>,
     pub items: Vec<astra_services::PublishJournalItemV1>,
     #[serde(default = "default_writer_ttl_seconds")]
     pub writer_ttl_seconds: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionExecutionGrantRequest {
+    pub idempotency_key: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub run_generation: u64,
+    #[serde(default)]
+    pub provider_binding_id: Option<String>,
+    #[serde(default)]
+    pub provider_generation: u64,
+    #[serde(default)]
+    pub round: u32,
+    #[serde(default)]
+    pub attempt: u32,
+    pub trace_id: String,
+    #[serde(default = "default_writer_ttl_seconds")]
+    pub ttl_seconds: u64,
 }
 
 pub(crate) async fn resume_session_handler(
@@ -2607,6 +2629,7 @@ pub(crate) async fn publish_session_handler(
                 idempotency_key: request.idempotency_key,
                 key,
                 actor,
+                writer_lease: request.writer_lease,
                 items: request.items,
             },
             std::time::Duration::from_secs(request.writer_ttl_seconds),
@@ -2614,6 +2637,102 @@ pub(crate) async fn publish_session_handler(
         .await
         .map(Json)
         .map_err(session_publish_http_error)
+}
+
+pub(crate) async fn issue_session_execution_grant_handler(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SessionExecutionGrantRequest>,
+) -> Result<
+    Json<astra_turn_types::ConversationAuthorityEnvelopeV1>,
+    (StatusCode, Json<ErrorResponse>),
+> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let session = state
+        .session_service
+        .get_session(session_id, user.user_id.clone())
+        .await?;
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .ok_or_else(|| internal_error("shared MatrixOne pool is not configured"))?;
+    let device = verify_device_proof_from_headers(
+        pool,
+        &user.user_id,
+        &session.session_id,
+        &headers,
+        DeviceProofPurpose::Publish,
+    )
+    .await?;
+    let key = server_session_key(&user.user_id, &session.session_id);
+    let coordinator = state
+        .session_context_coordinator
+        .as_ref()
+        .ok_or_else(|| internal_error("session context coordinator is not configured"))?;
+    let lease = coordinator
+        .load_active_writer(&key)
+        .await
+        .map_err(session_context_http_error)?
+        .filter(|lease| lease.actor.device_id.as_deref() == Some(device.device_id.as_str()))
+        .ok_or_else(|| {
+            error_response_coded(
+                StatusCode::CONFLICT,
+                "authenticated device does not own the active writer lease",
+                "session_writer_conflict",
+            )
+        })?;
+    let head = coordinator
+        .load_head(&key)
+        .await
+        .map_err(session_context_http_error)?;
+    let signer = state
+        .execution_grant_signer
+        .as_ref()
+        .ok_or_else(|| internal_error("execution grant signer is not configured"))?;
+    let now_unix_ms = chrono::Utc::now().timestamp_millis();
+    let grant = signer
+        .issue(
+            &lease,
+            request.run_id.clone(),
+            request.run_generation,
+            request.provider_binding_id.clone(),
+            request.provider_generation,
+            now_unix_ms,
+            std::time::Duration::from_secs(request.ttl_seconds),
+        )
+        .map_err(|error| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                format!("invalid execution grant request: {error}"),
+                "execution_grant_invalid",
+            )
+        })?;
+    let envelope = astra_turn_types::ConversationAuthorityEnvelopeV1 {
+        schema_version: astra_turn_types::CONVERSATION_AUTHORITY_ENVELOPE_SCHEMA_VERSION,
+        key,
+        expected_cursor: head.as_ref().map(|head| head.cursor.clone()),
+        prompt_manifest_root: head.as_ref().map(|head| head.latest_manifest_root.clone()),
+        writer_epoch: lease.writer_epoch,
+        run_id: request.run_id,
+        run_generation: request.run_generation,
+        provider_binding_id: request.provider_binding_id,
+        provider_generation: request.provider_generation,
+        round: request.round,
+        attempt: request.attempt,
+        idempotency_key: request.idempotency_key,
+        actor_id: lease.actor.actor_id,
+        trace_id: request.trace_id,
+        execution_grant: grant,
+    };
+    envelope.validate_shape().map_err(|error| {
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            format!("invalid execution authority coordinates: {error}"),
+            "execution_grant_invalid",
+        )
+    })?;
+    Ok(Json(envelope))
 }
 
 fn server_session_key(user_id: &str, session_id: &str) -> astra_turn_types::SessionKeyV1 {

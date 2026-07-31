@@ -82,6 +82,10 @@ pub(super) fn add_routes(router: Router<AppState>, state: AppState) -> Router<Ap
             post(session::session_handlers::publish_session_handler),
         )
         .route(
+            "/sessions/{session_id}/execution-grants",
+            post(session::session_handlers::issue_session_execution_grant_handler),
+        )
+        .route(
             "/sessions/{session_id}/handoffs",
             post(session::session_handlers::request_session_handoff_handler),
         )

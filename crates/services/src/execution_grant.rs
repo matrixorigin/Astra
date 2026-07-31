@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use astra_turn_types::{
-    AuthorityEpochsV1, ConversationWriterLeaseV1, EXECUTION_GRANT_SCHEMA_VERSION,
-    ExecutionGrantClaimsV1, SessionKeyV1, SignedExecutionGrantV1,
+    ConversationWriterLeaseV1, EXECUTION_GRANT_SCHEMA_VERSION, ExecutionGrantClaimsV1,
+    SignedExecutionGrantV1,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
@@ -116,8 +116,7 @@ impl ExecutionGrantSigner {
     pub fn verify<'a>(
         &self,
         grant: &'a SignedExecutionGrantV1,
-        expected_key: &SessionKeyV1,
-        expected_epochs: AuthorityEpochsV1,
+        active_lease: &ConversationWriterLeaseV1,
         expected_run_id: &str,
         expected_run_generation: u64,
         expected_provider_binding_id: Option<&str>,
@@ -153,8 +152,12 @@ impl ExecutionGrantSigner {
         if grant.claims.expires_at_unix_ms <= now_unix_ms {
             return Err(ExecutionGrantError::Expired);
         }
-        if &grant.claims.key != expected_key
-            || grant.claims.authority_epochs != expected_epochs
+        if grant.claims.key != active_lease.key
+            || grant.claims.lease_id != active_lease.lease_id
+            || grant.claims.writer_epoch != active_lease.writer_epoch
+            || grant.claims.actor_id != active_lease.actor.actor_id
+            || grant.claims.authority_epochs != active_lease.actor.authority_epochs
+            || active_lease.expires_at_unix_ms <= now_unix_ms
             || grant.claims.run_id != expected_run_id
             || grant.claims.run_generation != expected_run_generation
             || grant.claims.provider_binding_id.as_deref() != expected_provider_binding_id
@@ -234,22 +237,15 @@ mod tests {
             .unwrap();
 
         signer
-            .verify(
-                &grant,
-                &lease.key,
-                lease.actor.authority_epochs,
-                "run-1",
-                11,
-                Some("provider-1"),
-                13,
-                2_001,
-            )
+            .verify(&grant, &lease, "run-1", 11, Some("provider-1"), 13, 2_001)
             .unwrap();
         assert_eq!(
             signer.verify(
                 &grant,
-                &SessionKeyV1::owner_session("test", "owner-b", "session", "main"),
-                lease.actor.authority_epochs,
+                &ConversationWriterLeaseV1 {
+                    key: SessionKeyV1::owner_session("test", "owner-b", "session", "main",),
+                    ..lease.clone()
+                },
                 "run-1",
                 11,
                 Some("provider-1"),
@@ -259,29 +255,11 @@ mod tests {
             Err(ExecutionGrantError::Fenced)
         );
         assert_eq!(
-            signer.verify(
-                &grant,
-                &lease.key,
-                lease.actor.authority_epochs,
-                "run-1",
-                12,
-                Some("provider-1"),
-                13,
-                2_001,
-            ),
+            signer.verify(&grant, &lease, "run-1", 12, Some("provider-1"), 13, 2_001,),
             Err(ExecutionGrantError::Fenced)
         );
         assert_eq!(
-            signer.verify(
-                &grant,
-                &lease.key,
-                lease.actor.authority_epochs,
-                "run-1",
-                11,
-                Some("provider-2"),
-                13,
-                2_001,
-            ),
+            signer.verify(&grant, &lease, "run-1", 11, Some("provider-2"), 13, 2_001,),
             Err(ExecutionGrantError::Fenced)
         );
     }
@@ -295,16 +273,7 @@ mod tests {
             .unwrap();
         grant.claims.writer_epoch += 1;
         assert_eq!(
-            signer.verify(
-                &grant,
-                &lease.key,
-                lease.actor.authority_epochs,
-                "run-1",
-                1,
-                None,
-                1,
-                2_001,
-            ),
+            signer.verify(&grant, &lease, "run-1", 1, None, 1, 2_001,),
             Err(ExecutionGrantError::InvalidSignature)
         );
 
@@ -312,17 +281,34 @@ mod tests {
             .issue(&lease, "run-1", 1, None, 1, 2_000, Duration::from_secs(1))
             .unwrap();
         assert_eq!(
-            signer.verify(
-                &grant,
-                &lease.key,
-                lease.actor.authority_epochs,
+            signer.verify(&grant, &lease, "run-1", 1, None, 1, 3_000,),
+            Err(ExecutionGrantError::Expired)
+        );
+    }
+
+    #[test]
+    fn transfer_fences_a_previously_valid_grant() {
+        let signer = ExecutionGrantSigner::new([9_u8; 32]).unwrap();
+        let old_lease = lease("owner-a", 7);
+        let grant = signer
+            .issue(
+                &old_lease,
                 "run-1",
                 1,
                 None,
                 1,
-                3_000,
-            ),
-            Err(ExecutionGrantError::Expired)
+                2_000,
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        let mut transferred = old_lease.clone();
+        transferred.lease_id = "lease-2".into();
+        transferred.writer_epoch += 1;
+        transferred.actor.actor_id = "actor-2".into();
+
+        assert_eq!(
+            signer.verify(&grant, &transferred, "run-1", 1, None, 1, 2_001),
+            Err(ExecutionGrantError::Fenced)
         );
     }
 }
