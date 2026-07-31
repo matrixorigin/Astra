@@ -30,7 +30,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
-const AGENT_BINDING_MCP_RPC_TIMEOUT_SECS: u64 = 30;
+const AGENT_BINDING_MCP_RPC_TIMEOUT_SECS: u64 = 120;
 const AGENT_BINDING_SEMANTIC_READ_PREPARE_TIMEOUT: Duration = Duration::from_secs(2);
 const AGENT_BINDING_SEMANTIC_READ_CONTRACT_VERSION: &str =
     astra_services::runs::RUNTIME_SEMANTIC_READ_MCP_CONTRACT_VERSION;
