@@ -15,13 +15,14 @@ use std::{
 
 use astra_core::SharedPool;
 use astra_turn_types::{
-    ActorContextV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalTurnDeltaV1,
-    ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
+    ActorContextV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
+    CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
     CoordinatorConflictOptionV1, CoordinatorMutationV1, HandoffRiskEvidenceV1,
     MANIFEST_DELTA_SCHEMA_VERSION, ManifestDeltaV1, SESSION_COORDINATION_SCHEMA_VERSION,
-    SessionContextHeadV1, SessionCursorV1, SessionForkManifestV1, SessionForkStateV1,
-    SessionHandoffModeV1, SessionKeyV1, SharedManifestPrefixV1, TurnReservationV1,
-    canonical_conversation_root, canonical_conversation_serialized_len,
+    SessionContextHeadV1, SessionCoordinationValidationError, SessionCursorV1,
+    SessionForkManifestV1, SessionForkStateV1, SessionHandoffModeV1, SessionKeyV1,
+    SharedManifestPrefixV1, TurnReservationV1, canonical_conversation_root,
+    canonical_conversation_serialized_len,
 };
 use async_trait::async_trait;
 use fs2::FileExt;
@@ -35,6 +36,8 @@ use uuid::Uuid;
 const FILE_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
 const MAX_SEGMENT_BATCH: usize = 256;
+const MAX_STAGED_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_STAGED_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 const RECEIPT_HASH_DOMAIN: &[u8] = b"astra.session-coordinator-receipt.v1\0";
@@ -678,7 +681,17 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                         "manifest delta identity mismatch".into(),
                     ));
                 }
-                current = node.parent_manifest_root.clone();
+                if node.replaces_history
+                    && boundary.is_some()
+                    && node.parent_manifest_root.as_deref() != boundary
+                {
+                    return Err(SessionContextCoordinatorError::DivergentManifest);
+                }
+                current = if node.replaces_history && boundary.is_none() {
+                    None
+                } else {
+                    node.parent_manifest_root.clone()
+                };
                 reverse.push(node);
             }
             if !found_after {
@@ -1138,21 +1151,11 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                         )?,
                     );
                 }
-                let node = ContextManifestNodeV1::new(
-                    reservation.key.clone(),
-                    state
-                        .head
-                        .as_ref()
-                        .map(|head| head.latest_manifest_root.clone()),
-                    delta.completed_turn,
-                    delta.journal_event_seq,
-                    delta.conversation_seq,
-                    delta.compaction_generation,
-                    delta.config_version_id.clone(),
-                    segments
-                        .iter()
-                        .map(ConversationSegmentV1::reference)
-                        .collect(),
+                let node = manifest_node_for_delta(
+                    &reservation.key,
+                    state.head.as_ref(),
+                    &delta,
+                    &segments,
                 )
                 .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
 
@@ -1186,7 +1189,7 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                 archive_previous_commit(&coordinator, state, session_dir)?;
                 let cursor = node.cursor();
                 let (total_canonical_bytes, total_message_count) =
-                    next_head_totals(state.head.as_ref(), &segments)?;
+                    next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
                 state.head = Some(SessionContextHeadV1 {
                     schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
                     key: reservation.key.clone(),
@@ -1324,27 +1327,39 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let mut rows = sqlx::query(
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ?",
+               AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND reachable = 1",
         )
         .bind(&head.key.isolation_domain)
         .bind(&head.key.owner_user_id)
         .bind(&head.key.session_id)
         .bind(&head.key.branch_id)
+        .bind(i64_from_u64(
+            "head compaction generation",
+            head.cursor.compaction_generation,
+        )?)
         .fetch_all(self.pool.get())
         .await
         .map_err(|source| database_error("load_manifests", source))?;
-        if let Some(prefix) = &fork_base {
+        if let Some(prefix) = &fork_base
+            && prefix.parent_cursor.compaction_generation == head.cursor.compaction_generation
+        {
             rows.extend(
                 sqlx::query(
                     "SELECT manifest_json FROM conversation_manifest_nodes
                      WHERE isolation_domain = ? AND owner_user_id = ?
                        AND session_id = ? AND branch_id = ?
+                       AND compaction_generation = ? AND reachable = 1
                        AND conversation_seq <= ?",
                 )
                 .bind(&prefix.parent_key.isolation_domain)
                 .bind(&prefix.parent_key.owner_user_id)
                 .bind(&prefix.parent_key.session_id)
                 .bind(&prefix.parent_key.branch_id)
+                .bind(i64_from_u64(
+                    "fork parent compaction generation",
+                    prefix.parent_cursor.compaction_generation,
+                )?)
                 .bind(i64_from_u64(
                     "fork parent conversation sequence",
                     prefix.parent_cursor.conversation_seq,
@@ -1435,7 +1450,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                     let row = sqlx::query(
                         "SELECT conversation_seq FROM conversation_manifest_nodes
                          WHERE isolation_domain = ? AND owner_user_id = ?
-                           AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+                           AND session_id = ? AND branch_id = ?
+                           AND manifest_root = ? AND reachable = 1",
                     )
                     .bind(&key.isolation_domain)
                     .bind(&key.owner_user_id)
@@ -1456,12 +1472,18 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                 (Some(sequence), sequence, Some(root.to_owned()), None)
             }
             None => match &fork_base {
-                Some(prefix) => (
-                    Some(prefix.parent_cursor.conversation_seq),
-                    prefix.parent_cursor.conversation_seq,
-                    Some(prefix.parent_manifest_root.clone()),
-                    Some(prefix.clone()),
-                ),
+                Some(prefix)
+                    if prefix.parent_cursor.compaction_generation
+                        == head.cursor.compaction_generation =>
+                {
+                    (
+                        Some(prefix.parent_cursor.conversation_seq),
+                        prefix.parent_cursor.conversation_seq,
+                        Some(prefix.parent_manifest_root.clone()),
+                        Some(prefix.clone()),
+                    )
+                }
+                Some(_) => (None, 0, None, None),
                 None => (None, 0, None, None),
             },
         };
@@ -1478,6 +1500,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ?
+               AND compaction_generation = ? AND reachable = 1
                AND conversation_seq > ? AND conversation_seq <= ?
              ORDER BY conversation_seq ASC",
         )
@@ -1485,6 +1508,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .bind(&key.owner_user_id)
         .bind(&key.session_id)
         .bind(&key.branch_id)
+        .bind(i64_from_u64(
+            "manifest delta compaction generation",
+            head.cursor.compaction_generation,
+        )?)
         .bind(i64_from_u64("manifest delta lower bound", lower_bound)?)
         .bind(i64_from_u64(
             "manifest delta head sequence",
@@ -1742,7 +1769,8 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         let parent_row = sqlx::query(
             "SELECT manifest_json FROM conversation_manifest_nodes
              WHERE isolation_domain = ? AND owner_user_id = ?
-               AND session_id = ? AND branch_id = ? AND manifest_root = ?",
+               AND session_id = ? AND branch_id = ?
+               AND manifest_root = ? AND reachable = 1",
         )
         .bind(&manifest.parent_key.isolation_domain)
         .bind(&manifest.parent_key.owner_user_id)
@@ -2595,24 +2623,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
                     .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?,
             );
         }
-        let node = ContextManifestNodeV1::new(
-            reservation.key.clone(),
-            base_head
-                .as_ref()
-                .map(|head| head.latest_manifest_root.clone()),
-            delta.completed_turn,
-            delta.journal_event_seq,
-            delta.conversation_seq,
-            delta.compaction_generation,
-            delta.config_version_id.clone(),
-            segments
-                .iter()
-                .map(ConversationSegmentV1::reference)
-                .collect(),
-        )
-        .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        let node = manifest_node_for_delta(&reservation.key, base_head.as_ref(), &delta, &segments)
+            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
         let (prepared_total_canonical_bytes, prepared_total_message_count) =
-            next_head_totals(base_head.as_ref(), &segments)?;
+            next_head_totals(base_head.as_ref(), &segments, delta.mode)?;
         self.persist_database_immutables(
             &reservation.key,
             &segments,
@@ -2758,7 +2772,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         }
         let cursor = node.cursor();
         let (total_canonical_bytes, total_message_count) =
-            next_head_totals(state.head.as_ref(), &segments)?;
+            next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
         if (total_canonical_bytes, total_message_count)
             != (prepared_total_canonical_bytes, prepared_total_message_count)
         {
@@ -2789,6 +2803,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
              SET reachable = 1
              WHERE isolation_domain = ? AND owner_user_id = ?
                AND session_id = ? AND branch_id = ? AND manifest_root = ?
+               AND compaction_generation = ?
                AND total_canonical_bytes = ? AND total_message_count = ?",
         )
         .bind(&reservation.key.isolation_domain)
@@ -2796,6 +2811,10 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         .bind(&reservation.key.session_id)
         .bind(&reservation.key.branch_id)
         .bind(&cursor.canonical_root_hash)
+        .bind(i64_from_u64(
+            "reachable compaction generation",
+            cursor.compaction_generation,
+        )?)
         .bind(i64_from_u64(
             "reachable total canonical bytes",
             total_canonical_bytes,
@@ -3007,7 +3026,11 @@ impl FileSessionContextCoordinator {
                     "manifest owner, branch, or root mismatch".into(),
                 ));
             }
-            manifest_root = node.parent_manifest_root.clone();
+            manifest_root = if node.replaces_history {
+                None
+            } else {
+                node.parent_manifest_root.clone()
+            };
             reverse_nodes.push(node);
         }
         reverse_nodes.reverse();
@@ -3139,6 +3162,49 @@ impl DatabaseSessionContextCoordinator {
         total_message_count: u64,
     ) -> Result<(), SessionContextCoordinatorError> {
         self.persist_database_segments(key, segments).await?;
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_persist_manifest", source))?;
+        let mut lock_segments = QueryBuilder::<MySql>::new(
+            "SELECT segment_hash FROM conversation_segments
+             WHERE isolation_domain = ",
+        );
+        lock_segments
+            .push_bind(&key.isolation_domain)
+            .push(" AND owner_user_id = ")
+            .push_bind(&key.owner_user_id)
+            .push(" AND segment_hash IN (");
+        {
+            let mut separated = lock_segments.separated(", ");
+            for segment in segments {
+                separated.push_bind(&segment.segment_hash);
+            }
+        }
+        lock_segments.push(") FOR UPDATE");
+        let locked_segments = lock_segments
+            .build()
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|source| database_error("lock_manifest_segments", source))?;
+        let locked_hashes = locked_segments
+            .into_iter()
+            .map(|row| {
+                row.try_get::<String, _>("segment_hash")
+                    .map_err(|source| database_error("decode_locked_manifest_segment", source))
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        if locked_hashes.len() != segments.len()
+            || segments
+                .iter()
+                .any(|segment| !locked_hashes.contains(&segment.segment_hash))
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "manifest references a segment that is not durably staged".into(),
+            ));
+        }
         let canonical_segment_bytes =
             node.appended_segments
                 .iter()
@@ -3153,8 +3219,9 @@ impl DatabaseSessionContextCoordinator {
             "INSERT IGNORE INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
               parent_manifest_root, completed_turn, conversation_seq,
-              canonical_segment_bytes, total_canonical_bytes, total_message_count, manifest_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              compaction_generation, canonical_segment_bytes, total_canonical_bytes,
+              total_message_count, manifest_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&key.isolation_domain)
         .bind(&key.owner_user_id)
@@ -3166,6 +3233,10 @@ impl DatabaseSessionContextCoordinator {
         .bind(i64_from_u64(
             "conversation sequence",
             node.conversation_seq,
+        )?)
+        .bind(i64_from_u64(
+            "manifest compaction generation",
+            node.compaction_generation,
         )?)
         .bind(i64_from_u64(
             "manifest segment bytes",
@@ -3180,7 +3251,7 @@ impl DatabaseSessionContextCoordinator {
             total_message_count,
         )?)
         .bind(database_to_json("manifest", node)?)
-        .execute(self.pool.get())
+        .execute(&mut *tx)
         .await
         .map_err(|source| database_error("persist_manifest", source))?;
         if result.rows_affected() == 0 {
@@ -3194,7 +3265,7 @@ impl DatabaseSessionContextCoordinator {
             .bind(&key.session_id)
             .bind(&key.branch_id)
             .bind(&node.manifest_root)
-            .fetch_one(self.pool.get())
+            .fetch_one(&mut *tx)
             .await
             .map_err(|source| database_error("verify_existing_manifest", source))?
             .try_get::<String, _>("manifest_json")
@@ -3206,7 +3277,66 @@ impl DatabaseSessionContextCoordinator {
                 ));
             }
         }
-        Ok(())
+
+        let mut insert_references = QueryBuilder::<MySql>::new(
+            "INSERT IGNORE INTO conversation_manifest_segments
+             (isolation_domain, owner_user_id, session_id, branch_id,
+              manifest_root, segment_position, segment_hash) ",
+        );
+        insert_references.push_values(
+            node.appended_segments.iter().enumerate(),
+            |mut values, (position, segment)| {
+                values
+                    .push_bind(&key.isolation_domain)
+                    .push_bind(&key.owner_user_id)
+                    .push_bind(&key.session_id)
+                    .push_bind(&key.branch_id)
+                    .push_bind(&node.manifest_root)
+                    .push_bind(i64::try_from(position).unwrap_or(i64::MAX))
+                    .push_bind(&segment.segment_hash);
+            },
+        );
+        insert_references
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| database_error("persist_manifest_segment_references", source))?;
+        let stored_references = sqlx::query(
+            "SELECT segment_position, segment_hash
+             FROM conversation_manifest_segments
+             WHERE isolation_domain = ? AND owner_user_id = ?
+               AND session_id = ? AND branch_id = ? AND manifest_root = ?
+             ORDER BY segment_position ASC",
+        )
+        .bind(&key.isolation_domain)
+        .bind(&key.owner_user_id)
+        .bind(&key.session_id)
+        .bind(&key.branch_id)
+        .bind(&node.manifest_root)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|source| database_error("verify_manifest_segment_references", source))?;
+        if stored_references.len() != node.appended_segments.len() {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "immutable manifest segment reference count is inconsistent".into(),
+            ));
+        }
+        for (position, row) in stored_references.iter().enumerate() {
+            let stored_position = database_u64(row, "segment_position")?;
+            let stored_hash = row
+                .try_get::<String, _>("segment_hash")
+                .map_err(|source| database_error("decode_manifest_segment_reference", source))?;
+            if stored_position != u64::try_from(position).unwrap_or(u64::MAX)
+                || stored_hash != node.appended_segments[position].segment_hash
+            {
+                return Err(SessionContextCoordinatorError::NeedsRepair(
+                    "immutable manifest segment reference does not match the manifest".into(),
+                ));
+            }
+        }
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_persist_manifest", source))
     }
 
     async fn persist_database_segments(
@@ -3274,7 +3404,11 @@ fn order_manifest_chain(
         let node = nodes.remove(&current).ok_or_else(|| {
             SessionContextCoordinatorError::NeedsRepair(format!("missing manifest {current}"))
         })?;
-        root = node.parent_manifest_root.clone();
+        root = if node.replaces_history {
+            None
+        } else {
+            node.parent_manifest_root.clone()
+        };
         reverse.push(node);
     }
     reverse.reverse();
@@ -3326,7 +3460,17 @@ fn order_manifest_suffix(
         if after_sequence.is_some_and(|sequence| node.conversation_seq <= sequence) {
             return Err(SessionContextCoordinatorError::DivergentManifest);
         }
-        root = node.parent_manifest_root.clone();
+        if node.replaces_history
+            && after_manifest_root.is_some()
+            && node.parent_manifest_root.as_deref() != after_manifest_root
+        {
+            return Err(SessionContextCoordinatorError::DivergentManifest);
+        }
+        root = if node.replaces_history && after_manifest_root.is_none() {
+            None
+        } else {
+            node.parent_manifest_root.clone()
+        };
         reverse.push(node);
     }
     reverse.reverse();
@@ -4131,9 +4275,45 @@ fn i64_from_u64(field: &'static str, value: u64) -> Result<i64, SessionContextCo
         .map_err(|_| SessionContextCoordinatorError::Invalid(format!("{field} exceeds BIGINT")))
 }
 
+fn manifest_node_for_delta(
+    key: &SessionKeyV1,
+    head: Option<&SessionContextHeadV1>,
+    delta: &CanonicalTurnDeltaV1,
+    segments: &[ConversationSegmentV1],
+) -> Result<ContextManifestNodeV1, SessionCoordinationValidationError> {
+    let parent = head.map(|head| head.latest_manifest_root.clone());
+    let references = segments
+        .iter()
+        .map(ConversationSegmentV1::reference)
+        .collect();
+    match delta.mode {
+        CanonicalDeltaModeV1::Append => ContextManifestNodeV1::new(
+            key.clone(),
+            parent,
+            delta.completed_turn,
+            delta.journal_event_seq,
+            delta.conversation_seq,
+            delta.compaction_generation,
+            delta.config_version_id.clone(),
+            references,
+        ),
+        CanonicalDeltaModeV1::Replace => ContextManifestNodeV1::new_replacement(
+            key.clone(),
+            parent,
+            delta.completed_turn,
+            delta.journal_event_seq,
+            delta.conversation_seq,
+            delta.compaction_generation,
+            delta.config_version_id.clone(),
+            references,
+        ),
+    }
+}
+
 fn next_head_totals(
     head: Option<&SessionContextHeadV1>,
     segments: &[ConversationSegmentV1],
+    mode: CanonicalDeltaModeV1,
 ) -> Result<(u64, u64), SessionContextCoordinatorError> {
     let appended_bytes = segments.iter().try_fold(0_u64, |total, segment| {
         total.checked_add(segment.canonical_bytes).ok_or_else(|| {
@@ -4147,8 +4327,16 @@ fn next_head_totals(
                 SessionContextCoordinatorError::NeedsRepair("head message count overflow".into())
             })
     })?;
-    let base_bytes = head.map_or(0, |head| head.total_canonical_bytes);
-    let base_messages = head.map_or(0, |head| head.total_message_count);
+    let base_bytes = if mode == CanonicalDeltaModeV1::Replace {
+        0
+    } else {
+        head.map_or(0, |head| head.total_canonical_bytes)
+    };
+    let base_messages = if mode == CanonicalDeltaModeV1::Replace {
+        0
+    } else {
+        head.map_or(0, |head| head.total_message_count)
+    };
     Ok((
         base_bytes.checked_add(appended_bytes).ok_or_else(|| {
             SessionContextCoordinatorError::NeedsRepair("head canonical byte overflow".into())
@@ -4237,10 +4425,28 @@ fn validate_segment_upload(
         .map(|segment| segment.segment_hash.clone())
         .collect::<Vec<_>>();
     validate_segment_batch(key, &hashes)?;
+    let mut total_bytes = 0_u64;
     for segment in segments {
         segment
             .validate_for(key)
             .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
+        if segment.canonical_bytes > MAX_STAGED_SEGMENT_BYTES {
+            return Err(SessionContextCoordinatorError::Invalid(format!(
+                "conversation segment exceeds {MAX_STAGED_SEGMENT_BYTES} canonical bytes"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(segment.canonical_bytes)
+            .ok_or_else(|| {
+                SessionContextCoordinatorError::Invalid(
+                    "conversation segment batch byte count overflow".into(),
+                )
+            })?;
+    }
+    if total_bytes > MAX_STAGED_BATCH_BYTES {
+        return Err(SessionContextCoordinatorError::Invalid(format!(
+            "conversation segment batch exceeds {MAX_STAGED_BATCH_BYTES} canonical bytes"
+        )));
     }
     Ok(())
 }
@@ -4453,9 +4659,13 @@ fn validate_delta_advance(
                 head.cursor.compaction_generation,
             )
         });
+    let expected_compaction_generation = match delta.mode {
+        CanonicalDeltaModeV1::Append => base_compaction_generation,
+        CanonicalDeltaModeV1::Replace => base_compaction_generation.saturating_add(1),
+    };
     if delta.journal_event_seq <= base_journal_seq
         || delta.conversation_seq != base_conversation_seq.saturating_add(1)
-        || delta.compaction_generation != base_compaction_generation
+        || delta.compaction_generation != expected_compaction_generation
     {
         return Err(SessionContextCoordinatorError::Invalid(
             "turn delta must advance the reserved base monotonically".into(),
@@ -4473,13 +4683,29 @@ fn validate_manifest_advance(
         if cursor.completed_turn != prior.completed_turn.saturating_add(1)
             || cursor.conversation_seq != prior.conversation_seq.saturating_add(1)
             || cursor.journal_event_seq <= prior.journal_event_seq
-            || cursor.compaction_generation != prior.compaction_generation
+            || if node.replaces_history {
+                cursor.compaction_generation != prior.compaction_generation.saturating_add(1)
+            } else {
+                cursor.compaction_generation != prior.compaction_generation
+            }
         {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "manifest cursor sequence is non-monotonic".into(),
             ));
         }
-    } else if cursor.completed_turn != 1 || cursor.conversation_seq != 1 {
+    } else if node.replaces_history {
+        if cursor.completed_turn == 0
+            || cursor.conversation_seq == 0
+            || cursor.compaction_generation == 0
+        {
+            return Err(SessionContextCoordinatorError::NeedsRepair(
+                "replacement manifest cursor is invalid".into(),
+            ));
+        }
+    } else if cursor.completed_turn != 1
+        || cursor.conversation_seq != 1
+        || cursor.compaction_generation != 0
+    {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "manifest genesis cursor is invalid".into(),
         ));
@@ -4508,6 +4734,9 @@ fn turn_delta_hash(delta: &CanonicalTurnDeltaV1) -> String {
     digest.update(delta.journal_event_seq.to_be_bytes());
     digest.update(delta.conversation_seq.to_be_bytes());
     digest.update(delta.compaction_generation.to_be_bytes());
+    if delta.mode == CanonicalDeltaModeV1::Replace {
+        digest.update(b"replace\0");
+    }
     hash_field(
         &mut digest,
         delta.config_version_id.as_deref().unwrap_or_default(),
@@ -4932,6 +5161,7 @@ mod tests {
             conversation_seq,
             compaction_generation: 0,
             config_version_id: None,
+            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
             logical_segments: vec![vec![
                 json!({"role": "user", "content": format!("question-{turn}")}),
                 json!({"role": "assistant", "content": format!("answer-{turn}")}),
@@ -5342,6 +5572,109 @@ mod tests {
             .unwrap();
         assert_eq!(materialized.messages.len(), 2);
         assert_eq!(materialized.head.cursor, cursor);
+    }
+
+    #[tokio::test]
+    async fn replacement_commit_recalculates_head_and_cuts_materialization_history() {
+        let temp = TempDir::new().unwrap();
+        let clock = Arc::new(ManualClock::new(1_000));
+        let coordinator = coordinator(&temp, clock);
+        let key = key("owner-a");
+        let lease = acquired(
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &actor("owner-a"),
+                    Duration::from_secs(30),
+                    "acquire",
+                )
+                .await
+                .unwrap(),
+        );
+
+        let first_reservation = reserved(
+            coordinator
+                .reserve_turn(&lease, None, Duration::from_secs(20), "reserve-1")
+                .await
+                .unwrap(),
+        );
+        coordinator
+            .commit_turn(&first_reservation, delta(1, 1, 1), "commit-1")
+            .await
+            .unwrap();
+        let first_head = coordinator.load_head(&key).await.unwrap().unwrap();
+
+        let second_reservation = reserved(
+            coordinator
+                .reserve_turn(
+                    &lease,
+                    Some(&first_head.cursor),
+                    Duration::from_secs(20),
+                    "reserve-2",
+                )
+                .await
+                .unwrap(),
+        );
+        coordinator
+            .commit_turn(&second_reservation, delta(2, 2, 2), "commit-2")
+            .await
+            .unwrap();
+        let pre_compaction_head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(pre_compaction_head.total_message_count, 4);
+
+        let replacement_reservation = reserved(
+            coordinator
+                .reserve_turn(
+                    &lease,
+                    Some(&pre_compaction_head.cursor),
+                    Duration::from_secs(20),
+                    "reserve-replacement",
+                )
+                .await
+                .unwrap(),
+        );
+        let compacted_messages = vec![
+            json!({"role": "user", "content": "compacted question"}),
+            json!({"role": "assistant", "content": "compacted answer"}),
+        ];
+        let replacement = CanonicalTurnDeltaV1 {
+            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+            completed_turn: 3,
+            journal_event_seq: 3,
+            conversation_seq: 3,
+            compaction_generation: 1,
+            config_version_id: None,
+            mode: CanonicalDeltaModeV1::Replace,
+            logical_segments: vec![compacted_messages.clone()],
+        };
+        coordinator
+            .commit_turn(&replacement_reservation, replacement, "commit-replacement")
+            .await
+            .unwrap();
+
+        let compacted_head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(compacted_head.cursor.compaction_generation, 1);
+        assert_eq!(compacted_head.total_message_count, 2);
+        let materialized = coordinator.materialize(&compacted_head).await.unwrap();
+        assert_eq!(materialized.messages, compacted_messages);
+        assert_eq!(materialized.logical_segment_count, 1);
+
+        let delta_from_empty = coordinator.load_manifest_delta(&key, None).await.unwrap();
+        assert_eq!(delta_from_empty.missing_nodes.len(), 1);
+        assert!(delta_from_empty.missing_nodes[0].replaces_history);
+        assert!(matches!(
+            coordinator
+                .reserve_turn(
+                    &lease,
+                    Some(&pre_compaction_head.cursor),
+                    Duration::from_secs(20),
+                    "stale-after-replacement",
+                )
+                .await
+                .unwrap(),
+            ReserveTurnOutcome::Conflict { .. }
+        ));
     }
 
     #[tokio::test]

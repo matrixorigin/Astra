@@ -5848,7 +5848,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &final_tools,
                 Some(effective_max_output),
             );
-            crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+            crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
                 "server_loop_host",
                 self.shared_pool.clone(),
                 astra_services::PromptRequestPersistInput {
@@ -5863,7 +5863,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     provider: llm_cfg.provider.clone(),
                 },
                 prompt_request_plan,
-            );
+            )
+            .await;
             let durable_ledger = self.required_inference_ledger()?;
             let run_id = state.current_run_id.clone().ok_or_else(|| {
                 astra_core::ClassifiedError::new(

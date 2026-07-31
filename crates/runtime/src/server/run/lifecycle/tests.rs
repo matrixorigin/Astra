@@ -74,6 +74,34 @@ fn canonical_segment_packing_bounds_ordinary_groups_without_reordering() {
 }
 
 #[test]
+fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
+    let prior = vec![json!({"role": "user", "content": "already committed"})];
+    assert_eq!(
+        canonical_commit_delta(1, true, &prior, false, true).unwrap(),
+        None
+    );
+    assert!(
+        canonical_commit_delta(1, true, &prior, false, false)
+            .unwrap_err()
+            .contains("no committable messages")
+    );
+}
+
+#[test]
+fn compaction_commits_the_complete_replacement_projection() {
+    let compacted = vec![
+        json!({"role": "user", "content": "summary"}),
+        json!({"role": "assistant", "content": "current"}),
+    ];
+    let (mode, packs) = canonical_commit_delta(20, true, &compacted, true, false)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+    assert_eq!(packs.concat(), compacted);
+}
+
+#[test]
 fn fresh_request_admission_accounts_for_large_non_message_payloads() {
     let mut request = test_request("small");
     let baseline = fresh_request_admission_bytes(&request).unwrap();

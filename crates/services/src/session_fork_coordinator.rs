@@ -459,6 +459,80 @@ impl DatabaseSessionForkCoordinator {
         Ok(result.rows_affected())
     }
 
+    /// Remove normalized segment references after their manifest node is gone.
+    ///
+    /// This runs after manifest collection and is deliberately bounded so one
+    /// tenant's old history cannot monopolize a maintenance sweep.
+    pub async fn collect_orphaned_manifest_segment_references(
+        &self,
+        limit: u32,
+    ) -> Result<u64, SessionForkCoordinatorError> {
+        if limit == 0 || limit > 10_000 {
+            return Err(SessionForkCoordinatorError::Invalid(
+                "cleanup limit must be between 1 and 10000".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "DELETE FROM conversation_manifest_segments
+             WHERE NOT EXISTS (
+                       SELECT 1 FROM conversation_manifest_nodes
+                       WHERE conversation_manifest_nodes.isolation_domain =
+                                 conversation_manifest_segments.isolation_domain
+                         AND conversation_manifest_nodes.owner_user_id =
+                                 conversation_manifest_segments.owner_user_id
+                         AND conversation_manifest_nodes.session_id =
+                                 conversation_manifest_segments.session_id
+                         AND conversation_manifest_nodes.branch_id =
+                                 conversation_manifest_segments.branch_id
+                         AND conversation_manifest_nodes.manifest_root =
+                                 conversation_manifest_segments.manifest_root
+                   )
+             ORDER BY created_at ASC LIMIT ?",
+        )
+        .bind(i64::from(limit))
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| database_error("collect_orphan_manifest_segment_refs", source))?;
+        Ok(result.rows_affected())
+    }
+
+    /// Collect owner-deduplicated segment payloads with no manifest reference.
+    ///
+    /// A staging grace protects uploads that have not reached `commit_turn`
+    /// yet. Committed manifests install their references transactionally, so
+    /// anything older than the grace and still unreferenced is abandoned.
+    pub async fn collect_unreferenced_conversation_segments(
+        &self,
+        limit: u32,
+    ) -> Result<u64, SessionForkCoordinatorError> {
+        const STAGING_GRACE_SECS: i64 = 24 * 60 * 60;
+        if limit == 0 || limit > 10_000 {
+            return Err(SessionForkCoordinatorError::Invalid(
+                "cleanup limit must be between 1 and 10000".into(),
+            ));
+        }
+        let result = sqlx::query(
+            "DELETE FROM conversation_segments
+             WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
+               AND NOT EXISTS (
+                       SELECT 1 FROM conversation_manifest_segments
+                       WHERE conversation_manifest_segments.isolation_domain =
+                                 conversation_segments.isolation_domain
+                         AND conversation_manifest_segments.owner_user_id =
+                                 conversation_segments.owner_user_id
+                         AND conversation_manifest_segments.segment_hash =
+                                 conversation_segments.segment_hash
+                   )
+             ORDER BY created_at ASC LIMIT ?",
+        )
+        .bind(STAGING_GRACE_SECS)
+        .bind(i64::from(limit))
+        .execute(self.pool.get())
+        .await
+        .map_err(|source| database_error("collect_unreferenced_segments", source))?;
+        Ok(result.rows_affected())
+    }
+
     /// Remove fork metadata bottom-up after its child session is deleted.
     ///
     /// An ancestor pin is deliberately retained while a live descendant fork
@@ -1044,6 +1118,7 @@ mod tests {
             conversation_seq: u64::from(turn),
             compaction_generation: 0,
             config_version_id: None,
+            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
             logical_segments: vec![vec![
                 json!({"role":"user","content":format!("question-{turn}")}),
                 json!({"role":"assistant","content":format!("answer-{turn}")}),

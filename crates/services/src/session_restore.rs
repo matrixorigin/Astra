@@ -1460,6 +1460,7 @@ fn build_resume_bundle(
         source,
         cursor,
         conversation_messages: messages,
+        materialized_conversation_root_hash: None,
         degraded_reasons,
         repair_actions: vec![
             astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
@@ -1539,8 +1540,38 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     };
     let cursor = bundle.cursor.clone();
     let checkpoint = bundle.projections.checkpoint_at(&cursor).cloned();
-    let task = bundle.projections.task_at(&cursor).cloned();
-    let provider = bundle.projections.provider_at(&cursor).cloned();
+    let permits_degraded_projection_fallback = bundle.source.is_degraded()
+        && bundle
+            .degraded_reasons
+            .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing);
+    let task = bundle.projections.task_at(&cursor).cloned().or_else(|| {
+        permits_degraded_projection_fallback
+            .then(|| bundle.projections.task.as_ref())
+            .flatten()
+            .filter(|projection| {
+                projection.schema_version
+                    == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
+                    && projection.source_cursor.is_none()
+                    && projection.verified_through_root.is_none()
+            })
+            .map(|projection| projection.payload.clone())
+    });
+    let provider = bundle
+        .projections
+        .provider_at(&cursor)
+        .cloned()
+        .or_else(|| {
+            permits_degraded_projection_fallback
+                .then(|| bundle.projections.provider.as_ref())
+                .flatten()
+                .filter(|projection| {
+                    projection.schema_version
+                        == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
+                        && projection.source_cursor.is_none()
+                        && projection.verified_through_root.is_none()
+                })
+                .map(|projection| projection.payload.clone())
+        });
     let activated_deferred_tool_names = bundle.activated_deferred_tool_names().to_vec();
 
     session.activated_deferred_tool_names = activated_deferred_tool_names;
@@ -1587,6 +1618,102 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     session.plan_corrections.clear();
     session.last_context_trace = None;
     session.workspace = None;
+}
+
+/// Replace the resumable conversation with a coordinator-verified canonical
+/// bundle. Runtime-bearing side projections are re-admitted only when their
+/// own envelope proves the same causal boundary.
+pub fn install_canonical_resume_bundle(
+    session: &mut RestoredSession,
+    mut bundle: astra_turn_types::ResumeBundleV1,
+) -> Result<(), String> {
+    if bundle.source != astra_turn_types::ResumeSourceV1::CanonicalJournal
+        || !bundle.validates_root()
+    {
+        return Err("canonical resume bundle does not validate its materialized content".into());
+    }
+    if let Some(legacy) = session.resume_bundle.as_ref()
+        && resume_materializations_are_equivalent(legacy, &bundle)
+    {
+        transplant_equivalent_resume_projections(legacy, &mut bundle);
+    }
+    session.turn_count = bundle.cursor.completed_turn;
+    session.conversation_messages.clear();
+    session.resume_bundle = Some(bundle);
+    apply_selected_resume_bundle(session);
+    Ok(())
+}
+
+fn resume_materializations_are_equivalent(
+    legacy: &astra_turn_types::ResumeBundleV1,
+    canonical: &astra_turn_types::ResumeBundleV1,
+) -> bool {
+    let legacy_materialized_root =
+        astra_turn_types::canonical_conversation_root(&legacy.conversation_messages);
+    legacy.validates_root()
+        && legacy.cursor.owner_id == canonical.cursor.owner_id
+        && legacy.cursor.session_id == canonical.cursor.session_id
+        && legacy.cursor.branch_id == canonical.cursor.branch_id
+        && legacy.cursor.completed_turn == canonical.cursor.completed_turn
+        && canonical.materialized_conversation_root_hash.as_deref()
+            == Some(legacy_materialized_root.as_str())
+}
+
+fn transplant_equivalent_resume_projections(
+    legacy: &astra_turn_types::ResumeBundleV1,
+    canonical: &mut astra_turn_types::ResumeBundleV1,
+) {
+    let cursor = canonical.cursor.clone();
+    if canonical.projections.checkpoint.is_none()
+        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.checkpoint)
+    {
+        canonical.projections.checkpoint = Some(
+            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload),
+        );
+    }
+    if canonical.projections.task.is_none()
+        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.task)
+    {
+        canonical.projections.task = Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+            cursor.clone(),
+            payload,
+        ));
+    }
+    if canonical.projections.provider.is_none()
+        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.provider)
+    {
+        canonical.projections.provider = Some(
+            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload),
+        );
+    }
+    if canonical.projections.activation.is_none()
+        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.activation)
+    {
+        canonical.projections.activation = Some(
+            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor, payload),
+        );
+    }
+}
+
+fn equivalent_projection_payload<T: Clone>(
+    bundle: &astra_turn_types::ResumeBundleV1,
+    projection: &Option<astra_turn_types::CausalProjectionEnvelopeV1<T>>,
+) -> Option<T> {
+    let projection = projection.as_ref()?;
+    if projection.is_admissible_at(&bundle.cursor)
+        || (bundle.source.is_degraded()
+            && bundle
+                .degraded_reasons
+                .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
+            && projection.schema_version
+                == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
+            && projection.source_cursor.is_none()
+            && projection.verified_through_root.is_none())
+    {
+        Some(projection.payload.clone())
+    } else {
+        None
+    }
 }
 
 /// Reconcile two restore projections without combining history from different
@@ -3255,6 +3382,7 @@ mod tests {
                 source: astra_turn_types::ResumeSourceV1::Checkpoint,
                 cursor,
                 conversation_messages: messages,
+                materialized_conversation_root_hash: None,
                 degraded_reasons: Vec::new(),
                 repair_actions: Vec::new(),
                 projections: astra_turn_types::ResumeProjectionSetV1::default(),
@@ -4249,6 +4377,156 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("no valid resume candidate"), "{error}");
+    }
+
+    #[test]
+    fn degraded_cloud_resume_preserves_its_own_unversioned_session_snapshot() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
+        let cursor = typed_resume_bundle_from_messages(
+            "owner-1",
+            "legacy-cloud-session",
+            3,
+            messages.clone(),
+        )
+        .cursor;
+        let heavy = CloudHeavyCheckpointState {
+            conversation_cursor: Some(cursor),
+            messages: messages.clone(),
+            ..Default::default()
+        };
+        let bundle = build_resume_bundle(
+            "owner-1",
+            "legacy-cloud-session",
+            3,
+            messages,
+            true,
+            Some(&heavy),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1 {
+                    executing_plan_json: Some(r#"{"goal":"resume"}"#.into()),
+                    contract_json: Some(r#"{"state":"active"}"#.into()),
+                    ..Default::default()
+                },
+                provider: astra_turn_types::ResumeProviderProjectionV1 {
+                    model: Some("model-a".into()),
+                    permission_mode: Some("plan".into()),
+                    config_version_id: None,
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(bundle.projections.task_at(&bundle.cursor).is_none());
+        assert!(
+            bundle
+                .degraded_reasons
+                .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
+        );
+
+        let mut restored = RestoredSession {
+            session_id: "legacy-cloud-session".into(),
+            resume_bundle: Some(bundle),
+            ..Default::default()
+        };
+        apply_selected_resume_bundle(&mut restored);
+
+        assert_eq!(restored.model.as_deref(), Some("model-a"));
+        assert_eq!(restored.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            restored.executing_plan_json.as_deref(),
+            Some(r#"{"goal":"resume"}"#)
+        );
+        assert_eq!(
+            restored.contract_json.as_deref(),
+            Some(r#"{"state":"active"}"#)
+        );
+    }
+
+    #[test]
+    fn canonical_resume_transplants_side_state_only_for_equivalent_materialization() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
+        let heavy = CloudHeavyCheckpointState {
+            messages: messages.clone(),
+            blocked_tools: vec!["write".into()],
+            ..Default::default()
+        };
+        let legacy = build_resume_bundle(
+            "owner-1",
+            "canonical-session",
+            3,
+            messages.clone(),
+            true,
+            Some(&heavy),
+            ResumeBundleSupplementalProjections {
+                task: astra_turn_types::ResumeTaskProjectionV1 {
+                    executing_plan_json: Some(r#"{"goal":"resume"}"#.into()),
+                    contract_json: Some(r#"{"state":"active"}"#.into()),
+                    ..Default::default()
+                },
+                provider: astra_turn_types::ResumeProviderProjectionV1 {
+                    model: Some("model-a".into()),
+                    permission_mode: Some("plan".into()),
+                    config_version_id: None,
+                },
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let legacy_cursor = legacy.cursor.clone();
+        let canonical_bundle = |materialized_messages: Vec<serde_json::Value>| {
+            let mut cursor = legacy_cursor.clone();
+            cursor.schema_version = astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION;
+            cursor.projection_schema =
+                astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION;
+            cursor.canonical_root_hash = "a".repeat(64);
+            let materialized_root =
+                astra_turn_types::canonical_conversation_root(&materialized_messages);
+            astra_turn_types::select_resume_bundle(
+                Some(&cursor),
+                [astra_turn_types::ResumeCandidateV1 {
+                    source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                    cursor: cursor.clone(),
+                    conversation_messages: materialized_messages,
+                    materialized_conversation_root_hash: Some(materialized_root),
+                    degraded_reasons: Vec::new(),
+                    repair_actions: Vec::new(),
+                    projections: Default::default(),
+                }],
+            )
+            .unwrap()
+        };
+
+        let mut equivalent = RestoredSession {
+            session_id: "canonical-session".into(),
+            resume_bundle: Some(legacy.clone()),
+            ..Default::default()
+        };
+        install_canonical_resume_bundle(&mut equivalent, canonical_bundle(messages)).unwrap();
+        assert_eq!(equivalent.model.as_deref(), Some("model-a"));
+        assert_eq!(equivalent.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            equivalent.executing_plan_json.as_deref(),
+            Some(r#"{"goal":"resume"}"#)
+        );
+        assert_eq!(equivalent.blocked_tools, ["write"]);
+
+        let mut divergent = RestoredSession {
+            session_id: "canonical-session".into(),
+            resume_bundle: Some(legacy),
+            model: Some("must-be-cleared".into()),
+            ..Default::default()
+        };
+        install_canonical_resume_bundle(
+            &mut divergent,
+            canonical_bundle(vec![serde_json::json!({
+                "role": "user",
+                "content": "different"
+            })]),
+        )
+        .unwrap();
+        assert_eq!(divergent.model, None);
+        assert!(divergent.executing_plan_json.is_none());
+        assert!(divergent.blocked_tools.is_empty());
     }
 
     #[test]

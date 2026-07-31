@@ -3053,27 +3053,33 @@ impl AgenticRunLifecycleService {
                 };
                 (lease, true)
             };
-        let reservation = match coordinator
+        let reservation_outcome = coordinator
             .reserve_turn(
                 &lease,
                 head.as_ref().map(|head| &head.cursor),
                 Duration::from_secs(15 * 60),
                 &format!("server-run:{run_id}:turn"),
             )
-            .await
-            .map_err(|error| {
-                error_response_coded(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to reserve canonical turn: {error}"),
-                    "session_turn_reservation_unavailable",
-                )
-            })? {
-            astra_services::ReserveTurnOutcome::Reserved(reservation)
-            | astra_services::ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
-            astra_services::ReserveTurnOutcome::Conflict { .. } => {
+            .await;
+        let reservation = match reservation_outcome {
+            Err(error) => {
                 if release_writer_on_finish {
                     let _ = coordinator.release_writer(&lease).await;
                 }
+                let _ = distributed_permit.release().await;
+                return Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("failed to reserve canonical turn: {error}"),
+                    "session_turn_reservation_unavailable",
+                ));
+            }
+            Ok(astra_services::ReserveTurnOutcome::Reserved(reservation))
+            | Ok(astra_services::ReserveTurnOutcome::AlreadyReserved(reservation)) => reservation,
+            Ok(astra_services::ReserveTurnOutcome::Conflict { .. }) => {
+                if release_writer_on_finish {
+                    let _ = coordinator.release_writer(&lease).await;
+                }
+                let _ = distributed_permit.release().await;
                 return Err(error_response_coded(
                     StatusCode::CONFLICT,
                     "canonical session cursor changed before turn reservation",
@@ -3168,36 +3174,26 @@ impl AgenticRunLifecycleService {
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
         compaction_rewrote_prefix: bool,
+        cancellation_requested: bool,
         run_id: &str,
-    ) -> Result<(), astra_core::ClassifiedError> {
+    ) -> Result<bool, astra_core::ClassifiedError> {
         let Some(admission) = admission else {
-            return Ok(());
+            return Ok(false);
         };
         admission.renewal_cancel.cancel();
         let result = async {
-            if compaction_rewrote_prefix && admission.prior_message_count > 0 {
-                return Err(
-                    "compaction rewrote the admitted canonical prefix before CAS commit"
-                        .to_string(),
-                );
-            }
-            let suffix = messages
-                .get(admission.prior_message_count..)
-                .ok_or_else(|| {
-                    "canonical conversation became shorter than the admitted prefix".to_string()
-                })?;
-            let canonical_suffix =
-                astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
-                    suffix.to_vec(),
-                )
-                .map_err(|error| {
-                    format!("canonical turn contains invalid user-turn semantics: {error}")
-                })?;
-            let logical_segments = pack_canonical_turn_segments(canonical_suffix);
-            if logical_segments.is_empty() {
-                return Err("canonical turn produced no committable messages".to_string());
-            }
+            let Some((mode, logical_segments)) = canonical_commit_delta(
+                admission.prior_message_count,
+                admission.had_canonical_head,
+                messages,
+                compaction_rewrote_prefix,
+                cancellation_requested,
+            )?
+            else {
+                return Ok(false);
+            };
             let base = admission.reservation.expected_cursor.as_ref();
+            let replaces_history = mode == astra_turn_types::CanonicalDeltaModeV1::Replace;
             let delta = astra_turn_types::CanonicalTurnDeltaV1 {
                 schema_version: astra_turn_types::CANONICAL_TURN_DELTA_SCHEMA_VERSION,
                 completed_turn: admission.reservation.reserved_turn,
@@ -3205,8 +3201,13 @@ impl AgenticRunLifecycleService {
                     .map_or(1, |cursor| cursor.journal_event_seq.saturating_add(1)),
                 conversation_seq: base
                     .map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
-                compaction_generation: base.map_or(0, |cursor| cursor.compaction_generation),
+                compaction_generation: if replaces_history {
+                    base.map_or(1, |cursor| cursor.compaction_generation.saturating_add(1))
+                } else {
+                    base.map_or(0, |cursor| cursor.compaction_generation)
+                },
                 config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
+                mode,
                 logical_segments,
             };
             match admission
@@ -3220,7 +3221,7 @@ impl AgenticRunLifecycleService {
                 .map_err(|error| error.to_string())?
             {
                 astra_turn_types::CoordinatorMutationV1::Applied { .. }
-                | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { .. } => Ok(()),
+                | astra_turn_types::CoordinatorMutationV1::AlreadyApplied { .. } => Ok(true),
                 astra_turn_types::CoordinatorMutationV1::Conflict { .. } => {
                     Err("canonical session head changed before turn commit".to_string())
                 }
@@ -4164,6 +4165,7 @@ impl AgenticRunLifecycleService {
                 source: resume_source,
                 cursor,
                 conversation_messages: restored_messages,
+                materialized_conversation_root_hash: None,
                 degraded_reasons: resume_degraded_reasons,
                 repair_actions: resume_repair_actions,
                 projections: astra_turn_types::ResumeProjectionSetV1::default(),
@@ -8094,6 +8096,43 @@ fn runtime_workspace_authority_from_request(
     }
 }
 
+fn canonical_commit_delta(
+    prior_message_count: usize,
+    had_canonical_head: bool,
+    messages: &[Value],
+    compaction_rewrote_prefix: bool,
+    cancellation_requested: bool,
+) -> Result<Option<(astra_turn_types::CanonicalDeltaModeV1, Vec<Vec<Value>>)>, String> {
+    let mode = if compaction_rewrote_prefix && had_canonical_head {
+        astra_turn_types::CanonicalDeltaModeV1::Replace
+    } else {
+        astra_turn_types::CanonicalDeltaModeV1::Append
+    };
+    let changed_messages = if mode == astra_turn_types::CanonicalDeltaModeV1::Replace {
+        messages
+    } else {
+        messages.get(prior_message_count..).ok_or_else(|| {
+            "canonical conversation became shorter than the admitted prefix".to_string()
+        })?
+    };
+    let canonical_changed =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            changed_messages.to_vec(),
+        )
+        .map_err(|error| {
+            format!("canonical turn contains invalid user-turn semantics: {error}")
+        })?;
+    let logical_segments = pack_canonical_turn_segments(canonical_changed);
+    if logical_segments.is_empty() {
+        return if cancellation_requested {
+            Ok(None)
+        } else {
+            Err("canonical turn produced no committable messages".into())
+        };
+    }
+    Ok(Some((mode, logical_segments)))
+}
+
 fn pack_canonical_turn_segments(mut messages: Vec<Value>) -> Vec<Vec<Value>> {
     const TARGET_PACK_BYTES: u64 = 512 * 1024;
 
@@ -9058,11 +9097,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &loop_state.messages,
                         loop_state.context_compression_triggered,
+                        bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
                     )
                     .await
                     {
-                        Ok(()) => canonical_context_persisted = true,
+                        Ok(persisted) => canonical_context_persisted = persisted,
                         Err(commit_error) => outcome = Err(commit_error),
                     }
                 }
@@ -10688,11 +10729,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         canonical_turn.as_ref(),
                         &state.messages,
                         state.context_compression_triggered,
+                        bg_cancel_flag.load(Ordering::Acquire)
+                            || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
                     )
                     .await
                     {
-                        Ok(()) => canonical_context_persisted = true,
+                        Ok(persisted) => canonical_context_persisted = persisted,
                         Err(commit_error) => loop_result = Err(commit_error),
                     }
                 }

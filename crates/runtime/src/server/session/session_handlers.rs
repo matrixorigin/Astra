@@ -1977,16 +1977,56 @@ pub(crate) async fn resume_session_handler(
         return Err(internal_error("shared MatrixOne pool is not configured"));
     };
     let svc = astra_services::session_restore::HybridRestoreService::new(shared_pool.get().clone());
-    let mut restored = svc
+    let legacy = svc
         .restore_session(&user_id, &session.session_id)
         .await
-        .map_err(internal_error)?
-        .ok_or_else(|| {
-            error_response(
-                StatusCode::NOT_FOUND,
-                format!("session {} has no resumable state", session.session_id),
-            )
-        })?;
+        .map_err(internal_error)?;
+    let key = server_session_key(&user_id, &session.session_id);
+    let canonical_head = match state.session_context_coordinator.as_ref() {
+        Some(coordinator) => coordinator
+            .load_head(&key)
+            .await
+            .map_err(session_context_http_error)?,
+        None => None,
+    };
+    let mut restored = legacy.unwrap_or_else(|| astra_services::session_restore::RestoredSession {
+        session_id: session.session_id.clone(),
+        last_status: "active".into(),
+        restored_from_cloud: true,
+        ..Default::default()
+    });
+    if let Some(head) = canonical_head {
+        let coordinator = state
+            .session_context_coordinator
+            .as_ref()
+            .expect("coordinator produced the canonical head");
+        let materialized = coordinator
+            .materialize(&head)
+            .await
+            .map_err(session_context_http_error)?;
+        let materialized_root =
+            astra_turn_types::canonical_conversation_root(&materialized.messages);
+        let bundle = astra_turn_types::select_resume_bundle(
+            Some(&head.cursor),
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                cursor: head.cursor.clone(),
+                conversation_messages: materialized.messages,
+                materialized_conversation_root_hash: Some(materialized_root),
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }],
+        )
+        .map_err(internal_error)?;
+        astra_services::session_restore::install_canonical_resume_bundle(&mut restored, bundle)
+            .map_err(internal_error)?;
+    } else if restored.resume_bundle.is_none() && restored.conversation_messages.is_empty() {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            format!("session {} has no resumable state", session.session_id),
+        ));
+    }
     // Resume is the hydration API consumed by CLI clients. Cross-placement
     // observation and control remain explicit operations on `/attachments`
     // and `/handoffs`; inferring a Server attachment here would assign the

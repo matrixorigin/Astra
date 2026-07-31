@@ -2999,7 +2999,7 @@ impl InProcessChatTurnBridge {
                                 return;
                             }
                         };
-                    crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                    crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
                         "bridge_inprocess e2e capture",
                         shared_pool.clone(),
                         astra_services::PromptRequestPersistInput {
@@ -3014,7 +3014,8 @@ impl InProcessChatTurnBridge {
                             provider: provider.clone(),
                         },
                         prompt_request_plan,
-                    );
+                    )
+                    .await;
                     yield render_sse(&crate::turn::llm::context::context_meta_event_with_compactions(
                         &breakdown,
                         Some(&bridge_manifest_trace_json),
@@ -3115,7 +3116,7 @@ impl InProcessChatTurnBridge {
                                 return;
                             }
                         };
-                    crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                    crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
                         "bridge_inprocess live capture",
                         shared_pool.clone(),
                         astra_services::PromptRequestPersistInput {
@@ -3130,7 +3131,8 @@ impl InProcessChatTurnBridge {
                             provider: provider.clone(),
                         },
                         prompt_request_plan,
-                    );
+                    )
+                    .await;
 
                     // wip-7: emit per-channel fingerprints ONLY — no raw
                     // text crosses the HTTP boundary. Raw channel content
@@ -3639,7 +3641,7 @@ impl InProcessChatTurnBridge {
                                 Some(&bridge_manifest_trace_json),
                                 &context_compactions,
                             ));
-                            crate::turn::llm::exchange_capture::spawn_prompt_request_plan_persist_or_log(
+                            crate::turn::llm::exchange_capture::persist_prompt_request_plan_or_log(
                                 "bridge_inprocess retry capture",
                                 shared_pool.clone(),
                                 astra_services::PromptRequestPersistInput {
@@ -3654,7 +3656,8 @@ impl InProcessChatTurnBridge {
                                     provider: provider.clone(),
                                 },
                                 prompt_request_plan,
-                            );
+                            )
+                            .await;
 
                             // Retry LLM call
                             match call_llm_stream_with_attempt_observer(

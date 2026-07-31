@@ -51,7 +51,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v23";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v24";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -2459,6 +2459,90 @@ pub async fn ensure_core_schema(
     }
 }
 
+async fn backfill_conversation_manifest_segments(
+    pool: &sqlx::Pool<MySql>,
+) -> Result<(), sqlx::Error> {
+    const BACKFILL_BATCH: i64 = 128;
+    loop {
+        let rows = query(
+            "SELECT isolation_domain, owner_user_id, session_id, branch_id,
+                    manifest_root, CAST(manifest_json AS CHAR) AS manifest_json
+               FROM conversation_manifest_nodes node
+              WHERE NOT EXISTS (
+                        SELECT 1 FROM conversation_manifest_segments segment
+                         WHERE segment.isolation_domain = node.isolation_domain
+                           AND segment.owner_user_id = node.owner_user_id
+                           AND segment.session_id = node.session_id
+                           AND segment.branch_id = node.branch_id
+                           AND segment.manifest_root = node.manifest_root
+                    )
+              ORDER BY node.created_at ASC, node.manifest_root ASC
+              LIMIT ?",
+        )
+        .bind(BACKFILL_BATCH)
+        .fetch_all(pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        for row in rows {
+            let isolation_domain: String = row.try_get("isolation_domain")?;
+            let owner_user_id: String = row.try_get("owner_user_id")?;
+            let session_id: String = row.try_get("session_id")?;
+            let branch_id: String = row.try_get("branch_id")?;
+            let manifest_root: String = row.try_get("manifest_root")?;
+            let manifest_json: String = row.try_get("manifest_json")?;
+            let manifest: astra_turn_types::ContextManifestNodeV1 =
+                serde_json::from_str(&manifest_json).map_err(|source| {
+                    sqlx::Error::Protocol(format!(
+                        "decode manifest segment backfill row {manifest_root}: {source}"
+                    ))
+                })?;
+            manifest.validate().map_err(|source| {
+                sqlx::Error::Protocol(format!(
+                    "validate manifest segment backfill row {manifest_root}: {source}"
+                ))
+            })?;
+            if manifest.key.isolation_domain != isolation_domain
+                || manifest.key.owner_user_id != owner_user_id
+                || manifest.key.session_id != session_id
+                || manifest.key.branch_id != branch_id
+                || manifest.manifest_root != manifest_root
+            {
+                return Err(sqlx::Error::Protocol(format!(
+                    "manifest segment backfill identity mismatch for {manifest_root}"
+                )));
+            }
+
+            // One manifest's reference index is installed atomically. If
+            // bootstrap is interrupted, the next leased run sees either all
+            // positions or none and can safely retry.
+            let mut tx = pool.begin().await?;
+            let mut builder = QueryBuilder::<MySql>::new(
+                "INSERT IGNORE INTO conversation_manifest_segments
+                 (isolation_domain, owner_user_id, session_id, branch_id,
+                  manifest_root, segment_position, segment_hash) ",
+            );
+            builder.push_values(
+                manifest.appended_segments.iter().enumerate(),
+                |mut values, (position, segment)| {
+                    values
+                        .push_bind(&isolation_domain)
+                        .push_bind(&owner_user_id)
+                        .push_bind(&session_id)
+                        .push_bind(&branch_id)
+                        .push_bind(&manifest_root)
+                        .push_bind(i64::try_from(position).unwrap_or(i64::MAX))
+                        .push_bind(&segment.segment_hash);
+                },
+            );
+            builder.build().execute(&mut *tx).await?;
+            tx.commit().await?;
+        }
+    }
+}
+
 async fn ensure_core_schema_while_leased(
     settings: &MatrixOneSettings,
     pool: sqlx::Pool<MySql>,
@@ -3181,6 +3265,7 @@ async fn ensure_core_schema_while_leased(
             parent_manifest_root CHAR(64) NULL,
             completed_turn BIGINT NOT NULL,
             conversation_seq BIGINT NOT NULL,
+            compaction_generation BIGINT NOT NULL DEFAULT 0,
             canonical_segment_bytes BIGINT NOT NULL,
             total_canonical_bytes BIGINT NOT NULL,
             total_message_count BIGINT NOT NULL,
@@ -3189,7 +3274,9 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (isolation_domain, owner_user_id, session_id, branch_id, manifest_root),
             INDEX idx_context_manifest_parent (isolation_domain, owner_user_id, session_id, branch_id, parent_manifest_root),
-            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq)
+            INDEX idx_context_manifest_sequence (isolation_domain, owner_user_id, session_id, branch_id, conversation_seq),
+            INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq),
+            INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)
         )",
     )
     .execute(&pool)
@@ -3207,6 +3294,10 @@ async fn ensure_core_schema_while_leased(
             "reachable",
             "ALTER TABLE conversation_manifest_nodes ADD COLUMN reachable TINYINT NOT NULL DEFAULT 0",
         ),
+        (
+            "compaction_generation",
+            "ALTER TABLE conversation_manifest_nodes ADD COLUMN compaction_generation BIGINT NOT NULL DEFAULT 0",
+        ),
     ] {
         add_column_if_missing(
             &pool,
@@ -3217,6 +3308,39 @@ async fn ensure_core_schema_while_leased(
         )
         .await?;
     }
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "conversation_manifest_nodes",
+        "idx_context_manifest_reachable_sequence",
+        &[
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "reachable",
+            "conversation_seq",
+        ],
+        "ALTER TABLE conversation_manifest_nodes ADD INDEX idx_context_manifest_reachable_sequence (isolation_domain, owner_user_id, session_id, branch_id, reachable, conversation_seq)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "conversation_manifest_nodes",
+        "idx_context_manifest_generation_sequence",
+        &[
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "compaction_generation",
+            "reachable",
+            "conversation_seq",
+        ],
+        "ALTER TABLE conversation_manifest_nodes ADD INDEX idx_context_manifest_generation_sequence (isolation_domain, owner_user_id, session_id, branch_id, compaction_generation, reachable, conversation_seq)",
+    )
+    .await?;
     query(
         "UPDATE conversation_manifest_nodes n
          INNER JOIN session_context_heads h
@@ -3230,6 +3354,35 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
+    core_schema_create!(
+        pool,
+        "conversation_manifest_segments",
+        "CREATE TABLE IF NOT EXISTS conversation_manifest_segments (
+            isolation_domain VARCHAR(128) NOT NULL,
+            owner_user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(128) NOT NULL,
+            branch_id VARCHAR(128) NOT NULL,
+            manifest_root CHAR(64) NOT NULL,
+            segment_position BIGINT NOT NULL,
+            segment_hash CHAR(64) NOT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (
+                isolation_domain, owner_user_id, session_id, branch_id,
+                manifest_root, segment_position
+            ),
+            INDEX idx_manifest_segments_hash (
+                isolation_domain, owner_user_id, segment_hash, manifest_root
+            ),
+            INDEX idx_manifest_segments_session (
+                owner_user_id, session_id, branch_id, manifest_root
+            ),
+            INDEX idx_manifest_segments_created (created_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    backfill_conversation_manifest_segments(&pool).await?;
 
     core_schema_create!(
         pool,
@@ -5782,6 +5935,8 @@ async fn ensure_core_schema_while_leased(
                 (user_id, attempt_id, event_stage),
             INDEX idx_model_request_context_owner_session_created
                 (user_id, session_id, created_at, event_id),
+            INDEX idx_model_request_context_owner_harness_created
+                (user_id, harness_run_id, created_at, event_id),
             INDEX idx_model_request_context_metrics
                 (topology, provider, model_family, purpose, created_at),
             INDEX idx_model_request_context_terminal_status
@@ -5789,6 +5944,15 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "model_request_context_events",
+        "idx_model_request_context_owner_harness_created",
+        &["user_id", "harness_run_id", "created_at", "event_id"],
+        "ALTER TABLE model_request_context_events ADD INDEX idx_model_request_context_owner_harness_created (user_id, harness_run_id, created_at, event_id)",
+    )
     .await?;
 
     // Terminal request metrics are accumulated transactionally with their

@@ -51,6 +51,8 @@ fn validate_restored_session(
         if bundle.cursor.schema_version != 0
             && bundle.cursor.projection_schema
                 != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+            && bundle.cursor.projection_schema
+                != astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
         {
             return Err(format!(
                 "resume projection schema {} is unsupported",
@@ -258,6 +260,7 @@ mod tests {
             cursor,
             source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
             conversation_messages: messages,
+            materialized_conversation_root_hash: None,
             degraded_reasons: Vec::new(),
             repair_actions: Vec::new(),
             projections: Default::default(),

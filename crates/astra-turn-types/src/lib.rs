@@ -90,12 +90,12 @@ pub use semantic_read_cache::{
 pub use session_coordination::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION,
     CONTEXT_MANIFEST_NODE_SCHEMA_VERSION, CONVERSATION_AUTHORITY_ENVELOPE_SCHEMA_VERSION,
-    CONVERSATION_SEGMENT_SCHEMA_VERSION, CanonicalTurnDeltaV1, ContextManifestNodeV1,
-    ConversationAuthorityEnvelopeV1, ConversationSegmentRefV1, ConversationSegmentV1,
-    ConversationWriterLeaseV1, CoordinatorConflictOptionV1, CoordinatorMutationV1,
-    EXECUTION_GRANT_SCHEMA_VERSION, ExecutionGrantClaimsV1, SESSION_COORDINATION_SCHEMA_VERSION,
-    SessionContextHeadV1, SessionCoordinationValidationError, SessionKeyV1, SessionSurfaceV1,
-    SignedExecutionGrantV1, TurnReservationV1,
+    CONVERSATION_SEGMENT_SCHEMA_VERSION, CanonicalDeltaModeV1, CanonicalTurnDeltaV1,
+    ContextManifestNodeV1, ConversationAuthorityEnvelopeV1, ConversationSegmentRefV1,
+    ConversationSegmentV1, ConversationWriterLeaseV1, CoordinatorConflictOptionV1,
+    CoordinatorMutationV1, EXECUTION_GRANT_SCHEMA_VERSION, ExecutionGrantClaimsV1,
+    SESSION_COORDINATION_SCHEMA_VERSION, SessionContextHeadV1, SessionCoordinationValidationError,
+    SessionKeyV1, SessionSurfaceV1, SignedExecutionGrantV1, TurnReservationV1,
 };
 pub use session_cursor::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,

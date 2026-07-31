@@ -46,6 +46,18 @@ pub struct ReaperSweepResult {
     pub marked_ended: u64,
     /// Ended session rows deleted.
     pub deleted: u64,
+    /// Expired fork-retention pins released.
+    pub expired_fork_pins_released: u64,
+    /// Fork records whose child session no longer exists.
+    pub orphaned_forks_collected: u64,
+    /// Unpinned manifest nodes whose session no longer exists.
+    pub orphaned_manifests_collected: u64,
+    /// Segment references whose manifest node no longer exists.
+    pub orphaned_manifest_references_collected: u64,
+    /// Owner-deduplicated segment payloads outside the staging grace.
+    pub unreferenced_segments_collected: u64,
+    /// Detailed model-request context facts removed by age.
+    pub model_request_context_events_expired: u64,
     /// Total database rows deleted across session lifecycle tables.
     pub database_rows_deleted: u64,
     /// Session-scoped provenance references cleared without deleting durable owner-level rows.
@@ -189,6 +201,20 @@ pub async fn reap_sessions(
         }
     }
 
+    const MODEL_REQUEST_CONTEXT_RETENTION_DAYS: u32 = 30;
+    result.model_request_context_events_expired = sqlx::query(
+        "DELETE FROM model_request_context_events
+         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+         ORDER BY created_at ASC, event_id ASC
+         LIMIT ?",
+    )
+    .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
+    .bind(policy.batch_limit)
+    .execute(pool)
+    .await
+    .map_err(|source| format!("session_reaper.expire_model_request_context: {source}"))?
+    .rows_affected();
+
     Ok(result)
 }
 
@@ -252,6 +278,7 @@ fn record_reaper_database_delete(
 /// shutdown by triggering `cancel` and awaiting the handle.
 pub fn spawn_session_reaper(
     pool: astra_core::SharedPool,
+    fork_coordinator: Option<std::sync::Arc<crate::DatabaseSessionForkCoordinator>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let reaper_interval = Duration::from_secs(5 * 60); // 5 minutes
@@ -271,7 +298,7 @@ pub fn spawn_session_reaper(
                 }
                 _ = interval.tick() => {}
             }
-            let r = match reap_sessions(pool.get(), &policy).await {
+            let mut r = match reap_sessions(pool.get(), &policy).await {
                 Ok(result) => result,
                 Err(error) => {
                     tracing::warn!(
@@ -282,13 +309,67 @@ pub fn spawn_session_reaper(
                     continue;
                 }
             };
-            let total = r.marked_idle + r.marked_ended + r.deleted;
+            if let Some(coordinator) = fork_coordinator.as_ref() {
+                r.expired_fork_pins_released = record_context_storage_maintenance(
+                    &mut r.cleanup_errors,
+                    "release_expired_fork_pins",
+                    coordinator
+                        .release_expired_grace_pins(policy.batch_limit)
+                        .await,
+                );
+                r.orphaned_forks_collected = record_context_storage_maintenance(
+                    &mut r.cleanup_errors,
+                    "collect_orphaned_fork_records",
+                    coordinator
+                        .collect_orphaned_fork_records(policy.batch_limit)
+                        .await,
+                );
+                r.orphaned_manifests_collected = record_context_storage_maintenance(
+                    &mut r.cleanup_errors,
+                    "collect_unpinned_orphan_manifests",
+                    coordinator
+                        .collect_unpinned_orphan_manifests(policy.batch_limit)
+                        .await,
+                );
+                r.orphaned_manifest_references_collected = record_context_storage_maintenance(
+                    &mut r.cleanup_errors,
+                    "collect_orphaned_manifest_segment_references",
+                    coordinator
+                        .collect_orphaned_manifest_segment_references(policy.batch_limit)
+                        .await,
+                );
+                r.unreferenced_segments_collected = record_context_storage_maintenance(
+                    &mut r.cleanup_errors,
+                    "collect_unreferenced_conversation_segments",
+                    coordinator
+                        .collect_unreferenced_conversation_segments(policy.batch_limit)
+                        .await,
+                );
+            }
+            let total = r
+                .marked_idle
+                .saturating_add(r.marked_ended)
+                .saturating_add(r.deleted)
+                .saturating_add(r.expired_fork_pins_released)
+                .saturating_add(r.orphaned_forks_collected)
+                .saturating_add(r.orphaned_manifests_collected)
+                .saturating_add(r.orphaned_manifest_references_collected)
+                .saturating_add(r.unreferenced_segments_collected)
+                .saturating_add(r.model_request_context_events_expired);
             if total > 0 {
                 tracing::info!(
                     target: "astra_services::session_reaper",
                     marked_idle = r.marked_idle,
                     marked_ended = r.marked_ended,
                     deleted = r.deleted,
+                    expired_fork_pins_released = r.expired_fork_pins_released,
+                    orphaned_forks_collected = r.orphaned_forks_collected,
+                    orphaned_manifests_collected = r.orphaned_manifests_collected,
+                    orphaned_manifest_references_collected =
+                        r.orphaned_manifest_references_collected,
+                    unreferenced_segments_collected = r.unreferenced_segments_collected,
+                    model_request_context_events_expired =
+                        r.model_request_context_events_expired,
                     database_rows_deleted = r.database_rows_deleted,
                     session_references_cleared = r.session_references_cleared,
                     workspace_cleanup_debts_enqueued = r.workspace_cleanup_debts_enqueued,
@@ -305,6 +386,26 @@ pub fn spawn_session_reaper(
             }
         }
     })
+}
+
+fn record_context_storage_maintenance(
+    errors: &mut Vec<String>,
+    operation: &'static str,
+    outcome: Result<u64, crate::SessionForkCoordinatorError>,
+) -> u64 {
+    match outcome {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(
+                target: "astra_services::session_reaper",
+                %operation,
+                error = %error,
+                "context storage maintenance step failed"
+            );
+            errors.push(format!("{operation}: {error}"));
+            0
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────

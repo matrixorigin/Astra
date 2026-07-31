@@ -5561,6 +5561,7 @@ async fn apply_restored_session(
                 source: astra_turn_types::ResumeSourceV1::Checkpoint,
                 cursor,
                 conversation_messages: messages,
+                materialized_conversation_root_hash: None,
                 degraded_reasons: vec![
                     astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
                     astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
@@ -7133,6 +7134,7 @@ mod resume_tests {
             cursor: cursor.clone(),
             source: astra_turn_types::ResumeSourceV1::Checkpoint,
             conversation_messages: messages.clone(),
+            materialized_conversation_root_hash: None,
             degraded_reasons: vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
             repair_actions: Vec::new(),
             projections: Default::default(),

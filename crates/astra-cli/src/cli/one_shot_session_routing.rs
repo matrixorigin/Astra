@@ -54,6 +54,7 @@ impl OneShotSessionRouting {
                     source: astra_turn_types::ResumeSourceV1::Checkpoint,
                     cursor,
                     conversation_messages: messages,
+                    materialized_conversation_root_hash: None,
                     degraded_reasons: vec![
                         astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
                         astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
@@ -431,6 +432,7 @@ mod tests {
                 source: astra_turn_types::ResumeSourceV1::Checkpoint,
                 cursor,
                 conversation_messages: messages,
+                materialized_conversation_root_hash: None,
                 degraded_reasons: Vec::new(),
                 repair_actions: Vec::new(),
                 projections: astra_turn_types::ResumeProjectionSetV1 {

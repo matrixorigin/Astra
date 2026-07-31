@@ -432,6 +432,7 @@ impl DatabaseSessionHandoffService {
             risk: request.risk.clone(),
             reason: request.reason.clone(),
             status_detail: workspace_mismatch.then(|| "workspace_evidence_mismatch".to_owned()),
+            blocked_from: workspace_mismatch.then_some(SessionHandoffStateV1::Validating),
             deadline_unix_ms: checked_expiry(now, deadline)?,
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
@@ -1673,6 +1674,7 @@ mod tests {
                     conversation_seq: 1,
                     compaction_generation: 0,
                     config_version_id: None,
+                    mode: astra_turn_types::CanonicalDeltaModeV1::Append,
                     logical_segments: vec![vec![
                         json!({"role": "user", "content": "question"}),
                         json!({"role": "assistant", "content": "answer"}),

@@ -115,6 +115,7 @@ pub(crate) fn continuation_from_resume_bundle(
         cursor,
         source: resume_source,
         conversation_messages: messages,
+        materialized_conversation_root_hash: _,
         degraded_reasons,
         repair_actions,
         projections,
@@ -150,8 +151,21 @@ pub(crate) fn continuation_from_resume_bundle(
         )
         .ok()?
     } else {
+        // The server's schema-v2 cursor identifies the immutable manifest,
+        // while the local ActiveConversation journal identifies its flattened
+        // projection. Keep the authoritative cursor in `resume`, but derive a
+        // schema-v1 content cursor for the local projection store.
+        let mut projection_cursor = cursor.clone();
+        if projection_cursor.projection_schema
+            == astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
+        {
+            projection_cursor.projection_schema =
+                astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION;
+            projection_cursor.canonical_root_hash =
+                astra_turn_types::canonical_conversation_root(&messages);
+        }
         astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
-            cursor.clone(),
+            projection_cursor,
             messages.clone(),
             source,
         )
@@ -774,6 +788,56 @@ mod tests {
             ),
             messages,
             "instrumentation must not project or reinterpret typed continuation data"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn segmented_resume_keeps_authority_cursor_and_derives_local_content_cursor() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "segmented-resume-profile",
+            Some("account-1"),
+        )
+        .unwrap();
+        let messages = vec![json!({"role": "user", "content": "resume"})];
+        let materialized_root = astra_turn_types::canonical_conversation_root(&messages);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: "account-1".into(),
+            session_id: "segmented-session".into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: "a".repeat(64),
+            projection_schema: astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let continuation =
+            super::continuation_from_resume_bundle(astra_turn_types::ResumeBundleV1 {
+                schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                cursor: cursor.clone(),
+                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: Some(materialized_root.clone()),
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            })
+            .expect("segmented canonical resume must create a local continuation");
+
+        assert_eq!(continuation.resume.cursor, cursor);
+        assert_eq!(
+            continuation.active_conversation.cursor().projection_schema,
+            astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            continuation
+                .active_conversation
+                .cursor()
+                .canonical_root_hash,
+            materialized_root
         );
     }
 

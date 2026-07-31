@@ -61,6 +61,62 @@ const SESSION_DELETE_PLAN_STEP_RUNS_SQL: &str = "DELETE FROM plan_step_runs
                WHERE session_id = ? AND user_id = ?
            )";
 
+const SESSION_DELETE_CHILD_FORKS_SELECT_SQL: &str =
+    "SELECT isolation_domain, fork_id, parent_session_id
+       FROM session_forks
+      WHERE child_session_id = ? AND owner_user_id = ?";
+
+const SESSION_DELETE_CHILD_FORK_EVENTS_SQL: &str = "DELETE FROM session_fork_events
+         WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?";
+
+const SESSION_DELETE_CHILD_MANIFEST_PINS_SQL: &str = "DELETE FROM conversation_manifest_pins
+         WHERE isolation_domain = ? AND owner_user_id = ? AND pin_id = ?";
+
+const SESSION_DELETE_CHILD_FORKS_SQL: &str = "DELETE FROM session_forks
+         WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?";
+
+const SESSION_DELETE_ORPHAN_MANIFESTS_SQL: &str = "DELETE FROM conversation_manifest_nodes
+         WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?
+           AND NOT EXISTS (
+               SELECT 1 FROM agent_sessions
+               WHERE agent_sessions.session_id = conversation_manifest_nodes.session_id
+                 AND agent_sessions.user_id = conversation_manifest_nodes.owner_user_id
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM conversation_manifest_pins
+               WHERE conversation_manifest_pins.isolation_domain =
+                         conversation_manifest_nodes.isolation_domain
+                 AND conversation_manifest_pins.owner_user_id =
+                         conversation_manifest_nodes.owner_user_id
+                 AND conversation_manifest_pins.parent_session_id =
+                         conversation_manifest_nodes.session_id
+                 AND (
+                     conversation_manifest_pins.pin_state IN ('prepared', 'active')
+                     OR (
+                         conversation_manifest_pins.pin_state = 'grace'
+                         AND conversation_manifest_pins.grace_expires_at_ms >
+                             CAST(UNIX_TIMESTAMP(NOW(6)) * 1000 AS SIGNED)
+                     )
+                 )
+           )";
+
+const SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL: &str =
+    "DELETE FROM conversation_manifest_segments
+      WHERE owner_user_id = ? AND session_id = ?
+        AND NOT EXISTS (
+                SELECT 1 FROM conversation_manifest_nodes
+                 WHERE conversation_manifest_nodes.isolation_domain =
+                           conversation_manifest_segments.isolation_domain
+                   AND conversation_manifest_nodes.owner_user_id =
+                           conversation_manifest_segments.owner_user_id
+                   AND conversation_manifest_nodes.session_id =
+                           conversation_manifest_segments.session_id
+                   AND conversation_manifest_nodes.branch_id =
+                           conversation_manifest_segments.branch_id
+                   AND conversation_manifest_nodes.manifest_root =
+                           conversation_manifest_segments.manifest_root
+            )";
+
 const SESSION_DELETE_WORKSPACE_CLEANUP_DEBT_MESSAGE: &str =
     "session hard delete requested cloud workspace cleanup";
 
@@ -412,6 +468,13 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
              ORDER BY created_at ASC, request_id ASC
              LIMIT ?",
     },
+    SessionBatchDeleteStatement {
+        label: "model_request_context_events",
+        sql: "DELETE FROM model_request_context_events
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT ?",
+    },
 ];
 
 const SESSION_DELETE_TERMINAL_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
@@ -711,6 +774,106 @@ async fn clear_session_provenance_references(
         .map_err(|source| format!("delete_session.config_versions.first_seen_session: {source}"))
 }
 
+async fn delete_child_fork_state(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    outcome: &mut SessionDatabaseDeleteOutcome,
+) -> Result<Vec<(String, String)>, String> {
+    let forks = query(SESSION_DELETE_CHILD_FORKS_SELECT_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.load_child_forks: {source}"))?;
+    let mut parent_scopes = Vec::with_capacity(forks.len());
+    for fork in forks {
+        let isolation_domain: String = fork
+            .try_get("isolation_domain")
+            .map_err(|source| format!("delete_session.decode_child_fork.isolation: {source}"))?;
+        let fork_id: String = fork
+            .try_get("fork_id")
+            .map_err(|source| format!("delete_session.decode_child_fork.id: {source}"))?;
+        let parent_session_id: String = fork
+            .try_get("parent_session_id")
+            .map_err(|source| format!("delete_session.decode_child_fork.parent: {source}"))?;
+
+        let rows = query(SESSION_DELETE_CHILD_FORK_EVENTS_SQL)
+            .bind(&isolation_domain)
+            .bind(user_id)
+            .bind(&fork_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| format!("delete_session.session_fork_events: {source}"))?
+            .rows_affected();
+        record_table_delete(outcome, "session_fork_events", rows)?;
+
+        let rows = query(SESSION_DELETE_CHILD_MANIFEST_PINS_SQL)
+            .bind(&isolation_domain)
+            .bind(user_id)
+            .bind(&fork_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| format!("delete_session.conversation_manifest_pins: {source}"))?
+            .rows_affected();
+        record_table_delete(outcome, "conversation_manifest_pins", rows)?;
+
+        let rows = query(SESSION_DELETE_CHILD_FORKS_SQL)
+            .bind(&isolation_domain)
+            .bind(user_id)
+            .bind(&fork_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| format!("delete_session.session_forks: {source}"))?
+            .rows_affected();
+        record_table_delete(outcome, "session_forks", rows)?;
+        parent_scopes.push((isolation_domain, parent_session_id));
+    }
+    parent_scopes.sort_unstable();
+    parent_scopes.dedup();
+    Ok(parent_scopes)
+}
+
+async fn delete_unpinned_orphan_manifests(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    user_id: &str,
+    parent_scopes: &[(String, String)],
+    outcome: &mut SessionDatabaseDeleteOutcome,
+) -> Result<(), String> {
+    for (isolation_domain, parent_session_id) in parent_scopes {
+        let rows = query(SESSION_DELETE_ORPHAN_MANIFESTS_SQL)
+            .bind(isolation_domain)
+            .bind(user_id)
+            .bind(parent_session_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| {
+                format!("delete_session.orphan_conversation_manifest_nodes: {source}")
+            })?
+            .rows_affected();
+        record_table_delete(outcome, "orphan_conversation_manifest_nodes", rows)?;
+    }
+    Ok(())
+}
+
+async fn delete_orphan_manifest_references_for_session(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    outcome: &mut SessionDatabaseDeleteOutcome,
+) -> Result<(), String> {
+    let rows = query(SESSION_DELETE_ORPHAN_MANIFEST_REFERENCES_SQL)
+        .bind(user_id)
+        .bind(session_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| {
+            format!("delete_session.orphan_conversation_manifest_segments: {source}")
+        })?
+        .rows_affected();
+    record_table_delete(outcome, "orphan_conversation_manifest_segments", rows)
+}
+
 pub(crate) async fn hard_delete_session_rows(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -801,6 +964,11 @@ pub(crate) async fn hard_delete_session_rows(
     outcome.session_references_cleared =
         clear_session_provenance_references(tx, session_id, user_id).await?;
 
+    // A child fork owns the pin that keeps its parent's exact prefix alive.
+    // Remove that dependency before deleting the child; parent deletion keeps
+    // the same records intact while any child still exists.
+    let fork_parent_scopes = delete_child_fork_state(tx, session_id, user_id, &mut outcome).await?;
+
     for statement in SESSION_DELETE_DIRECT_BATCH_TABLES {
         let rows_deleted = delete_session_rows_session_user_batched(
             tx,
@@ -847,6 +1015,15 @@ pub(crate) async fn hard_delete_session_rows(
         )
         .await?;
         record_table_delete(&mut outcome, statement.label, rows_deleted)?;
+    }
+
+    // If the parent session was deleted earlier, removing its last child pin
+    // makes the retained manifests collectible in this same transaction.
+    delete_unpinned_orphan_manifests(tx, user_id, &fork_parent_scopes, &mut outcome).await?;
+    delete_orphan_manifest_references_for_session(tx, session_id, user_id, &mut outcome).await?;
+    for (_, parent_session_id) in &fork_parent_scopes {
+        delete_orphan_manifest_references_for_session(tx, parent_session_id, user_id, &mut outcome)
+            .await?;
     }
 
     // A provider terminal that already owned the invocation lock can publish a
@@ -1197,6 +1374,7 @@ mod tests {
                 "inference_invocations",
                 "inference_provider_attempts",
                 "inference_routes",
+                "model_request_context_events",
                 "prompt_deltas",
                 "prompt_request_records",
                 "session_tool_output_batches",

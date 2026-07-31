@@ -17,6 +17,7 @@ pub const CONVERSATION_AUTHORITY_ENVELOPE_SCHEMA_VERSION: u32 = 1;
 
 const SEGMENT_HASH_DOMAIN: &[u8] = b"astra.owner-scoped-conversation-segment.v1\0";
 const MANIFEST_HASH_DOMAIN: &[u8] = b"astra.incremental-context-manifest.v1\0";
+const REPLACEMENT_MANIFEST_MARKER: &[u8] = b"replacement\0";
 
 /// Full isolation key for one canonical conversation branch.
 ///
@@ -279,6 +280,11 @@ pub struct ContextManifestNodeV1 {
     pub compaction_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    /// This node contains the complete canonical projection at this point.
+    /// Its parent remains committed for lineage/audit, but materialization
+    /// must not read content through that parent.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replaces_history: bool,
     pub appended_segments: Vec<ConversationSegmentRefV1>,
     pub manifest_root: String,
 }
@@ -293,6 +299,55 @@ impl ContextManifestNodeV1 {
         conversation_seq: u64,
         compaction_generation: u64,
         config_version_id: Option<String>,
+        appended_segments: Vec<ConversationSegmentRefV1>,
+    ) -> Result<Self, SessionCoordinationValidationError> {
+        Self::new_with_mode(
+            key,
+            parent_manifest_root,
+            completed_turn,
+            journal_event_seq,
+            conversation_seq,
+            compaction_generation,
+            config_version_id,
+            false,
+            appended_segments,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_replacement(
+        key: SessionKeyV1,
+        parent_manifest_root: Option<String>,
+        completed_turn: u32,
+        journal_event_seq: u64,
+        conversation_seq: u64,
+        compaction_generation: u64,
+        config_version_id: Option<String>,
+        appended_segments: Vec<ConversationSegmentRefV1>,
+    ) -> Result<Self, SessionCoordinationValidationError> {
+        Self::new_with_mode(
+            key,
+            parent_manifest_root,
+            completed_turn,
+            journal_event_seq,
+            conversation_seq,
+            compaction_generation,
+            config_version_id,
+            true,
+            appended_segments,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_mode(
+        key: SessionKeyV1,
+        parent_manifest_root: Option<String>,
+        completed_turn: u32,
+        journal_event_seq: u64,
+        conversation_seq: u64,
+        compaction_generation: u64,
+        config_version_id: Option<String>,
+        replaces_history: bool,
         appended_segments: Vec<ConversationSegmentRefV1>,
     ) -> Result<Self, SessionCoordinationValidationError> {
         key.validate()?;
@@ -320,6 +375,7 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id.as_deref(),
+            replaces_history,
             &appended_segments,
         );
         Ok(Self {
@@ -331,6 +387,7 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id,
+            replaces_history,
             appended_segments,
             manifest_root,
         })
@@ -353,7 +410,7 @@ impl ContextManifestNodeV1 {
     }
 
     pub fn validate(&self) -> Result<(), SessionCoordinationValidationError> {
-        let expected = Self::new(
+        let expected = Self::new_with_mode(
             self.key.clone(),
             self.parent_manifest_root.clone(),
             self.completed_turn,
@@ -361,6 +418,7 @@ impl ContextManifestNodeV1 {
             self.conversation_seq,
             self.compaction_generation,
             self.config_version_id.clone(),
+            self.replaces_history,
             self.appended_segments.clone(),
         )?;
         if expected.manifest_root != self.manifest_root {
@@ -508,6 +566,14 @@ impl ConversationAuthorityEnvelopeV1 {
 
 /// Changed logical groups and deterministic cursor coordinates for one turn.
 /// The coordinator derives the new root; callers cannot choose it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CanonicalDeltaModeV1 {
+    #[default]
+    Append,
+    Replace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CanonicalTurnDeltaV1 {
     pub schema_version: u32,
@@ -517,7 +583,17 @@ pub struct CanonicalTurnDeltaV1 {
     pub compaction_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_append_delta")]
+    pub mode: CanonicalDeltaModeV1,
     pub logical_segments: Vec<Vec<Value>>,
+}
+
+fn is_append_delta(mode: &CanonicalDeltaModeV1) -> bool {
+    *mode == CanonicalDeltaModeV1::Append
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CanonicalTurnDeltaV1 {
@@ -643,10 +719,14 @@ fn manifest_hash(
     conversation_seq: u64,
     compaction_generation: u64,
     config_version_id: Option<&str>,
+    replaces_history: bool,
     segments: &[ConversationSegmentRefV1],
 ) -> String {
     let mut digest = Sha256::new();
     digest.update(MANIFEST_HASH_DOMAIN);
+    if replaces_history {
+        digest.update(REPLACEMENT_MANIFEST_MARKER);
+    }
     hash_field(&mut digest, key.isolation_domain.as_bytes());
     hash_field(&mut digest, key.owner_user_id.as_bytes());
     hash_field(&mut digest, key.session_id.as_bytes());

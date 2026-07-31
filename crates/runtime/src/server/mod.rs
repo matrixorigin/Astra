@@ -277,6 +277,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         ));
         bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
             pool.clone(),
+            state.session_fork_coordinator.clone(),
             bg_cancel.clone(),
         ));
         // Spawn background cleanup-debt retry task

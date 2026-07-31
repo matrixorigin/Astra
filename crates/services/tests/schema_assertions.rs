@@ -1258,8 +1258,25 @@ async fn phase1_run_durability_schema_contract() {
         ],
         "manifest lookup must carry complete owner/session/branch identity"
     );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "conversation_manifest_segments").await,
+        [
+            "isolation_domain",
+            "owner_user_id",
+            "session_id",
+            "branch_id",
+            "manifest_root",
+            "segment_position"
+        ],
+        "segment reachability must be indexed by the immutable manifest identity"
+    );
     let manifest_nodes = column_names(&pool, &schema, "conversation_manifest_nodes").await;
-    for expected in ["total_canonical_bytes", "total_message_count", "reachable"] {
+    for expected in [
+        "total_canonical_bytes",
+        "total_message_count",
+        "reachable",
+        "compaction_generation",
+    ] {
         assert!(
             manifest_nodes.iter().any(|column| column == expected),
             "conversation_manifest_nodes missing O(1) retained-fork coordinate {expected}"

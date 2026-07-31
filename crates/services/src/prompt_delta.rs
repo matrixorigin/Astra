@@ -576,7 +576,7 @@ pub async fn load_latest_prompt_observability_for_run(
         "SELECT request_id, request_hash, message_count, tool_count, summary_json
          FROM prompt_request_records
          WHERE user_id = ? AND run_id = ?
-         ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
+         ORDER BY turn DESC, round DESC, attempt DESC, created_at DESC, request_id DESC
          LIMIT 1",
         user_id,
         run_id,
@@ -594,7 +594,7 @@ pub async fn load_latest_prompt_observability_for_session(
         "SELECT request_id, request_hash, message_count, tool_count, summary_json
          FROM prompt_request_records
          WHERE user_id = ? AND session_id = ?
-         ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
+         ORDER BY turn DESC, round DESC, attempt DESC, created_at DESC, request_id DESC
          LIMIT 1",
         user_id,
         session_id,
@@ -801,12 +801,23 @@ async fn load_previous_request(
         "SELECT request_id, provider, CAST(summary_json AS CHAR) AS summary_json
          FROM prompt_request_records
          WHERE user_id = ? AND session_id = ? AND source = ?
-         ORDER BY created_at DESC, turn DESC, round DESC, attempt DESC
+           AND (
+               turn < ?
+               OR (turn = ? AND round < ?)
+               OR (turn = ? AND round = ? AND attempt < ?)
+           )
+         ORDER BY turn DESC, round DESC, attempt DESC, created_at DESC, request_id DESC
          LIMIT 1",
     )
     .bind(&input.user_id)
     .bind(&input.session_id)
     .bind(&input.source)
+    .bind(i64::from(input.turn))
+    .bind(i64::from(input.turn))
+    .bind(i64::from(input.round))
+    .bind(i64::from(input.turn))
+    .bind(i64::from(input.round))
+    .bind(i64::from(input.attempt))
     .fetch_optional(pool)
     .await
     .map_err(|error| error.to_string())
@@ -834,8 +845,8 @@ async fn load_request_chunks(
          WHERE request.user_id = ? AND request.session_id = ? AND request.source = ?
          GROUP BY request.request_id, request.previous_request_id,
                   request.created_at, request.turn, request.round, request.attempt
-         ORDER BY request.created_at DESC, request.turn DESC,
-                  request.round DESC, request.attempt DESC
+         ORDER BY request.turn DESC, request.round DESC,
+                  request.attempt DESC, request.created_at DESC, request.request_id DESC
          LIMIT ?",
     )
     .bind(&input.user_id)

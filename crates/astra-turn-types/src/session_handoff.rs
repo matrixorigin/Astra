@@ -148,8 +148,12 @@ impl ManifestDeltaV1 {
                         .as_ref()
                         .map(|prefix| prefix.parent_manifest_root.as_str())
                 });
-                for node in &self.missing_nodes {
-                    if node.parent_manifest_root.as_deref() != expected_parent {
+                for (index, node) in self.missing_nodes.iter().enumerate() {
+                    let replacement_from_empty =
+                        index == 0 && expected_parent.is_none() && node.replaces_history;
+                    if !replacement_from_empty
+                        && node.parent_manifest_root.as_deref() != expected_parent
+                    {
                         return Err(SessionHandoffValidationError::InvalidManifestDelta);
                     }
                     expected_parent = Some(node.manifest_root.as_str());
@@ -313,6 +317,9 @@ pub struct SessionHandoffRecordV1 {
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_detail: Option<String>,
+    /// Exact operation state interrupted by `Blocked`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_from: Option<SessionHandoffStateV1>,
     pub deadline_unix_ms: i64,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
@@ -346,6 +353,8 @@ impl SessionHandoffRecordV1 {
         if self.transition_seq == 0
             || self.deadline_unix_ms <= self.created_at_unix_ms
             || self.updated_at_unix_ms < self.created_at_unix_ms
+            || (self.state != SessionHandoffStateV1::Blocked && self.blocked_from.is_some())
+            || self.blocked_from == Some(SessionHandoffStateV1::Blocked)
         {
             return Err(SessionHandoffValidationError::InvalidCoordinate);
         }
@@ -368,7 +377,10 @@ impl SessionHandoffRecordV1 {
         if self.state != expected {
             return Err(SessionHandoffValidationError::StateConflict);
         }
-        if !valid_transition(self.mode, expected, next) {
+        let resumes_blocked_operation = expected == SessionHandoffStateV1::Blocked
+            && (self.blocked_from == Some(next)
+                || (self.blocked_from.is_none() && next == SessionHandoffStateV1::Validating));
+        if !resumes_blocked_operation && !valid_transition(self.mode, expected, next) {
             return Err(SessionHandoffValidationError::InvalidTransition {
                 from: expected,
                 to: next,
@@ -376,6 +388,11 @@ impl SessionHandoffRecordV1 {
         }
         if now_unix_ms < self.updated_at_unix_ms {
             return Err(SessionHandoffValidationError::InvalidCoordinate);
+        }
+        if next == SessionHandoffStateV1::Blocked {
+            self.blocked_from = Some(expected);
+        } else if expected == SessionHandoffStateV1::Blocked {
+            self.blocked_from = None;
         }
         self.state = next;
         self.updated_at_unix_ms = now_unix_ms;
@@ -393,6 +410,9 @@ pub fn valid_transition(
     to: SessionHandoffStateV1,
 ) -> bool {
     use SessionHandoffStateV1 as State;
+    if from == to {
+        return false;
+    }
     if matches!(to, State::Blocked | State::Aborted)
         && !matches!(from, State::Active | State::Aborted)
     {
@@ -405,7 +425,6 @@ pub fn valid_transition(
             | (_, State::Fenced, State::Hydrating)
             | (_, State::Hydrating, State::Active)
             | (_, State::NeedsReconciliation, State::Fencing)
-            | (_, State::Blocked, State::Validating)
             | (
                 SessionHandoffModeV1::Graceful,
                 State::Validating,
@@ -534,6 +553,7 @@ mod tests {
             },
             reason: "move".into(),
             status_detail: None,
+            blocked_from: None,
             deadline_unix_ms: 10_000,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 1_000,
@@ -601,6 +621,49 @@ mod tests {
         }
         assert!(handoff.state.is_terminal());
         assert_eq!(handoff.transition_seq, 8);
+    }
+
+    #[test]
+    fn blocked_retry_resumes_the_exact_interrupted_operation() {
+        let mut fencing = record(SessionHandoffModeV1::Forced);
+        fencing
+            .transition(
+                SessionHandoffStateV1::Requested,
+                SessionHandoffStateV1::Validating,
+                1_001,
+            )
+            .unwrap();
+        fencing
+            .transition(
+                SessionHandoffStateV1::Validating,
+                SessionHandoffStateV1::Fencing,
+                1_002,
+            )
+            .unwrap();
+        fencing
+            .transition(
+                SessionHandoffStateV1::Fencing,
+                SessionHandoffStateV1::Blocked,
+                1_003,
+            )
+            .unwrap();
+        assert_eq!(fencing.blocked_from, Some(SessionHandoffStateV1::Fencing));
+        assert!(matches!(
+            fencing.transition(
+                SessionHandoffStateV1::Blocked,
+                SessionHandoffStateV1::Validating,
+                1_004,
+            ),
+            Err(SessionHandoffValidationError::InvalidTransition { .. })
+        ));
+        fencing
+            .transition(
+                SessionHandoffStateV1::Blocked,
+                SessionHandoffStateV1::Fencing,
+                1_004,
+            )
+            .unwrap();
+        assert_eq!(fencing.blocked_from, None);
     }
 
     #[test]

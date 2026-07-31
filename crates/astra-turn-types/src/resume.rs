@@ -4,7 +4,8 @@ use thiserror::Error;
 
 use crate::{
     CONVERSATION_PROJECTION_SCHEMA_VERSION, DEFAULT_CONVERSATION_BRANCH_ID,
-    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
+    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SESSION_CURSOR_SCHEMA_VERSION,
+    SessionCursorV1, canonical_conversation_root,
 };
 
 pub const CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -307,6 +308,10 @@ pub struct ResumeCandidateV1 {
     pub source: ResumeSourceV1,
     pub cursor: SessionCursorV1,
     pub conversation_messages: Vec<Value>,
+    /// Content identity for projections whose cursor root identifies a
+    /// manifest rather than the flattened message vector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_conversation_root_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_reasons: Vec<ResumeDegradedReasonV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -317,7 +322,12 @@ pub struct ResumeCandidateV1 {
 
 impl ResumeCandidateV1 {
     pub fn validates_root(&self) -> bool {
-        canonical_conversation_root(&self.conversation_messages) == self.cursor.canonical_root_hash
+        validates_materialized_root(
+            self.source,
+            &self.cursor,
+            &self.conversation_messages,
+            self.materialized_conversation_root_hash.as_deref(),
+        )
     }
 
     pub fn descriptor(&self) -> ResumeDescriptorV1 {
@@ -357,6 +367,8 @@ pub struct ResumeBundleV1 {
     pub cursor: SessionCursorV1,
     pub source: ResumeSourceV1,
     pub conversation_messages: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materialized_conversation_root_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_reasons: Vec<ResumeDegradedReasonV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -371,7 +383,12 @@ impl ResumeBundleV1 {
     }
 
     pub fn validates_root(&self) -> bool {
-        canonical_conversation_root(&self.conversation_messages) == self.cursor.canonical_root_hash
+        validates_materialized_root(
+            self.source,
+            &self.cursor,
+            &self.conversation_messages,
+            self.materialized_conversation_root_hash.as_deref(),
+        )
     }
 
     pub fn descriptor(&self) -> ResumeDescriptorV1 {
@@ -429,7 +446,9 @@ fn validate_cursor_schema(cursor: &SessionCursorV1) -> Result<(), ResumeSelectio
             cursor.schema_version,
         ));
     }
-    if cursor.projection_schema != CONVERSATION_PROJECTION_SCHEMA_VERSION {
+    if cursor.projection_schema != CONVERSATION_PROJECTION_SCHEMA_VERSION
+        && cursor.projection_schema != SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
+    {
         return Err(ResumeSelectionError::UnsupportedProjectionSchema(
             cursor.projection_schema,
         ));
@@ -572,10 +591,27 @@ pub fn select_resume_bundle(
         cursor,
         source: selected.source,
         conversation_messages: selected.conversation_messages,
+        materialized_conversation_root_hash: selected.materialized_conversation_root_hash,
         degraded_reasons: selected.degraded_reasons,
         repair_actions: selected.repair_actions,
         projections: selected.projections,
     })
+}
+
+fn validates_materialized_root(
+    source: ResumeSourceV1,
+    cursor: &SessionCursorV1,
+    messages: &[Value],
+    materialized_root: Option<&str>,
+) -> bool {
+    let root = canonical_conversation_root(messages);
+    match cursor.projection_schema {
+        0 | CONVERSATION_PROJECTION_SCHEMA_VERSION => root == cursor.canonical_root_hash,
+        SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION => {
+            source == ResumeSourceV1::CanonicalJournal && materialized_root == Some(root.as_str())
+        }
+        _ => false,
+    }
 }
 
 pub fn legacy_resume_cursor(
@@ -627,6 +663,7 @@ mod tests {
             source,
             cursor: cursor(seq, &canonical_conversation_root(&messages)),
             conversation_messages: messages,
+            materialized_conversation_root_hash: None,
             degraded_reasons: Vec::new(),
             repair_actions: Vec::new(),
             projections: ResumeProjectionSetV1::default(),
@@ -641,6 +678,34 @@ mod tests {
         let selected = select_resume_bundle(Some(&head), [unrelated, canonical]).unwrap();
         assert_eq!(selected.source, ResumeSourceV1::CanonicalJournal);
         assert_eq!(selected.cursor, head);
+    }
+
+    #[test]
+    fn segmented_canonical_resume_verifies_materialized_content_separately_from_manifest_identity()
+    {
+        let messages = vec![json!({"role": "user", "content": "canonical"})];
+        let content_root = canonical_conversation_root(&messages);
+        let mut manifest_cursor = cursor(2, &"a".repeat(64));
+        manifest_cursor.projection_schema = SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION;
+        let candidate = ResumeCandidateV1 {
+            source: ResumeSourceV1::CanonicalJournal,
+            cursor: manifest_cursor.clone(),
+            conversation_messages: messages.clone(),
+            materialized_conversation_root_hash: Some(content_root),
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: ResumeProjectionSetV1::default(),
+        };
+
+        let selected = select_resume_bundle(Some(&manifest_cursor), [candidate.clone()]).unwrap();
+        assert!(selected.validates_root());
+
+        let mut missing_proof = candidate;
+        missing_proof.materialized_conversation_root_hash = None;
+        assert_eq!(
+            select_resume_bundle(Some(&manifest_cursor), [missing_proof]),
+            Err(ResumeSelectionError::NoCandidate)
+        );
     }
 
     #[test]
@@ -682,6 +747,7 @@ mod tests {
             source: ResumeSourceV1::Checkpoint,
             cursor: legacy_resume_cursor("owner", "session", 7, &messages),
             conversation_messages: messages,
+            materialized_conversation_root_hash: None,
             degraded_reasons: vec![
                 ResumeDegradedReasonV1::LegacyCursorUnknown,
                 ResumeDegradedReasonV1::CheckpointFallback,
