@@ -12565,9 +12565,14 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut buf);
         let pane_text = crate::tui::testing::render::buffer_to_string(&buf);
+        assert!(bottom_pane.footer.is_turn_active);
         assert!(
-            pane_text.contains("Enter queues") && pane_text.contains("Ctrl+C stops"),
-            "active-turn composer feedback missing: {pane_text:?}"
+            pane_text.contains("Message Astra"),
+            "dispatch feedback must not displace the composer: {pane_text:?}"
+        );
+        assert!(
+            !pane_text.contains("Enter queues") && !pane_text.contains("Ctrl+C stops"),
+            "the status indicator owns dispatch feedback; the composer must stay free of duplicate key chrome: {pane_text:?}"
         );
 
         finish_submission_feedback(&mut bottom_pane, &mut indicator);
@@ -12576,6 +12581,7 @@ mod tests {
             status_indicator::IndicatorState::Idle
         ));
         assert!(indicator.render_at(at).is_none());
+        assert!(!bottom_pane.footer.is_turn_active);
 
         let mut settled = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut settled);
@@ -12592,6 +12598,7 @@ mod tests {
             indicator.state(),
             status_indicator::IndicatorState::Idle
         ));
+        assert!(!bottom_pane.footer.is_turn_active);
         let mut after_late_progress = ratatui::buffer::Buffer::empty(area);
         bottom_pane.render(area, &mut after_late_progress);
         let after_late_progress =
