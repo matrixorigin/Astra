@@ -23,6 +23,7 @@ use crate::lock_recovery::LockRecovery;
 use astra_services::session_journal::ToolCallRecord;
 use astra_services::session_journal::{JournalEvent, JournalEventType};
 use astra_turn_core::context_assembly_trace::ContextAssemblyTrace;
+use crossterm::style::Stylize;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 
@@ -5852,6 +5853,7 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut output_settled_at: Option<std::time::Instant> = None;
+                                    let mut exit_after_turn_settlement = false;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     // Phase 3b.3c: prime the bash detach slot for this
                                     // turn. The bash runner takes the handle on entry;
@@ -6182,12 +6184,32 @@ pub(crate) async fn run_tui_session(
                                                                     BottomPaneAction::SubmitInput(queued_text) => {
                                                                         match slash_dispatch::immediate_control(&queued_text) {
                                                                             Some(slash_dispatch::ImmediateControl::Exit) => {
-                                                                                // `/exit` is a workbench lifecycle command in every
-                                                                                // turn phase. Cancel the in-flight local boundary and
-                                                                                // leave through the regular shutdown path; never queue
-                                                                                // it as model guidance or a follow-up user message.
-                                                                                tui_cancel_token.cancel();
-                                                                                break 'main Ok(());
+                                                                                // Exit is a lifecycle intent, not permission to drop a
+                                                                                // visible-but-not-yet-durable turn. If generation is
+                                                                                // still active, request its normal cancellation; in both
+                                                                                // cases keep polling the turn future until settlement has
+                                                                                // rebound/persisted the session, then leave the main loop.
+                                                                                if !exit_after_turn_settlement {
+                                                                                    exit_after_turn_settlement = true;
+                                                                                    if output_settled_at.is_none() {
+                                                                                        request_active_run_cancel(
+                                                                                            &mut chat_widget,
+                                                                                            &mut bottom_pane,
+                                                                                            &mut status_indicator,
+                                                                                            &mut cancel_control_tasks,
+                                                                                            task_service_for_cancel.as_ref(),
+                                                                                            &preinstalled_run_control,
+                                                                                            &tui_cancel_token,
+                                                                                        );
+                                                                                        interrupt_pending = true;
+                                                                                        bottom_pane.interrupt_pending = true;
+                                                                                    }
+                                                                                    let now = std::time::Instant::now();
+                                                                                    bottom_pane.set_task_status(TaskStatus::Exiting);
+                                                                                    status_indicator.begin_exit(now);
+                                                                                    frame_requester.schedule_frame();
+                                                                                }
+                                                                                continue;
                                                                             }
                                                                             Some(slash_dispatch::ImmediateControl::StopCurrentRun) => {
                                                                                 if output_settled_at.is_some() {
@@ -7282,7 +7304,9 @@ pub(crate) async fn run_tui_session(
                                     let unapplied_user_intents =
                                         bottom_pane.take_unapplied_user_intents();
                                     let should_start_followups =
-                                        turn_result.is_ok() && !state.last_turn_interrupted;
+                                        turn_result.is_ok()
+                                            && !state.last_turn_interrupted
+                                            && !exit_after_turn_settlement;
                                     if interrupt_pending {
                                         interrupt_pending = false;
                                         bottom_pane.interrupt_pending = false;
@@ -7433,6 +7457,10 @@ pub(crate) async fn run_tui_session(
                                     // possibly TurnSummary + SystemError) to
                                     // scrollback in one shot.
                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
+
+                                    if exit_after_turn_settlement {
+                                        break 'main turn_result;
+                                    }
 
                                     let new_tok = std::sync::Arc::new(
                                         session_shutdown_token.child_token(),
@@ -8539,6 +8567,34 @@ pub(crate) async fn run_tui_session(
             }
         }
     };
+    // A graceful exit can spend time settling journals, background workers,
+    // and session memory. Render that accepted lifecycle state before any of
+    // those waits so the terminal never appears unresponsive.
+    if result.is_ok() {
+        let now = std::time::Instant::now();
+        bottom_pane.set_task_status(TaskStatus::Exiting);
+        status_indicator.begin_exit(now);
+        let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+        let frame = active_viewport(
+            &chat_widget,
+            &status_indicator,
+            Some(&*task_board),
+            board_expanded,
+            board_user_pin,
+            width,
+            guard.terminal.size().map(|size| size.height).unwrap_or(24),
+        );
+        board_expanded = frame.resolved_board_expanded;
+        let _ = do_draw(
+            &mut guard,
+            frame.active,
+            frame.multi_agent,
+            &mut bottom_pane,
+            Some((&*task_board, board_expanded)),
+            frame.task_board,
+        );
+    }
+
     let shutdown_signal = if session_shutdown_token.is_cancelled() {
         match (&mut shutdown_monitor).await {
             Ok(signal) => Some(signal),
@@ -8553,6 +8609,13 @@ pub(crate) async fn run_tui_session(
         None
     };
     let signal_driven_shutdown = shutdown_signal.is_some();
+    let exit_reason = match (result.is_err(), shutdown_signal) {
+        (true, _) => crate::cli::session::session_cleanup::SessionExit::Error,
+        (false, Some(signal)) => {
+            crate::cli::session::session_cleanup::SessionExit::Shutdown(signal)
+        }
+        (false, None) => crate::cli::session::session_cleanup::SessionExit::Command,
+    };
     if let Some(signal) = shutdown_signal {
         tracing::info!(
             signal = signal.label(),
@@ -8639,6 +8702,13 @@ pub(crate) async fn run_tui_session(
     );
     let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
     flush_chat_widget(&mut guard, &mut chat_widget, width);
+    // Capture before finalization: process-local cleanup may release the live
+    // identity, while the copyable command must name the durable session that
+    // was just committed.
+    let resume_hint = crate::cli::session::session_cleanup::resume_hint_for_exit(
+        exit_reason,
+        state.session_id.as_deref(),
+    );
     let finalization_budget = if signal_driven_shutdown {
         Duration::from_secs(2)
     } else {
@@ -8666,6 +8736,10 @@ pub(crate) async fn run_tui_session(
     // turn/agent work has stopped so no consumer outlives its provider.
     drop(pipeline_modules);
     drop(guard);
+    if let Some((label, command)) = resume_hint {
+        println!("{}", label.dim());
+        println!("  {}", command.cyan());
+    }
     result
 }
 

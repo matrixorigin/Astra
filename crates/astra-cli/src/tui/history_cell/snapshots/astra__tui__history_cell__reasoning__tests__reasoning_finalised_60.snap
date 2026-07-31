@@ -1,6 +1,5 @@
 ---
 source: crates/astra-cli/src/tui/history_cell/reasoning.rs
-assertion_line: 558
 expression: "render(&c, 60, 4)"
 ---
-Thought · 3s · 2 lines · 10 tokens
+● Thought · 3s · 2 lines · 10 tokens

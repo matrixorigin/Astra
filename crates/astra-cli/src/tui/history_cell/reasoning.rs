@@ -3,7 +3,7 @@
 //!
 //! While streaming: a fixed-height scrolling preview window so the
 //! composer stays visible. After completion: collapses to a one-line
-//! header (`Thought · Xs · N lines · N tokens`) — not a framed window or
+//! header (`● Thought · Xs · N lines · N tokens`) — not a framed window or
 //! expanding pill. A reasoning cell is just another cell in the
 //! scrollback; toggle visibility lives in ChatWidget, not here.
 //!
@@ -144,12 +144,15 @@ impl ReasoningCell {
             .duration_label()
             .map(|d| format!(" · {d} · {line_label} · {tok_label}"))
             .unwrap_or_else(|| format!(" · {line_label} · {tok_label}"));
-        // The normal conversation projection has no tree affordance: a
-        // leading bullet made a collapsed Thought sit two columns to the
-        // right of adjacent assistant content. The transcript navigator keeps
-        // an arrow only when the item is actually interactive.
+        // The live viewport already has a two-column `█ ` gutter. Once this
+        // cell freezes into ordinary scrollback, `● ` takes over those two
+        // columns so the title stays fixed in the same terminal column. The
+        // transcript navigator replaces that marker with its interactive
+        // disclosure arrow.
         let marker = if transcript && self.has_transcript_details(width) {
             if expanded { "▼ " } else { "▶ " }
+        } else if !self.live {
+            "● "
         } else {
             ""
         };
@@ -372,16 +375,27 @@ mod tests {
     }
 
     #[test]
-    fn normal_header_has_no_decorative_bullet() {
+    fn live_header_has_no_inner_marker_and_frozen_header_has_terminal_marker() {
         let mut c = ReasoningCell::new_streaming();
         c.push_delta("analysis");
-        let out = render(&c, 60, 3);
-        let header = out.lines().next().unwrap_or_default();
+        let live = render(&c, 60, 3);
+        let header = live.lines().next().unwrap_or_default();
         assert!(
             header.starts_with("Thought"),
-            "misaligned header: {header:?}"
+            "live gutter owns the marker: {header:?}"
         );
-        assert!(!header.contains("• Thought"));
+        assert!(!header.contains("● Thought"));
+
+        c.finalize();
+        let frozen = render(&c, 60, 3);
+        assert!(
+            frozen
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("● Thought"),
+            "frozen row needs its terminal marker: {frozen:?}"
+        );
     }
 
     #[test]
@@ -460,7 +474,7 @@ mod tests {
     #[test]
     fn finalised_cell_hides_body_and_shows_line_and_token_count() {
         // Once thinking is done, scrollback shows only the compact
-        // header `Thought · Xs · N lines · N tokens` — not the 20-40 row
+        // header `● Thought · Xs · N lines · N tokens` — not the 20-40 row
         // dim wall. The count cues the user that there's
         // substance behind the header without dumping it on-screen.
         // (The full text stays in the JSONL transcript for later.)

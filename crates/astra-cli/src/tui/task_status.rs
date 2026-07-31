@@ -5,9 +5,19 @@ pub(crate) enum TaskStatus {
     Idle,
     Dispatching,
     Cancelling,
-    TurnRunning { started_at: Instant },
-    ToolExecuting { name: String, started_at: Instant },
-    WaitingApproval { tool: String },
+    /// The workbench accepted an exit request and is converging durable
+    /// session state before restoring the terminal.
+    Exiting,
+    TurnRunning {
+        started_at: Instant,
+    },
+    ToolExecuting {
+        name: String,
+        started_at: Instant,
+    },
+    WaitingApproval {
+        tool: String,
+    },
     WaitingModel,
 }
 
@@ -29,6 +39,7 @@ impl TaskStatus {
             TaskStatus::Idle => "",
             TaskStatus::Dispatching => "Sending",
             TaskStatus::Cancelling => "Stopping",
+            TaskStatus::Exiting => "Stopping",
             TaskStatus::TurnRunning { .. } => "Thinking",
             TaskStatus::ToolExecuting { .. } => "Running tool",
             TaskStatus::WaitingApproval { .. } => "Awaiting approval",
@@ -41,6 +52,7 @@ impl TaskStatus {
             TaskStatus::Idle => None,
             TaskStatus::Dispatching => Some("Sending".to_string()),
             TaskStatus::Cancelling => Some("Stopping".to_string()),
+            TaskStatus::Exiting => Some("Stopping".to_string()),
             TaskStatus::TurnRunning { .. } => Some("Thinking".to_string()),
             TaskStatus::ToolExecuting { name, .. } => Some(format!("Running {name}")),
             TaskStatus::WaitingApproval { tool } => {
@@ -87,6 +99,14 @@ mod tests {
     #[test]
     fn cancelling_replaces_the_running_objective() {
         let status = TaskStatus::Cancelling;
+        assert!(status.is_active());
+        assert_eq!(status.display_label(), "Stopping");
+        assert_eq!(status.objective_label().as_deref(), Some("Stopping"));
+    }
+
+    #[test]
+    fn exiting_is_an_active_stopping_boundary() {
+        let status = TaskStatus::Exiting;
         assert!(status.is_active());
         assert_eq!(status.display_label(), "Stopping");
         assert_eq!(status.objective_label().as_deref(), Some("Stopping"));

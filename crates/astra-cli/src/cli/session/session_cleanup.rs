@@ -55,20 +55,21 @@ pub(crate) async fn finalize_session_exit(
     profile: Option<&str>,
     reason: SessionExit,
 ) {
+    // Finalization is allowed to release process-local session state. Capture
+    // the durable identity first so exit UX and EOF profile cleanup do not
+    // depend on mutation order inside the finalizer.
+    let session_id = state.session_id.clone();
+    let resume_hint = resume_hint_for_exit(reason, session_id.as_deref());
     finalize_session(state).await;
 
-    if should_show_resume_hint(reason)
-        && state.turn > 0
-        && let Some(ref sid) = state.session_id
-    {
-        let (label, command) = resume_hint_lines(sid);
+    if let Some((label, command)) = resume_hint {
         eprintln!();
         eprintln!("{}", format!("  {label}").dim());
         eprintln!("{}", format!("    {command}").cyan());
     }
 
     if should_clear_last_session_id(reason)
-        && let Some(ref session_id) = state.session_id
+        && let Some(ref session_id) = session_id
     {
         clear_profile_last_session_if_matches_or_warn(
             profile,
@@ -84,11 +85,27 @@ fn should_show_resume_hint(reason: SessionExit) -> bool {
     !matches!(reason, SessionExit::Error)
 }
 
-fn resume_hint_lines(session_id: &str) -> (String, String) {
-    (
+pub(crate) fn resume_hint_for_exit(
+    reason: SessionExit,
+    session_id: Option<&str>,
+) -> Option<(String, String)> {
+    if !should_show_resume_hint(reason) {
+        return None;
+    }
+    let session_id = session_id.filter(|id| !id.is_empty())?;
+    session_journal::validate_session_id(session_id).ok()?;
+    let session_argument = if session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        session_id.to_string()
+    } else {
+        crate::edge_tools::shell_escape(session_id)
+    };
+    Some((
         "Resume this session with:".to_string(),
-        format!("/resume {session_id}"),
-    )
+        format!("astra --resume {session_argument}"),
+    ))
 }
 
 fn should_clear_last_session_id(reason: SessionExit) -> bool {
@@ -389,7 +406,7 @@ pub(crate) fn shutdown_session_facts(state: &SessionState) -> astra_runtime::Ses
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionExit, finalize_session_exit, resume_hint_lines, settle_memory_maintenance,
+        SessionExit, finalize_session_exit, resume_hint_for_exit, settle_memory_maintenance,
         should_clear_last_session_id, should_show_resume_hint, shutdown_session_facts,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -464,9 +481,32 @@ mod tests {
 
     #[test]
     fn resume_hint_prints_copyable_resume_command() {
-        let (label, command) = resume_hint_lines("1234-5678");
+        let (label, command) = resume_hint_for_exit(
+            SessionExit::Command,
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .expect("completed interactive session is resumable");
         assert_eq!(label, "Resume this session with:");
-        assert_eq!(command, "/resume 1234-5678");
+        assert_eq!(
+            command,
+            "astra --resume 550e8400-e29b-41d4-a716-446655440000"
+        );
+        assert_eq!(resume_hint_for_exit(SessionExit::Command, None), None);
+        assert_eq!(
+            resume_hint_for_exit(SessionExit::Command, Some(" session-1 ")),
+            Some((
+                "Resume this session with:".to_string(),
+                "astra --resume ' session-1 '".to_string(),
+            ))
+        );
+        assert_eq!(
+            resume_hint_for_exit(SessionExit::Error, Some("session-1")),
+            None
+        );
+        assert_eq!(
+            resume_hint_for_exit(SessionExit::Command, Some("../../unsafe")),
+            None
+        );
     }
 
     #[test]

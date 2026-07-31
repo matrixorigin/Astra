@@ -43,6 +43,9 @@ pub(crate) enum IndicatorState {
     /// A user stop request is visible locally while the run and any child
     /// control-plane updates converge on a terminal state.
     Cancelling { started_at: Instant },
+    /// The process is preserving the current turn and finalizing its session
+    /// before returning control to the shell.
+    Exiting { started_at: Instant },
     /// Turn is running, model is thinking / producing tokens.
     Thinking { started_at: Instant },
     /// Tool is executing mid-turn.
@@ -59,6 +62,7 @@ impl IndicatorState {
             IndicatorState::Idle => None,
             IndicatorState::Dispatching { started_at }
             | IndicatorState::Cancelling { started_at }
+            | IndicatorState::Exiting { started_at }
             | IndicatorState::Thinking { started_at }
             | IndicatorState::Tool { started_at, .. }
             | IndicatorState::WaitingModel { started_at }
@@ -123,12 +127,15 @@ impl StatusIndicator {
         // Stream events queued before Ctrl+C can arrive during shutdown. They
         // are progress evidence, not authority to revoke the user's cancel
         // intent, so keep Stopping monotonic until terminal settlement.
-        if matches!(self.state, IndicatorState::Cancelling { .. })
-            && !matches!(
-                state,
-                IndicatorState::Cancelling { .. } | IndicatorState::Idle
-            )
-        {
+        if matches!(
+            self.state,
+            IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
+        ) && !matches!(
+            state,
+            IndicatorState::Cancelling { .. }
+                | IndicatorState::Exiting { .. }
+                | IndicatorState::Idle
+        ) {
             return;
         }
         // The stream counter resets across state changes only when
@@ -150,7 +157,10 @@ impl StatusIndicator {
             self.stream_chars = 0;
             self.turn_started_at = None;
             self.turn_label = None;
-        } else if matches!(state, IndicatorState::Cancelling { .. }) {
+        } else if matches!(
+            state,
+            IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
+        ) {
             self.turn_label = Some("Stopping");
         }
         self.state = state;
@@ -179,6 +189,14 @@ impl StatusIndicator {
         self.turn_label = Some("Sending");
         self.stream_chars = 0;
         self.state = IndicatorState::Dispatching { started_at: at };
+    }
+
+    /// Project an accepted process-exit request immediately. Unlike
+    /// cancellation, this is also valid while idle, when no turn start exists.
+    pub fn begin_exit(&mut self, at: Instant) {
+        self.turn_started_at = Some(at);
+        self.turn_label = Some("Stopping");
+        self.state = IndicatorState::Exiting { started_at: at };
     }
 
     pub fn mark_dispatched(&mut self) {
@@ -255,6 +273,7 @@ fn render_for_with_bash_hint(
     let state_label: String = match state {
         IndicatorState::Dispatching { .. } => "Sending".into(),
         IndicatorState::Cancelling { .. } => "Stopping".into(),
+        IndicatorState::Exiting { .. } => "Stopping".into(),
         IndicatorState::Thinking { .. } => "Thinking".into(),
         IndicatorState::Tool { name, .. } => label_for_tool(name),
         IndicatorState::WaitingModel { .. } => "Starting".into(),
@@ -312,7 +331,7 @@ fn label_for_tool(name: &str) -> String {
 fn indicator_state_color(state: &IndicatorState, theme: &crate::tui::theme::Theme) -> Color {
     match state {
         IndicatorState::AwaitingApproval { .. } => theme.warn,
-        IndicatorState::Cancelling { .. } => theme.warn,
+        IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. } => theme.warn,
         IndicatorState::Dispatching { .. }
         | IndicatorState::Thinking { .. }
         | IndicatorState::Tool { .. }
@@ -353,7 +372,10 @@ fn suffix(
             crate::tui::background_shortcut::ctrl_b_background_shortcut()
         ));
     }
-    if !matches!(state, IndicatorState::Cancelling { .. }) {
+    if !matches!(
+        state,
+        IndicatorState::Cancelling { .. } | IndicatorState::Exiting { .. }
+    ) {
         parts.push("Ctrl+C to stop".into());
     }
     parts.join(" · ")
@@ -494,6 +516,22 @@ mod tests {
     fn idle_renders_none() {
         let s = StatusIndicator::new();
         assert!(s.render().is_none());
+    }
+
+    #[test]
+    fn exit_is_visible_without_an_active_turn() {
+        let mut indicator = StatusIndicator::new();
+        let started_at = Instant::now();
+
+        indicator.begin_exit(started_at);
+
+        let rendered = text_of(
+            &indicator
+                .render_at(started_at + Duration::from_secs(1))
+                .expect("accepted exit remains visible during finalization"),
+        );
+        assert!(rendered.contains("Stopping"), "{rendered}");
+        assert!(!rendered.contains("Ctrl+C to stop"), "{rendered}");
     }
 
     #[test]

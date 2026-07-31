@@ -124,12 +124,9 @@ impl Theme {
             // rows legible without turning the TUI into a stack of cards.
             selected_bg: Color::Rgb(31, 42, 55),
             selected_fg: Color::Rgb(231, 238, 248),
-            // Active work uses a vivid emerald gutter: it is a compact,
-            // high-salience execution marker rather than another panel.
-            // Settled output switches to a cool slate, not a dimmer green:
-            // colour must communicate terminal state at a glance, even in a
-            // peripheral transcript scan.
-            gutter: Color::Rgb(43, 220, 142),
+            // Live work gets a high-chroma violet signal distinct from both
+            // blue interactive focus and green completed output.
+            gutter: Color::Rgb(205, 132, 255),
             gutter_frozen: Color::Rgb(91, 115, 136),
             success: Color::Rgb(54, 226, 157),
             warn: Color::Rgb(244, 192, 102),
@@ -173,7 +170,7 @@ impl Theme {
             accent: Color::Rgb(39, 98, 149),
             selected_bg: Color::Rgb(226, 235, 243),
             selected_fg: Color::Rgb(23, 34, 45),
-            gutter: Color::Rgb(48, 117, 153),
+            gutter: Color::Rgb(126, 55, 190),
             gutter_frozen: Color::Rgb(89, 119, 139),
             success: Color::Rgb(33, 120, 101),
             warn: Color::Rgb(139, 100, 38),
@@ -206,15 +203,14 @@ impl Theme {
     /// an indexed colour the terminal can actually display.
     pub fn dark_256() -> Self {
         let mut theme = Self::quantize_256(Self::dark());
-        // The xterm cube has no genuinely low-saturation dark red/green
-        // surfaces: indices 22/52 turn a wide diff into solid green/red bars.
-        // Keep the *row* grouping on a quiet graphite surface and carry
-        // direction with the foreground plus the explicit +/- marker. This is
-        // an intentional capability fallback, not a second visual language.
+        // Preserve the product-level add/delete surfaces when truecolour is
+        // unavailable. 22/52 are the darkest useful green/red cells in the
+        // xterm cube; using one neutral graphite for both directions made a
+        // common xterm-256 session look as if diff backgrounds were missing.
         theme.diff_add_fg = Color::Indexed(115);
-        theme.diff_add_bg = Color::Indexed(234);
+        theme.diff_add_bg = Color::Indexed(22);
         theme.diff_del_fg = Color::Indexed(217);
-        theme.diff_del_bg = Color::Indexed(234);
+        theme.diff_del_bg = Color::Indexed(52);
         theme
     }
 
@@ -265,7 +261,7 @@ impl Theme {
         theme.accent = Color::LightBlue;
         theme.selected_bg = Color::DarkGray;
         theme.selected_fg = Color::White;
-        theme.gutter = Color::LightGreen;
+        theme.gutter = Color::LightMagenta;
         theme.gutter_frozen = Color::DarkGray;
         theme.success = Color::LightGreen;
         theme.warn = Color::Yellow;
@@ -280,14 +276,12 @@ impl Theme {
         theme.md_link = Color::Cyan;
         theme.md_blockquote = Color::LightGreen;
         theme.md_list_marker = Color::LightBlue;
-        // A genuine 16-colour palette cannot express a restrained tinted
-        // surface. Painting a complete row with `Green`/`Red` is much more
-        // disruptive than losing the tint, so degrade to a neutral surface
-        // while retaining direction in foreground and the +/- marker.
-        theme.diff_add_fg = Color::LightGreen;
-        theme.diff_add_bg = Color::Black;
-        theme.diff_del_fg = Color::LightRed;
-        theme.diff_del_bg = Color::Black;
+        // Even the smallest palette keeps add/delete as distinct surfaces;
+        // terminal-defined ANSI colours preserve user palette preferences.
+        theme.diff_add_fg = Color::Black;
+        theme.diff_add_bg = Color::Green;
+        theme.diff_del_fg = Color::White;
+        theme.diff_del_bg = Color::Red;
         theme.diff_hunk = Color::Cyan;
         theme.diff_context = Color::DarkGray;
         theme.stall_warn = Color::Yellow;
@@ -302,7 +296,7 @@ impl Theme {
         theme.accent = Color::Blue;
         theme.selected_bg = Color::Gray;
         theme.selected_fg = Color::Black;
-        theme.gutter = Color::LightGreen;
+        theme.gutter = Color::Magenta;
         theme.gutter_frozen = Color::DarkGray;
         theme.success = Color::LightGreen;
         theme.warn = Color::Yellow;
@@ -317,12 +311,12 @@ impl Theme {
         theme.md_link = Color::Blue;
         theme.md_blockquote = Color::LightGreen;
         theme.md_list_marker = Color::Blue;
-        // See `dark_ansi`: on a light 16-colour terminal the default-like
-        // neutral surface is white, with direction carried by readable text.
-        theme.diff_add_fg = Color::Green;
-        theme.diff_add_bg = Color::White;
-        theme.diff_del_fg = Color::Red;
-        theme.diff_del_bg = Color::White;
+        // See `dark_ansi`: direction remains a row-level surface rather than
+        // collapsing into coloured punctuation on limited terminals.
+        theme.diff_add_fg = Color::Black;
+        theme.diff_add_bg = Color::LightGreen;
+        theme.diff_del_fg = Color::Black;
+        theme.diff_del_bg = Color::LightRed;
         theme.diff_hunk = Color::Blue;
         theme.diff_context = Color::DarkGray;
         theme.stall_warn = Color::Yellow;
@@ -572,10 +566,10 @@ mod tests {
     }
 
     #[test]
-    fn indexed_theme_uses_quiet_edit_surfaces() {
+    fn indexed_theme_preserves_distinct_add_and_delete_surfaces() {
         let dark = Theme::dark_256();
-        assert_eq!(dark.diff_add_bg, Color::Indexed(234), "{dark:?}");
-        assert_eq!(dark.diff_del_bg, Color::Indexed(234), "{dark:?}");
+        assert_eq!(dark.diff_add_bg, Color::Indexed(22), "{dark:?}");
+        assert_eq!(dark.diff_del_bg, Color::Indexed(52), "{dark:?}");
         assert_ne!(dark.diff_add_fg, dark.diff_del_fg, "{dark:?}");
 
         for theme in [dark, Theme::light_256()] {
@@ -583,6 +577,7 @@ mod tests {
             assert!(matches!(theme.diff_del_bg, Color::Indexed(_)), "{theme:?}");
             assert_ne!(theme.diff_add_bg, Color::Reset, "{theme:?}");
             assert_ne!(theme.diff_del_bg, Color::Reset, "{theme:?}");
+            assert_ne!(theme.diff_add_bg, theme.diff_del_bg, "{theme:?}");
         }
     }
 
@@ -616,10 +611,11 @@ mod tests {
     }
 
     #[test]
-    fn dark_palette_uses_emerald_activity_and_reserves_red_for_failure() {
+    fn dark_palette_separates_live_activity_focus_success_and_failure() {
         let theme = Theme::dark();
         let (ar, ag, ab) = color_to_rgb(theme.accent);
         let (gr, gg, gb) = color_to_rgb(theme.gutter);
+        let (sr, sg, sb) = color_to_rgb(theme.success);
         let (er, eg, eb) = color_to_rgb(theme.error);
 
         assert!(
@@ -627,9 +623,15 @@ mod tests {
             "accent should read as a cool focus color: {theme:?}"
         );
         assert!(
-            gg > gr && gg > gb,
-            "live activity should use the high-salience emerald gutter: {theme:?}"
+            gr > gg && gb > gg,
+            "live activity should be a high-chroma violet signal: {theme:?}"
         );
+        assert_ne!(theme.gutter, theme.accent);
+        assert!(
+            sg > sr && sg > sb,
+            "completed success markers should remain emerald: {theme:?}"
+        );
+        assert_ne!(theme.gutter, theme.success);
         assert!(
             er > eg && er > eb,
             "only the error role should carry a warm failure hue: {theme:?}"
@@ -639,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_rows_stay_restrained_at_every_terminal_color_level() {
+    fn diff_rows_keep_readable_semantic_surfaces_at_every_color_level() {
         let dark = Theme::dark();
         let (_, add_g, _) = color_to_rgb(dark.diff_add_bg);
         let (del_r, _, _) = color_to_rgb(dark.diff_del_bg);
@@ -653,16 +655,16 @@ mod tests {
         );
 
         let dark_ansi = Theme::dark_ansi();
-        assert_eq!(dark_ansi.diff_add_bg, Color::Black);
-        assert_eq!(dark_ansi.diff_del_bg, Color::Black);
-        assert_eq!(dark_ansi.diff_add_fg, Color::LightGreen);
-        assert_eq!(dark_ansi.diff_del_fg, Color::LightRed);
+        assert_eq!(dark_ansi.diff_add_bg, Color::Green);
+        assert_eq!(dark_ansi.diff_del_bg, Color::Red);
+        assert_eq!(dark_ansi.diff_add_fg, Color::Black);
+        assert_eq!(dark_ansi.diff_del_fg, Color::White);
 
         let light_ansi = Theme::light_ansi();
-        assert_eq!(light_ansi.diff_add_bg, Color::White);
-        assert_eq!(light_ansi.diff_del_bg, Color::White);
-        assert_eq!(light_ansi.diff_add_fg, Color::Green);
-        assert_eq!(light_ansi.diff_del_fg, Color::Red);
+        assert_eq!(light_ansi.diff_add_bg, Color::LightGreen);
+        assert_eq!(light_ansi.diff_del_bg, Color::LightRed);
+        assert_eq!(light_ansi.diff_add_fg, Color::Black);
+        assert_eq!(light_ansi.diff_del_fg, Color::Black);
     }
 
     #[test]

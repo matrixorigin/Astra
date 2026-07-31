@@ -106,6 +106,7 @@ mod shell;
 use astra_tools::env_tools;
 use astra_tools::schemas::all_tool_schemas as full_tool_schemas;
 pub use env_tools::apply_overlay as apply_env_overlay;
+pub(crate) use shell::shell_escape;
 #[path = "edge_tools/code_analysis.rs"]
 mod code_analysis;
 #[path = "edge_tools/config_tool.rs"]

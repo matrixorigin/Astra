@@ -171,6 +171,7 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
             TaskStatus::Cancelling => {
                 "Stopping current run · guidance returns to composer".to_string()
             }
+            TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
             TaskStatus::Idle | TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
                 "Queued for current run · applies at next model boundary".to_string()
             }
@@ -475,9 +476,13 @@ impl BottomPane {
         // events already queued before Ctrl+C may still arrive, but they do
         // not revoke the user's stop intent. Only terminal settlement may
         // return the pane to Idle.
-        if matches!(self.task_status, TaskStatus::Cancelling)
-            && !matches!(status, TaskStatus::Cancelling | TaskStatus::Idle)
-        {
+        if matches!(
+            self.task_status,
+            TaskStatus::Cancelling | TaskStatus::Exiting
+        ) && !matches!(
+            status,
+            TaskStatus::Cancelling | TaskStatus::Exiting | TaskStatus::Idle
+        ) {
             return;
         }
         let was_active = self.task_status.is_active();

@@ -2106,6 +2106,41 @@ mod multi_agent_strip_tests {
     }
 
     #[test]
+    fn live_and_frozen_thought_titles_render_in_the_same_terminal_column() {
+        use crate::tui::history_cell::{HistoryCell, reasoning::ReasoningCell};
+        use crate::tui::render::{line_utils::FullRowParagraph, renderable::Renderable};
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+
+        let area = Rect::new(0, 0, 60, 2);
+        let mut thought = ReasoningCell::new_streaming();
+        thought.push_delta("inspect the state");
+
+        let mut live_buffer = Buffer::empty(area);
+        LiveFramedCell {
+            lines: thought.display_lines(area.width.saturating_sub(2)),
+            live: true,
+        }
+        .render(area, &mut live_buffer);
+
+        thought.finalize();
+        let mut frozen_buffer = Buffer::empty(area);
+        Widget::render(
+            FullRowParagraph::new(thought.display_lines(area.width)),
+            area,
+            &mut frozen_buffer,
+        );
+
+        let title_column = |buffer: &Buffer| {
+            (area.x..area.right())
+                .find(|&x| buffer[(x, area.y)].symbol() == "T")
+                .expect("thought title must be rendered")
+        };
+        assert_eq!(live_buffer[(0, 0)].symbol(), "█");
+        assert_eq!(frozen_buffer[(0, 0)].symbol(), "●");
+        assert_eq!(title_column(&live_buffer), title_column(&frozen_buffer));
+    }
+
+    #[test]
     fn active_edit_diff_paints_the_entire_available_row_surface() {
         use crate::tui::history_cell::{
             HistoryCell,

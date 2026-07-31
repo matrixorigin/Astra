@@ -291,6 +291,7 @@ impl PtyAstra {
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(status) = self.child.try_wait().expect("poll Astra child") {
+                self.drain_output_after_exit();
                 return status;
             }
             assert!(
@@ -299,6 +300,22 @@ impl PtyAstra {
                 self.output_tail()
             );
             self.receive(Duration::from_millis(50));
+        }
+    }
+
+    fn drain_output_after_exit(&mut self) {
+        // Once the child has exited, PTY EOF is authoritative. Join the sole
+        // reader first, then consume every chunk it published; a wall-clock
+        // grace period can lose the final post-terminal resume line on a busy
+        // test host.
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .expect("join PTY output reader after child exit");
+        }
+        while let Ok(chunk) = self.output_rx.try_recv() {
+            self.screen.process(&chunk);
+            self.output.extend_from_slice(&chunk);
         }
     }
 
@@ -723,6 +740,31 @@ async fn ctrl_o_round_trip_preserves_composer_draft_in_a_real_pty() {
     astra.write(b"/exit\r");
     let status = astra.wait_for_exit(Duration::from_secs(10));
     assert!(status.success(), "Astra exit status: {status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exit_after_a_completed_turn_prints_a_copyable_resume_command() {
+    let _journey = pty_journey_lock().lock().await;
+    let mock = astra_cli::cli::mock_llm::MockLlmServer::start(
+        astra_cli::cli::mock_llm::MockScenario::Slow,
+    )
+    .await
+    .expect("start scripted LLM server");
+    let home = tempfile::tempdir().expect("temporary isolated Astra home");
+    seed_trusted_workspace(home.path());
+    let mut astra = PtyAstra::spawn(home.path(), &mock.base_url);
+
+    astra.wait_for("Message", Duration::from_secs(15));
+    astra.write(b"create_a_resumable_session\r");
+    astra.wait_for("successfully.", Duration::from_secs(10));
+    astra.write(b"/exit\r");
+
+    let status = astra.wait_for_exit(Duration::from_secs(10));
+    assert!(status.success(), "Astra exit status: {status}");
+    let output = astra.output_tail();
+    assert!(output.contains("Stopping"), "{output}");
+    assert!(output.contains("Resume this session with:"), "{output}");
+    assert!(output.contains("astra --resume mock-session"), "{output}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

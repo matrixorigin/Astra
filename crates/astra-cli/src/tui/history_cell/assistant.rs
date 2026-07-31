@@ -318,7 +318,10 @@ impl AssistantCell {
         let inner_width = (width as usize).saturating_sub(2).max(20);
         let (rendered, total) = self.markdown_layout_window(source, inner_width, start, maximum);
         let theme = crate::tui::theme::current();
-        let gutter_style = Style::default().fg(theme.gutter_frozen);
+        // A settled assistant response is a completed unit, so its guide uses
+        // the exact success colour of terminal `●` markers. Live responses
+        // use the distinct focus gutter supplied by `LiveFramedCell`.
+        let gutter_style = Style::default().fg(theme.success);
         let lines = rendered
             .into_iter()
             .map(|line| {
@@ -551,7 +554,7 @@ impl AssistantCell {
         }
 
         let theme = crate::tui::theme::current();
-        let gutter_style = Style::default().fg(theme.gutter_frozen);
+        let gutter_style = Style::default().fg(theme.success);
         rendered
             .into_iter()
             .map(|line| {
@@ -621,7 +624,7 @@ impl HistoryCell for AssistantCell {
 /// Collapsed one-line header shown in place of a `<think>` block
 /// once the closing tag has arrived.
 ///
-/// Example: `• Thought · 12 lines · 50 tokens`
+/// Example: `● Thought · 12 lines · 50 tokens`
 fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static>> {
     let theme = crate::tui::theme::current();
     let dim = Style::default().fg(theme.dim);
@@ -637,7 +640,7 @@ fn thought_header_lines(line_count: usize, token_count: u64) -> Vec<Line<'static
         format!("{token_count} tokens")
     };
     vec![Line::from(vec![
-        Span::styled("• ", dim),
+        Span::styled("● ", dim),
         thought_gradient("Thought", theme),
         Span::styled(" · ", stat),
         Span::styled(label, stat),
@@ -696,9 +699,10 @@ fn render_live_thinking(think_partial: &str, width: u16) -> Vec<Line<'static>> {
         format!("{token_count} tokens")
     };
 
-    // Header line: bold Thought with accent blend, then dim stats.
+    // The outer live gutter owns the activity marker. Keeping the inner
+    // header marker-free makes its title align with `● Thought` after the
+    // thinking segment freezes.
     let mut out = vec![Line::from(vec![
-        Span::styled("• ", dim),
         thought_gradient("Thought", theme),
         Span::styled(" · ", stat),
         Span::styled(line_label, stat),
@@ -854,6 +858,18 @@ mod tests {
         assert!(c.is_live());
         c.finalize();
         assert!(!c.is_live());
+    }
+
+    #[test]
+    fn settled_assistant_guide_matches_terminal_success_marker() {
+        let c = AssistantCell::from_markdown("done");
+        let lines = c.display_lines(40);
+        let guide = lines
+            .first()
+            .and_then(|line| line.spans.first())
+            .expect("settled assistant has a guide");
+        assert_eq!(guide.content.as_ref(), "█ ");
+        assert_eq!(guide.style.fg, Some(crate::tui::theme::current().success));
     }
 
     #[test]
@@ -1034,6 +1050,13 @@ mod tests {
             out.contains("Thought") && out.contains("2 lines") && out.contains("token"),
             "collapsed header missing: {out}"
         );
+        assert!(
+            out.lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("● Thought"),
+            "closed thinking needs a terminal marker: {out}"
+        );
         assert!(out.contains("I am Astra"), "body missing: {out}");
     }
 
@@ -1107,6 +1130,17 @@ mod tests {
         c.push_delta("<think>\nstep one\nstep two in progres");
         let out = render(&c, 80, 5);
         assert!(out.contains("Thought"), "live indicator missing: {out}");
+        assert!(
+            out.lines()
+                .next()
+                .unwrap_or_default()
+                .starts_with("Thought"),
+            "outer live gutter owns the marker: {out}"
+        );
+        assert!(
+            !out.contains("● Thought"),
+            "live marker must not double up: {out}"
+        );
         assert!(out.contains("2 lines"), "line count missing: {out}");
         assert!(out.contains("token"), "token count missing: {out}");
         assert!(
@@ -1157,6 +1191,10 @@ mod tests {
         assert!(
             out.contains("Thought") && out.contains("3 lines") && out.contains("token"),
             "collapsed header with line count: {out}"
+        );
+        assert!(
+            out.contains("● Thought"),
+            "closed thinking marker missing: {out}"
         );
         assert!(out.contains("answer"), "body still visible: {out}");
     }
