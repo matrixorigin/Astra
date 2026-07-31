@@ -53,9 +53,8 @@ impl HttpTaskService {
     /// matching the `TaskService` trait error type.
     async fn rpc(&self, method: &str, args: Value) -> Result<Value, String> {
         let url = self.rpc_url();
-        let client = reqwest::Client::builder()
+        let client = astra_core::net::client_builder_for_target(&url)
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
-            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
         let mut req = client
@@ -425,12 +424,12 @@ impl HttpTaskLeaseService {
         body: Value,
         edge_id: Option<&str>,
     ) -> Result<Value, String> {
-        let client = reqwest::Client::builder()
+        let url = self.url(path);
+        let client = astra_core::net::client_builder_for_target(&url)
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
-            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
-        let mut req = client.post(self.url(path)).json(&body);
+        let mut req = client.post(url).json(&body);
         if let Some(edge_id) = edge_id.filter(|edge_id| !edge_id.trim().is_empty()) {
             req = req.header(ASTRA_EDGE_ID_HEADER, edge_id);
         }
@@ -452,12 +451,12 @@ impl HttpTaskLeaseService {
     }
 
     async fn get(&self, path: &str) -> Result<Value, String> {
-        let client = reqwest::Client::builder()
+        let url = self.url(path);
+        let client = astra_core::net::client_builder_for_target(&url)
             .timeout(std::time::Duration::from_secs(TASK_HTTP_TIMEOUT_SECS))
-            .no_proxy()
             .build()
             .map_err(|e| format!("http client init: {e}"))?;
-        let mut req = client.get(self.url(path));
+        let mut req = client.get(url);
         if let Some(tok) = self.token.as_deref() {
             req = req.bearer_auth(tok);
         }

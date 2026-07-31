@@ -10,6 +10,8 @@
 //! ```
 
 mod invocation_journal;
+mod token_manager;
+mod token_renewal;
 
 use astra_credentials::{CredentialStore, CredentialsFile};
 use astra_runtime_env::{
@@ -88,10 +90,12 @@ struct Args {
     reconnect: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct EdgeConfig {
     server_url: String,
-    token: String,
+    /// Single owner of the token state machine: memory value, token file,
+    /// startup fallback and persistence debt (see token_manager.rs).
+    token_manager: Arc<token_manager::TokenManager>,
     workspace_dir: PathBuf,
     edge_id: String,
     reconnect: bool,
@@ -318,14 +322,100 @@ fn resolve_token(args: &Args) -> Result<String, String> {
 fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
     let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
-    let token = resolve_token(&args)?;
+    // Prefer a valid persisted moi-user-token-v1 (written by a prior renewal)
+    // over the env/flag token; astra JWT flows are untouched.
+    let token_file = token_renewal::resolve_token_file_path(&workspace_dir);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Pick whichever unexpired token expires LATER. A recreated Runner that
+    // reuses the workspace volume injects a fresh env token while the file
+    // still holds the previous (revoked-but-unexpired) one; preferring the
+    // file unconditionally would leave the edge permanently rejected.
+    let env_token = resolve_token(&args);
+    let file_token = token_renewal::read_valid_file_token(&token_file, now);
+    let mut fallback_token = None;
+    let token = match (file_token, &env_token) {
+        (Some(file_token), Ok(env)) => {
+            // Generation order is (iat, exp); expiry seconds alone cannot
+            // order double-renew siblings. Exact ties keep the file (with the
+            // env token retained as the one-shot auth-failure fallback), and
+            // the AuthOk heal-write converges the file to whatever actually
+            // authenticates.
+            let file_claims = token_renewal::parse_moi_token_claims(&file_token);
+            let env_claims = token_renewal::parse_moi_token_claims(env);
+            match (file_claims, env_claims) {
+                (_, None) => {
+                    // The explicit credential is NOT a moi-user-token (plain
+                    // Astra token / profile identity): it wins absolutely. A
+                    // leftover sandbox token file must never replace an
+                    // explicitly chosen identity, and the two are different
+                    // identity domains — no fallback between them either.
+                    tracing::info!(
+                        "using explicit non-MOI credential (persisted MOI token file ignored)"
+                    );
+                    env.clone()
+                }
+                (None, Some(_)) => {
+                    // File token is not a parseable moi-user-token but the
+                    // explicit credential is: prefer the explicit token.
+                    tracing::info!("using env/flag edge token (persisted token file unparseable)");
+                    env.clone()
+                }
+                (Some(fc), Some(ec)) if !token_renewal::same_moi_identity(&fc, &ec) => {
+                    // Different identity (e.g. the workspace volume was reused
+                    // by another user/tenant). Generation order is meaningless
+                    // across identities: the explicit env token wins and the
+                    // stale file token is ignored — never used, never a fallback.
+                    tracing::info!(
+                        "using explicit edge token (persisted token file has a different identity — ignored)"
+                    );
+                    env.clone()
+                }
+                (Some(fc), Some(ec)) => {
+                    // Same identity: order by generation (iat, exp). Expiry
+                    // seconds alone cannot order double-renew siblings; exact
+                    // ties keep the file (env retained as one-shot fallback) and
+                    // the AuthOk heal-write converges the file to whatever
+                    // actually authenticates.
+                    let file_gen = (fc.iat, fc.exp);
+                    let env_gen = (ec.iat, ec.exp);
+                    if env_gen > file_gen {
+                        tracing::info!(
+                            "using env/flag edge token (newer than persisted token file)"
+                        );
+                        fallback_token = Some(file_token);
+                        env.clone()
+                    } else {
+                        tracing::info!(
+                            path = %token_file.display(),
+                            "using persisted edge token from token file"
+                        );
+                        if env != &file_token {
+                            fallback_token = Some(env.clone());
+                        }
+                        file_token
+                    }
+                }
+            }
+        }
+        (Some(file_token), Err(_)) => {
+            tracing::info!(
+                path = %token_file.display(),
+                "using persisted edge token from token file"
+            );
+            file_token
+        }
+        (None, _) => env_token?,
+    };
     let edge_id = args
         .edge_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
     Ok(EdgeConfig {
         server_url: edge_ws_url(&raw_server_url)?,
-        token,
+        token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
         workspace_dir,
         edge_id,
         reconnect: args.reconnect,
@@ -777,8 +867,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         })
     };
 
+    // Snapshot the live token per connection attempt: the renewal task may
+    // have replaced it since the previous (re)connect.
+    let token_snapshot = config.token_manager.snapshot().await;
     let ws_stream = if let Some(ref proxy_url) = proxy {
-        connect_via_proxy(&url, proxy_url, &config.token)
+        connect_via_proxy(&url, proxy_url, &token_snapshot)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -792,7 +885,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 e
             })?
     } else {
-        let request = edge_ws_request(&url, &config.token)?;
+        let request = edge_ws_request(&url, &token_snapshot)?;
         let (ws, _) = connect_async(request).await.map_err(|e| {
             tracing::error!(
                 target: "astra.edge",
@@ -836,6 +929,16 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         {
             Ok(EdgeServerMessage::AuthOk { user_id }) => {
                 tracing::info!(user_id = %user_id, "Authenticated successfully");
+                // The token that just proved itself is the SNAPSHOT this
+                // connection authenticated with — not the current shared value
+                // (a renewal during the handshake may have swapped in a newer,
+                // unproven token). Persist exactly what was proven — but only
+                // for MOI tokens, and never REGRESS the file over a token with
+                // a later expiry (the renewal task owns forward progress).
+                // The token that just proved itself is the SNAPSHOT this
+                // connection authenticated with. The manager applies the
+                // generation rule and owns any persistence retry.
+                config.token_manager.mark_proven(&token_snapshot).await;
             }
             Ok(EdgeServerMessage::AuthError { message }) => {
                 tracing::error!(
@@ -1186,6 +1289,9 @@ async fn main() {
     eprintln!("  workspace: {}", config.workspace_dir.display());
     eprintln!();
 
+    // Background self-renewal of moi-user-token-v1 edge-registration tokens.
+    token_renewal::spawn_renewal_task(config.token_manager.clone());
+
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
@@ -1208,6 +1314,17 @@ async fn main() {
             }
             Err(e) => {
                 if is_permanent_connection_error(e.as_ref()) {
+                    // The chosen startup token may be revoked (e.g. a renewal
+                    // rotated it away but the persist was lost). Before giving
+                    // up, try the other startup candidate once.
+                    if config.token_manager.swap_to_fallback().await {
+                        tracing::warn!(
+                            error = %e,
+                            "Authentication failed with the selected token — retrying with the alternate startup token"
+                        );
+                        reconnect_delay_secs = 1;
+                        continue;
+                    }
                     tracing::error!(
                         error = %e,
                         "Permanent authentication failure — not retrying"

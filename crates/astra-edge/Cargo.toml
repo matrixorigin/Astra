@@ -32,12 +32,10 @@ base64 = { workspace = true }
 fastrand = "2"
 fs2.workspace = true
 reqwest = { workspace = true }
+tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -8,6 +8,9 @@ pub struct ExternalAuthProviderConfig {
     pub id: String,
     pub display_name: String,
     pub external_auth_endpoint: String,
+    /// Optional bearer key sent on callback requests. Callbacks that mint
+    /// runtime credentials must be key-protected; empty sends no header.
+    pub auth_key: String,
 }
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
@@ -561,26 +564,93 @@ pub trait ExternalProviderClient: Send + Sync {
     ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)>;
 }
 
-#[derive(Clone)]
-pub struct HttpExternalProviderClient {
-    client: reqwest::Client,
+/// Outcome of an edge-token revocation check against moi-core.
+#[derive(Debug)]
+pub enum EdgeTokenRevocationCheckError {
+    /// The token is revoked or explicitly denied by moi-core.
+    Denied(String),
+    /// The revocation endpoint could not give a definitive answer
+    /// (transport error, timeout, 5xx, malformed response). Fail closed.
+    Unavailable(String),
 }
 
-impl Default for HttpExternalProviderClient {
-    fn default() -> Self {
-        Self {
-            client: reqwest::Client::builder()
-                .no_proxy()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("external provider HTTP client configuration is static"),
-        }
+/// Ask moi-core whether an edge token (jti) has been revoked.
+///
+/// POSTs `{"token": "<token>"}` to `endpoint`
+/// (e.g. `https://catalog/api/v1/astra/edge-tokens/check`). A 2xx response
+/// with body `{"code":0,"data":{"ok":true}}` means the token is still valid.
+/// HTTP 401/403 or a non-zero code / `ok != true` means the token is revoked
+/// (`Denied`); everything else is `Unavailable`.
+pub async fn check_edge_token_revocation(
+    endpoint: &str,
+    token: &str,
+) -> Result<(), EdgeTokenRevocationCheckError> {
+    // Proxy policy follows the shared target-based rule: loopback endpoints
+    // (local dev) bypass env proxies; remote catalog endpoints honour them,
+    // so a mandatory-egress-proxy astra-server does not fail closed forever.
+    let client = astra_core::net::client_builder_for_target(endpoint)
+        .timeout(Duration::from_secs(10))
+        // Never let a 307/308 forward this POST (which carries the full edge
+        // token) to a different origin.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| {
+            EdgeTokenRevocationCheckError::Unavailable(format!(
+                "failed to build revocation-check HTTP client: {error}"
+            ))
+        })?;
+    let response = client
+        .post(endpoint)
+        .json(&serde_json::json!({ "token": token }))
+        .send()
+        .await
+        .map_err(|error| {
+            EdgeTokenRevocationCheckError::Unavailable(format!(
+                "edge token revocation check request failed: {error}"
+            ))
+        })?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(EdgeTokenRevocationCheckError::Denied(format!(
+            "edge token revocation check denied with HTTP {status}"
+        )));
+    }
+    if !status.is_success() {
+        return Err(EdgeTokenRevocationCheckError::Unavailable(format!(
+            "edge token revocation check returned HTTP {status}"
+        )));
+    }
+    let body: Value = response.json().await.map_err(|error| {
+        EdgeTokenRevocationCheckError::Unavailable(format!(
+            "edge token revocation check response is malformed: {error}"
+        ))
+    })?;
+    let code_ok = body.get("code").and_then(Value::as_i64) == Some(0);
+    let token_ok = body
+        .get("data")
+        .and_then(|data| data.get("ok"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    if code_ok && token_ok {
+        Ok(())
+    } else {
+        Err(EdgeTokenRevocationCheckError::Denied(format!(
+            "edge token revocation check rejected the token (code {:?}, ok {:?})",
+            body.get("code"),
+            body.get("data").and_then(|data| data.get("ok")),
+        )))
     }
 }
 
+// No shared client: the proxy decision is per-target (loopback bypasses the
+// env proxy, remote honours it), so the client is built per external-provider
+// endpoint via astra_core::net::client_builder_for_target in post_action.
+#[derive(Clone)]
+pub struct HttpExternalProviderClient;
+
 impl HttpExternalProviderClient {
     pub fn shared() -> Arc<dyn ExternalProviderClient> {
-        Arc::new(Self::default())
+        Arc::new(Self)
     }
 
     async fn post_action<T, R>(
@@ -598,22 +668,39 @@ impl HttpExternalProviderClient {
             provider_id: &provider.id,
             payload,
         };
-        let response = self
-            .client
-            .post(&provider.external_auth_endpoint)
-            .json(&request)
-            .send()
-            .await
+        // Build a target-aware client per endpoint: loopback callbacks bypass
+        // the env proxy, remote catalog/runtime-context endpoints honour it.
+        // (A shared client cannot make this per-target decision.)
+        let client = astra_core::net::client_builder_for_target(&provider.external_auth_endpoint)
+            .timeout(Duration::from_secs(30))
+            // Never let a 307/308 forward this POST (provider payload + Bearer
+            // auth key) to a different origin.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
             .map_err(|error| {
                 error_response_coded(
                     StatusCode::BAD_GATEWAY,
                     format!(
-                        "external provider '{}' action '{}' request failed: {error}",
+                        "external provider '{}' action '{}' client build failed: {error}",
                         provider.id, action
                     ),
                     "external_provider_request_failed",
                 )
             })?;
+        let mut http_request = client.post(&provider.external_auth_endpoint).json(&request);
+        if !provider.auth_key.is_empty() {
+            http_request = http_request.bearer_auth(&provider.auth_key);
+        }
+        let response = http_request.send().await.map_err(|error| {
+            error_response_coded(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "external provider '{}' action '{}' request failed: {error}",
+                    provider.id, action
+                ),
+                "external_provider_request_failed",
+            )
+        })?;
         let status = response.status();
         let body = response.text().await.map_err(|error| {
             error_response_coded(
@@ -1221,6 +1308,7 @@ mod tests {
             id: "moi".to_string(),
             display_name: "MOI".to_string(),
             external_auth_endpoint: endpoint,
+            auth_key: String::new(),
         }
     }
 
@@ -1258,7 +1346,7 @@ mod tests {
                 .expect("serve test provider");
         });
 
-        let client = HttpExternalProviderClient::default();
+        let client = HttpExternalProviderClient;
         let authorized = client
             .authorize_request(
                 &provider(endpoint.clone()),
@@ -1438,7 +1526,7 @@ mod tests {
                 .expect("serve test provider");
         });
 
-        let client = HttpExternalProviderClient::default();
+        let client = HttpExternalProviderClient;
         let err = client
             .logout(
                 &provider(endpoint),

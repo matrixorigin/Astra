@@ -1295,9 +1295,8 @@ impl MemoriaToolGateway {
         if let Some(sid) = session_id {
             body["session_id"] = json!(sid);
         }
-        let client = reqwest::Client::builder()
+        let client = astra_core::net::client_builder_for_target(&mem.base_url)
             .timeout(Duration::from_secs(2))
-            .no_proxy()
             .build()
             .ok()?;
         let request = client
@@ -1445,9 +1444,8 @@ impl MemoriaToolGateway {
             self.apply_focus_hints(sid, &mut payload);
         }
 
-        let raw_text = match reqwest::Client::builder()
+        let raw_text = match astra_core::net::client_builder_for_target(&endpoint)
             .timeout(timeout)
-            .no_proxy()
             .build()
         {
             Ok(client) => {
@@ -1647,9 +1645,8 @@ impl MemoriaToolGateway {
         let Some(token) = self.cloud_token.as_deref() else {
             return memoria_snapshot_create(name).await.map(|_| ());
         };
-        let client = reqwest::Client::builder()
+        let client = astra_core::net::client_builder_for_target(cloud_base)
             .timeout(Duration::from_secs(5))
-            .no_proxy()
             .build()
             .map_err(|e| format!("build client: {e}"))?;
         let resp = client
@@ -1707,9 +1704,8 @@ impl MemoriaToolGateway {
             Some(token) => token,
             None => return vec![],
         };
-        let client = match reqwest::Client::builder()
+        let client = match astra_core::net::client_builder_for_target(cloud_base)
             .timeout(Duration::from_millis(800))
-            .no_proxy()
             .build()
         {
             Ok(c) => c,
@@ -2459,9 +2455,8 @@ fn format_remember_conflict(arr: &[Value], floor: f64) -> Option<String> {
 pub fn memoria_oneshot_client(timeout_secs: u64) -> Option<(reqwest::Client, String, String)> {
     let mem = astra_core::MemoriaSettings::from_env();
     let key = mem.master_key?;
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(&mem.base_url)
         .timeout(Duration::from_secs(timeout_secs))
-        .no_proxy()
         .build()
         .ok()?;
     Some((client, mem.base_url, key))

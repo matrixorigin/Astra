@@ -18,12 +18,11 @@ use crate::cli::theme;
 
 /// Build a reqwest client for the durable-task bridge.
 ///
-/// Durable-bridge traffic is local-only (CLI ↔ local API server), so we always
-/// skip any system proxy. Only the LLM HTTP client (runtime `llm_client.rs`)
-/// honours env proxy vars.
-fn build_client_for_url(_url: &str) -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
+/// Loopback targets (CLI ↔ local API server) bypass any system proxy; remote
+/// targets keep env-aware proxy behavior so mandatory-egress-proxy sandboxes
+/// (e.g. OpenShell) can reach the remote bridge.
+fn build_client_for_url(url: &str) -> reqwest::Client {
+    astra_core::net::client_builder_for_target(url)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30))
         .build()

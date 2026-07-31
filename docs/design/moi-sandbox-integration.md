@@ -67,6 +67,7 @@ payload.  Edge-registration tokens carry a `jti` for revocation.
 | F7 | Feature | `edge_agent` CapabilityDescriptor field | `services/src/runs.rs` |
 | F8 | Feature | Force EdgeWs transport to EdgeBound routing | `runtime/src/server/tool_route_selection.rs` |
 | F9 | Feature | Service-to-service edge status endpoint | `runtime/src/server/edge/edge_service_status_handler.rs` |
+| F10 | Feature | Local edge-token verification + connect-time revocation check (replaces the retired external-auth callback) | `services/src/auth/mod.rs`, `services/src/auth/external.rs`, `core/src/config.rs` |
 | B1 | Bug Fix | Connection pool generation guards against stale cleanup races | `astra-server-types/src/edge_connection_pool.rs` |
 | B2 | Bug Fix | DB registration failure rejects WebSocket connection | `runtime/src/server/edge/edge_ws_handler.rs` |
 | B3 | Bug Fix | Heartbeat scoped by edge_id to prevent stale connection refresh | `services/src/multi_agent/edge_registry.rs` |
@@ -84,6 +85,10 @@ payload.  Edge-registration tokens carry a `jti` for revocation.
 ## Detailed Descriptions
 
 ### F1 — MOI edge-registration token WebSocket auth
+
+> **Superseded in part by F10**: token verification is now local (no
+> authorize_request callback); the binding/three-state semantics below are
+> unchanged.
 
 **Files:** `services/src/auth/mod.rs`, `runtime/src/server/edge/edge_ws_handler.rs`
 
@@ -180,6 +185,17 @@ New `connect_via_proxy()` implements HTTP CONNECT tunneling:
 **`astra-thin-client/src/client.rs`:** `.no_proxy()` removed from both
 `streaming_http_client` and `ThinClient::new()`.  A source-level guard test
 asserts `.no_proxy()` is absent to prevent accidental re-introduction.
+
+**`astra-core/src/net.rs` + `astra-cli` (2026-07-23 follow-up):** the CLI's
+auxiliary clients (task service, todos, preferences, team store, durable
+bridge, memoria cloud tools) hard-coded `.no_proxy()` under the "internal =
+same host" assumption, which broke inside mandatory-egress-proxy sandboxes
+(requests to the remote Astra server timed out; symptom: `Skill sources
+unavailable`).  New shared policy `astra_core::net::client_builder_for_target
+(url)`: loopback targets stay `no_proxy`, remote targets keep reqwest's
+env-aware proxy behavior.  All nine call sites now route through it; the
+env-mutating proxy regression test and the cloud_sync tests are serialized
+(`serial_test`) because proxy env vars are process-global.
 
 #### Scope
 
@@ -427,6 +443,45 @@ is delayed at most one 2-second poll cycle — correctness is unaffected.
 ---
 
 ## Refactors Applied During Code Review
+
+### F10 — Local edge-token verification + connect-time revocation check
+
+**Files:** `services/src/auth/mod.rs`, `services/src/auth/external.rs`, `core/src/config.rs`
+
+moi-core #12865 retired the `POST /api/v1/astra/external-auth` callback (and the
+whole provider-session surface) in favor of provider HMAC. Astra's edge path
+followed:
+
+- `verify_user_token` verifies `moi-user-token-v1.*` tokens **locally** with the
+  shared HMAC key (`auth.edge_token_auth.key`, env
+  `${ASTRA_EDGE_TOKEN_HMAC_KEY}`), mirroring moi-core `UserTokenSigner.Verify`
+  fail-closed rules (iss=moi-backend ⇒ edge_registration; edge_registration ⇒
+  edge_agent_id + jti required).
+- `principal_from_edge_token` and `edge_registration_binding` no longer call
+  the provider over HTTP; claims map directly to the principal / binding.
+- **Revocation** (the one thing a self-contained token cannot carry) is checked
+  against moi-core `POST /api/v1/astra/edge-tokens/check`
+  (`auth.edge_token_auth.check_endpoint`) on **every surface that accepts an
+  edge token** — the edge WebSocket connect AND every HTTP request (chat, GET
+  /models, ...). Fail-closed on denial or unavailability.
+
+**Revocation surface (updated 2026-07-29).** Revocation is enforced
+per-request with a **30-second positive-only cache** keyed by jti
+(`check_edge_token_revoked_cached`): a jti that recently passed is trusted for
+up to 30s; denials and check-endpoint outages are never cached and always fail
+closed. Operational implications:
+
+- Worst-case revocation propagation on astra surfaces is **≤ 30 seconds**
+  (plus the moi-backend renewal grace window of ≤ 5 minutes for
+  rotated-away previous jtis — see the dual-valid rotation design).
+- Catalog load is bounded at ~1 check per active jti per 30s, not one per
+  request.
+
+The earlier design traded per-request revocation away entirely (exposure
+bounded only by token TTL); that stance was reversed after review — a revoked
+30-day token remaining valid on `/chat/stream` was judged unacceptable.
+
+---
 
 ### R1 — Phase 1.5 reads from resolved principal (no second provider call)
 

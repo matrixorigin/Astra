@@ -3,6 +3,7 @@ use crate::server::deployment_tool_policy::{
     DeploymentToolPolicy, apply_deployment_tool_policy, load_deployment_tool_policy,
 };
 use crate::server::tool_transport::ToolExecutionService;
+use astra_services::ExternalAuthProviderConfig;
 
 pub(super) fn build_auth_service(
     settings: &AppSettings,
@@ -13,7 +14,24 @@ pub(super) fn build_auth_service(
         DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
             .with_pool(shared_pool.clone())
             .with_encryptor(shared_encryptor.as_ref().clone())
-            .with_provider_request_auth(settings.provider_request_auth.clone()),
+            .with_provider_request_auth(settings.provider_request_auth.clone())
+            .with_edge_token_auth(settings.edge_token_auth.clone())
+            .with_external_providers(
+                settings
+                    .external_providers
+                    .iter()
+                    .map(|provider| ExternalAuthProviderConfig {
+                        id: provider.id.clone(),
+                        display_name: if provider.display_name.is_empty() {
+                            provider.id.clone()
+                        } else {
+                            provider.display_name.clone()
+                        },
+                        external_auth_endpoint: provider.external_auth_endpoint.clone(),
+                        auth_key: provider.auth_key.clone(),
+                    })
+                    .collect(),
+            ),
     ))
 }
 

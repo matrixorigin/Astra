@@ -1,7 +1,7 @@
 use crate::storage::database_user_from_row;
 use astra_core::{
-    ErrorResponse, JwtSettings, MatrixOneSettings, ProviderRequestAuthConfig, SharedPool,
-    bearer_token, error_response, error_response_coded,
+    EdgeTokenAuthConfig, ErrorResponse, JwtSettings, MatrixOneSettings, ProviderRequestAuthConfig,
+    SharedPool, bearer_token, error_response, error_response_coded,
     identity::{USER_ID_MAX_LEN, USERNAME_MAX_LEN},
     internal_error, is_duplicate_key_error,
 };
@@ -12,6 +12,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bcrypt::{hash as bcrypt_hash, verify as bcrypt_verify};
+use futures_util::FutureExt as _;
 use hmac::{Hmac, Mac};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -78,6 +79,9 @@ pub use session::{
 use validation::validate_register_request;
 
 type AuthHttpError = (StatusCode, Json<ErrorResponse>);
+type EdgeRevocationResult = Result<(), AuthHttpError>;
+type EdgeRevocationFlight =
+    futures_util::future::Shared<futures_util::future::BoxFuture<'static, EdgeRevocationResult>>;
 type ExternalRequestAuthHeaders = Option<(String, String, String)>;
 type ParsedTokenSession = (String, String, Option<String>);
 type HmacSha256 = Hmac<Sha256>;
@@ -86,6 +90,89 @@ const PROVIDER_REQUEST_MAX_TTL_SECONDS: i64 = 300;
 const PROVIDER_REQUEST_CLOCK_SKEW_SECONDS: i64 = 60;
 const REAUTHENTICATION_PROOF_TTL_SECONDS: i64 = 300;
 const AUTH_PASSWORD_MAX_BYTES: usize = 72;
+const USER_TOKEN_PURPOSE_EDGE_REGISTRATION: &str = "edge_registration";
+
+/// Claims carried by a `moi-user-token-v1` token minted by moi-core /
+/// moi-backend (`UserTokenSigner`). Field semantics mirror the Go struct.
+#[derive(Debug, Deserialize)]
+struct UserTokenClaims {
+    sub: String,
+    workspace_id: String,
+    #[serde(default)]
+    iss: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    iat: i64,
+    exp: i64,
+    #[serde(default)]
+    edge_agent_id: String,
+    #[serde(default)]
+    jti: String,
+    /// Empty means "runtime" (server-to-server).
+    #[serde(default)]
+    purpose: String,
+}
+
+/// Verify a `moi-user-token-v1.<claims>.<sig>` token locally with the shared
+/// HMAC key, mirroring moi-core's `UserTokenSigner.Verify` semantics.
+fn verify_user_token(key: &str, token: &str) -> Result<UserTokenClaims, AuthHttpError> {
+    if key.is_empty() {
+        return Err(edge_token_auth_error(
+            "Edge token verification key is not configured",
+        ));
+    }
+    let mut parts = token.split('.');
+    let (Some(prefix), Some(encoded_claims), Some(encoded_signature), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(edge_token_auth_error("Edge token is malformed"));
+    };
+    if prefix != MOI_USER_TOKEN_PREFIX {
+        return Err(edge_token_auth_error("Edge token is malformed"));
+    }
+    if !verify_provider_request_signature(key.as_bytes(), encoded_claims, encoded_signature) {
+        return Err(edge_token_auth_error("Edge token signature is invalid"));
+    }
+    let claims_bytes = URL_SAFE_NO_PAD
+        .decode(encoded_claims)
+        .map_err(|_| edge_token_auth_error("Edge token claims are malformed"))?;
+    let claims: UserTokenClaims = serde_json::from_slice(&claims_bytes)
+        .map_err(|_| edge_token_auth_error("Edge token claims are malformed"))?;
+    // `>` (not `>=`): the token is accepted through the exp second, matching
+    // the Go verifiers (moi-backend edgetoken, moi-core astraauth).
+    if claims.exp <= 0 || Utc::now().timestamp() > claims.exp {
+        return Err(edge_token_auth_error("Edge token has expired"));
+    }
+    if claims.sub.is_empty() {
+        return Err(edge_token_auth_error("Edge token subject is missing"));
+    }
+    if claims.workspace_id.is_empty() {
+        return Err(edge_token_auth_error("Edge token workspace_id is missing"));
+    }
+    // moi-backend only mints edge-registration tokens for astra; fail closed
+    // on any other purpose claiming that issuer.
+    if claims.iss == "moi-backend" && claims.purpose != USER_TOKEN_PURPOSE_EDGE_REGISTRATION {
+        return Err(edge_token_auth_error(
+            "Edge token issuer moi-backend requires edge_registration purpose",
+        ));
+    }
+    if claims.purpose == USER_TOKEN_PURPOSE_EDGE_REGISTRATION
+        && (claims.edge_agent_id.is_empty() || claims.jti.is_empty())
+    {
+        return Err(edge_token_auth_error(
+            "Edge registration token requires edge_agent_id and jti",
+        ));
+    }
+    Ok(claims)
+}
+
+fn edge_token_auth_error(message: impl Into<String>) -> AuthHttpError {
+    error_response_coded(
+        StatusCode::UNAUTHORIZED,
+        message.into(),
+        "edge_token_auth_invalid",
+    )
+}
 
 #[derive(Debug, Deserialize)]
 struct ProviderRequestClaims {
@@ -599,6 +686,14 @@ pub struct DatabaseAuthService {
     external_client: std::sync::Arc<dyn ExternalProviderClient>,
     provider_request_auth: Vec<ProviderRequestAuthConfig>,
     provider_request_replay_cache: Arc<Mutex<HashMap<String, i64>>>,
+    edge_token_auth: Option<EdgeTokenAuthConfig>,
+    /// Short-TTL cache of jtis that passed the moi-core revocation check, so
+    /// per-request revocation on the HTTP surface stays cheap. Only positive
+    /// results are cached; denied/unavailable always fail closed uncached.
+    edge_revocation_ok_cache: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Per-JTI shared checks. Weak entries avoid retaining attacker- or
+    /// issuer-controlled JTIs after the last waiter receives the result.
+    edge_revocation_inflight: Arc<Mutex<HashMap<String, std::sync::Weak<EdgeRevocationFlight>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -664,6 +759,9 @@ impl DatabaseAuthService {
             external_client: HttpExternalProviderClient::shared(),
             provider_request_auth: Vec::new(),
             provider_request_replay_cache: Arc::new(Mutex::new(HashMap::new())),
+            edge_revocation_ok_cache: Arc::new(Mutex::new(HashMap::new())),
+            edge_revocation_inflight: Arc::new(Mutex::new(HashMap::new())),
+            edge_token_auth: None,
         }
     }
 
@@ -863,6 +961,113 @@ impl DatabaseAuthService {
     pub fn with_provider_request_auth(mut self, auth: Vec<ProviderRequestAuthConfig>) -> Self {
         self.provider_request_auth = auth;
         self
+    }
+
+    pub fn with_edge_token_auth(mut self, cfg: EdgeTokenAuthConfig) -> Self {
+        if !cfg.key.is_empty() {
+            if cfg.check_endpoint.is_empty() {
+                tracing::warn!(
+                    target: "astra_services::auth",
+                    "edge token revocation check endpoint not configured — edge-registration \
+                     tokens will be refused at verification (fail closed)"
+                );
+            }
+            self.edge_token_auth = Some(cfg);
+        }
+        self
+    }
+
+    /// Once-per-connection revocation check for an edge-registration token
+    /// against moi-core's check endpoint. Fail-closed: a revoked token or an
+    /// unavailable endpoint both deny the request.
+    /// Cached revocation check: a jti that recently passed is trusted for
+    /// EDGE_REVOCATION_OK_TTL, bounding staleness after an out-of-band revoke
+    /// to that window. Tokens without a jti are never cached.
+    async fn check_edge_token_revoked_cached(
+        &self,
+        check_endpoint: &str,
+        token: &str,
+        jti: &str,
+    ) -> Result<(), AuthHttpError> {
+        const EDGE_REVOCATION_OK_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+        if !jti.is_empty()
+            && let Ok(cache) = self.edge_revocation_ok_cache.lock()
+            && let Some(checked_at) = cache.get(jti)
+            && checked_at.elapsed() < EDGE_REVOCATION_OK_TTL
+        {
+            return Ok(());
+        }
+
+        if jti.is_empty() {
+            return self.check_edge_token_revoked(check_endpoint, token).await;
+        }
+
+        let flight = {
+            let mut inflight = self
+                .edge_revocation_inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inflight.retain(|_, flight| flight.strong_count() > 0);
+            match inflight.get(jti).and_then(std::sync::Weak::upgrade) {
+                Some(flight) => flight,
+                None => {
+                    let service = self.clone();
+                    let check_endpoint = check_endpoint.to_string();
+                    let token = token.to_string();
+                    let jti_owned = jti.to_string();
+                    let flight = Arc::new(
+                        async move {
+                            let result = service
+                                .check_edge_token_revoked(&check_endpoint, &token)
+                                .await;
+                            if result.is_ok()
+                                && let Ok(mut cache) = service.edge_revocation_ok_cache.lock()
+                            {
+                                let now = std::time::Instant::now();
+                                cache.retain(|_, at| at.elapsed() < EDGE_REVOCATION_OK_TTL);
+                                cache.insert(jti_owned, now);
+                            }
+                            result
+                        }
+                        .boxed()
+                        .shared(),
+                    );
+                    inflight.insert(jti.to_string(), Arc::downgrade(&flight));
+                    flight
+                }
+            }
+        };
+        flight.as_ref().clone().await
+    }
+
+    async fn check_edge_token_revoked(
+        &self,
+        check_endpoint: &str,
+        token: &str,
+    ) -> Result<(), AuthHttpError> {
+        match external::check_edge_token_revocation(check_endpoint, token).await {
+            Ok(()) => Ok(()),
+            Err(external::EdgeTokenRevocationCheckError::Denied(detail)) => {
+                warn!(
+                    target: "astra_services::auth",
+                    detail = %detail,
+                    "edge token revocation check: token revoked"
+                );
+                Err(edge_token_auth_error("Edge token is revoked"))
+            }
+            Err(external::EdgeTokenRevocationCheckError::Unavailable(detail)) => {
+                warn!(
+                    target: "astra_services::auth",
+                    detail = %detail,
+                    "edge token revocation check unavailable; failing closed"
+                );
+                Err(error_response_coded(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Edge token revocation check unavailable",
+                    "edge_token_revocation_unavailable",
+                ))
+            }
+        }
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
@@ -1185,72 +1390,70 @@ impl DatabaseAuthService {
         })
     }
 
-    /// Resolve an [`AuthPrincipal`] from a moi-backend edge-registration token
-    /// (`moi-user-token-v1.*`) via the external auth provider.
+    /// Resolve an [`AuthPrincipal`] from a moi-issued edge-registration token
+    /// (`moi-user-token-v1.*`) by verifying it locally with the shared HMAC
+    /// key (`auth.edge_token_auth.key`).
     ///
-    /// The caller must supply the request that is actually being authorized.
-    /// This keeps route/method policy in the provider meaningful and prevents a
-    /// long-lived edge credential from being authorized against a synthetic
-    /// catch-all request.
+    /// A revocation check against moi-core's check endpoint is performed on
+    /// every surface (fail-closed), with a short positive cache (see
+    /// `check_edge_token_revoked_cached`).
     async fn principal_from_edge_token(
         &self,
         token: &str,
-        request: ProviderRequestDescriptor,
+        _request: ProviderRequestDescriptor,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
-        let provider = self
-            .ext_providers
-            .iter()
-            .find(|p| p.id == "moi")
-            .or_else(|| self.ext_providers.first())
-            .ok_or_else(|| {
-                error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "No external provider configured for edge token auth",
-                )
-            })?
-            .clone();
-        let authorized = self
-            .external_client
-            .authorize_request(
-                &provider,
-                ExternalAuthorizeRequestData {
-                    provider_id: provider.id.clone(),
-                    token: format!("Bearer {token}"),
-                    request: ExternalRequestDescriptor {
-                        method: request.method,
-                        path: request.path,
-                        route: request.route,
-                        request_id: request.request_id,
-                        body_digest: request.body_digest,
-                    },
-                },
+        let cfg = self.edge_token_auth.as_ref().ok_or_else(|| {
+            edge_token_auth_error(
+                "Edge token verification is not configured (auth.edge_token_auth.key)",
             )
-            .await?;
+        })?;
+        let claims = verify_user_token(&cfg.key, token)?;
+        let is_edge_registration = claims.purpose == USER_TOKEN_PURPOSE_EDGE_REGISTRATION;
+        // Revocation is checked on EVERY surface (WS connect and HTTP), not
+        // just /edge/ws: a revoked 30-day token must not keep working over
+        // the chat/model HTTP endpoints. A short positive cache keeps the
+        // per-request cost bounded; deny/unavailable are never cached.
+        //
+        // Fail closed: config validation already requires check_endpoint
+        // whenever the HMAC key is set, but if an edge-registration token ever
+        // reaches here without a revocation endpoint we must deny — never
+        // accept a long-lived credential we cannot revoke.
+        if is_edge_registration {
+            if cfg.check_endpoint.is_empty() {
+                return Err(edge_token_auth_error(
+                    "Edge token revocation endpoint is not configured; refusing edge-registration token (fail closed)",
+                ));
+            }
+            self.check_edge_token_revoked_cached(&cfg.check_endpoint, token, &claims.jti)
+                .await?;
+        }
         tracing::debug!(
             target: "astra_services::auth",
-            provider_id = %authorized.provider_id,
-            external_subject = %authorized.external_subject,
-            "principal_from_edge_token: edge token authorized for request"
+            external_subject = %claims.sub,
+            workspace_id = %claims.workspace_id,
+            "principal_from_edge_token: edge token verified locally"
         );
-        let user_id = format!(
-            "external_authorized:{}:{}",
-            authorized.provider_id, authorized.external_subject
-        );
+        let request_authorization_id = if claims.jti.is_empty() {
+            format!("{MOI_USER_TOKEN_PREFIX}:{}:{}", claims.sub, claims.exp)
+        } else {
+            format!("{MOI_USER_TOKEN_PREFIX}:jti:{}", claims.jti)
+        };
+        let user_id = format!("external_authorized:moi:{}", claims.sub);
         Ok(AuthPrincipal {
             user: AuthUserRecord {
                 user_id,
-                username: authorized.external_subject.clone(),
+                username: claims.sub.clone(),
                 email: String::new(),
                 display_name: None,
             },
             session_id: None,
             origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
                 AuthProviderAuthorizedRequestContext {
-                    provider_id: authorized.provider_id,
-                    external_subject: authorized.external_subject,
-                    provider_scope_id: authorized.provider_scope_id,
-                    request_authorization_id: authorized.request_authorization_id,
-                    edge_agent_id: authorized.edge_agent_id,
+                    provider_id: "moi".to_string(),
+                    external_subject: claims.sub,
+                    provider_scope_id: claims.workspace_id,
+                    request_authorization_id,
+                    edge_agent_id: is_edge_registration.then(|| claims.edge_agent_id.clone()),
                 },
             ),
         })
@@ -1777,15 +1980,24 @@ impl AuthService for DatabaseAuthService {
         headers: &HeaderMap,
     ) -> Result<AuthPrincipal, (StatusCode, Json<ErrorResponse>)> {
         let token = bearer_token(headers)?;
-        // Long-lived edge-registration tokens must only be accepted by handlers
-        // that supply the real request descriptor. Otherwise the provider has
-        // no method/path information with which to enforce token purpose.
+        // Edge-registration tokens are verified locally (shared HMAC key) with
+        // a fail-closed revocation check — no request descriptor needed since
+        // the retired authorize_request callback was replaced by local
+        // verification. This is what lets edge CLIs call plain read surfaces
+        // such as GET /models (external catalog branch).
         if token.starts_with(MOI_USER_TOKEN_PREFIX) {
-            return Err(error_response_coded(
-                StatusCode::UNAUTHORIZED,
-                "Edge registration token requires request-aware authorization",
-                "edge_token_request_context_required",
-            ));
+            return self
+                .principal_from_edge_token(
+                    token,
+                    ProviderRequestDescriptor {
+                        method: String::new(),
+                        path: String::new(),
+                        route: None,
+                        request_id: None,
+                        body_digest: None,
+                    },
+                )
+                .await;
         }
         let claims = decode_jwt_claims(token, &self.jwt)?;
 
@@ -1908,82 +2120,62 @@ impl AuthService for DatabaseAuthService {
         if !token.starts_with(MOI_USER_TOKEN_PREFIX) {
             return Ok(EdgeTokenBinding::NotEdgeToken);
         }
-        // Resolve the MOI external provider. An edge-token-shaped credential
-        // cannot be downgraded to an unbound first-party token when its verifier
-        // is unavailable; that would turn configuration loss into authorization.
-        let provider = match self
-            .ext_providers
-            .iter()
-            .find(|p| p.id == "moi")
-            .or_else(|| self.ext_providers.first())
-        {
-            Some(provider) => provider.clone(),
-            None => {
-                tracing::error!(
-                    target: "astra_services::auth",
-                    "edge_registration_binding: no external provider configured; cannot verify edge binding"
-                );
-                return Err(error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "No external provider configured for edge token auth",
-                ));
-            }
+        // An edge-token-shaped credential cannot be downgraded to an unbound
+        // first-party token when its verifier is unavailable; that would turn
+        // configuration loss into authorization (upstream #582 fail-closed).
+        let Some(cfg) = self.edge_token_auth.as_ref() else {
+            tracing::error!(
+                target: "astra_services::auth",
+                "edge_registration_binding: edge token verification not configured; cannot verify edge binding"
+            );
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Edge token verification is not configured (auth.edge_token_auth.key)",
+            ));
         };
-        // authorize_request verifies the token (signature, expiry, jti
-        // revocation) and returns the bound edge_agent_id and provider_scope_id
-        // (workspace_id). A revoked or invalid edge token yields an Err here,
-        // which the caller treats as a denial.
-        tracing::debug!(
-            target: "astra_services::auth",
-            provider_id = %provider.id,
-            "edge_registration_binding: verifying moi edge token via provider authorize_request"
-        );
-        let authorized = match self
-            .external_client
-            .authorize_request(
-                &provider,
-                ExternalAuthorizeRequestData {
-                    provider_id: provider.id.clone(),
-                    token: format!("Bearer {token}"),
-                    request: ExternalRequestDescriptor {
-                        method: "GET".to_string(),
-                        path: "/edge/ws".to_string(),
-                        route: Some("/edge/ws".to_string()),
-                        request_id: None,
-                        body_digest: None,
-                    },
-                },
-            )
-            .await
-        {
-            Ok(authorized) => authorized,
+        // Local verification covers signature, expiry, and the
+        // edge-registration claim invariants (edge_agent_id + jti present).
+        let claims = match verify_user_token(&cfg.key, token) {
+            Ok(claims) => claims,
             Err((status, err)) => {
                 tracing::warn!(
                     target: "astra_services::auth",
-                    provider_id = %provider.id,
                     status = %status,
                     error = ?err,
-                    "edge_registration_binding: provider rejected edge token (revoked/invalid/expired)"
+                    "edge_registration_binding: edge token rejected (invalid/expired)"
                 );
                 return Err((status, err));
             }
         };
+        if claims.purpose != USER_TOKEN_PURPOSE_EDGE_REGISTRATION {
+            // A verified moi token without the edge_registration purpose is a
+            // runtime (server-to-server) token, not an edge-registration token.
+            return Ok(EdgeTokenBinding::MissingBinding);
+        }
+        // Once-per-connection jti revocation check against moi-core
+        // (fail-closed on denial or unavailability). Fail closed when no
+        // revocation endpoint is configured — consistent with
+        // principal_from_edge_token(); never accept a long-lived
+        // edge-registration credential we cannot revoke.
+        if cfg.check_endpoint.is_empty() {
+            return Err(error_response(
+                StatusCode::UNAUTHORIZED,
+                "Edge token revocation endpoint is not configured; refusing edge-registration token (fail closed)"
+                    .to_string(),
+            ));
+        }
+        self.check_edge_token_revoked(&cfg.check_endpoint, token)
+            .await?;
         tracing::debug!(
             target: "astra_services::auth",
-            provider_id = %provider.id,
-            edge_agent_id = ?authorized.edge_agent_id,
-            workspace_id = %authorized.provider_scope_id,
-            "edge_registration_binding: provider accepted edge token"
+            edge_agent_id = %claims.edge_agent_id,
+            workspace_id = %claims.workspace_id,
+            "edge_registration_binding: edge token verified locally"
         );
-        match authorized.edge_agent_id {
-            Some(edge_agent_id) => Ok(EdgeTokenBinding::Bound {
-                edge_agent_id,
-                workspace_id: authorized.provider_scope_id,
-            }),
-            // A recognized moi token that authorized without an edge_agent_id is
-            // a runtime (server-to-server) token, not an edge-registration token.
-            None => Ok(EdgeTokenBinding::MissingBinding),
-        }
+        Ok(EdgeTokenBinding::Bound {
+            edge_agent_id: claims.edge_agent_id,
+            workspace_id: claims.workspace_id,
+        })
     }
 
     async fn external_providers(
@@ -2154,11 +2346,7 @@ impl AuthService for StubAuthService {
 
 #[cfg(test)]
 mod tests {
-    use super::external::{
-        ExternalLogoutResponse, ExternalProviderAuthResponse, ExternalRefreshSessionResponse,
-    };
     use super::*;
-    use crate::auth::external::ExternalProviderSessionHandle;
     use astra_core::ProviderRequestAuthConfig;
     use chrono::Utc;
     use serde_json::json;
@@ -2167,99 +2355,84 @@ mod tests {
     const GOLDEN_PROVIDER_HMAC_KEY: &str = "WrE2irtwGEq1Ih2stZUtgFfLFNv2gVhOAwsBD999QLI";
     const GOLDEN_PROVIDER_TOKEN: &str = "moi-provider-v1.eyJzdWIiOiJ1c2VyXzEiLCJzY29wZSI6IndvcmtzcGFjZV8xIiwicHJvdmlkZXIiOiJtb2kiLCJpYXQiOjQxMDI0NDQ1MDAsImV4cCI6NDEwMjQ0NDgwMH0.wZS9mRKasIEmreqhzGheguYYPbq1URTYkJoSK3nfW3M";
 
-    #[allow(dead_code)]
-    struct AuthorizingProviderClient;
+    const TEST_EDGE_TOKEN_HMAC_KEY: &str = "test-edge-token-hmac-key";
 
-    #[async_trait]
-    impl ExternalProviderClient for AuthorizingProviderClient {
-        async fn authorize_request(
-            &self,
-            provider: &ExternalAuthProviderConfig,
-            request: ExternalAuthorizeRequestData,
-        ) -> Result<ExternalAuthorizedRequest, (StatusCode, Json<ErrorResponse>)> {
-            assert_eq!(provider.id, "moi");
-            assert_eq!(request.token, "Bearer moi-user-token-v1.payload.signature");
-            assert_eq!(request.request.method, "POST");
-            assert_eq!(request.request.path, "/chat/stream");
-            assert_eq!(request.request.route.as_deref(), Some("/chat/stream"));
-            assert_eq!(request.request.request_id.as_deref(), Some("request-1"));
-            assert_eq!(request.request.body_digest.as_deref(), Some("sha256-body"));
-            Ok(ExternalAuthorizedRequest {
-                provider_id: "moi".to_string(),
-                external_subject: "moi-user-1".to_string(),
-                provider_scope_id: "workspace-1".to_string(),
-                request_authorization_id: "authz-1".to_string(),
-                edge_agent_id: Some("edge-1".to_string()),
-            })
-        }
+    // spawn_revocation_ok_server starts a minimal HTTP endpoint that always
+    // reports "not revoked" ({"code":0,"data":{"ok":true}}). Edge-registration
+    // tokens now fail closed without a revocation endpoint, so acceptance tests
+    // must point check_endpoint at a live "not revoked" responder.
+    async fn spawn_revocation_ok_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind revocation mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let app = axum::Router::new().route(
+            "/check",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({"code": 0, "data": {"ok": true}}))
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/check")
+    }
 
-        async fn authenticate(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _request: ExternalLoginRequestData,
-        ) -> Result<ExternalProviderAuthResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("AuthorizingProviderClient stub: authenticate not used in these tests")
-        }
+    async fn spawn_counted_revocation_server(
+        response: serde_json::Value,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
 
-        async fn list_catalog(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("AuthorizingProviderClient stub: list_catalog not used in these tests")
-        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_calls = Arc::clone(&calls);
+        let response = Arc::new(response);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind counted revocation mock");
+        let addr = listener.local_addr().expect("counted mock addr");
+        let app = axum::Router::new().route(
+            "/check",
+            axum::routing::post(move || {
+                let handler_calls = Arc::clone(&handler_calls);
+                let response = Arc::clone(&response);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    axum::Json((*response).clone())
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/check"), calls)
+    }
 
-        async fn issue_runtime_context(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-            _request: ExternalRuntimeContextRequestData,
-        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!(
-                "AuthorizingProviderClient stub: issue_runtime_context not used in these tests"
-            )
-        }
+    fn mint_user_token(key: &str, claims: &serde_json::Value) -> String {
+        let encoded_claims =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims json"));
+        let signature = provider_request_signature(key.as_bytes(), &encoded_claims);
+        format!("{MOI_USER_TOKEN_PREFIX}.{encoded_claims}.{signature}")
+    }
 
-        async fn refresh_session(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<ExternalRefreshSessionResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!(
-                "AuthorizingProviderClient stub: refresh_session not used in these tests"
-            )
-        }
+    fn edge_registration_claims(now: i64) -> serde_json::Value {
+        json!({
+            "sub": "moi-user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+            "iat": now,
+            "exp": now + 3600,
+            "edge_agent_id": "edge-1",
+            "jti": "jti-1",
+            "purpose": "edge_registration",
+        })
+    }
 
-        async fn logout(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _session: ExternalProviderSessionHandle,
-        ) -> Result<ExternalLogoutResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!("AuthorizingProviderClient stub: logout not used in these tests")
-        }
-
-        async fn list_catalog_by_scope(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _provider_scope_id: String,
-            _external_subject: String,
-        ) -> Result<ExternalCatalogResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!(
-                "AuthorizingProviderClient stub: list_catalog_by_scope not used in these tests"
-            )
-        }
-
-        async fn issue_runtime_context_by_scope(
-            &self,
-            _provider: &ExternalAuthProviderConfig,
-            _provider_scope_id: String,
-            _external_subject: String,
-            _request: ExternalRuntimeContextRequestData,
-        ) -> Result<ExternalRuntimeContextResponse, (StatusCode, Json<ErrorResponse>)> {
-            unimplemented!(
-                "AuthorizingProviderClient stub: issue_runtime_context_by_scope not used in these tests"
-            )
-        }
+    fn edge_registration_token() -> String {
+        mint_user_token(
+            TEST_EDGE_TOKEN_HMAC_KEY,
+            &edge_registration_claims(Utc::now().timestamp()),
+        )
     }
 
     fn hmac_provider_token(
@@ -2309,7 +2482,7 @@ mod tests {
     }
 
     fn edge_provider_service() -> DatabaseAuthService {
-        let mut service = DatabaseAuthService::new(
+        DatabaseAuthService::new(
             astra_core::MatrixOneSettings::mock(),
             JwtSettings {
                 secret_key: "test-secret-key-for-unit-tests".into(),
@@ -2318,20 +2491,35 @@ mod tests {
                 refresh_token_expire_days: 7,
             },
         )
-        .with_external_providers(vec![ExternalAuthProviderConfig {
-            id: "moi".to_string(),
-            display_name: "MOI".to_string(),
-            external_auth_endpoint: "http://127.0.0.1/unused".to_string(),
-        }]);
-        service.external_client = Arc::new(AuthorizingProviderClient);
-        service
+        .with_edge_token_auth(EdgeTokenAuthConfig {
+            key: TEST_EDGE_TOKEN_HMAC_KEY.to_string(),
+            check_endpoint: String::new(),
+        })
     }
 
-    fn edge_headers() -> HeaderMap {
+    // edge_provider_service_with_revocation configures a live revocation
+    // endpoint, required for accepting edge-registration tokens (fail closed).
+    fn edge_provider_service_with_revocation(check_endpoint: String) -> DatabaseAuthService {
+        DatabaseAuthService::new(
+            astra_core::MatrixOneSettings::mock(),
+            JwtSettings {
+                secret_key: "test-secret-key-for-unit-tests".into(),
+                algorithm: "HS256".into(),
+                access_token_expire_minutes: 60,
+                refresh_token_expire_days: 7,
+            },
+        )
+        .with_edge_token_auth(EdgeTokenAuthConfig {
+            key: TEST_EDGE_TOKEN_HMAC_KEY.to_string(),
+            check_endpoint,
+        })
+    }
+
+    fn edge_headers(token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             "authorization",
-            "Bearer moi-user-token-v1.payload.signature"
+            format!("Bearer {token}")
                 .parse()
                 .expect("authorization header"),
         );
@@ -2391,13 +2579,111 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_token_authorization_forwards_the_actual_request_descriptor() {
-        let principal = edge_provider_service()
-            .current_principal_for_request(&edge_headers(), chat_stream_descriptor())
+    async fn edge_token_local_verification_resolves_principal() {
+        let token = edge_registration_token();
+        let check_endpoint = spawn_revocation_ok_server().await;
+        let principal = edge_provider_service_with_revocation(check_endpoint)
+            .current_principal_for_request(&edge_headers(&token), chat_stream_descriptor())
             .await
-            .expect("edge token should be authorized for the described request");
+            .expect("edge token should verify locally for the described request");
 
         assert_eq!(principal.user.user_id, "external_authorized:moi:moi-user-1");
+        assert_eq!(principal.user.username, "moi-user-1");
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = principal.origin else {
+            panic!("expected provider-authorized principal");
+        };
+        assert_eq!(context.provider_id, "moi");
+        assert_eq!(context.external_subject, "moi-user-1");
+        assert_eq!(context.provider_scope_id, "workspace-1");
+        assert_eq!(context.edge_agent_id.as_deref(), Some("edge-1"));
+        assert_eq!(
+            context.request_authorization_id,
+            "moi-user-token-v1:jti:jti-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_revocation_cache_misses_are_singleflight_per_jti() {
+        use std::sync::atomic::Ordering;
+
+        let (check_endpoint, calls) =
+            spawn_counted_revocation_server(serde_json::json!({"code": 0, "data": {"ok": true}}))
+                .await;
+        let service = Arc::new(edge_provider_service_with_revocation(
+            check_endpoint.clone(),
+        ));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let service = Arc::clone(&service);
+            let check_endpoint = check_endpoint.clone();
+            requests.spawn(async move {
+                service
+                    .check_edge_token_revoked_cached(&check_endpoint, "same-token", "same-jti")
+                    .await
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            result
+                .expect("revocation check task")
+                .expect("revocation check");
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent misses for one jti must share one remote check"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_revocation_denials_share_the_same_inflight_result() {
+        use std::sync::atomic::Ordering;
+
+        let (check_endpoint, calls) =
+            spawn_counted_revocation_server(serde_json::json!({"code": 1, "data": {"ok": false}}))
+                .await;
+        let service = Arc::new(edge_provider_service_with_revocation(
+            check_endpoint.clone(),
+        ));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let service = Arc::clone(&service);
+            let check_endpoint = check_endpoint.clone();
+            requests.spawn(async move {
+                service
+                    .check_edge_token_revoked_cached(&check_endpoint, "same-token", "same-jti")
+                    .await
+            });
+        }
+        while let Some(result) = requests.join_next().await {
+            assert!(
+                result.expect("revocation check task").is_err(),
+                "all waiters must receive the shared denial"
+            );
+        }
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent denials for one jti must share one remote check"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_token_is_accepted_by_context_free_auth_via_local_verification() {
+        // current_principal verifies edge tokens locally (shared HMAC key) so
+        // edge CLIs can call plain read surfaces such as GET /models; the old
+        // request-descriptor requirement died with the authorize_request
+        // callback. Revocation is enforced inside principal_from_edge_token
+        // whenever a check endpoint is configured (none in this fixture).
+        let token = edge_registration_token();
+        let check_endpoint = spawn_revocation_ok_server().await;
+        let principal = edge_provider_service_with_revocation(check_endpoint)
+            .current_principal(&edge_headers(&token))
+            .await
+            .expect("edge token should verify locally without a request descriptor");
+
+        assert!(principal.is_edge_registration());
         let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = principal.origin else {
             panic!("expected provider-authorized principal");
         };
@@ -2406,21 +2692,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edge_token_is_rejected_without_request_context() {
-        let err = edge_provider_service()
-            .current_principal(&edge_headers())
+    async fn edge_registration_binding_returns_bound_for_valid_token() {
+        let token = edge_registration_token();
+        // Fail-closed: binding now requires a revocation endpoint.
+        let check_endpoint = spawn_revocation_ok_server().await;
+        let binding = edge_provider_service_with_revocation(check_endpoint)
+            .edge_registration_binding(&token)
             .await
-            .expect_err("context-free auth must not accept an edge token");
-
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+            .expect("valid edge registration token should bind");
         assert_eq!(
-            err.1.error_code.as_deref(),
-            Some("edge_token_request_context_required")
+            binding,
+            EdgeTokenBinding::Bound {
+                edge_agent_id: "edge-1".to_string(),
+                workspace_id: "workspace-1".to_string(),
+            }
         );
     }
 
     #[tokio::test]
-    async fn edge_registration_binding_fails_closed_without_provider() {
+    async fn edge_registration_binding_runtime_purpose_is_missing_binding() {
+        let now = Utc::now().timestamp();
+        let token = mint_user_token(
+            TEST_EDGE_TOKEN_HMAC_KEY,
+            &json!({
+                "sub": "moi-user-1",
+                "workspace_id": "workspace-1",
+                "iss": "moi-catalog",
+                "iat": now,
+                "exp": now + 3600,
+                "purpose": "runtime",
+            }),
+        );
+        let binding = edge_provider_service()
+            .edge_registration_binding(&token)
+            .await
+            .expect("runtime token should verify but carry no binding");
+        assert_eq!(binding, EdgeTokenBinding::MissingBinding);
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_rejects_wrong_key_signature() {
+        let token = mint_user_token(
+            "wrong-key",
+            &edge_registration_claims(Utc::now().timestamp()),
+        );
+        let err = edge_provider_service()
+            .edge_registration_binding(&token)
+            .await
+            .expect_err("wrong-key signature must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1.error_code.as_deref(), Some("edge_token_auth_invalid"));
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_rejects_expired_token() {
+        let now = Utc::now().timestamp();
+        let mut claims = edge_registration_claims(now - 7200);
+        claims["exp"] = json!(now - 3600);
+        let token = mint_user_token(TEST_EDGE_TOKEN_HMAC_KEY, &claims);
+        let err = edge_provider_service()
+            .edge_registration_binding(&token)
+            .await
+            .expect_err("expired token must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1.error_code.as_deref(), Some("edge_token_auth_invalid"));
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_accepts_token_at_exp_second() {
+        // Parity with the Go verifiers: the token is accepted through the exp
+        // second (`now > exp` rejects, `now == exp` does not).
+        let now = Utc::now().timestamp();
+        let mut claims = edge_registration_claims(now);
+        claims["exp"] = json!(now + 1);
+        let token = mint_user_token(TEST_EDGE_TOKEN_HMAC_KEY, &claims);
+        // Fail-closed: binding now requires a revocation endpoint.
+        let check_endpoint = spawn_revocation_ok_server().await;
+        edge_provider_service_with_revocation(check_endpoint)
+            .edge_registration_binding(&token)
+            .await
+            .expect("token at/before exp second must be accepted");
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_fails_closed_without_revocation_endpoint() {
+        // A valid edge token whose HMAC key is configured but with no revocation
+        // endpoint must be refused (fail-closed) — consistent with
+        // principal_from_edge_token; never accept a long-lived credential we
+        // cannot revoke.
+        let token = edge_registration_token();
+        let err = edge_provider_service() // empty check_endpoint
+            .edge_registration_binding(&token)
+            .await
+            .expect_err("edge token without a revocation endpoint must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_rejects_missing_jti() {
+        let now = Utc::now().timestamp();
+        let mut claims = edge_registration_claims(now);
+        claims.as_object_mut().expect("claims object").remove("jti");
+        let token = mint_user_token(TEST_EDGE_TOKEN_HMAC_KEY, &claims);
+        let err = edge_provider_service()
+            .edge_registration_binding(&token)
+            .await
+            .expect_err("edge_registration token without jti must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1.error_code.as_deref(), Some("edge_token_auth_invalid"));
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_rejects_moi_backend_runtime_purpose() {
+        let now = Utc::now().timestamp();
+        let token = mint_user_token(
+            TEST_EDGE_TOKEN_HMAC_KEY,
+            &json!({
+                "sub": "moi-user-1",
+                "workspace_id": "workspace-1",
+                "iss": "moi-backend",
+                "iat": now,
+                "exp": now + 3600,
+                "purpose": "runtime",
+            }),
+        );
+        let err = edge_provider_service()
+            .edge_registration_binding(&token)
+            .await
+            .expect_err("moi-backend issuer with runtime purpose must be rejected");
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1.error_code.as_deref(), Some("edge_token_auth_invalid"));
+    }
+
+    #[tokio::test]
+    async fn edge_token_runtime_purpose_principal_has_no_edge_binding() {
+        let now = Utc::now().timestamp();
+        let token = mint_user_token(
+            TEST_EDGE_TOKEN_HMAC_KEY,
+            &json!({
+                "sub": "moi-user-2",
+                "workspace_id": "workspace-2",
+                "iss": "moi-catalog",
+                "iat": now,
+                "exp": now + 3600,
+            }),
+        );
+        let principal = edge_provider_service()
+            .current_principal_for_request(&edge_headers(&token), chat_stream_descriptor())
+            .await
+            .expect("runtime token should resolve a principal");
+        let AuthPrincipalOrigin::ProviderAuthorizedRequest(context) = principal.origin else {
+            panic!("expected provider-authorized principal");
+        };
+        assert_eq!(context.provider_scope_id, "workspace-2");
+        assert_eq!(context.edge_agent_id, None);
+        assert_eq!(
+            context.request_authorization_id,
+            format!("moi-user-token-v1:moi-user-2:{}", now + 3600)
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_registration_binding_fails_closed_without_edge_token_auth() {
         let service = DatabaseAuthService::new(
             astra_core::MatrixOneSettings::mock(),
             JwtSettings {

@@ -76,9 +76,8 @@ async fn memoria_proxy_request(
     body: Option<&Value>,
 ) -> Result<String, String> {
     let (base, token) = current_memoria_proxy_target()?;
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(&base)
         .timeout(timeout)
-        .no_proxy()
         .build()
         .map_err(|e| format!("build client: {e}"))?;
     let url = format!("{}{}", base.trim_end_matches('/'), path);
@@ -416,9 +415,8 @@ impl ToolExecutor {
             Some(token) => token,
             None => return vec![],
         };
-        let client = match reqwest::Client::builder()
+        let client = match astra_core::net::client_builder_for_target(&cloud_base)
             .timeout(Duration::from_millis(800))
-            .no_proxy()
             .build()
         {
             Ok(c) => c,
@@ -489,9 +487,8 @@ impl ToolExecutor {
             None => return,
         };
         tokio::spawn(async move {
-            let client = match reqwest::Client::builder()
+            let client = match astra_core::net::client_builder_for_target(&cloud_base)
                 .timeout(Duration::from_secs(5))
-                .no_proxy()
                 .build()
             {
                 Ok(c) => c,

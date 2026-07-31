@@ -85,6 +85,25 @@ by MOI deployment tooling. Astra uses the configured string's UTF-8 bytes
 directly as the provider request HMAC key; it does not base64url-decode the
 string before verifying request tokens.
 
+### Edge Token Auth
+
+MOI edge-registration tokens (`moi-user-token-v1.*`) presented by sandbox/runner
+edge agents are verified locally under `auth.edge_token_auth` in `server.toml`
+using a shared HMAC key (the MOI `jwt_secret`). Whenever `key` is configured,
+`check_endpoint` is **required** — config validation rejects a key without one so
+revocation can never be silently skipped. Astra then performs a jti revocation
+check against moi-core on **every surface that
+accepts an edge token** — the edge WebSocket connect and every HTTP request —
+with a 30-second positive-only cache per jti (denials and check-endpoint
+outages are never cached; both fail closed). Worst-case revocation propagation
+on astra surfaces is therefore ≤ 30 seconds.
+
+```toml
+[auth.edge_token_auth]
+key = "${ASTRA_EDGE_TOKEN_HMAC_KEY}"
+check_endpoint = "http://moi-catalog:8081/api/v1/astra/edge-tokens/check"
+```
+
 ### LLM
 
 LLM models are **not** configured via env vars. Use the admin CLI:
