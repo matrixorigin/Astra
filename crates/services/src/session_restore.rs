@@ -1546,7 +1546,7 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
             .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing);
     let task = bundle.projections.task_at(&cursor).cloned().or_else(|| {
         permits_degraded_projection_fallback
-            .then(|| bundle.projections.task.as_ref())
+            .then_some(bundle.projections.task.as_ref())
             .flatten()
             .filter(|projection| {
                 projection.schema_version
@@ -1562,7 +1562,7 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
         .cloned()
         .or_else(|| {
             permits_degraded_projection_fallback
-                .then(|| bundle.projections.provider.as_ref())
+                .then_some(bundle.projections.provider.as_ref())
                 .flatten()
                 .filter(|projection| {
                     projection.schema_version
