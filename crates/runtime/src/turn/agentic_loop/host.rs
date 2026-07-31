@@ -2427,10 +2427,28 @@ impl AgenticLoopState {
 
     /// Append a genuine conversational item to prompt history and, when this
     /// is a locally durable child run, to its ordered transcript capture.
-    /// Runtime context must use the typed volatile lanes instead.
-    pub fn push_prompt_history_message(&mut self, message: Value) {
+    /// Runtime context must use the typed volatile lanes instead. Root bridge
+    /// turns stamp append-only identity here so history optimization cannot
+    /// erase the current-turn boundary.
+    pub fn push_prompt_history_message(&mut self, mut message: Value) {
+        if let Some(turn_chain_id) = self.bridge_turn_chain_id.as_deref() {
+            astra_turn_types::mark_bridge_turn_message(&mut message, turn_chain_id);
+        }
         self.messages.push(message.clone());
         self.record_prompt_history_messages(std::iter::once(message));
+    }
+
+    /// Stamp and capture a suffix appended by a lower-level routine that had
+    /// direct mutable access to `messages`.
+    pub fn record_appended_prompt_history_from(&mut self, start: usize) {
+        let start = start.min(self.messages.len());
+        if let Some(turn_chain_id) = self.bridge_turn_chain_id.as_deref() {
+            for message in &mut self.messages[start..] {
+                astra_turn_types::mark_bridge_turn_message(message, turn_chain_id);
+            }
+        }
+        let appended = self.messages[start..].to_vec();
+        self.record_prompt_history_messages(appended);
     }
 
     /// Record items appended by a lower-level routine that receives a mutable
@@ -3684,6 +3702,36 @@ pub(crate) mod tests {
             vec![task, repeated.clone(), repeated]
         );
         assert!(state.take_run_transcript_capture().is_empty());
+    }
+
+    #[test]
+    fn bridge_turn_identity_covers_all_append_paths_without_text_matching() {
+        let mut state = make_test_loop_state();
+        state.bridge_turn_chain_id = Some("chain-current".into());
+        state.begin_run_transcript_capture(std::iter::empty());
+
+        state.push_prompt_history_message(json!({"role": "user", "content": "same"}));
+        let direct_start = state.messages.len();
+        state.messages.extend([
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "same"}),
+        ]);
+        state.record_appended_prompt_history_from(direct_start);
+
+        assert!(state.messages.iter().all(|message| {
+            astra_turn_types::bridge_turn_message_provenance(message)
+                .unwrap()
+                .is_some_and(|provenance| provenance.turn_chain_id == "chain-current")
+        }));
+        assert_eq!(state.take_run_transcript_capture(), state.messages);
     }
 
     #[test]

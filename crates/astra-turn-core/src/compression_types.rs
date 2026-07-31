@@ -271,7 +271,13 @@ impl From<Message> for Value {
         // conversation metadata and are stripped only at the provider wire
         // boundary.
         for (k, v) in m.extra {
-            if !k.starts_with('_') || k == astra_turn_types::USER_TURN_SEMANTICS_FIELD {
+            if !k.starts_with('_')
+                || matches!(
+                    k.as_str(),
+                    astra_turn_types::USER_TURN_SEMANTICS_FIELD
+                        | astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD
+                )
+            {
                 map.insert(k, v);
             }
         }
@@ -610,7 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_conversion_preserves_stable_semantics_but_strips_dynamic_extras() {
+    fn canonical_conversion_preserves_stable_identity_but_strips_dynamic_extras() {
         // Dynamic telemetry counters (`_messages_removed`, `_turns_removed`,
         // `_reactive`, `_compact_boundary`) live in `extra` but must NOT
         // cross the provider wire: they change across re-compactions and
@@ -626,6 +632,10 @@ mod tests {
             astra_turn_types::USER_TURN_SEMANTICS_FIELD: {
                 "schema_version": 1,
                 "objective_relation": "refine"
+            },
+            astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD: {
+                "schema_version": 1,
+                "turn_chain_id": "chain-1"
             },
             "custom_provider_field": {"ok": true}
         });
@@ -651,6 +661,11 @@ mod tests {
             back.get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
                 .is_some(),
             "stable turn semantics must survive canonical compaction"
+        );
+        assert!(
+            back.get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+                .is_some(),
+            "bridge turn identity must survive context optimization"
         );
         // Non-`_`-prefixed extras still pass through.
         assert_eq!(back["custom_provider_field"], json!({"ok": true}));

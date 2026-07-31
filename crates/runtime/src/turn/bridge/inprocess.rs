@@ -462,6 +462,7 @@ fn start_bridge_canonical_renewal(
 fn canonical_bridge_current_turn_suffix_is_valid(
     messages: &[Value],
     allow_leading_system: bool,
+    allow_additional_user_inputs: bool,
 ) -> bool {
     let mut index = 0;
     if allow_leading_system {
@@ -485,6 +486,12 @@ fn canonical_bridge_current_turn_suffix_is_valid(
     index += 1;
 
     while index < messages.len() {
+        if allow_additional_user_inputs
+            && messages[index].get("role").and_then(Value::as_str) == Some("user")
+        {
+            index += 1;
+            continue;
+        }
         let Some(calls) = messages[index]
             .get("tool_calls")
             .and_then(Value::as_array)
@@ -524,10 +531,58 @@ fn canonical_bridge_current_turn_suffix_is_valid(
     true
 }
 
+fn canonical_bridge_provenance_suffix_start(
+    messages: &[Value],
+    turn_chain_id: &str,
+) -> Result<Option<usize>, String> {
+    let mut current_start = None;
+    for (index, message) in messages.iter().enumerate() {
+        let provenance = astra_turn_types::bridge_turn_message_provenance(message)
+            .map_err(|error| format!("bridge prompt has invalid turn provenance: {error}"))?;
+        let belongs_to_current = provenance
+            .as_ref()
+            .is_some_and(|provenance| provenance.turn_chain_id == turn_chain_id);
+        match (current_start, belongs_to_current) {
+            (None, true) => current_start = Some(index),
+            (Some(_), false) => {
+                return Err(
+                    "bridge prompt current-turn provenance must form one contiguous suffix".into(),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(current_start)
+}
+
+fn clear_bridge_turn_provenance(messages: &mut [Value]) {
+    for message in messages {
+        astra_turn_types::clear_bridge_turn_message_provenance(message);
+    }
+}
+
 fn admit_canonical_bridge_prompt(
     mut prior_messages: Vec<Value>,
-    request_messages: Vec<Value>,
+    mut request_messages: Vec<Value>,
+    turn_chain_id: Option<&str>,
 ) -> Result<(Vec<Value>, Vec<Value>), String> {
+    if let Some(turn_chain_id) = turn_chain_id
+        && let Some(current_start) =
+            canonical_bridge_provenance_suffix_start(&request_messages, turn_chain_id)?
+    {
+        let current_turn = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            request_messages[current_start..].to_vec(),
+        )
+        .map_err(|error| format!("bridge prompt has invalid turn semantics: {error}"))?;
+        if !canonical_bridge_current_turn_suffix_is_valid(&current_turn, false, true) {
+            return Err(
+                "bridge prompt provenance identifies an invalid current-turn transcript".into(),
+            );
+        }
+        clear_bridge_turn_provenance(&mut request_messages);
+        return Ok((current_turn, request_messages));
+    }
+
     let mut request_canonical =
         astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
             request_messages.clone(),
@@ -546,7 +601,7 @@ fn admit_canonical_bridge_prompt(
         (request_canonical, provider_messages)
     };
 
-    if !canonical_bridge_current_turn_suffix_is_valid(&current_turn, !had_canonical_head) {
+    if !canonical_bridge_current_turn_suffix_is_valid(&current_turn, !had_canonical_head, false) {
         return Err(
             "bridge prompt must contain exactly one structurally valid current-turn suffix".into(),
         );
@@ -596,7 +651,7 @@ async fn begin_bridge_canonical_admission(
         None => Vec::new(),
     };
     let (current_turn_canonical_messages, provider_messages) =
-        admit_canonical_bridge_prompt(prior_messages, request_messages)
+        admit_canonical_bridge_prompt(prior_messages, request_messages, Some(turn_chain_id))
             .map_err(|error| (StatusCode::CONFLICT, error))?;
 
     let (lease, release_writer_on_finish, release_writer_on_admission_failure) =
@@ -6416,9 +6471,86 @@ mod tests {
             json!({"role": "user", "content": "current"}),
         ];
 
-        let error = admit_canonical_bridge_prompt(prior, divergent)
+        let error = admit_canonical_bridge_prompt(prior, divergent, None)
             .expect_err("a completed client-side history must not be reinterpreted as one turn");
         assert!(error.contains("structurally valid current-turn suffix"));
+    }
+
+    #[test]
+    fn canonical_bridge_prompt_uses_typed_turn_suffix_after_history_optimization() {
+        let prior = vec![
+            json!({"role": "user", "content": "discarded old request"}),
+            json!({"role": "assistant", "content": "discarded old answer"}),
+            json!({"role": "user", "content": "retained request"}),
+            json!({"role": "assistant", "content": "retained answer"}),
+        ];
+        let mut request = vec![
+            json!({"role": "user", "content": "retained request"}),
+            json!({"role": "assistant", "content": "retained answer"}),
+            json!({"role": "user", "content": "inspect current changes"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call-1", "content": "evidence"}),
+            json!({"role": "user", "content": "keep this readonly"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-2",
+                    "type": "function",
+                    "function": {"name": "git_diff", "arguments": "{}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call-2", "content": "diff"}),
+        ];
+        for message in &mut request[2..] {
+            assert!(astra_turn_types::mark_bridge_turn_message(
+                message,
+                "chain-current"
+            ));
+        }
+
+        let (current_turn, provider_messages) =
+            admit_canonical_bridge_prompt(prior, request, Some("chain-current")).unwrap();
+
+        assert_eq!(current_turn.len(), 6);
+        assert_eq!(current_turn[0]["content"], "inspect current changes");
+        assert_eq!(current_turn[3]["content"], "keep this readonly");
+        assert!(current_turn.iter().all(|message| {
+            message
+                .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        }));
+        assert_eq!(provider_messages.len(), 8);
+        assert_eq!(provider_messages[0]["content"], "retained request");
+        assert!(provider_messages.iter().all(|message| {
+            message
+                .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+                .is_none()
+        }));
+    }
+
+    #[test]
+    fn canonical_bridge_prompt_rejects_noncontiguous_typed_turn_identity() {
+        let mut request = vec![
+            json!({"role": "user", "content": "current"}),
+            json!({"role": "assistant", "content": "unmarked terminal history"}),
+        ];
+        assert!(astra_turn_types::mark_bridge_turn_message(
+            &mut request[0],
+            "chain-current"
+        ));
+
+        let error = admit_canonical_bridge_prompt(Vec::new(), request, Some("chain-current"))
+            .expect_err("typed current-turn identity must be a suffix");
+        assert!(error.contains("one contiguous suffix"));
     }
 
     #[test]

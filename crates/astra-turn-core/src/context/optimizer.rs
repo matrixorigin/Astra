@@ -289,13 +289,30 @@ fn drop_oldest_rounds(messages: &mut Vec<Value>, pressure: f64) -> u32 {
         messages,
     );
     let mut units = Vec::<Vec<usize>>::new();
+    let mut active_bridge_turn: Option<&str> = None;
     for (idx, message) in messages.iter().enumerate() {
         let role = message.get("role").and_then(Value::as_str);
         if role == Some("system") {
             continue;
         }
-        if role == Some("user") || units.is_empty() {
+        let bridge_turn = message
+            .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+            .and_then(Value::as_object)
+            .filter(|provenance| {
+                provenance.get("schema_version").and_then(Value::as_u64)
+                    == Some(u64::from(
+                        astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+                    ))
+            })
+            .and_then(|provenance| provenance.get("turn_chain_id"))
+            .and_then(Value::as_str)
+            .filter(|turn_chain_id| !turn_chain_id.is_empty());
+        let starts_unit = units.is_empty()
+            || (role == Some("user")
+                && (bridge_turn.is_none() || bridge_turn != active_bridge_turn));
+        if starts_unit {
             units.push(Vec::new());
+            active_bridge_turn = bridge_turn;
         }
         if let Some(unit) = units.last_mut() {
             unit.push(idx);
@@ -1110,6 +1127,29 @@ mod tests {
             ],
             "a user request and every assistant/tool continuation it caused form one atomic unit"
         );
+    }
+
+    #[test]
+    fn round_dropping_keeps_guidance_in_the_same_active_bridge_turn_atomic() {
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "old request"}),
+            serde_json::json!({"role": "assistant", "content": "old answer"}),
+            serde_json::json!({"role": "user", "content": "current request"}),
+            serde_json::json!({"role": "assistant", "content": "current progress"}),
+            serde_json::json!({"role": "user", "content": "keep it readonly"}),
+            serde_json::json!({"role": "assistant", "content": "continued progress"}),
+        ];
+        for message in &mut messages[2..] {
+            assert!(astra_turn_types::mark_bridge_turn_message(
+                message,
+                "chain-current"
+            ));
+        }
+
+        assert!(drop_oldest_rounds(&mut messages, 1.0) > 0);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["content"], "current request");
+        assert_eq!(messages[2]["content"], "keep it readonly");
     }
 
     #[test]

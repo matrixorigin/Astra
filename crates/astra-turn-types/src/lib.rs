@@ -6,6 +6,7 @@
 mod agent_communication;
 mod agent_transcript_evidence;
 mod agent_transcript_location;
+mod bridge_turn;
 mod canonical_tool_pairing;
 mod context_identity;
 mod context_window;
@@ -33,6 +34,11 @@ pub use agent_communication::{
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
+pub use bridge_turn::{
+    BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD, BRIDGE_TURN_MESSAGE_PROVENANCE_SCHEMA_VERSION,
+    BridgeTurnMessageProvenanceError, BridgeTurnMessageProvenanceV1,
+    bridge_turn_message_provenance, clear_bridge_turn_message_provenance, mark_bridge_turn_message,
+};
 pub use canonical_tool_pairing::{CanonicalToolPairingError, validate_canonical_tool_pairing};
 pub use context_identity::{
     ContextIdentityError, LLM_ARTIFACT_EVIDENCE_CONTRACT_VERSION,

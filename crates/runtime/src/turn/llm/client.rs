@@ -2550,6 +2550,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
         if let Some(object) = message.as_object_mut() {
             object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
+            object.remove(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove("_compact_boundary");
         }
     }
@@ -8649,6 +8650,10 @@ mod tests {
             "schema_version": 1,
             "objective_relation": "continue"
         });
+        runtime[astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD] = json!({
+            "schema_version": 1,
+            "turn_chain_id": "chain-current"
+        });
 
         let out = consolidate_system_messages_for_provider(&[runtime], "openai");
 
@@ -8661,6 +8666,11 @@ mod tests {
         assert!(
             out[0]
                 .get(astra_turn_types::USER_TURN_SEMANTICS_FIELD)
+                .is_none()
+        );
+        assert!(
+            out[0]
+                .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());

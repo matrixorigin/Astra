@@ -172,9 +172,14 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
     let messages = messages
         .into_iter()
         .skip(start)
-        .filter(|message| {
-            message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
-                && !is_runtime_owned_message(message)
+        .filter_map(|mut message| {
+            let keep = message.get("_compact_boundary").and_then(Value::as_bool) != Some(true)
+                && !is_runtime_owned_message(&message);
+            if !keep {
+                return None;
+            }
+            astra_turn_types::clear_bridge_turn_message_provenance(&mut message);
+            Some(message)
         })
         .collect::<Vec<_>>();
 

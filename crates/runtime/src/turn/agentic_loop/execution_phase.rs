@@ -1481,8 +1481,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
             consecutive_context_window_errors: &mut state.consecutive_context_window_errors,
         },
     );
-    let transcript_appended = state.messages[transcript_append_start..].to_vec();
-    state.record_prompt_history_messages(transcript_appended);
+    state.record_appended_prompt_history_from(transcript_append_start);
     if let Some(session_id) = state.current_session_id.as_deref() {
         host.on_session_bound(session_id);
         if let Some(buffer) = state.turn_event_buffer.as_mut()

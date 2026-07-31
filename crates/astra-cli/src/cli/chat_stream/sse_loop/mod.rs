@@ -500,15 +500,17 @@ pub(crate) async fn stream_chat_sse(
             }
         }
     }
-    let messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message).map_err(
-        |error| crate::TurnFailure {
+    let mut messages = load_turn_messages(p.pre_loaded_messages.take(), p.history, p.message)
+        .map_err(|error| crate::TurnFailure {
             error: error.to_string(),
             partial: crate::PartialTurnData {
                 session_id: p.session_id.map(str::to_string),
                 ..Default::default()
             },
-        },
-    )?;
+        })?;
+    if let Some(current) = messages.last_mut() {
+        astra_turn_types::mark_bridge_turn_message(current, &parent_turn_run_id);
+    }
     // Only the fresh user suffix starts this root execution transcript. The
     // preceding prompt history is inherited context, not a new conversation
     // item for this run.

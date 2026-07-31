@@ -1322,8 +1322,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         })
         .await;
     }
-    let transcript_appended = state.messages[transcript_append_start..].to_vec();
-    state.record_prompt_history_messages(transcript_appended);
+    state.record_appended_prompt_history_from(transcript_append_start);
 
     // Record LLM round in the turn event buffer and advance the round counter.
     // Also post-process new ToolCallRecords to set batch_id and parallel flags.
