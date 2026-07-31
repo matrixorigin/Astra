@@ -5048,12 +5048,16 @@ fn apply_heavy_checkpoint_fallback(
     );
 }
 
-fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &RestoredSession) {
+fn apply_restored_cloud_heavy_state(
+    state: &mut SessionState,
+    restored: &RestoredSession,
+    resume_messages: &[serde_json::Value],
+) {
     apply_heavy_state_fallback(
         state,
         &restored.blocked_tools,
         &restored.recent_tools,
-        &restored.conversation_messages,
+        resume_messages,
         restored.approval_overrides.as_ref(),
     );
 }
@@ -5061,6 +5065,7 @@ fn apply_restored_cloud_heavy_state(state: &mut SessionState, restored: &Restore
 struct PreparedForkRestore {
     history: Vec<(String, String)>,
     active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
+    resume: Option<astra_turn_types::ResumeDescriptorV1>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
@@ -5207,7 +5212,7 @@ fn materialize_prepared_fork_restore(
         history = session_continuation::history_pairs_from_messages(&canonical_messages);
         active_conversation =
             astra_turn_core::active_conversation::ActiveConversation::from_projection(
-                astra_services::local_owner_scope().id(),
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
                 session_id,
                 canonical_messages,
                 materialized.last_turn,
@@ -5228,6 +5233,7 @@ fn materialize_prepared_fork_restore(
     PreparedForkRestore {
         history,
         active_conversation,
+        resume: None,
         recent_tools,
         activated_deferred_tool_names,
         csl_manager: has_csl_materialization.then_some(mgr),
@@ -5245,6 +5251,7 @@ fn prepared_fork_restore_from_restored_journal(
             &restored_journal.session.history,
         ),
         active_conversation: None,
+        resume: None,
         recent_tools: restored_journal.session.recent_tools.clone(),
         activated_deferred_tool_names: Vec::new(),
         csl_manager: None,
@@ -5289,6 +5296,7 @@ async fn prepared_fork_restore_from_journal(
         }
         prepared.activated_deferred_tool_names = continuation.activated_deferred_tool_names;
         prepared.active_conversation = Some(continuation.active_conversation);
+        prepared.resume = Some(continuation.resume);
     }
     Ok(prepared)
 }
@@ -5531,8 +5539,47 @@ async fn apply_restored_session(
     profile: Option<&str>,
     api: &astra_thin_client::ThinClient,
     state: &mut SessionState,
-    restored: RestoredSession,
+    mut restored: RestoredSession,
 ) -> Result<(), String> {
+    let had_versioned_resume_bundle = restored.resume_bundle.is_some();
+    let resume_bundle = restored.resume_bundle.take().or_else(|| {
+        let messages = session_continuation::sanitize_continuation_messages(std::mem::take(
+            &mut restored.conversation_messages,
+        ));
+        if messages.is_empty() {
+            return None;
+        }
+        let cursor = astra_turn_types::legacy_resume_cursor(
+            &crate::cli::cli_config::cli_utils::cli_user_id(),
+            &restored.session_id,
+            restored.turn_count,
+            &messages,
+        );
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                degraded_reasons: vec![
+                    astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+                    astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
+                    astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback,
+                ],
+                repair_actions: vec![
+                    astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
+                    astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
+                ],
+                projections: Default::default(),
+            }],
+        )
+        .ok()
+    });
+    let typed_continuation =
+        resume_bundle.and_then(session_continuation::continuation_from_resume_bundle);
+    if had_versioned_resume_bundle && typed_continuation.is_none() {
+        return Err("restored ResumeBundle failed causal validation".to_string());
+    }
     let local_journal = session_runtime::restored_journal_state(&restored.session_id)?;
     if !restored.restored_from_cloud && !local_journal.exists {
         return Err(format!(
@@ -5540,8 +5587,6 @@ async fn apply_restored_session(
             restored.session_id
         ));
     }
-    let restored_permission_mode = parse_restored_permission_mode(&restored)?;
-
     let local_state = local_journal.session;
     let total_cache_read_tokens = restored
         .total_cache_read_tokens
@@ -5551,7 +5596,68 @@ async fn apply_restored_session(
         .max(local_state.total_cache_creation_tokens);
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
-    let mut restored_activation = restored.activated_deferred_tool_names.clone();
+    let use_typed_continuation = match (
+        prepared_history.resume.as_ref(),
+        typed_continuation.as_ref(),
+    ) {
+        (_, None) => false,
+        (None, Some(_)) => true,
+        (Some(local), Some(remote)) => {
+            let candidates = [
+                session_continuation::portable_resume_descriptor(local.clone()),
+                session_continuation::portable_resume_descriptor(remote.resume.clone()),
+            ];
+            astra_turn_types::select_resume_candidate_index(None, &candidates).map_err(|error| {
+                format!("TUI resume candidates are causally inconsistent: {error}")
+            })? == 1
+        }
+    };
+    let selected_cursor = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.resume.cursor.clone())
+    } else {
+        prepared_history
+            .resume
+            .as_ref()
+            .map(|resume| resume.cursor.clone())
+    };
+    let use_restored_projection = use_typed_continuation || prepared_history.resume.is_none();
+    if !use_restored_projection {
+        // The local canonical generation won causal selection. Do not retain
+        // independently persisted cloud/checkpoint controls from a different
+        // generation.
+        restored.activated_deferred_tool_names.clear();
+        restored.recent_tools.clear();
+        restored.blocked_tools.clear();
+        restored.approval_overrides = None;
+        restored.interruption = None;
+        restored.compaction_state = None;
+        restored.pipeline_state = None;
+        restored.executing_plan_json = None;
+        restored.plan_goal = None;
+        restored.plan_config_json = None;
+        restored.plan_execution_rounds = 0;
+        restored.contract_json = None;
+        restored.model = None;
+        restored.permission_mode = None;
+    }
+    let restored_permission_mode = parse_restored_permission_mode(&restored)?;
+    let restored_resume_messages = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.messages.as_slice())
+            .unwrap_or_default()
+    } else if let Some(active) = prepared_history.active_conversation.as_ref() {
+        active.messages()
+    } else {
+        restored.conversation_messages.as_slice()
+    };
+    let mut restored_activation = if use_restored_projection {
+        restored.activated_deferred_tool_names.clone()
+    } else {
+        Vec::new()
+    };
     let last_turn_event = local_journal.last_turn_event;
     let user_id = state
         .ingestion_user_id
@@ -5561,8 +5667,38 @@ async fn apply_restored_session(
         .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
 
     let mut step_restore_error = None;
+    let local_checkpoint_is_admissible = match selected_cursor.as_ref() {
+        None => true,
+        Some(selected) => {
+            match astra_pipeline::step_checkpoint::read_latest_heavy_checkpoint(
+                &user_id,
+                &restored.session_id,
+            ) {
+                Ok(None) => true,
+                Ok(Some(checkpoint)) => {
+                    checkpoint
+                        .conversation_cursor
+                        .as_ref()
+                        .is_some_and(|source| {
+                            session_continuation::cursor_is_exact_for_attached_account(
+                                source, selected,
+                            )
+                        })
+                }
+                // Let the established recovery path surface the concrete I/O
+                // or decode error instead of replacing it with a causal one.
+                Err(_) => true,
+            }
+        }
+    };
     // Try new crash recovery state machine first; fall back to legacy restore
-    let step_restored =
+    let step_restored = if !local_checkpoint_is_admissible {
+        tracing::warn!(
+            session_id = %restored.session_id,
+            "skipping crash recovery from a checkpoint outside the selected conversation generation"
+        );
+        None
+    } else {
         match astra_pipeline::crash_recovery::recover_from_crash(&user_id, &restored.session_id) {
             Ok(Some(astra_pipeline::crash_recovery::RecoveryOutcome::AutoRecovered {
                 restored: cr_restored,
@@ -5692,23 +5828,55 @@ async fn apply_restored_session(
                     }
                 }
             }
+        }
+    };
+    let step_restored = step_restored.filter(|checkpoint| {
+        let admissible = match (
+            selected_cursor.as_ref(),
+            checkpoint.conversation_cursor.as_ref(),
+        ) {
+            (None, _) => true,
+            (Some(selected), Some(source)) => {
+                session_continuation::cursor_is_exact_for_attached_account(source, selected)
+            }
+            _ => false,
         };
-    let has_cloud_heavy_fallback = !restored.conversation_messages.is_empty()
-        || !restored.blocked_tools.is_empty()
-        || restored.approval_overrides.is_some()
-        || restored.interruption.is_some()
-        || restored.compaction_state.is_some();
+        if !admissible {
+            tracing::warn!(
+                session_id = %restored.session_id,
+                "ignoring a local step checkpoint outside the selected conversation generation"
+            );
+        }
+        admissible
+    });
+    let has_cloud_heavy_fallback = use_restored_projection
+        && (!restored_resume_messages.is_empty()
+            || !restored.blocked_tools.is_empty()
+            || restored.approval_overrides.is_some()
+            || restored.interruption.is_some()
+            || restored.compaction_state.is_some());
     if let Some(step_restored) = step_restored.as_ref() {
         restored_activation.extend(step_restored.activated_deferred_tool_names.iter().cloned());
     }
-    restored_activation.extend(
-        prepared_history
-            .activated_deferred_tool_names
-            .iter()
-            .cloned(),
-    );
+    let prepared_activation_is_admissible =
+        match (selected_cursor.as_ref(), prepared_history.resume.as_ref()) {
+            (None, _) => true,
+            (Some(selected), Some(source)) => {
+                session_continuation::cursor_is_exact_for_attached_account(&source.cursor, selected)
+            }
+            _ => false,
+        };
+    if prepared_activation_is_admissible {
+        restored_activation.extend(
+            prepared_history
+                .activated_deferred_tool_names
+                .iter()
+                .cloned(),
+        );
+    }
     if step_restore_error.is_some()
         && !has_cloud_heavy_fallback
+        && selected_cursor.is_none()
         && let Some(error) = step_restore_error.as_ref()
     {
         return Err(format!(
@@ -5777,7 +5945,7 @@ async fn apply_restored_session(
         }
         eprintln!("  {} {}", "↻".magenta(), summary.dim());
     } else if has_cloud_heavy_fallback {
-        apply_restored_cloud_heavy_state(state, &restored);
+        apply_restored_cloud_heavy_state(state, &restored, restored_resume_messages);
         apply_resume_recovery_state(
             state,
             restored.interruption.as_ref(),
@@ -5809,19 +5977,29 @@ async fn apply_restored_session(
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
     crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
 
-    if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
+    if use_typed_continuation {
+        state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
+    } else if prepared_history.history.len() > state.history.len() || state.history.is_empty() {
         state.history = prepared_history.history;
     }
-    if !prepared_history.recent_tools.is_empty() {
+    if prepared_activation_is_admissible && !prepared_history.recent_tools.is_empty() {
         state.recent_tools = prepared_history.recent_tools;
     }
-    state.csl_manager = prepared_history.csl_manager;
-    state.active_conversation = prepared_history.active_conversation;
+    state.csl_manager = prepared_activation_is_admissible
+        .then_some(prepared_history.csl_manager)
+        .flatten();
+    state.active_conversation = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .map(|continuation| continuation.active_conversation.clone())
+    } else {
+        prepared_history.active_conversation.clone()
+    };
     state.last_response = state.history.last().map(|(_, resp)| resp.clone());
     state.last_turn_event = last_turn_event;
     let fallback_resume_messages;
-    let canonical_resume_messages = if !restored.conversation_messages.is_empty() {
-        restored.conversation_messages.as_slice()
+    let canonical_resume_messages = if !restored_resume_messages.is_empty() {
+        restored_resume_messages
     } else {
         fallback_resume_messages =
             session_continuation::load_session_messages_for_continuation(&restored.session_id)
@@ -6530,6 +6708,38 @@ mod resume_tests {
         session_workspace::write_workspace(&ws).unwrap();
     }
 
+    fn attach_checkpoint_to_canonical_test_generation(
+        session_id: &str,
+        turn_count: u32,
+        heavy: &mut astra_pipeline::step_protocol::HeavyCheckpoint,
+    ) {
+        let owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let active =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, session_id)
+                .unwrap();
+        let prepared = active
+            .prepare_commit(turn_count, None, heavy.messages.clone())
+            .unwrap();
+        heavy.conversation_cursor = Some(prepared.next.cursor().clone());
+        session_journal::JournalWriter::new(session_id)
+            .unwrap()
+            .append(
+                &session_journal::JournalEvent::turn(
+                    Some(session_id),
+                    turn_count,
+                    Some("gpt-5"),
+                    "display user",
+                    "display assistant",
+                    0,
+                    0,
+                    0,
+                    0,
+                )
+                .with_conversation_commit(prepared.commit),
+            )
+            .unwrap();
+    }
+
     fn write_local_step_checkpoint_with_interruption(session_id: &str, turn_count: u32) {
         let mut heavy = match astra_pipeline::step_protocol::StepCheckpoint::heavy(
             format!("step-{turn_count}"),
@@ -6553,6 +6763,7 @@ mod resume_tests {
             "turns_completed": turn_count,
             "remaining_turns": 2,
         }));
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -6582,6 +6793,7 @@ mod resume_tests {
             serde_json::json!({"role": "assistant", "content": "restoring session approvals"}),
         ];
         heavy.approval_overrides = Some(approval_overrides);
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -6725,6 +6937,7 @@ mod resume_tests {
             "recovery": {"ptl_error_count": 2},
         }));
         heavy.consecutive_context_window_errors = 2;
+        attach_checkpoint_to_canonical_test_generation(session_id, turn_count, &mut heavy);
         let completed_event_created_at = heavy.light.created_at.saturating_add(1);
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
@@ -6867,6 +7080,78 @@ mod resume_tests {
         assert!(guidance.contains("3 attempt(s)"), "{guidance}");
         assert!(guidance.contains("15000 tokens freed"), "{guidance}");
         assert!(guidance.contains("insufficient"), "{guidance}");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn cloud_only_typed_resume_installs_the_selected_active_conversation() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("resume-typed-cloud-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "retain typed history"}),
+            serde_json::json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a\"}"}
+                }]
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "file body"
+            }),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.clone(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 3,
+            journal_event_seq: 3,
+            conversation_seq: 3,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let bundle = astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor: cursor.clone(),
+            source: astra_turn_types::ResumeSourceV1::Checkpoint,
+            conversation_messages: messages.clone(),
+            degraded_reasons: vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        };
+        let restored = RestoredSession {
+            session_id: session_id.clone(),
+            turn_count: 3,
+            restored_from_cloud: true,
+            resume_bundle: Some(bundle),
+            last_status: "active".into(),
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("apply typed cloud resume");
+
+        let active = state
+            .active_conversation
+            .expect("typed cloud resume must install active conversation");
+        assert_eq!(active.cursor(), &cursor);
+        assert_eq!(active.messages(), messages);
+        assert!(
+            state
+                .history
+                .iter()
+                .any(|(_, assistant)| assistant == "done")
+        );
     }
 
     #[serial_test::serial]
@@ -7195,7 +7480,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn apply_restored_session_fails_when_local_step_checkpoint_is_invalid_without_fallback() {
+    async fn apply_restored_session_ignores_corrupt_checkpoint_when_journal_is_recoverable() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-bad-step-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -7216,20 +7501,19 @@ mod resume_tests {
             ..Default::default()
         };
 
-        let error = apply_restored_session(None, &api, &mut state, restored)
+        apply_restored_session(None, &api, &mut state, restored)
             .await
-            .expect_err("invalid checkpoint without fallback should fail restore");
+            .expect("the journal is a valid degraded recovery source");
 
-        assert!(
-            error.contains("Failed to restore local step checkpoint"),
-            "{error}"
-        );
-        assert_eq!(state.session_id.as_deref(), Some("existing-session"));
-        assert_eq!(state.turn, 7);
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.turn, 2);
         assert_eq!(
             state.history,
-            vec![("old".to_string(), "state".to_string())]
+            vec![("continue".to_string(), "restored".to_string())]
         );
+        assert!(state.runtime_compaction_state.is_none());
+        assert!(state.runtime_pipeline_state.is_none());
+        assert!(state.tool_health_entries.is_empty());
     }
 
     #[serial_test::serial]
@@ -8634,6 +8918,7 @@ mod resume_tests {
             let restored_child = PreparedForkRestore {
                 history: child_state.history.clone(),
                 active_conversation: None,
+                resume: None,
                 recent_tools: child_state.recent_tools.clone(),
                 activated_deferred_tool_names: Vec::new(),
                 csl_manager: None,
@@ -8723,6 +9008,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8791,6 +9077,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8844,6 +9131,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8909,6 +9197,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -8964,6 +9253,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,
@@ -9018,6 +9308,7 @@ mod resume_tests {
         let restored_child = PreparedForkRestore {
             history: child_state.history.clone(),
             active_conversation: None,
+            resume: None,
             recent_tools: child_state.recent_tools.clone(),
             activated_deferred_tool_names: Vec::new(),
             csl_manager: None,

@@ -694,6 +694,12 @@ pub struct LightCheckpoint {
 pub struct HeavyCheckpoint {
     /// All fields from light checkpoint
     pub light: LightCheckpoint,
+    /// Canonical conversation boundary projected by this checkpoint.
+    ///
+    /// Legacy checkpoints omit it and are therefore degraded recovery
+    /// candidates until journal replay establishes their ancestry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_cursor: Option<astra_turn_types::SessionCursorV1>,
     /// Full conversation messages (for LLM resume)
     pub messages: Vec<serde_json::Value>,
     /// Recovery diagnostics only. Despite the legacy field names these are
@@ -853,6 +859,7 @@ impl StepCheckpoint {
                 total_tokens: 0,
                 created_at: epoch_ms(),
             },
+            conversation_cursor: None,
             messages: Vec::new(),
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
@@ -2887,6 +2894,7 @@ mod tests {
                 total_tokens: 500,
                 created_at: 0,
             },
+            conversation_cursor: None,
             messages: vec![], // empty for non-Perceive!
             budget_remaining_tokens: 1000,
             budget_remaining_rounds: 5,
@@ -2923,6 +2931,7 @@ mod tests {
                 total_tokens: 0,
                 created_at: 0,
             },
+            conversation_cursor: None,
             messages: vec![],
             budget_remaining_tokens: 4000,
             budget_remaining_rounds: 10,

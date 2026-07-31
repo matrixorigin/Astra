@@ -1221,6 +1221,7 @@ mod tests {
     fn make_heavy(step_id: &str, messages: Vec<serde_json::Value>) -> HeavyCheckpoint {
         HeavyCheckpoint {
             light: make_light(step_id, 0.5),
+            conversation_cursor: None,
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 8,

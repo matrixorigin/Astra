@@ -576,7 +576,7 @@ async fn execute_headless_task_body(
         task_session_id,
         prompt,
         svc,
-        session_routing,
+        mut session_routing,
     } = input;
     use astra_services::TaskStatus;
     let (_creds, profile_name, _, _token) = get_profile_and_token(profile)?;
@@ -599,7 +599,7 @@ async fn execute_headless_task_body(
         true,
     )?;
     let (mut continuation_messages, activated_deferred_tool_names) =
-        session_routing.continuation_turn_inputs();
+        session_routing.continuation_turn_inputs()?;
 
     emit_task_event(
         options.stream_events,
@@ -1441,7 +1441,7 @@ async fn execute_cli_command_impl(
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
             let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
-            let session_routing = resolve_one_shot_session_routing(
+            let mut session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
                 cli_context.session_id.clone(),
@@ -1466,7 +1466,7 @@ async fn execute_cli_command_impl(
                 false,
             )?;
             let (mut continuation_messages, activated_deferred_tool_names) =
-                session_routing.continuation_turn_inputs();
+                session_routing.continuation_turn_inputs()?;
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = PermissionManager::with_load_policy(
                 effective_permission_mode,
@@ -1921,7 +1921,7 @@ async fn execute_cli_command_impl(
             let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let explicit_session_id = args.session_id.clone();
-            let session_routing = resolve_one_shot_session_routing(
+            let mut session_routing = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
                 match explicit_session_id {
@@ -1949,7 +1949,7 @@ async fn execute_cli_command_impl(
                 false,
             )?;
             let (mut continuation_messages, activated_deferred_tool_names) =
-                session_routing.continuation_turn_inputs();
+                session_routing.continuation_turn_inputs()?;
             let is_tty = terminal::size().is_ok();
             let _pipeline = create_pipeline_modules(api, profile.as_deref());
             let mut pm = {
@@ -2617,7 +2617,7 @@ pub(crate) async fn run_print_mode(
 
     let (_, _, _, _token) = get_profile_and_token(profile)?;
     let token = fresh_access_token_or_error(api, profile).await?;
-    let session_routing =
+    let mut session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
     let session_id = session_routing.server_session_id.clone();
@@ -2632,7 +2632,7 @@ pub(crate) async fn run_print_mode(
         true,
     )?;
     let (mut continuation_messages, activated_deferred_tool_names) =
-        session_routing.continuation_turn_inputs();
+        session_routing.continuation_turn_inputs()?;
     let _pipeline = create_pipeline_modules(api, profile);
     // Print mode is non-interactive. Restored session mode wins when present;
     // otherwise Auto is the headless fallback.

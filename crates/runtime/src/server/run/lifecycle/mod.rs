@@ -3558,11 +3558,24 @@ impl AgenticRunLifecycleService {
         mgr.set_trace_id(run_id.to_string());
 
         let restored_messages;
+        let mut resume_source = astra_turn_types::ResumeSourceV1::CslProjection;
+        let mut resume_cursor = None;
+        let mut resume_degraded_reasons = Vec::new();
+        let mut resume_repair_actions = Vec::new();
 
         let mut csl_reusable = true;
         match mgr.load().await {
             Ok(Some(mat)) => {
                 let mut session_state = mat.session_state;
+                resume_cursor = session_state.source_cursor.clone();
+                if resume_cursor.is_none() {
+                    resume_degraded_reasons.extend([
+                        astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+                        astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
+                    ]);
+                    resume_repair_actions
+                        .push(astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal);
+                }
                 session_state.activated_deferred_tool_names =
                     astra_turn_core::tool::deferred_activation::merged_activated_tool_names(
                         &mat.messages,
@@ -3572,6 +3585,13 @@ impl AgenticRunLifecycleService {
                 restore_session_state_compact(session_state, loop_state);
             }
             Ok(None) => {
+                resume_source = astra_turn_types::ResumeSourceV1::TranscriptProjection;
+                resume_degraded_reasons.extend([
+                    astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
+                    astra_turn_types::ResumeDegradedReasonV1::TranscriptOnly,
+                ]);
+                resume_repair_actions
+                    .push(astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal);
                 restored_messages = self
                     .restore_transcript_prompt_messages(user_id, session_id, run_id, "csl_empty")
                     .await;
@@ -3616,6 +3636,15 @@ impl AgenticRunLifecycleService {
                     "timeout",
                 )
                 .await;
+                resume_source = astra_turn_types::ResumeSourceV1::TranscriptProjection;
+                resume_degraded_reasons.extend([
+                    astra_turn_types::ResumeDegradedReasonV1::ProjectionCorrupt,
+                    astra_turn_types::ResumeDegradedReasonV1::TranscriptOnly,
+                ]);
+                resume_repair_actions.extend([
+                    astra_turn_types::ResumeRepairActionV1::DiscardCorruptProjection,
+                    astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
+                ]);
                 restored_messages = self
                     .restore_transcript_prompt_messages(
                         user_id,
@@ -3628,6 +3657,7 @@ impl AgenticRunLifecycleService {
                     e,
                     astra_turn_core::conversation_log::CslStoreError::Serde(_)
                         | astra_turn_core::conversation_log::CslStoreError::Materialize(_)
+                        | astra_turn_core::conversation_log::CslStoreError::CausalProjection(_)
                 );
                 if csl_reusable && let Err(reset_error) = mgr.reset().await {
                     tracing::warn!(
@@ -3641,6 +3671,70 @@ impl AgenticRunLifecycleService {
             }
         }
 
+        let restored_messages = if restored_messages.is_empty() {
+            restored_messages
+        } else {
+            let cursor = resume_cursor.unwrap_or_else(|| {
+                astra_turn_types::legacy_resume_cursor(
+                    user_id,
+                    session_id,
+                    loop_state.session_turn.saturating_sub(1),
+                    &restored_messages,
+                )
+            });
+            if cursor.owner_id != user_id
+                || cursor.session_id != session_id
+                || cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID
+            {
+                tracing::error!(
+                    session_id,
+                    run_id,
+                    cursor_owner = %cursor.owner_id,
+                    cursor_session = %cursor.session_id,
+                    "server loop rejected resume material outside the requested owner/session"
+                );
+                if let Err(error) = mgr.reset().await {
+                    tracing::warn!(
+                        session_id,
+                        run_id,
+                        %error,
+                        "failed to reset rejected causal projection"
+                    );
+                }
+                return Some(mgr);
+            }
+            let candidate = astra_turn_types::ResumeCandidateV1 {
+                source: resume_source,
+                cursor,
+                conversation_messages: restored_messages,
+                degraded_reasons: resume_degraded_reasons,
+                repair_actions: resume_repair_actions,
+                projections: astra_turn_types::ResumeProjectionSetV1::default(),
+            };
+            match astra_turn_types::select_resume_bundle(None, [candidate]) {
+                Ok(bundle) => {
+                    if bundle.is_degraded() {
+                        tracing::warn!(
+                            session_id,
+                            run_id,
+                            source = ?bundle.source,
+                            degraded_reasons = ?bundle.degraded_reasons,
+                            "server loop resumed from an explicitly degraded causal bundle"
+                        );
+                    }
+                    bundle.conversation_messages
+                }
+                Err(error) => {
+                    tracing::error!(
+                        session_id,
+                        run_id,
+                        %error,
+                        "server loop rejected inconsistent resume material"
+                    );
+                    Vec::new()
+                }
+            }
+        };
         let turn_start_message_count =
             Self::restore_csl_messages_into_loop_state(restored_messages, loop_state);
         if !csl_reusable {

@@ -1737,6 +1737,7 @@ mod tests {
                 total_tokens: 42,
                 created_at: astra_pipeline::step_protocol::epoch_ms(),
             },
+            conversation_cursor: None,
             messages: vec![
                 serde_json::json!({"role": "user", "content": "previous question"}),
                 serde_json::json!({"role": "assistant", "content": "previous answer"}),

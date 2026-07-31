@@ -5064,15 +5064,36 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
     let session_id = Uuid::new_v4().to_string();
     let heavy_only_session = Uuid::new_v4().to_string();
 
-    let heavy_state_json = |messages: serde_json::Value,
+    let heavy_state_json = |owner_id: &str,
+                            session_id: &str,
+                            sequence: u64,
+                            messages: serde_json::Value,
                             blocked_tools: serde_json::Value,
                             recent_tools: serde_json::Value,
                             approval_overrides: serde_json::Value,
                             interruption: serde_json::Value,
                             compaction_state: serde_json::Value| {
+        let conversation_cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: owner_id.to_string(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: 1,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(
+                messages
+                    .as_array()
+                    .expect("checkpoint messages must be an array"),
+            ),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
         serde_json::json!({
             "Heavy": {
                 "light": {},
+                "conversation_cursor": conversation_cursor,
                 "messages": messages,
                 "blocked_tools": blocked_tools,
                 "recent_tools": recent_tools,
@@ -5182,6 +5203,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "step-heavy-v1",
         &serde_json::json!(["step-one"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &session_id,
+            2,
             serde_json::json!([{"role":"user","content":"first"}]),
             serde_json::json!(["dangerous_tool"]),
             serde_json::json!(["step-one"]),
@@ -5209,6 +5233,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "step-heavy-v2",
         &serde_json::json!(["step-two"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &session_id,
+            3,
             serde_json::json!([
                 {"role":"user","content":"first"},
                 {"role":"assistant","content":"reply"},
@@ -5233,6 +5260,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "heavy-only-v1",
         &serde_json::json!(["heavy-only-tool"]).to_string(),
         &heavy_state_json(
+            &user_id,
+            &heavy_only_session,
+            1,
             serde_json::json!([
                 {"role":"user","content":"heavy-only user"},
                 {"role":"assistant","content":"heavy-only answer"}
@@ -5349,9 +5379,9 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         restored.recent_tools,
         vec!["bash".to_string(), "rg".to_string()]
     );
-    assert_eq!(restored.conversation_messages.len(), 4);
-    assert_eq!(restored.conversation_messages[0]["role"], "user");
-    assert_eq!(restored.conversation_messages[3]["content"], "done");
+    assert_eq!(restored.resume_messages().len(), 4);
+    assert_eq!(restored.resume_messages()[0]["role"], "user");
+    assert_eq!(restored.resume_messages()[3]["content"], "done");
     assert_eq!(
         restored.blocked_tools,
         vec!["dangerous_tool".to_string(), "web_fetch".to_string()]
@@ -5389,7 +5419,7 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
         "cloud restore should fall back to heavy checkpoint recent_tools when no ordinary checkpoint exists"
     );
     assert_eq!(restored_heavy_only.blocked_tools, vec!["grep".to_string()]);
-    assert_eq!(restored_heavy_only.conversation_messages.len(), 2);
+    assert_eq!(restored_heavy_only.resume_messages().len(), 2);
     assert_eq!(
         restored_heavy_only
             .interruption

@@ -15,6 +15,48 @@ use super::{
     SessionStatePatch, materialize, validate_session_id,
 };
 
+fn validate_csl_source_cursor(
+    session_id: &str,
+    cursor: &astra_turn_types::SessionCursorV1,
+    messages: &[serde_json::Value],
+) -> Result<(), CslStoreError> {
+    if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION {
+        return Err(CslStoreError::CausalProjection(format!(
+            "unsupported cursor schema {}",
+            cursor.schema_version
+        )));
+    }
+    if cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION {
+        return Err(CslStoreError::CausalProjection(format!(
+            "unsupported conversation projection schema {}",
+            cursor.projection_schema
+        )));
+    }
+    if cursor.owner_id.trim().is_empty() {
+        return Err(CslStoreError::CausalProjection(
+            "cursor owner must not be empty".to_string(),
+        ));
+    }
+    if cursor.session_id != session_id {
+        return Err(CslStoreError::CausalProjection(format!(
+            "cursor belongs to session `{}`, expected `{session_id}`",
+            cursor.session_id
+        )));
+    }
+    if cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID {
+        return Err(CslStoreError::CausalProjection(format!(
+            "unsupported cursor branch `{}`",
+            cursor.branch_id
+        )));
+    }
+    if astra_turn_types::canonical_conversation_root(messages) != cursor.canonical_root_hash {
+        return Err(CslStoreError::CausalProjection(
+            "materialized messages do not match the source cursor root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct CslManagerConfig {
     pub snapshot_interval: u32,
@@ -103,6 +145,9 @@ impl CslManager {
         }
         let mut mat = materialize(&entries)?;
         mat.session_state = mat.session_state.for_csl_continuity();
+        if let Some(cursor) = mat.session_state.source_cursor.as_ref() {
+            validate_csl_source_cursor(&self.session_id, cursor, &mat.messages)?;
+        }
         self.last_seq = mat.last_seq;
         self.last_turn = mat.last_turn;
         record_full_history_clone(
@@ -140,6 +185,48 @@ impl CslManager {
             self.load().await?;
         }
         let session_state = session_state.for_csl_continuity();
+        if let Some(cursor) = session_state.source_cursor.as_ref() {
+            validate_csl_source_cursor(&self.session_id, cursor, messages)?;
+            if cursor.completed_turn != turn {
+                return Err(CslStoreError::CausalProjection(format!(
+                    "CSL projection turn {turn} does not match cursor turn {}",
+                    cursor.completed_turn
+                )));
+            }
+            if let Some(previous) = self.last_session_state.source_cursor.as_ref() {
+                match astra_turn_types::cursor_relation(previous, cursor) {
+                    astra_turn_types::CursorRelationV1::Exact => {
+                        if session_state == self.last_session_state {
+                            return Ok(());
+                        }
+                        return Err(CslStoreError::CausalProjection(
+                            "same CSL cursor was reused with different projection state"
+                                .to_string(),
+                        ));
+                    }
+                    astra_turn_types::CursorRelationV1::BehindUnverified => {
+                        if cursor.compaction_generation < previous.compaction_generation {
+                            return Err(CslStoreError::CausalProjection(
+                                "CSL projection compaction generation regressed".to_string(),
+                            ));
+                        }
+                        if cursor.compaction_generation == previous.compaction_generation
+                            && !messages.starts_with(&self.last_canonical_messages)
+                        {
+                            return Err(CslStoreError::CausalProjection(
+                                "CSL projection does not extend the prior canonical messages"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    relation => {
+                        return Err(CslStoreError::CausalProjection(format!(
+                            "CSL projection cursor does not advance the prior source: {relation:?}"
+                        )));
+                    }
+                }
+            }
+        }
         record_full_history_clone(
             astra_core::history_work::HistoryWorkSite::CslPersistInputClone,
             messages,
@@ -461,6 +548,7 @@ impl SessionStatePatch {
     /// budget fields are intentionally omitted.
     pub fn from_full(state: &SessionStateCompact) -> Self {
         Self {
+            source_cursor: Some(state.source_cursor.clone()),
             blocked_tools: Some(state.blocked_tools.clone()),
             recent_tools: Some(state.recent_tools.clone()),
             activated_deferred_tool_names: Some(state.activated_deferred_tool_names.clone()),
@@ -504,6 +592,29 @@ mod tests {
         }
     }
 
+    fn state_at_cursor(
+        session_id: &str,
+        sequence: u64,
+        messages: &[serde_json::Value],
+    ) -> SessionStateCompact {
+        SessionStateCompact {
+            source_cursor: Some(astra_turn_types::SessionCursorV1 {
+                schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+                owner_id: "owner".into(),
+                session_id: session_id.into(),
+                branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+                completed_turn: sequence as u32,
+                journal_event_seq: sequence,
+                conversation_seq: sequence,
+                canonical_root_hash: astra_turn_types::canonical_conversation_root(messages),
+                projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                compaction_generation: 0,
+                config_version_id: None,
+            }),
+            ..Default::default()
+        }
+    }
+
     fn make_store(tmp: &tempfile::TempDir) -> Arc<dyn CslStore> {
         Arc::new(FileCslStore::new(tmp.path())) as Arc<dyn CslStore>
     }
@@ -542,6 +653,58 @@ mod tests {
         assert_eq!(mat.messages.len(), 2);
         assert_eq!(mat.last_seq, 1);
         assert_eq!(mat.messages[0]["content"], "hello");
+    }
+
+    #[tokio::test]
+    async fn cursor_advance_cannot_replace_uncompacted_canonical_history() {
+        let tmp = TempDir::new().unwrap();
+        let mut manager = test_manager(&tmp);
+        let first = vec![user_msg("first"), assistant_msg("one")];
+        manager
+            .persist_turn(1, &first, &state_at_cursor("test-session", 1, &first))
+            .await
+            .unwrap();
+
+        let unrelated = vec![user_msg("unrelated"), assistant_msg("history")];
+        let error = manager
+            .persist_turn(
+                2,
+                &unrelated,
+                &state_at_cursor("test-session", 2, &unrelated),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CslStoreError::CausalProjection(ref detail)
+                if detail.contains("does not extend")),
+            "{error}"
+        );
+        assert_eq!(manager.last_turn(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_cursor_retry_must_be_projection_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let mut manager = test_manager(&tmp);
+        let messages = vec![user_msg("first"), assistant_msg("one")];
+        let mut first = state_at_cursor("test-session", 1, &messages);
+        first.recent_tools = vec!["read_file".into()];
+        manager.persist_turn(1, &messages, &first).await.unwrap();
+
+        manager.persist_turn(1, &messages, &first).await.unwrap();
+        let mut conflicting = first;
+        conflicting.recent_tools = vec!["bash".into()];
+        let error = manager
+            .persist_turn(1, &messages, &conflicting)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, CslStoreError::CausalProjection(ref detail)
+                if detail.contains("reused with different")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -917,6 +1080,7 @@ mod tests {
     #[tokio::test]
     async fn session_state_patch_from_full_covers_all_fields() {
         let state = SessionStateCompact {
+            source_cursor: None,
             blocked_tools: vec!["bash".into()],
             recent_tools: vec!["read".into()],
             activated_deferred_tool_names: vec!["write_file".into()],

@@ -33,6 +33,7 @@ fn write_test_heavy_checkpoint(session_id: &str, step_id: &str, created_at: u64)
 
     let checkpoint = StepCheckpoint::Heavy(Box::new(HeavyCheckpoint {
         light,
+        conversation_cursor: None,
         messages: vec![],
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,

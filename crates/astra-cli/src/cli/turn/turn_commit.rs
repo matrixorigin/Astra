@@ -21,7 +21,12 @@ fn prepare_canonical_conversation_commit(
     let Some(session_id) = state.session_id.as_deref() else {
         return Ok(None);
     };
-    let owner_id = astra_services::local_owner_scope().id().to_string();
+    // New canonical lineages follow the authenticated account across devices.
+    // A Phase-1 lineage may still carry the profile-scoped local owner; keep
+    // that already-durable identity until an explicit migration event instead
+    // of silently changing owner midway through a journal.
+    let account_owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    let local_owner_id = astra_services::local_owner_scope().id().to_string();
     let canonical_messages =
         astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
             result.final_messages.clone(),
@@ -29,9 +34,11 @@ fn prepare_canonical_conversation_commit(
         .map_err(|error| format!("validate canonical conversation: {error}"))?;
     let active = match state.active_conversation.as_ref() {
         Some(active) => {
-            if active.cursor().owner_id != owner_id {
+            if active.cursor().owner_id != account_owner_id
+                && active.cursor().owner_id != local_owner_id
+            {
                 return Err(format!(
-                    "active conversation owner `{}` does not match attached owner `{owner_id}`",
+                    "active conversation owner `{}` does not match the attached account",
                     active.cursor().owner_id
                 ));
             }
@@ -43,10 +50,11 @@ fn prepare_canonical_conversation_commit(
             }
             active.clone()
         }
-        None => {
-            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, session_id)
-                .map_err(|error| error.to_string())?
-        }
+        None => astra_turn_core::active_conversation::ActiveConversation::empty(
+            &account_owner_id,
+            session_id,
+        )
+        .map_err(|error| error.to_string())?,
     };
     active
         .prepare_commit(
@@ -801,7 +809,10 @@ fn merge_interruption_metadata(
 }
 #[cfg(test)]
 mod tests {
-    use super::{commit_primary_turn, merge_interruption_metadata, stall_type_confidence};
+    use super::{
+        commit_primary_turn, merge_interruption_metadata, prepare_canonical_conversation_commit,
+        stall_type_confidence,
+    };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::turn_learning::analyze_chat_turn_learning;
     use astra_services::session_journal;
@@ -823,6 +834,54 @@ mod tests {
             state.session_persistence_error = Some(error.to_string());
         }
         outcome
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn new_lineage_uses_account_owner_while_existing_local_lineage_keeps_its_identity() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "canonical-owner",
+            Some("account-a"),
+        )
+        .unwrap();
+        let session_id = "canonical-owner-session";
+        let messages = vec![
+            json!({"role": "user", "content": "question"}),
+            json!({"role": "assistant", "content": "answer"}),
+        ];
+        let mut result = crate::tests::stub_stream_result("answer");
+        result.final_messages = messages.clone();
+        let state = SessionState {
+            session_id: Some(session_id.into()),
+            turn: 1,
+            ..Default::default()
+        };
+
+        let first = prepare_canonical_conversation_commit(&state, &result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.next.cursor().owner_id, "account-a");
+
+        let local_owner = astra_services::local_owner_scope().id().to_string();
+        let legacy_active =
+            astra_turn_core::active_conversation::ActiveConversation::from_projection(
+                &local_owner,
+                session_id,
+                messages,
+                1,
+                astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+            )
+            .unwrap();
+        let state = SessionState {
+            session_id: Some(session_id.into()),
+            active_conversation: Some(legacy_active),
+            turn: 2,
+            ..Default::default()
+        };
+        let continued = prepare_canonical_conversation_commit(&state, &result)
+            .unwrap()
+            .unwrap();
+        assert_eq!(continued.next.cursor().owner_id, local_owner);
     }
 
     #[test]

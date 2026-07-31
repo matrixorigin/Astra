@@ -797,6 +797,7 @@ pub(crate) fn extract_session_state_compact(
         .map(crate::server::runtime_tool_executor::RuntimeToolExecutor::activated_deferred_tool_names)
         .unwrap_or_else(|| state.activated_deferred_tool_names.clone());
     astra_turn_core::conversation_log::SessionStateCompact {
+        source_cursor: None,
         // CSL is conversation materialization, not execution policy. Persisting
         // transient restrictions, approvals, interruptions, budgets, or
         // compaction pressure here makes old materialized state hard-steer later

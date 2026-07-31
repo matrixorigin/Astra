@@ -1389,6 +1389,7 @@ impl StepRecorder {
         );
         Some(HeavyCheckpoint {
             light,
+            conversation_cursor: None,
             messages: messages.to_vec(),
             budget_remaining_tokens,
             budget_remaining_rounds,

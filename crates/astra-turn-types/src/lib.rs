@@ -13,6 +13,7 @@ mod memory_ranking;
 mod memory_structure;
 mod provider_contract;
 mod result_quality;
+mod resume;
 mod runtime_scaffolding;
 mod semantic_read_cache;
 mod session_cursor;
@@ -59,6 +60,14 @@ pub use provider_contract::{
     ResolvedToolIdempotency, ResolvedToolSemantics, ToolIdentity,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
+pub use resume::{
+    CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION, CausalProjectionEnvelopeV1, CursorRelationV1,
+    RESUME_BUNDLE_SCHEMA_VERSION, ResumeActivationProjectionV1, ResumeBundleV1, ResumeCandidateV1,
+    ResumeCheckpointProjectionV1, ResumeDegradedReasonV1, ResumeDescriptorV1,
+    ResumeProjectionSetV1, ResumeProviderProjectionV1, ResumeRepairActionV1, ResumeSelectionError,
+    ResumeSourceV1, ResumeTaskProjectionV1, cursor_relation, legacy_resume_cursor,
+    select_resume_bundle, select_resume_candidate_index,
+};
 pub use runtime_scaffolding::{
     RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,
     mark_runtime_owned_message, runtime_message_delivery, runtime_owned_message,
@@ -76,6 +85,7 @@ pub use session_cursor::{
     CONVERSATION_COMMIT_SCHEMA_VERSION, CONVERSATION_PROJECTION_SCHEMA_VERSION,
     ConversationCommitV1, ConversationDeltaV1, ConversationReplaceReason,
     DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
+    canonical_conversation_root,
 };
 pub use tool_idempotency::{ToolIdempotency, classify_tool_idempotency};
 pub use tool_invocation::{

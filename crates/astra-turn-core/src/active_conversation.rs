@@ -6,10 +6,9 @@ use astra_turn_types::{
     DEFAULT_CONVERSATION_BRANCH_ID, SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1,
 };
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const ROOT_HASH_DOMAIN: &[u8] = b"astra.canonical-conversation.v1\0";
+pub use astra_turn_types::canonical_conversation_root;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveConversationSource {
@@ -49,6 +48,8 @@ pub enum ActiveConversationError {
     UnsupportedCommitSchema(u32),
     #[error("session cursor schema {0} is unsupported")]
     UnsupportedCursorSchema(u32),
+    #[error("conversation projection schema {0} is unsupported")]
+    UnsupportedProjectionSchema(u32),
     #[error("conversation commit belongs to owner `{actual}`, expected `{expected}`")]
     OwnerMismatch { expected: String, actual: String },
     #[error("conversation commit belongs to session `{actual}`, expected `{expected}`")]
@@ -112,6 +113,45 @@ impl ActiveConversation {
                 compaction_generation: 0,
                 config_version_id: None,
             },
+            messages: messages.into(),
+            source,
+        })
+    }
+
+    /// Attach a materialized projection to the exact canonical cursor it
+    /// names. Unlike [`Self::from_projection`], this never fabricates a new
+    /// sequence or root from legacy metadata.
+    pub fn from_cursor_projection(
+        cursor: SessionCursorV1,
+        messages: Vec<Value>,
+        source: ActiveConversationSource,
+    ) -> Result<Self, ActiveConversationError> {
+        if cursor.schema_version != SESSION_CURSOR_SCHEMA_VERSION {
+            return Err(ActiveConversationError::UnsupportedCursorSchema(
+                cursor.schema_version,
+            ));
+        }
+        if cursor.projection_schema != CONVERSATION_PROJECTION_SCHEMA_VERSION {
+            return Err(ActiveConversationError::UnsupportedProjectionSchema(
+                cursor.projection_schema,
+            ));
+        }
+        if cursor.owner_id.trim().is_empty() {
+            return Err(ActiveConversationError::EmptyOwner);
+        }
+        if cursor.session_id.trim().is_empty() {
+            return Err(ActiveConversationError::EmptySession);
+        }
+        if cursor.branch_id != DEFAULT_CONVERSATION_BRANCH_ID {
+            return Err(ActiveConversationError::UnsupportedBranch(
+                cursor.branch_id.clone(),
+            ));
+        }
+        if canonical_conversation_root(&messages) != cursor.canonical_root_hash {
+            return Err(ActiveConversationError::RootMismatch);
+        }
+        Ok(Self {
+            cursor,
             messages: messages.into(),
             source,
         })
@@ -279,6 +319,11 @@ fn validate_commit_identity(
             commit.cursor.schema_version,
         ));
     }
+    if commit.cursor.projection_schema != CONVERSATION_PROJECTION_SCHEMA_VERSION {
+        return Err(ActiveConversationError::UnsupportedProjectionSchema(
+            commit.cursor.projection_schema,
+        ));
+    }
     if commit.cursor.owner_id != current.owner_id {
         return Err(ActiveConversationError::OwnerMismatch {
             expected: current.owner_id.clone(),
@@ -330,62 +375,6 @@ fn common_prefix_len(left: &[Value], right: &[Value]) -> usize {
         .zip(right)
         .take_while(|(left, right)| left == right)
         .count()
-}
-
-pub fn canonical_conversation_root(messages: &[Value]) -> String {
-    let mut bytes = Vec::new();
-    bytes.push(b'[');
-    for (index, message) in messages.iter().enumerate() {
-        if index > 0 {
-            bytes.push(b',');
-        }
-        write_canonical_json(message, &mut bytes);
-    }
-    bytes.push(b']');
-    let mut digest = Sha256::new();
-    digest.update(ROOT_HASH_DOMAIN);
-    digest.update((bytes.len() as u64).to_be_bytes());
-    digest.update(bytes);
-    format!("{:x}", digest.finalize())
-}
-
-fn write_canonical_json(value: &Value, out: &mut Vec<u8>) {
-    match value {
-        Value::Null => out.extend_from_slice(b"null"),
-        Value::Bool(value) => out.extend_from_slice(if *value { b"true" } else { b"false" }),
-        Value::Number(value) => out.extend_from_slice(value.to_string().as_bytes()),
-        Value::String(value) => {
-            out.extend_from_slice(
-                serde_json::to_string(value)
-                    .expect("serializing a JSON string cannot fail")
-                    .as_bytes(),
-            );
-        }
-        Value::Array(values) => {
-            out.push(b'[');
-            for (index, value) in values.iter().enumerate() {
-                if index > 0 {
-                    out.push(b',');
-                }
-                write_canonical_json(value, out);
-            }
-            out.push(b']');
-        }
-        Value::Object(values) => {
-            out.push(b'{');
-            let mut keys = values.keys().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for (index, key) in keys.into_iter().enumerate() {
-                if index > 0 {
-                    out.push(b',');
-                }
-                write_canonical_json(&Value::String(key.clone()), out);
-                out.push(b':');
-                write_canonical_json(&values[key], out);
-            }
-            out.push(b'}');
-        }
-    }
 }
 
 #[cfg(test)]

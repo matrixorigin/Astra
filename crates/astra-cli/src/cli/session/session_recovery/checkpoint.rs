@@ -193,6 +193,7 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
 
     let heavy = HeavyCheckpoint {
         light,
+        conversation_cursor: matching_active_conversation_cursor(state, &messages),
         messages,
         budget_remaining_tokens: previous_budget_tokens
             .unwrap_or_else(|| context_input_headroom_tokens_from_state(state)),
@@ -232,6 +233,17 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         config_version_id: state.config_version_id.clone(),
     };
     StepCheckpoint::Heavy(Box::new(heavy))
+}
+
+fn matching_active_conversation_cursor(
+    state: &SessionState,
+    messages: &[serde_json::Value],
+) -> Option<astra_turn_types::SessionCursorV1> {
+    state.active_conversation.as_ref().and_then(|conversation| {
+        (astra_turn_types::canonical_conversation_root(messages)
+            == conversation.cursor().canonical_root_hash)
+            .then(|| conversation.cursor().clone())
+    })
 }
 
 /// Persist heavy JSON + composite snapshot index before any workspace/journal mutation.
@@ -365,7 +377,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     super::super::session_projection::rebuild_continuation_anchor_from_live_state(state).await;
     let user_id = recovery_user_id(state);
     let (previous_heavy, prev_state) = load_previous_recovery_state(state, &user_id, &sid).await?;
-    let session_state = super::super::session_projection::build_full_session_state_compact(
+    let mut session_state = super::super::session_projection::build_full_session_state_compact(
         state,
         super::super::session_projection::CslCheckpointFields,
         &prev_state,
@@ -374,6 +386,14 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         astra_core::history_work::HistoryWorkSite::CliRecoveryCslHistoryMaterialization,
         &state.history,
     );
+    if session_state.source_cursor.is_some()
+        && matching_active_conversation_cursor(state, &messages).is_none()
+    {
+        // Manual history editing currently produces a display-derived generation.
+        // Do not label that lossy projection with the active canonical cursor:
+        // causal resume must either rebuild it or treat it as legacy generation 0.
+        session_state.source_cursor = None;
+    }
     let workspace_path = workspace_path_for(&sid);
     let workspace_backup = read_optional_file_bytes(&workspace_path)?;
 
@@ -457,6 +477,87 @@ mod tests {
         assert_eq!(heavy.messages[1]["content"], "continue");
         assert_eq!(heavy.messages[2]["role"], "assistant");
         assert_eq!(heavy.messages[2]["content"], "Done.");
+    }
+
+    #[test]
+    fn manual_heavy_checkpoint_cursor_and_messages_share_one_canonical_generation() {
+        let canonical_messages = vec![
+            serde_json::json!({"role": "user", "content": "canonical"}),
+            serde_json::json!({"role": "assistant", "content": "typed answer"}),
+        ];
+        let active = astra_turn_core::active_conversation::ActiveConversation::from_projection(
+            "owner-1",
+            "checkpoint-causal",
+            canonical_messages.clone(),
+            3,
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+        )
+        .unwrap();
+        let state = SessionState {
+            history: vec![("canonical".into(), "typed answer".into())],
+            active_conversation: Some(active),
+            ..Default::default()
+        };
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "checkpoint-causal",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            None,
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+
+        assert_eq!(heavy.messages, canonical_messages);
+        assert_eq!(
+            heavy
+                .conversation_cursor
+                .as_ref()
+                .unwrap()
+                .canonical_root_hash,
+            astra_turn_types::canonical_conversation_root(&heavy.messages)
+        );
+    }
+
+    #[test]
+    fn manual_heavy_checkpoint_does_not_attach_cursor_to_lossy_display_generation() {
+        let canonical_messages = vec![
+            serde_json::json!({"role": "user", "content": "canonical"}),
+            serde_json::json!({"role": "assistant", "content": "typed answer"}),
+        ];
+        let active = astra_turn_core::active_conversation::ActiveConversation::from_projection(
+            "owner-1",
+            "checkpoint-causal",
+            canonical_messages,
+            3,
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+        )
+        .unwrap();
+        let state = SessionState {
+            history: vec![("lossy display".into(), "projection".into())],
+            active_conversation: Some(active),
+            ..Default::default()
+        };
+
+        let checkpoint = build_manual_heavy_step_checkpoint(
+            &state,
+            "checkpoint-causal",
+            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            None,
+        );
+        let astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy) = checkpoint else {
+            panic!("expected heavy checkpoint");
+        };
+
+        assert!(heavy.conversation_cursor.is_none());
+        assert_eq!(
+            heavy.messages,
+            vec![
+                serde_json::json!({"role": "user", "content": "lossy display"}),
+                serde_json::json!({"role": "assistant", "content": "projection"}),
+            ]
+        );
     }
 
     #[test]

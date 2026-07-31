@@ -165,6 +165,23 @@ fn build_restored_from_scan(
     use crate::step_protocol::persisted_cache_key_is_context_bound;
     use std::collections::HashMap;
 
+    if let Some(cursor) = heavy.conversation_cursor.as_ref() {
+        if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION
+            || cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION
+        {
+            return Err(RecoveryError::CorruptedCheckpoint(
+                "conversation cursor schema is unsupported".to_string(),
+            ));
+        }
+        if astra_turn_types::canonical_conversation_root(&heavy.messages)
+            != cursor.canonical_root_hash
+        {
+            return Err(RecoveryError::CorruptedCheckpoint(
+                "checkpoint messages do not match the conversation cursor root".to_string(),
+            ));
+        }
+    }
+
     let mut completed_results: HashMap<String, Vec<String>> = HashMap::new();
     let mut cache_restore_report = CacheRestoreReport::default();
 
@@ -198,6 +215,7 @@ fn build_restored_from_scan(
         &heavy.messages,
     );
     Ok(RestoredSession {
+        conversation_cursor: heavy.conversation_cursor.clone(),
         messages: heavy.messages.clone(),
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,

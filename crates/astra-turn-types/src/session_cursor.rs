@@ -1,10 +1,14 @@
+use std::io::{self, Write};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub const SESSION_CURSOR_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_COMMIT_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_PROJECTION_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_CONVERSATION_BRANCH_ID: &str = "main";
+const ROOT_HASH_DOMAIN: &[u8] = b"astra.canonical-conversation.v1\0";
 
 /// Durable identity of one committed canonical-conversation boundary.
 ///
@@ -58,4 +62,126 @@ pub struct ConversationCommitV1 {
     pub base_root_hash: String,
     pub cursor: SessionCursorV1,
     pub delta: ConversationDeltaV1,
+}
+
+/// Content root for canonical ordered typed conversation messages.
+///
+/// JSON object keys are sorted recursively so equivalent wire objects have
+/// one placement-independent root.
+pub fn canonical_conversation_root(messages: &[Value]) -> String {
+    let mut counter = CountingWriter::default();
+    write_canonical_messages(messages, &mut counter)
+        .expect("counting canonical JSON bytes cannot fail");
+
+    let mut digest = Sha256::new();
+    digest.update(ROOT_HASH_DOMAIN);
+    digest.update(counter.bytes.to_be_bytes());
+    write_canonical_messages(messages, &mut DigestWriter(&mut digest))
+        .expect("hashing canonical JSON bytes cannot fail");
+    format!("{:x}", digest.finalize())
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::other("canonical JSON length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_canonical_messages(messages: &[Value], out: &mut impl Write) -> io::Result<()> {
+    out.write_all(b"[")?;
+    for (index, message) in messages.iter().enumerate() {
+        if index > 0 {
+            out.write_all(b",")?;
+        }
+        write_canonical_json(message, out)?;
+    }
+    out.write_all(b"]")
+}
+
+fn write_canonical_json(value: &Value, out: &mut impl Write) -> io::Result<()> {
+    match value {
+        Value::Null => out.write_all(b"null")?,
+        Value::Bool(value) => out.write_all(if *value { b"true" } else { b"false" })?,
+        Value::Number(value) => write_json(value, out)?,
+        Value::String(value) => write_json(value, out)?,
+        Value::Array(values) => {
+            out.write_all(b"[")?;
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b",")?;
+                }
+                write_canonical_json(value, out)?;
+            }
+            out.write_all(b"]")?;
+        }
+        Value::Object(values) => {
+            out.write_all(b"{")?;
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    out.write_all(b",")?;
+                }
+                write_json(key, out)?;
+                out.write_all(b":")?;
+                write_canonical_json(&values[key], out)?;
+            }
+            out.write_all(b"}")?;
+        }
+    }
+    Ok(())
+}
+
+fn write_json(value: &impl Serialize, out: &mut impl Write) -> io::Result<()> {
+    serde_json::to_writer(out, value).map_err(io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::canonical_conversation_root;
+
+    #[test]
+    fn streaming_root_preserves_the_v1_wire_hash() {
+        let messages = vec![
+            json!({"role": "user", "content": "hello 世界"}),
+            json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": "ok\nnext"}],
+                "meta": {"b": 2, "a": true}
+            }),
+        ];
+
+        assert_eq!(
+            canonical_conversation_root(&messages),
+            "18fd5901a9aa39a4802a649a8f13a2f79a5266ff76f514645d33d5cd1bd6891b"
+        );
+    }
 }

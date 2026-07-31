@@ -897,6 +897,7 @@ fn restore_step_checkpoint_runtime_state_rejects_event_cache_and_restores_runtim
         None,
     );
     let restored = astra_pipeline::step_restore::RestoredSession {
+        conversation_cursor: None,
         messages: Vec::new(),
         budget_remaining_tokens: 0,
         budget_remaining_rounds: 0,

@@ -619,6 +619,10 @@ pub(crate) fn build_full_session_state_compact(
     _prev_state: &astra_turn_core::conversation_log::SessionStateCompact,
 ) -> astra_turn_core::conversation_log::SessionStateCompact {
     astra_turn_core::conversation_log::SessionStateCompact {
+        source_cursor: state
+            .active_conversation
+            .as_ref()
+            .map(|conversation| conversation.cursor().clone()),
         recent_tools: state.recent_tools.clone(),
         activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
         blocked_tools: Vec::new(),
