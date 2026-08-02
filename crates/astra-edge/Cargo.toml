@@ -39,3 +39,8 @@ astra-tools.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` and virtual-time
+# advancement used by the token-renewal retry-schedule test.
+tokio = { workspace = true, features = ["test-util"] }

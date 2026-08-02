@@ -254,10 +254,15 @@ mod tests {
 
     fn make_moi_token(iat: i64, exp: i64, jti: &str) -> String {
         use base64::Engine as _;
+        // sub/workspace_id are required for a token the server (and now
+        // read_valid_file_token) would accept. All tokens here share one
+        // identity, so same-identity generation ordering still applies.
         let claims = serde_json::json!({
             "iat": TEST_EPOCH_BASE + iat,
             "exp": TEST_EPOCH_BASE + exp,
             "jti": jti,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
         });
         let encoded =
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());

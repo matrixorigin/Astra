@@ -28,6 +28,34 @@ const RENEW_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// backend's rotation grace window (5 minutes) so a lost rotation response can
 /// recover via the previous-jti renewal path.
 const TRANSIENT_RETRY_SECS: &[u64] = &[30, 60, 120];
+/// The backend keeps a rotated jti renewable for this long after it hands out a
+/// successor (dual-valid rotation). A lost rotation response can only be
+/// recovered by a fast retry that both BEGINS and completes within this window,
+/// measured from the first retry attempt; past it the old jti is swept and
+/// every subsequent renewal is rejected. Fast retries are budgeted against this
+/// deadline so the last attempt cannot start at or after the boundary.
+const ROTATION_GRACE_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+/// Sleep to apply before the next fast retry so the attempt after it still
+/// begins — and, budgeting one `request_timeout`, completes — within the
+/// rotation grace window measured from the first attempt.
+///
+/// `elapsed` is the time since the first retry attempt began. Returns `None`
+/// once no further attempt can complete before the deadline (stop fast
+/// retrying); otherwise the requested `backoff`, clamped so the next attempt
+/// leaves a full `request_timeout` of headroom before the deadline.
+fn retry_delay_within_grace(
+    elapsed: Duration,
+    backoff: Duration,
+    grace: Duration,
+    request_timeout: Duration,
+) -> Option<Duration> {
+    let remaining = grace.checked_sub(elapsed)?;
+    if remaining <= request_timeout {
+        return None;
+    }
+    Some(backoff.min(remaining - request_timeout))
+}
 
 /// Claims embedded in the middle segment of a `moi-user-token-v1` token.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -67,10 +95,12 @@ pub fn parse_moi_token_claims(token: &str) -> Option<TokenClaims> {
 
 /// Decide whether an authentication-PROVEN token should overwrite the token
 /// file. Skip only when the file already holds the proven token itself, or a
-/// STRICTLY newer generation (by iat, then exp). Anything else — including a
-/// different jti with the SAME iat/exp, which double-renew / grace recovery
-/// can legitimately produce — is overwritten: expiry seconds do not order
-/// generations, but an AuthOk is hard proof the token works.
+/// same-identity, STRICTLY newer generation (by iat, then exp). Anything else —
+/// including a different jti with the SAME iat/exp, which double-renew / grace
+/// recovery can legitimately produce, or a token of a DIFFERENT MOI identity —
+/// is overwritten: expiry seconds do not order generations, and generations of
+/// different identities are not comparable at all, but an AuthOk is hard proof
+/// the proven token works for the current identity.
 pub fn should_persist_proven(existing: Option<&str>, proven: &str) -> bool {
     let Some(proven_claims) = parse_moi_token_claims(proven) else {
         // Non-MOI tokens never touch the MOI token file.
@@ -85,6 +115,16 @@ pub fn should_persist_proven(existing: Option<&str>, proven: &str) -> bool {
     let Some(existing_claims) = parse_moi_token_claims(existing) else {
         return true;
     };
+    // Different MOI identity (e.g. a reused workspace volume still holding a
+    // previous tenant's token): generation ordering via (iat, exp) is
+    // meaningless across identities. Comparing them could leave a
+    // later-generation previous-tenant token on disk, which a later env-less
+    // startup would then select and be permanently rejected on. The proven
+    // token is hard AuthOk proof for the CURRENT identity — replace the stale
+    // foreign-identity file rather than generation-comparing it.
+    if !same_moi_identity(&existing_claims, &proven_claims) {
+        return true;
+    }
     let existing_gen = (existing_claims.iat, existing_claims.exp);
     let proven_gen = (proven_claims.iat, proven_claims.exp);
     // Strictly newer file wins (renewal owns forward progress); ties go to
@@ -110,6 +150,32 @@ fn now_unix() -> i64 {
 /// Purpose claim of an edge-registration token; the server requires a non-empty
 /// jti for tokens carrying it.
 const EDGE_REGISTRATION_PURPOSE: &str = "edge_registration";
+
+/// Issuer that mints edge-registration tokens exclusively. The server rejects a
+/// token from this issuer that does not declare the edge-registration purpose
+/// (a pre-binding historical runner token).
+const ISSUER_MOI_BACKEND: &str = "moi-backend";
+
+/// Mirror the server's `Verify` (crate `astraauth`) acceptance rules that the
+/// edge CAN check without the signing key: exactly three segments, non-empty
+/// `sub`/`workspace_id`, the moi-backend-issuer / edge-registration coupling,
+/// and the edge-registration binding (`edge_agent_id` + `jti`). Signature and
+/// expiry are checked by the caller. A token failing these is one the server
+/// would reject, so the edge must neither select it from the token file nor
+/// persist it from a renewal — with no env fallback, doing so bricks the edge.
+fn matches_server_acceptance(token: &str, claims: &TokenClaims) -> bool {
+    is_wellformed_moi_token(token)
+        && !claims.sub.is_empty()
+        && !claims.workspace_id.is_empty()
+        // moi-backend issues edge-registration tokens exclusively; any other
+        // purpose from that issuer is a pre-binding historical token the server
+        // rejects.
+        && !(claims.iss == ISSUER_MOI_BACKEND && claims.purpose != EDGE_REGISTRATION_PURPOSE)
+        // Edge-registration tokens must bind an edge_agent_id and carry a jti.
+        && (claims.purpose != EDGE_REGISTRATION_PURPOSE
+            || (!claims.edge_agent_id.is_empty()
+                && claims.jti.as_deref().is_some_and(|jti| !jti.is_empty())))
+}
 
 /// Structural check mirroring the server's `verify_user_token`: a moi-user token
 /// must be exactly `moi-user-token-v1.<claims>.<sig>` — three dot-separated
@@ -141,13 +207,10 @@ fn parse_usable_renewed_token(
             && renewed.iss == current.iss
             && renewed.edge_agent_id == current.edge_agent_id
             && renewed.purpose == current.purpose
-            // Match the server's acceptance rules before overwriting the persisted
-            // identity: an exactly-three-segment token, and (for edge-registration
-            // tokens) a non-empty jti. A token that passes the generation/identity
+            // Match the server's acceptance rules before overwriting the
+            // persisted identity. A token that passes the generation/identity
             // checks but the server would reject would brick the edge on restart.
-            && is_wellformed_moi_token(token)
-            && (renewed.purpose != EDGE_REGISTRATION_PURPOSE
-                || renewed.jti.as_deref().is_some_and(|jti| !jti.is_empty()))
+            && matches_server_acceptance(token, renewed)
     })
 }
 
@@ -184,7 +247,11 @@ pub fn resolve_token_file_path(workspace_dir: &Path) -> PathBuf {
 }
 
 /// Read the token file and return its token only if it is a `moi-user-token-v1`
-/// token with parseable claims that have not expired.
+/// token with parseable claims that have not expired AND that the server would
+/// accept ([`matches_server_acceptance`]). The lenient claims parser tolerates
+/// extra segments and defaulted identity fields the server rejects; without an
+/// env fallback, selecting such a file would let the edge pick a token it is
+/// then permanently rejected on, so the structural/claim checks are applied here.
 pub fn read_valid_file_token(path: &Path, now_unix: i64) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     let token = contents.trim();
@@ -193,6 +260,9 @@ pub fn read_valid_file_token(path: &Path, now_unix: i64) -> Option<String> {
     }
     let claims = parse_moi_token_claims(token)?;
     if claims.exp <= now_unix {
+        return None;
+    }
+    if !matches_server_acceptance(token, &claims) {
         return None;
     }
     Some(token.to_string())
@@ -419,6 +489,12 @@ pub fn spawn_renewal_task(manager: Arc<crate::token_manager::TokenManager>) {
             // the fast retries are what make the recovery path reachable.
             let mut transient_backoff = TRANSIENT_RETRY_SECS.iter();
             let mut rejected = false;
+            // Anchor the grace deadline at the first attempt of this cycle. A
+            // lost rotation response is only recoverable while the old jti is
+            // still dual-valid, so retries are driven off this absolute deadline
+            // rather than the raw backoff schedule (whose last sleep could push
+            // an attempt to or past the boundary once request duration counts).
+            let retry_start = tokio::time::Instant::now();
             loop {
                 let transient = renewal_cycle(
                     &client,
@@ -433,15 +509,31 @@ pub fn spawn_renewal_task(manager: Arc<crate::token_manager::TokenManager>) {
                 if !transient {
                     break;
                 }
-                let Some(delay_secs) = transient_backoff.next() else {
+                let Some(backoff_secs) = transient_backoff.next() else {
+                    break;
+                };
+                let elapsed = tokio::time::Instant::now().duration_since(retry_start);
+                let Some(delay) = retry_delay_within_grace(
+                    elapsed,
+                    Duration::from_secs(*backoff_secs),
+                    ROTATION_GRACE_WINDOW,
+                    RENEW_HTTP_TIMEOUT,
+                ) else {
+                    // No further attempt can complete inside the rotation grace
+                    // window; stop fast-retrying and fall to the outer wait
+                    // (which still polls at 30s while persistence debt remains).
+                    tracing::info!(
+                        target: "astra.edge",
+                        "edge token renewal fast-retries exhausted the rotation grace window"
+                    );
                     break;
                 };
                 tracing::info!(
                     target: "astra.edge",
-                    retry_in_secs = delay_secs,
+                    retry_in_secs = delay.as_secs(),
                     "retrying edge token renewal after transient failure"
                 );
-                tokio::time::sleep(Duration::from_secs(*delay_secs)).await;
+                tokio::time::sleep(delay).await;
             }
             // Wake early when someone (renewal itself or the AuthOk heal
             // path) records persistence debt. Outstanding debt must NEVER
@@ -824,6 +916,42 @@ mod tests {
         assert!(!should_persist_proven(None, "plain-astra-token"));
     }
 
+    // Reused-workspace regression: the file holds a previous tenant's token of a
+    // LATER generation than the token that just authenticated for the current
+    // tenant. Generation ordering is meaningless across identities — comparing
+    // (iat, exp) would keep the stale foreign token, which a later env-less
+    // startup would then select and be permanently rejected on. The proven
+    // current-tenant token must overwrite it.
+    #[test]
+    fn should_persist_proven_replaces_stale_other_identity() {
+        let identity_tok = |sub: &str, workspace: &str, iat: i64, exp: i64| {
+            make_token(&serde_json::json!({
+                "iat": iat,
+                "exp": exp,
+                "jti": format!("jti-{sub}"),
+                "sub": sub,
+                "workspace_id": workspace,
+                "iss": "moi-backend",
+                "edge_agent_id": format!("edge-{sub}"),
+                "purpose": "edge_registration",
+            }))
+        };
+        // Tenant A's leftover file token is a LATER generation than tenant B's
+        // freshly-proven token.
+        let tenant_a_file = identity_tok("tenant-a", "ws-a", 5_000, 9_000);
+        let tenant_b_proven = identity_tok("tenant-b", "ws-b", 100, 200);
+        assert!(
+            should_persist_proven(Some(&tenant_a_file), &tenant_b_proven),
+            "a proven current-identity token must overwrite a later-generation \
+             previous-tenant token left in a reused workspace"
+        );
+
+        // Sanity: same identity still obeys generation ordering (a strictly
+        // newer same-identity file is kept).
+        let same_newer = identity_tok("tenant-b", "ws-b", 300, 400);
+        assert!(!should_persist_proven(Some(&same_newer), &tenant_b_proven));
+    }
+
     #[test]
     fn parse_valid_claims() {
         let token = make_token(&serde_json::json!({ "exp": 1234567890, "jti": "abc" }));
@@ -881,17 +1009,90 @@ mod tests {
         // Missing file → none.
         assert!(read_valid_file_token(&path, now).is_none());
 
-        // Valid unexpired moi token → preferred.
-        let valid = make_token(&serde_json::json!({ "exp": now + 86_400 }));
+        // Valid unexpired moi token with the server-required identity claims →
+        // preferred. (No iss/purpose ⇒ not an edge-registration token, so no
+        // edge_agent_id/jti required.)
+        let valid = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+        }));
         write_token_atomic(&path, &valid).expect("write");
         assert_eq!(
             read_valid_file_token(&path, now).as_deref(),
             Some(valid.as_str())
         );
 
+        // A valid edge-registration token (iss=moi-backend + purpose) needs the
+        // edge_agent_id and jti binding the server requires.
+        let valid_edge = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+            "purpose": "edge_registration",
+            "edge_agent_id": "edge-1",
+            "jti": "jti-1",
+        }));
+        write_token_atomic(&path, &valid_edge).expect("write");
+        assert_eq!(
+            read_valid_file_token(&path, now).as_deref(),
+            Some(valid_edge.as_str())
+        );
+
         // Expired token → rejected.
-        let expired = make_token(&serde_json::json!({ "exp": now - 1 }));
+        let expired = make_token(&serde_json::json!({
+            "exp": now - 1,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+        }));
         write_token_atomic(&path, &expired).expect("write");
+        assert!(read_valid_file_token(&path, now).is_none());
+
+        // The lenient parser accepts these, but the server would reject them, so
+        // the file selector must too (no env fallback ⇒ selecting one bricks the
+        // edge). Each mutates the otherwise-valid token in exactly one way.
+
+        // Extra (4th) segment — server requires exactly three.
+        write_token_atomic(&path, &format!("{valid}.extra")).expect("write");
+        assert!(read_valid_file_token(&path, now).is_none());
+
+        // Missing sub — required for every token type.
+        let no_sub = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "workspace_id": "workspace-1",
+        }));
+        write_token_atomic(&path, &no_sub).expect("write");
+        assert!(read_valid_file_token(&path, now).is_none());
+
+        // Missing workspace_id — required for every token type.
+        let no_workspace = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+        }));
+        write_token_atomic(&path, &no_workspace).expect("write");
+        assert!(read_valid_file_token(&path, now).is_none());
+
+        // moi-backend issuer without the edge_registration purpose — a
+        // pre-binding historical token the server rejects.
+        let backend_non_edge = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+        }));
+        write_token_atomic(&path, &backend_non_edge).expect("write");
+        assert!(read_valid_file_token(&path, now).is_none());
+
+        // edge_registration purpose without edge_agent_id / jti — rejected.
+        let edge_no_binding = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+            "iss": "moi-backend",
+            "purpose": "edge_registration",
+        }));
+        write_token_atomic(&path, &edge_no_binding).expect("write");
         assert!(read_valid_file_token(&path, now).is_none());
 
         // Non-moi content → rejected.
@@ -901,6 +1102,110 @@ mod tests {
         // Empty / whitespace file → rejected.
         write_token_atomic(&path, "  \n").expect("write");
         assert!(read_valid_file_token(&path, now).is_none());
+    }
+
+    #[test]
+    fn retry_delay_within_grace_budgets_request_timeout() {
+        let grace = Duration::from_secs(300);
+        let timeout = Duration::from_secs(30);
+        // Early in the window: the full backoff is granted.
+        assert_eq!(
+            retry_delay_within_grace(
+                Duration::from_secs(30),
+                Duration::from_secs(30),
+                grace,
+                timeout
+            ),
+            Some(Duration::from_secs(30))
+        );
+        // Late enough that the raw backoff would overrun: clamped so the next
+        // attempt keeps a full request timeout of headroom before the deadline.
+        assert_eq!(
+            retry_delay_within_grace(
+                Duration::from_secs(180),
+                Duration::from_secs(120),
+                grace,
+                timeout
+            ),
+            Some(Duration::from_secs(90))
+        );
+        // Not enough room for another completing attempt → stop retrying.
+        assert_eq!(
+            retry_delay_within_grace(
+                Duration::from_secs(280),
+                Duration::from_secs(30),
+                grace,
+                timeout
+            ),
+            None
+        );
+        // Exactly one request timeout of room left (remaining == timeout) → stop.
+        assert_eq!(
+            retry_delay_within_grace(
+                Duration::from_secs(270),
+                Duration::from_secs(10),
+                grace,
+                timeout
+            ),
+            None
+        );
+        // Elapsed already past the grace window → None (saturating, no panic).
+        assert_eq!(
+            retry_delay_within_grace(
+                Duration::from_secs(400),
+                Duration::from_secs(30),
+                grace,
+                timeout
+            ),
+            None
+        );
+    }
+
+    // Paused-time regression for the retry schedule: driving the real backoff
+    // constants through the grace-deadline helper, every attempt — including the
+    // last — must BEGIN early enough to complete within the rotation grace
+    // window even when each attempt burns the full request timeout before it
+    // fails. The pre-fix fixed schedule [30,60,120] pushed the 4th attempt to
+    // t=300, at the boundary.
+    #[tokio::test(start_paused = true)]
+    async fn fast_retries_stay_within_rotation_grace_window() {
+        let grace = ROTATION_GRACE_WINDOW;
+        let timeout = RENEW_HTTP_TIMEOUT;
+        let start = tokio::time::Instant::now();
+        let mut backoff = TRANSIENT_RETRY_SECS.iter().copied();
+        let mut attempt_offsets = vec![Duration::ZERO];
+        loop {
+            // Worst case: the attempt runs the full request timeout before it
+            // reports the transient failure.
+            tokio::time::sleep(timeout).await;
+            let Some(backoff_secs) = backoff.next() else {
+                break;
+            };
+            let elapsed = tokio::time::Instant::now().duration_since(start);
+            let Some(delay) = retry_delay_within_grace(
+                elapsed,
+                Duration::from_secs(backoff_secs),
+                grace,
+                timeout,
+            ) else {
+                break;
+            };
+            tokio::time::sleep(delay).await;
+            attempt_offsets.push(tokio::time::Instant::now().duration_since(start));
+        }
+        for offset in &attempt_offsets {
+            assert!(
+                *offset + timeout <= grace,
+                "attempt starting at {offset:?} cannot complete within the {grace:?} grace window"
+            );
+        }
+        // The window is genuinely used for several recovery attempts, not
+        // collapsed to a single try.
+        assert!(
+            attempt_offsets.len() >= 2,
+            "expected multiple in-window retries, got {}",
+            attempt_offsets.len()
+        );
     }
 
     #[test]
