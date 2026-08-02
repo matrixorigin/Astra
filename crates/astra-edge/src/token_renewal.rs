@@ -253,6 +253,14 @@ pub fn resolve_token_file_path(workspace_dir: &Path) -> PathBuf {
 /// env fallback, selecting such a file would let the edge pick a token it is
 /// then permanently rejected on, so the structural/claim checks are applied here.
 pub fn read_valid_file_token(path: &Path, now_unix: i64) -> Option<String> {
+    // Credential file: it must be a regular file. Reject symlinks (which the
+    // write path treats as needing repair — see token_file_needs_permission_repair)
+    // and cap the read so a planted symlink to a huge target cannot be slurped
+    // into memory. symlink_metadata does not follow the link.
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 16 * 1024 {
+        return None;
+    }
     let contents = std::fs::read_to_string(path).ok()?;
     let token = contents.trim();
     if token.is_empty() {
@@ -1102,6 +1110,32 @@ mod tests {
         // Empty / whitespace file → rejected.
         write_token_atomic(&path, "  \n").expect("write");
         assert!(read_valid_file_token(&path, now).is_none());
+    }
+
+    // A credential file must be a regular file: a symlink to an otherwise-valid
+    // token is rejected (never followed), matching the write path's treatment of
+    // symlinks as needing repair.
+    #[cfg(unix)]
+    #[test]
+    fn read_valid_file_token_rejects_symlink() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = 1_000_000;
+        let target = dir.path().join("real-token");
+        let valid = make_token(&serde_json::json!({
+            "exp": now + 86_400,
+            "sub": "user-1",
+            "workspace_id": "workspace-1",
+        }));
+        write_token_atomic(&target, &valid).expect("write");
+        // Through the regular file directly: accepted.
+        assert_eq!(
+            read_valid_file_token(&target, now).as_deref(),
+            Some(valid.as_str())
+        );
+        // Through a symlink to it: rejected.
+        let link = dir.path().join("token-link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        assert!(read_valid_file_token(&link, now).is_none());
     }
 
     #[test]
