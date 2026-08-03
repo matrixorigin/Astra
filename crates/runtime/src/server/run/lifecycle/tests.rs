@@ -102,6 +102,15 @@ fn compaction_commits_the_complete_replacement_projection() {
 }
 
 #[test]
+fn unexplained_canonical_prefix_shrink_remains_rejected() {
+    let shortened = vec![json!({"role": "user", "content": "unexpected tail"})];
+
+    let error = canonical_commit_delta(20, true, &shortened, false, false).unwrap_err();
+
+    assert!(error.contains("shorter than the admitted prefix"));
+}
+
+#[test]
 fn fresh_request_admission_accounts_for_large_non_message_payloads() {
     let mut request = test_request("small");
     let baseline = fresh_request_admission_bytes(&request).unwrap();

@@ -127,6 +127,7 @@ fn apply_pre_turn_summary(
         }),
     );
     state.compact_tier_applied = CompactionTier::CompactHistory;
+    state.context_compression_triggered = true;
 
     let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
         &state.messages,
@@ -9801,6 +9802,19 @@ mod tests {
         );
         assert_eq!(event.messages_after, state.messages.len());
         assert_eq!(state.compact_tier_applied, CompactionTier::CompactHistory);
+        assert!(state.context_compression_triggered);
+
+        let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+            messages_before,
+            true,
+            &state.messages,
+            state.context_compression_triggered,
+            false,
+        )
+        .expect("pre-turn compaction must produce a canonical replacement")
+        .expect("pre-turn compaction must remain committable");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+        assert!(!packs.is_empty());
     }
 
     #[test]

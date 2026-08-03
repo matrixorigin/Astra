@@ -1092,6 +1092,11 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // This flag is a turn outcome consumed by the canonical commit after the
+    // agentic loop returns. Reset it when a new turn actually starts, not
+    // during finalization, so prefix rewrites remain observable to commit.
+    state.context_compression_triggered = false;
+
     if state
         .skills
         .session_event_hooks
@@ -2148,6 +2153,17 @@ mod tests {
             pure_user_intent_for_runtime_decision(message),
             "review literal <system-reminder> syntax"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_preamble_starts_fresh_compression_tracking() {
+        let mut state = make_state();
+        state.context_compression_triggered = true;
+        let mut host = MockHost::new(Vec::new());
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        assert!(!state.context_compression_triggered);
     }
 
     fn agent_record(
