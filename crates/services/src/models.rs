@@ -3528,7 +3528,20 @@ fn project_access_availability(
 /// access source. That mismatch is a contract error rather than a UI guess.
 pub fn project_model_access(
     declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItemResponse>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    project_model_access_with_default(declared, offerings, None, observed_at)
+}
+
+/// Build Model Access while honoring an optional provider-owned default
+/// Offering. The override is only available to the source that owns the
+/// effective catalog (for example an external edge provider); an invalid
+/// override is a contract error and must not silently select another model.
+pub fn project_model_access_with_default(
+    declared: Vec<DeclaredModelAccess>,
     mut offerings: Vec<ModelListItemResponse>,
+    provider_default_offering_id: Option<String>,
     observed_at: String,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let mut accesses = BTreeMap::new();
@@ -3611,12 +3624,26 @@ pub fn project_model_access(
         })
         .collect::<crate::service_error::ServiceResult<_>>()?;
 
-    // Phase 0 has one deterministic Server-owned default policy: the first
-    // canonical active Offering. Clients receive the decision and never
-    // recreate this ordering rule locally.
-    let default_offering_id = offerings
-        .first()
-        .map(|offering| offering.offering_id.clone());
+    // A provider which owns the effective catalog may nominate one of its
+    // effective Offerings as the default. Otherwise retain the deterministic
+    // server default: the first canonical active Offering.
+    let default_offering_id = match provider_default_offering_id {
+        Some(default_offering_id) => {
+            if !offerings
+                .iter()
+                .any(|offering| offering.offering_id == default_offering_id)
+            {
+                return Err(crate::service_error::ServiceError::invalid(format!(
+                    "provider default Offering '{}' is not in the effective catalog",
+                    default_offering_id
+                )));
+            }
+            Some(default_offering_id)
+        }
+        None => offerings
+            .first()
+            .map(|offering| offering.offering_id.clone()),
+    };
 
     #[derive(Serialize)]
     struct CatalogRevisionFacts<'a> {
@@ -4880,6 +4907,86 @@ mod tests {
         assert_eq!(reverse.default_offering_id, forward.default_offering_id);
         assert_eq!(reverse.catalog_revision, forward.catalog_revision);
         assert_eq!(reverse.offerings, forward.offerings);
+    }
+
+    #[test]
+    fn model_access_projection_honors_provider_default_offering() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = |id: &str, name: &str| ModelListItemResponse {
+            offering_id: id.into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: name.into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let alpha = offering("offer-alpha", "Alpha");
+        let beta = offering("offer-beta", "Beta");
+
+        let projection = project_model_access_with_default(
+            vec![declared],
+            vec![alpha, beta],
+            Some("offer-beta".into()),
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect("provider default in catalog");
+
+        assert_eq!(
+            projection.default_offering_id.as_deref(),
+            Some("offer-beta")
+        );
+    }
+
+    #[test]
+    fn model_access_projection_rejects_missing_provider_default_offering() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-alpha".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Alpha".into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let error = project_model_access_with_default(
+            vec![declared],
+            vec![offering],
+            Some("offer-missing".into()),
+            "2026-07-20T00:00:00Z".into(),
+        )
+        .expect_err("missing provider default must fail closed");
+
+        assert!(
+            error.to_string().contains(
+                "provider default Offering 'offer-missing' is not in the effective catalog"
+            )
+        );
     }
 
     #[test]

@@ -250,6 +250,11 @@ pub struct ExternalCatalogKnowledgeBase {
 pub struct ExternalCatalogResponse {
     #[serde(default)]
     pub models: Vec<ExternalCatalogModel>,
+    /// Provider-owned default model for this effective catalog. The id must
+    /// refer to one of `models`; Astra validates that before publishing Model
+    /// Access instead of silently selecting a different offering.
+    #[serde(default)]
+    pub default_model_id: Option<String>,
     #[serde(default)]
     pub tools: Vec<ExternalCatalogTool>,
     #[serde(default)]
@@ -1396,6 +1401,7 @@ mod tests {
             .await
             .expect("list_catalog should parse MOI catalog");
         assert_eq!(catalog.models[0].id, "model-qwen");
+        assert_eq!(catalog.default_model_id.as_deref(), Some("model-qwen"));
         let model = ModelListItem::from(catalog.models.into_iter().next().unwrap());
         assert_eq!(model.offering_id, "model-qwen");
         assert_eq!(
@@ -1762,6 +1768,7 @@ mod tests {
                 "limits": {"context_window": 32768, "max_completion_tokens": 4096},
                 "metadata": {"description": "MOI model", "architecture": "transformer"}
             }],
+            "default_model_id": "model-qwen",
             "tools": [{
                 "id": "tool-search",
                 "name": "search",

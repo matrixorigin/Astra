@@ -650,6 +650,11 @@ Four gaps in the original `connect_via_proxy`:
 2. **GAP-2 `_by_scope` actions** must be implemented on the matrixflow side
    before astra-edge can fetch runtime context via HTTP.
 3. **GAP-3 `edge_agent` descriptor** must be populated by moi-core catalog.
+4. **External catalog default model rollout order:** deploy the Astra version
+   that accepts `default_model_id` before deploying Matrixflow Catalog that
+   emits it. `ExternalCatalogResponse` is deliberately strict
+   (`deny_unknown_fields`), so an older Astra server rejects this additive
+   provider field instead of silently choosing a potentially different default.
 
 ---
 

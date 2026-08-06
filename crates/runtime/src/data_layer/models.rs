@@ -58,6 +58,7 @@ pub async fn list_models_handler(
 struct EffectiveModelCatalog {
     declared: Vec<DeclaredModelAccess>,
     offerings: Vec<ModelListItem>,
+    provider_default_offering_id: Option<String>,
 }
 
 async fn effective_model_catalog(
@@ -83,6 +84,7 @@ async fn effective_model_catalog(
                 .into_iter()
                 .map(ModelListItem::from)
                 .collect(),
+            provider_default_offering_id: catalog.default_model_id,
         });
     }
     let user = principal.user;
@@ -100,6 +102,7 @@ async fn effective_model_catalog(
             availability: ModelAccessAvailability::Ready,
         }],
         offerings,
+        provider_default_offering_id: None,
     })
 }
 
@@ -108,16 +111,27 @@ pub async fn get_model_access_handler(
     headers: HeaderMap,
 ) -> Result<Json<ModelAccessProjectionResponse>, (StatusCode, Json<ErrorResponse>)> {
     let catalog = effective_model_catalog(&state, &headers).await?;
+    let projection = project_effective_model_access(catalog, chrono::Utc::now().to_rfc3339())
+        .map_err(internal_error)?;
+    Ok(Json(projection))
+}
+
+fn project_effective_model_access(
+    catalog: EffectiveModelCatalog,
+    observed_at: String,
+) -> astra_services::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let offerings = catalog
         .offerings
         .into_iter()
         .filter(|offering| offering.is_active)
         .map(ModelListItemResponse::from)
         .collect();
-    let projection =
-        project_model_access(catalog.declared, offerings, chrono::Utc::now().to_rfc3339())
-            .map_err(internal_error)?;
-    Ok(Json(projection))
+    project_model_access_with_default(
+        catalog.declared,
+        offerings,
+        catalog.provider_default_offering_id,
+        observed_at,
+    )
 }
 
 pub async fn get_model_handler(
@@ -235,4 +249,54 @@ pub async fn check_model_handler(
     let _admin = state.admin.authorizer.require_admin(&headers).await?;
     let model = state.model_service.check_model(model_name).await?;
     Ok(Json(ModelResponse::from(model)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offering(id: &str, name: &str) -> ModelListItem {
+        ModelListItem {
+            offering_id: id.to_string(),
+            access_id: "this-device".to_string(),
+            access_kind: ModelAccessKind::ThisDevice,
+            access_label: "This device".to_string(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            name: name.to_string(),
+            provider: "moi".to_string(),
+            description: None,
+            is_active: true,
+            context_window: 128_000,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        }
+    }
+
+    #[test]
+    fn model_access_uses_external_catalog_default_instead_of_catalog_order() {
+        let projection = project_effective_model_access(
+            EffectiveModelCatalog {
+                declared: vec![DeclaredModelAccess {
+                    id: "this-device".to_string(),
+                    kind: ModelAccessKind::ThisDevice,
+                    label: "This device".to_string(),
+                    execution_placement: ModelExecutionPlacement::Edge,
+                    availability: ModelAccessAvailability::Ready,
+                }],
+                offerings: vec![
+                    offering("model-alpha", "Alpha"),
+                    offering("model-beta", "Beta"),
+                ],
+                provider_default_offering_id: Some("model-beta".to_string()),
+            },
+            "2026-08-06T00:00:00Z".to_string(),
+        )
+        .expect("external catalog default must be projected");
+
+        assert_eq!(
+            projection.default_offering_id.as_deref(),
+            Some("model-beta")
+        );
+    }
 }
