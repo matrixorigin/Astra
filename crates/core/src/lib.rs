@@ -174,9 +174,9 @@ fn try_allocate_with_cap(max: u64, cap: u64) -> Result<(), ConnectionQuotaError>
 
 /// Release `max` connections back to the global counter.
 ///
-/// Callers that obtain a pool via [`connect_matrixone`] and later call
-/// `.close()` on it should invoke this immediately after closing so the
-/// quota is recycled.
+/// Callers that obtain a raw pool via [`connect_matrixone`] must invoke this
+/// when the pool is no longer used. Prefer [`DedicatedPool`] for bounded
+/// lifetimes so quota release and MatrixOne socket teardown stay coupled.
 pub fn release_global_connections(max: u64) {
     loop {
         let current = GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire);
@@ -269,6 +269,31 @@ mod connection_quota_tests {
         assert_eq!(GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire), 5);
         assert!(try_allocate_with_cap(5, 10).is_ok());
         assert_eq!(GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire), 10);
+    }
+
+    #[tokio::test]
+    async fn dedicated_pool_release_consumes_pool_and_returns_quota() {
+        let _g = crate::sync_poison::recover_mutex_lock(&TEST_MUTEX);
+        reset_quota();
+        GLOBAL_CONNECTION_ALLOCATED.store(1, Ordering::Release);
+        let settings = MatrixOneSettings {
+            db_pool_max_connections: 1,
+            db_pool_min_connections: 0,
+            ..MatrixOneSettings::default()
+        };
+        let pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_lazy(&settings.database_url_with_password())
+            .expect("lazy pool should not connect");
+
+        DedicatedPool::new(pool, 1).release();
+
+        assert_eq!(
+            GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire),
+            0,
+            "releasing a dedicated pool must return its reserved quota"
+        );
     }
 
     #[test]
@@ -697,10 +722,11 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
 /// has a bounded lifetime.  The wrapper calls [`release_global_connections`]
 /// in its [`Drop`] impl so the quota is automatically recycled.
 ///
-/// Call [`DedicatedPool::close`] explicitly before drop to close
-/// connections promptly.  `Drop` is a safety net that releases the
-/// quota counter but cannot `.await` [`Pool::close`][sqlx::Pool::close].
-/// For long-lived pools prefer [`SharedPool`].
+/// Call [`DedicatedPool::release`] when the bounded operation completes.
+/// MatrixOne does not complete SQLx's MySQL shutdown handshake, so dedicated
+/// pools synchronously detach and drop their idle connections instead of
+/// awaiting [`Pool::close`][sqlx::Pool::close]. For long-lived pools prefer
+/// [`SharedPool`].
 pub struct DedicatedPool {
     pub(crate) pool: Pool<MySql>,
     pub(crate) max_connections: u64,
@@ -723,14 +749,16 @@ impl DedicatedPool {
         }
     }
 
-    /// Close the pool and release the global connection quota.
+    /// Close idle sockets, release the global connection quota, and consume the pool.
     ///
-    /// Prefer calling this explicitly before drop to ensure connections
-    /// are released back to the database promptly.  `Drop` is a safety
-    /// net that only releases the quota counter; it cannot `.await`
-    /// [`Pool::close`].
-    pub async fn close(self) {
-        self.pool.close().await;
+    /// SQLx's graceful and hard MySQL close paths both wait for stream shutdown,
+    /// which MatrixOne does not complete. Detaching each idle connection and
+    /// dropping the raw socket closes it immediately without spawning SQLx's
+    /// asynchronous pool-return path.
+    pub fn release(self) {
+        while let Some(connection) = self.pool.try_acquire() {
+            drop(connection.detach());
+        }
         self.release_quota();
     }
 

@@ -895,7 +895,7 @@ async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result
     loop {
         let verify_pool = DedicatedPool::new(connect_matrixone(&verify_settings).await?, 1);
         let visibility_result = verify_core_schema_visible(&verify_pool, &settings.database).await;
-        verify_pool.close().await;
+        verify_pool.release();
         match visibility_result {
             Ok(CoreSchemaVisibility::Visible) => return Ok(()),
             Ok(CoreSchemaVisibility::Lag(_)) if tokio::time::Instant::now() < deadline => {
@@ -1275,7 +1275,7 @@ async fn ensure_matrixone_database_exists(
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
     let create_result = query(&ddl).execute(&*admin_pool).await.map(|_| ());
-    admin_pool.close().await;
+    admin_pool.release();
     create_result
 }
 
@@ -2427,15 +2427,15 @@ pub async fn ensure_core_schema(
     let lease_pool = match connect_matrixone(&schema_settings).await {
         Ok(lease_pool) => DedicatedPool::new(lease_pool, 1),
         Err(error) => {
-            pool.close().await;
+            pool.release();
             return Err(error);
         }
     };
     let database_lease = match CoreSchemaDatabaseLease::acquire(&lease_pool).await {
         Ok(lease) => lease,
         Err(error) => {
-            lease_pool.close().await;
-            pool.close().await;
+            lease_pool.release();
+            pool.release();
             return Err(error);
         }
     };
@@ -2443,8 +2443,8 @@ pub async fn ensure_core_schema(
         ensure_core_schema_while_leased(settings, (*pool).clone(), database_lease.holder_id())
             .await;
     let release_result = database_lease.release().await;
-    lease_pool.close().await;
-    pool.close().await;
+    lease_pool.release();
+    pool.release();
     let bootstrap_result = match (schema_result, release_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(schema_error), Ok(())) => Err(schema_error),
