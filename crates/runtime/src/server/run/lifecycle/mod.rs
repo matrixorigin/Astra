@@ -34,7 +34,9 @@ use astra_server_types::ws_progress_callback::ProgressEvent;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::turn::canonical_commit::{canonical_commit_delta, pack_canonical_turn_segments};
+use crate::turn::canonical_commit::{
+    CanonicalRewriteProof, canonical_commit_delta, pack_canonical_turn_segments,
+};
 use crate::turn::run_control::{RunControlProvider, RunControlStatus, UserIntentProvider};
 use astra_core::{
     ErrorResponse, SharedPool, connect_matrixone, error_response, error_response_coded,
@@ -2710,7 +2712,6 @@ struct CanonicalTurnAdmission {
     lease: astra_turn_types::ConversationWriterLeaseV1,
     reservation: astra_turn_types::TurnReservationV1,
     prior_messages: Vec<Value>,
-    prior_message_count: usize,
     had_canonical_head: bool,
     /// Leases supplied as an explicit controller capability outlive one run;
     /// only leases acquired internally by this run are released here.
@@ -3088,7 +3089,6 @@ impl AgenticRunLifecycleService {
                 ));
             }
         };
-        let prior_message_count = prior_messages.len();
         let renewal_cancel = CancellationToken::new();
         let heartbeat_cancel = renewal_cancel.clone();
         let heartbeat_run_cancel = authority_loss_cancel;
@@ -3161,7 +3161,6 @@ impl AgenticRunLifecycleService {
             lease,
             reservation,
             prior_messages,
-            prior_message_count,
             had_canonical_head: head.is_some(),
             release_writer_on_finish,
             release_started: Arc::new(AtomicBool::new(false)),
@@ -3174,7 +3173,7 @@ impl AgenticRunLifecycleService {
     async fn commit_canonical_turn(
         admission: Option<&CanonicalTurnAdmission>,
         messages: &[Value],
-        compaction_rewrote_prefix: bool,
+        rewrite_proof: Option<&CanonicalRewriteProof>,
         cancellation_requested: bool,
         run_id: &str,
     ) -> Result<bool, astra_core::ClassifiedError> {
@@ -3184,10 +3183,10 @@ impl AgenticRunLifecycleService {
         admission.renewal_cancel.cancel();
         let result = async {
             let Some((mode, logical_segments)) = canonical_commit_delta(
-                admission.prior_message_count,
+                &admission.prior_messages,
                 admission.had_canonical_head,
                 messages,
-                compaction_rewrote_prefix,
+                rewrite_proof,
                 cancellation_requested,
             )?
             else {
@@ -3203,7 +3202,20 @@ impl AgenticRunLifecycleService {
                 conversation_seq: base
                     .map_or(1, |cursor| cursor.conversation_seq.saturating_add(1)),
                 compaction_generation: if replaces_history {
-                    base.map_or(1, |cursor| cursor.compaction_generation.saturating_add(1))
+                    let proof = rewrite_proof.ok_or_else(|| {
+                        "canonical replacement is missing its typed rewrite proof".to_string()
+                    })?;
+                    let cursor = base.ok_or_else(|| {
+                        "canonical replacement is missing its admitted base cursor".to_string()
+                    })?;
+                    if proof.base_root() != cursor.canonical_root_hash {
+                        return Err(
+                            "canonical rewrite proof does not match the admitted base root".into(),
+                        );
+                    }
+                    proof.replacement_generation().ok_or_else(|| {
+                        "canonical rewrite proof has no resulting compaction generation".to_string()
+                    })?
                 } else {
                     base.map_or(0, |cursor| cursor.compaction_generation)
                 },
@@ -7082,6 +7094,7 @@ impl AgenticRunLifecycleService {
             max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
@@ -8465,7 +8478,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
         }
-        let mut canonical_turn = match self
+        let canonical_turn = match self
             .prepare_canonical_turn(
                 &user_id,
                 &session_id,
@@ -8526,11 +8539,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         loop_state.session_turn =
             infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
-        if let Some(admission) = canonical_turn.as_mut()
+        if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
         {
-            admission.prior_messages.append(&mut loop_state.messages);
-            loop_state.messages = std::mem::take(&mut admission.prior_messages);
+            let mut messages = admission.prior_messages.clone();
+            messages.append(&mut loop_state.messages);
+            loop_state.messages = messages;
+            if let Some(base) = admission.reservation.expected_cursor.as_ref() {
+                loop_state.initialize_canonical_rewrite_proof(
+                    &admission.prior_messages,
+                    &base.canonical_root_hash,
+                    base.compaction_generation,
+                );
+            }
         }
         self.configure_host_approval_audit_context(
             &mut host,
@@ -8995,7 +9016,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     match Self::commit_canonical_turn(
                         canonical_turn.as_ref(),
                         &loop_state.messages,
-                        loop_state.context_compression_triggered,
+                        loop_state.canonical_rewrite_proof(),
                         bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
@@ -9848,7 +9869,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 agent_id: None,
                 event_tx: Some(event_tx.clone()),
             });
-        let mut canonical_turn = match self
+        let canonical_turn = match self
             .prepare_canonical_turn(
                 &user_id,
                 &session_id,
@@ -9909,11 +9930,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
 
         state.session_turn =
             infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
-        if let Some(admission) = canonical_turn.as_mut()
+        if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
         {
-            admission.prior_messages.append(&mut state.messages);
-            state.messages = std::mem::take(&mut admission.prior_messages);
+            let mut messages = admission.prior_messages.clone();
+            messages.append(&mut state.messages);
+            state.messages = messages;
+            if let Some(base) = admission.reservation.expected_cursor.as_ref() {
+                state.initialize_canonical_rewrite_proof(
+                    &admission.prior_messages,
+                    &base.canonical_root_hash,
+                    base.compaction_generation,
+                );
+            }
         }
         let fresh_session_current_date = state
             .pipeline_session
@@ -10627,7 +10656,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     match Self::commit_canonical_turn(
                         canonical_turn.as_ref(),
                         &state.messages,
-                        state.context_compression_triggered,
+                        state.canonical_rewrite_proof(),
                         bg_cancel_flag.load(Ordering::Acquire)
                             || bg_llm_cancel_token.is_cancelled(),
                         &bg_run_id,
@@ -13432,6 +13461,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
             max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

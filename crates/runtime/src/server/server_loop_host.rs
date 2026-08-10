@@ -98,6 +98,7 @@ fn apply_pre_turn_summary(
     pressure: f64,
     summary_text: String,
 ) -> CompactionEvent {
+    let rewrite_permit = state.begin_canonical_rewrite();
     let max_tokens = state.max_turn_input_tokens;
     let (tokens_before, old_count) = (
         crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
@@ -126,7 +127,9 @@ fn apply_pre_turn_summary(
             )
         }),
     );
+    state.finish_canonical_rewrite(rewrite_permit);
     state.compact_tier_applied = CompactionTier::CompactHistory;
+    state.context_compression_triggered = true;
 
     let tokens_after = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
         &state.messages,
@@ -9771,6 +9774,9 @@ mod tests {
                 "content": format!("answer {index}: {}", "detail ".repeat(80))
             }));
         }
+        let admitted_messages = state.messages.clone();
+        let admitted_root = astra_turn_types::canonical_conversation_root(&admitted_messages);
+        state.initialize_canonical_rewrite_proof(&admitted_messages, &admitted_root, 0);
         let messages_before = state.messages.len();
         let tokens_before = crate::turn::agentic_loop::lifecycle::estimate_context_pressure(
             &state.messages,
@@ -9801,6 +9807,19 @@ mod tests {
         );
         assert_eq!(event.messages_after, state.messages.len());
         assert_eq!(state.compact_tier_applied, CompactionTier::CompactHistory);
+        assert!(state.context_compression_triggered);
+
+        let (mode, packs) = crate::turn::canonical_commit::canonical_commit_delta(
+            &admitted_messages,
+            true,
+            &state.messages,
+            state.canonical_rewrite_proof(),
+            false,
+        )
+        .expect("pre-turn compaction must produce a canonical replacement")
+        .expect("pre-turn compaction must remain committable");
+        assert_eq!(mode, astra_turn_types::CanonicalDeltaModeV1::Replace);
+        assert!(!packs.is_empty());
     }
 
     #[test]
@@ -11124,6 +11143,7 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

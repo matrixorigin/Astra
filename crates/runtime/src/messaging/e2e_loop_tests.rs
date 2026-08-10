@@ -240,6 +240,7 @@ mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

@@ -984,7 +984,6 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     // `budget_wrapup_injected` is still true from the previous turn),
     // which was exactly the stale-state bug the code-review called out.
     state.budget_wrapup_injected = false;
-    state.context_compression_triggered = false;
     state.budget_wrapup_ignored_rounds = 0;
     // Defensive reset: last_finish_reason is rewritten before every LLM call
     // in execution_phase.rs, but resetting here prevents stale leakage if a
@@ -2200,6 +2199,19 @@ mod tests {
         assert!(
             guard.context_traces[0].token_budget.compression_triggered,
             "trace must report actual context compaction independently of budget wrap-up policy"
+        );
+    }
+
+    #[test]
+    fn turn_finalization_preserves_compression_observability() {
+        let mut state = make_state();
+        state.context_compression_triggered = true;
+
+        reset_per_turn_advisory_state(&mut state);
+
+        assert!(
+            state.context_compression_triggered,
+            "turn tracing must retain whether provider-visible compaction occurred"
         );
     }
 

@@ -1092,6 +1092,11 @@ pub(crate) async fn run_loop_preamble<H: AgenticLoopHost>(
     host: &mut H,
     state: &mut AgenticLoopState,
 ) {
+    // This flag is a turn outcome consumed by the canonical commit after the
+    // agentic loop returns. Reset it when a new turn actually starts, not
+    // during finalization, so prefix rewrites remain observable to commit.
+    state.context_compression_triggered = false;
+
     if state
         .skills
         .session_event_hooks
@@ -1257,11 +1262,13 @@ fn run_proactive_compaction<H: AgenticLoopHost>(
         CompactionEngine::default_pipeline_for(max_tokens)
     };
     let messages_before = state.messages.len();
+    let rewrite_permit = state.begin_canonical_rewrite();
     let outcome = pipeline.compress_if_needed(&mut state.messages, &budget);
     state
         .compaction_effectiveness
         .record_compaction(outcome.total_tokens_freed);
     if outcome.total_tokens_freed > 0 {
+        state.finish_canonical_rewrite(rewrite_permit);
         let messages_after = state.messages.len();
         let messages_removed = messages_before.saturating_sub(messages_after);
         let layer_descriptions: Vec<String> = outcome
@@ -2015,6 +2022,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
             .ok()
         });
+        let rewrite_permit = state.begin_canonical_rewrite();
         let mc = if !pipeline_allows_clearing {
             // Cascade detected: skip clearing this turn to break the loop.
             astra_turn_core::microcompact::CompactStats::default()
@@ -2038,6 +2046,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             )
         };
         if mc.results_compacted > 0 {
+            state.finish_canonical_rewrite(rewrite_permit);
             state.context_compression_triggered = true;
             let event = CompactionEvent::new(
                 CompactionKind::Microcompact,
@@ -2148,6 +2157,17 @@ mod tests {
             pure_user_intent_for_runtime_decision(message),
             "review literal <system-reminder> syntax"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_preamble_starts_fresh_compression_tracking() {
+        let mut state = make_state();
+        state.context_compression_triggered = true;
+        let mut host = MockHost::new(Vec::new());
+
+        run_loop_preamble(&mut host, &mut state).await;
+
+        assert!(!state.context_compression_triggered);
     }
 
     fn agent_record(

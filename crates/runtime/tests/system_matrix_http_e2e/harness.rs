@@ -556,21 +556,40 @@ pub async fn wait_for_agent_event_types(
     types: &[&str],
     timeout: std::time::Duration,
 ) {
+    let expected_counts = types
+        .iter()
+        .map(|event_type| (*event_type, 1_i64))
+        .collect::<Vec<_>>();
+    wait_for_agent_event_type_counts(pool, user_id, session_id, &expected_counts, timeout).await;
+}
+
+/// Poll until every `event_type` reaches its expected row count for this session, or `timeout`.
+///
+/// Bridge turns persist some observability events asynchronously after the SSE response completes.
+/// Callers that assert a session-wide projection must wait for every expected turn event, rather
+/// than merely observing one row of each type.
+pub async fn wait_for_agent_event_type_counts(
+    pool: &sqlx::MySqlPool,
+    user_id: &str,
+    session_id: &str,
+    expected_counts: &[(&str, i64)],
+    timeout: std::time::Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let mut ok = true;
-        for et in types {
+        for (event_type, expected_count) in expected_counts {
             let n: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM agent_events \
                  WHERE session_id = ? AND user_id = ? AND event_type = ?",
             )
             .bind(session_id)
             .bind(user_id)
-            .bind(*et)
+            .bind(*event_type)
             .fetch_one(pool)
             .await
             .unwrap_or(0);
-            if n < 1 {
+            if n < *expected_count {
                 ok = false;
                 break;
             }
@@ -580,7 +599,7 @@ pub async fn wait_for_agent_event_types(
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout ({timeout:?}) waiting for agent_events types {types:?} for user_id={user_id} session_id={session_id}"
+                "timeout ({timeout:?}) waiting for agent_events counts {expected_counts:?} for user_id={user_id} session_id={session_id}"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
