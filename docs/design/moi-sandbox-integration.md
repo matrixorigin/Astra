@@ -656,10 +656,11 @@ Four gaps in the original `connect_via_proxy`:
    supplied; this integration changes only which valid Offering is selected.
    A provider value is carried as a scoped `external_provider` candidate and
    resolved by Astra against the current effective catalog.  An invalid
-   candidate is reported as `default_resolution: invalid` with the typed
-   `not_effective_offering` reason; Astra does not silently substitute another
-   Offering, while the valid Offerings remain available for an explicit user
-   selection.
+   candidate is reported as `default_resolution: invalid` with one of two
+   typed reasons: `invalid_offering_id` when its identity fails validation, or
+   `not_effective_offering` when it is not in the effective catalog. Astra
+   does not silently substitute another Offering, while the valid Offerings
+   remain available for an explicit user selection.
 
    `ExternalCatalogResponse` remains deliberately strict
    (`deny_unknown_fields`), so an older Astra server rejects an additive

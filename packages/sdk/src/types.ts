@@ -1170,12 +1170,6 @@ export type RuntimeModelDefaultSource = "astra" | "external_provider";
 
 export type RuntimeModelDefaultScope = "effective_catalog";
 
-export type RuntimeModelDefaultCandidate = {
-  offering_id: string;
-  source: RuntimeModelDefaultSource;
-  scope: RuntimeModelDefaultScope;
-};
-
 export type RuntimeModelDefaultResolution =
   | {
       state: "selected";
@@ -1186,8 +1180,7 @@ export type RuntimeModelDefaultResolution =
   | { state: "missing" }
   | {
       state: "invalid";
-      candidate: RuntimeModelDefaultCandidate;
-      reason: "not_effective_offering";
+      reason: "invalid_offering_id" | "not_effective_offering";
     };
 
 export type RuntimeModelAccessProjection = {

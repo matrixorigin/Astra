@@ -139,11 +139,6 @@ describe("/api/models route", () => {
         default_offering_id: null,
         default_resolution: {
           state: "invalid",
-          candidate: {
-            offering_id: "offer-disabled",
-            source: "external_provider",
-            scope: "effective_catalog",
-          },
           reason: "not_effective_offering",
         },
         catalog_revision: "sha256:invalid-provider-default",
