@@ -3385,6 +3385,7 @@ pub struct ModelDefaultCandidate {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDefaultInvalidReason {
+    InvalidOfferingId,
     NotEffectiveOffering,
 }
 
@@ -3401,7 +3402,6 @@ pub enum ModelDefaultResolution {
     },
     Missing,
     Invalid {
-        candidate: ModelDefaultCandidate,
         reason: ModelDefaultInvalidReason,
     },
 }
@@ -3727,6 +3727,11 @@ fn resolve_model_default(
     provider_default: Option<ModelDefaultCandidate>,
 ) -> ModelDefaultResolution {
     match provider_default {
+        Some(candidate) if validate_model_offering_id(&candidate.offering_id).is_err() => {
+            ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::InvalidOfferingId,
+            }
+        }
         Some(candidate)
             if offerings
                 .iter()
@@ -3738,8 +3743,7 @@ fn resolve_model_default(
                 scope: candidate.scope,
             }
         }
-        Some(candidate) => ModelDefaultResolution::Invalid {
-            candidate,
+        Some(_) => ModelDefaultResolution::Invalid {
             reason: ModelDefaultInvalidReason::NotEffectiveOffering,
         },
         None => match offerings.first() {
@@ -5078,6 +5082,55 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn model_access_projection_hides_invalid_provider_default_identity() {
+        let declared = DeclaredModelAccess {
+            id: "this-device".into(),
+            kind: ModelAccessKind::ThisDevice,
+            label: "This device".into(),
+            execution_placement: ModelExecutionPlacement::Edge,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = ModelListItemResponse {
+            offering_id: "offer-alpha".into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: "Alpha".into(),
+            provider: "external".into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+        let invalid_id = "not-a-valid\noffering-id";
+        let projection = project_model_access_with_default(
+            vec![declared],
+            vec![offering],
+            Some(ModelDefaultCandidate {
+                offering_id: invalid_id.into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
+            "2026-08-10T00:00:00Z".into(),
+        )
+        .expect("invalid default does not invalidate otherwise authorized offerings");
+
+        assert_eq!(projection.offerings.len(), 1);
+        assert!(projection.default_offering_id.is_none());
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::InvalidOfferingId,
+            })
+        ));
+        let encoded = serde_json::to_string(&projection).expect("projection serializes");
+        assert!(!encoded.contains("not-a-valid"));
     }
 
     #[test]
