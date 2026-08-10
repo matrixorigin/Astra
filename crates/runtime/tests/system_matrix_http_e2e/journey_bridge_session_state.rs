@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use super::harness::{
     bootstrap, cleanup_session_data, get_json, post_json, seeded_model_selection,
-    sse_first_data_json_with_type, wait_for_agent_event_types,
+    sse_first_data_json_with_type, wait_for_agent_event_type_counts,
 };
 
 const REAL_USER_MESSAGE: &str = "review the branch with three independent agents";
@@ -177,16 +177,16 @@ pub async fn run_cli_bridge_session_views_remain_consistent() {
     .await;
     assert_ne!(first_run_id, reconciliation_run_id);
 
-    wait_for_agent_event_types(
+    wait_for_agent_event_type_counts(
         pool,
         user_id,
         &session_id,
         &[
-            "user_query",
-            "runtime_reconciliation",
-            "llm_response",
-            "routing_decision",
-            "context_trace_signal",
+            ("user_query", 1),
+            ("runtime_reconciliation", 1),
+            ("llm_response", 2),
+            ("routing_decision", 2),
+            ("context_trace_signal", 2),
         ],
         std::time::Duration::from_secs(20),
     )
