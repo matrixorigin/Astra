@@ -3344,8 +3344,66 @@ pub struct ModelAccessProjectionResponse {
     pub accesses: Vec<ModelAccessViewResponse>,
     pub offerings: Vec<ModelListItemResponse>,
     pub default_offering_id: Option<String>,
+    /// The Astra-owned result of resolving a default against this effective
+    /// catalog.  Clients must not infer a replacement default when this is
+    /// `invalid`; the listed Offerings remain available for an explicit user
+    /// choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_resolution: Option<ModelDefaultResolution>,
     pub catalog_revision: String,
     pub observed_at: String,
+}
+
+/// The authority that nominated a candidate default.  Astra owns resolution;
+/// an external provider may only nominate a candidate for its own scoped
+/// catalog.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultSource {
+    Astra,
+    ExternalProvider,
+}
+
+/// The catalog boundary against which a default candidate is valid.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultScope {
+    EffectiveCatalog,
+}
+
+/// A scoped, source-owned proposal.  This deliberately is not a bare model
+/// id: future workspace and platform policies can add candidates without
+/// letting a provider redefine Astra's precedence rules.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelDefaultCandidate {
+    pub offering_id: String,
+    pub source: ModelDefaultSource,
+    pub scope: ModelDefaultScope,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelDefaultInvalidReason {
+    NotEffectiveOffering,
+}
+
+/// Outcome of resolving the default separately from projecting the usable
+/// catalog.  `Invalid` is an upstream contract violation, but it must not
+/// hide otherwise authorized Offerings from a user selecting one manually.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ModelDefaultResolution {
+    Selected {
+        offering_id: String,
+        source: ModelDefaultSource,
+        scope: ModelDefaultScope,
+    },
+    Missing,
+    Invalid {
+        candidate: ModelDefaultCandidate,
+        reason: ModelDefaultInvalidReason,
+    },
 }
 
 struct ProjectedModelAccessAvailability {
@@ -3534,14 +3592,13 @@ pub fn project_model_access(
     project_model_access_with_default(declared, offerings, None, observed_at)
 }
 
-/// Build Model Access while honoring an optional provider-owned default
-/// Offering. The override is only available to the source that owns the
-/// effective catalog (for example an external edge provider); an invalid
-/// override is a contract error and must not silently select another model.
+/// Build Model Access while resolving an optional scoped provider candidate.
+/// Astra never substitutes another Offering for an invalid provider
+/// candidate, while still returning the valid Offerings for explicit choice.
 pub fn project_model_access_with_default(
     declared: Vec<DeclaredModelAccess>,
     mut offerings: Vec<ModelListItemResponse>,
-    provider_default_offering_id: Option<String>,
+    provider_default: Option<ModelDefaultCandidate>,
     observed_at: String,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
     let mut accesses = BTreeMap::new();
@@ -3624,25 +3681,10 @@ pub fn project_model_access_with_default(
         })
         .collect::<crate::service_error::ServiceResult<_>>()?;
 
-    // A provider which owns the effective catalog may nominate one of its
-    // effective Offerings as the default. Otherwise retain the deterministic
-    // server default: the first canonical active Offering.
-    let default_offering_id = match provider_default_offering_id {
-        Some(default_offering_id) => {
-            if !offerings
-                .iter()
-                .any(|offering| offering.offering_id == default_offering_id)
-            {
-                return Err(crate::service_error::ServiceError::invalid(format!(
-                    "provider default Offering '{}' is not in the effective catalog",
-                    default_offering_id
-                )));
-            }
-            Some(default_offering_id)
-        }
-        None => offerings
-            .first()
-            .map(|offering| offering.offering_id.clone()),
+    let default_resolution = resolve_model_default(&offerings, provider_default);
+    let default_offering_id = match &default_resolution {
+        ModelDefaultResolution::Selected { offering_id, .. } => Some(offering_id.clone()),
+        ModelDefaultResolution::Missing | ModelDefaultResolution::Invalid { .. } => None,
     };
 
     #[derive(Serialize)]
@@ -3650,11 +3692,13 @@ pub fn project_model_access_with_default(
         accesses: &'a [ModelAccessViewResponse],
         offerings: &'a [ModelListItemResponse],
         default_offering_id: &'a Option<String>,
+        default_resolution: &'a ModelDefaultResolution,
     }
     let revision_bytes = serde_json::to_vec(&CatalogRevisionFacts {
         accesses: &accesses,
         offerings: &offerings,
         default_offering_id: &default_offering_id,
+        default_resolution: &default_resolution,
     })
     .map_err(|error| {
         crate::service_error::ServiceError::with_source(
@@ -3669,9 +3713,44 @@ pub fn project_model_access_with_default(
         accesses,
         offerings,
         default_offering_id,
+        default_resolution: Some(default_resolution),
         catalog_revision,
         observed_at,
     })
+}
+
+/// Resolve a source-scoped candidate only against the catalog it was admitted
+/// to.  This is intentionally the sole default-precedence point: callers may
+/// supply candidates but cannot select a fallback themselves.
+fn resolve_model_default(
+    offerings: &[ModelListItemResponse],
+    provider_default: Option<ModelDefaultCandidate>,
+) -> ModelDefaultResolution {
+    match provider_default {
+        Some(candidate)
+            if offerings
+                .iter()
+                .any(|offering| offering.offering_id == candidate.offering_id) =>
+        {
+            ModelDefaultResolution::Selected {
+                offering_id: candidate.offering_id,
+                source: candidate.source,
+                scope: candidate.scope,
+            }
+        }
+        Some(candidate) => ModelDefaultResolution::Invalid {
+            candidate,
+            reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+        },
+        None => match offerings.first() {
+            Some(offering) => ModelDefaultResolution::Selected {
+                offering_id: offering.offering_id.clone(),
+                source: ModelDefaultSource::Astra,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            },
+            None => ModelDefaultResolution::Missing,
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4939,7 +5018,11 @@ mod tests {
         let projection = project_model_access_with_default(
             vec![declared],
             vec![alpha, beta],
-            Some("offer-beta".into()),
+            Some(ModelDefaultCandidate {
+                offering_id: "offer-beta".into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
             "2026-07-20T00:00:00Z".into(),
         )
         .expect("provider default in catalog");
@@ -4951,7 +5034,7 @@ mod tests {
     }
 
     #[test]
-    fn model_access_projection_rejects_missing_provider_default_offering() {
+    fn model_access_projection_marks_missing_provider_default_without_hiding_offerings() {
         let declared = DeclaredModelAccess {
             id: "this-device".into(),
             kind: ModelAccessKind::ThisDevice,
@@ -4974,19 +5057,27 @@ mod tests {
             architecture: None,
             thinking_capability: None,
         };
-        let error = project_model_access_with_default(
+        let projection = project_model_access_with_default(
             vec![declared],
             vec![offering],
-            Some("offer-missing".into()),
+            Some(ModelDefaultCandidate {
+                offering_id: "offer-missing".into(),
+                source: ModelDefaultSource::ExternalProvider,
+                scope: ModelDefaultScope::EffectiveCatalog,
+            }),
             "2026-07-20T00:00:00Z".into(),
         )
-        .expect_err("missing provider default must fail closed");
+        .expect("invalid default does not invalidate otherwise authorized offerings");
 
-        assert!(
-            error.to_string().contains(
-                "provider default Offering 'offer-missing' is not in the effective catalog"
-            )
-        );
+        assert_eq!(projection.offerings.len(), 1);
+        assert!(projection.default_offering_id.is_none());
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+                ..
+            })
+        ));
     }
 
     #[test]

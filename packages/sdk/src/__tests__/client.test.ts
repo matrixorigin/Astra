@@ -978,6 +978,7 @@ describe("AstraClient — Models", () => {
       ],
       offerings: [],
       default_offering_id: null,
+      default_resolution: { state: "missing" },
       catalog_revision: "sha256:catalog",
       observed_at: "2026-07-20T00:00:00Z",
     });
@@ -990,6 +991,7 @@ describe("AstraClient — Models", () => {
       usable: false,
     });
     expect(result.default_offering_id).toBeNull();
+    expect(result.default_resolution).toEqual({ state: "missing" });
     expect(result.catalog_revision).toBe("sha256:catalog");
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],

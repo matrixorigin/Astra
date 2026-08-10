@@ -39,6 +39,12 @@ describe("/api/models", () => {
         actions: [],
       }],
       default_offering_id: "row-only",
+      default_resolution: {
+        state: "selected",
+        offering_id: "row-only",
+        source: "astra",
+        scope: "effective_catalog",
+      },
       catalog_revision: "sha256:catalog",
       observed_at: "2026-07-20T00:00:00Z",
       offerings: [{

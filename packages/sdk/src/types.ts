@@ -1166,10 +1166,35 @@ export type RuntimeModelAccessView = {
   actions: RuntimeModelAccessAction[];
 };
 
+export type RuntimeModelDefaultSource = "astra" | "external_provider";
+
+export type RuntimeModelDefaultScope = "effective_catalog";
+
+export type RuntimeModelDefaultCandidate = {
+  offering_id: string;
+  source: RuntimeModelDefaultSource;
+  scope: RuntimeModelDefaultScope;
+};
+
+export type RuntimeModelDefaultResolution =
+  | {
+      state: "selected";
+      offering_id: string;
+      source: RuntimeModelDefaultSource;
+      scope: RuntimeModelDefaultScope;
+    }
+  | { state: "missing" }
+  | {
+      state: "invalid";
+      candidate: RuntimeModelDefaultCandidate;
+      reason: "not_effective_offering";
+    };
+
 export type RuntimeModelAccessProjection = {
   accesses: RuntimeModelAccessView[];
   offerings: RuntimeModelListItem[];
   default_offering_id: string | null;
+  default_resolution?: RuntimeModelDefaultResolution;
   catalog_revision: string;
   observed_at: string;
 };

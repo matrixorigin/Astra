@@ -57,9 +57,11 @@ export async function GET() {
       .map(toModelSummary)
       .filter((model): model is ModelSummary => model !== null);
     const defaultOfferingId = projection.default_offering_id;
+    const defaultResolution = projection.default_resolution ?? null;
     if (
       (items.length === 0 && defaultOfferingId !== null) ||
       (items.length > 0 &&
+        defaultResolution?.state !== "invalid" &&
         (!defaultOfferingId ||
           !items.some((model) => model.id === defaultOfferingId)))
     ) {
@@ -72,6 +74,7 @@ export async function GET() {
       items,
       accesses: projection.accesses,
       defaultOfferingId,
+      defaultResolution,
       catalogRevision: projection.catalog_revision,
       observedAt: projection.observed_at,
       source: "astra",

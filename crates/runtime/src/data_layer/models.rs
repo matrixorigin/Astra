@@ -58,7 +58,7 @@ pub async fn list_models_handler(
 struct EffectiveModelCatalog {
     declared: Vec<DeclaredModelAccess>,
     offerings: Vec<ModelListItem>,
-    provider_default_offering_id: Option<String>,
+    provider_default: Option<ModelDefaultCandidate>,
 }
 
 async fn effective_model_catalog(
@@ -84,7 +84,13 @@ async fn effective_model_catalog(
                 .into_iter()
                 .map(ModelListItem::from)
                 .collect(),
-            provider_default_offering_id: catalog.default_model_id,
+            provider_default: catalog
+                .default_model_id
+                .map(|offering_id| ModelDefaultCandidate {
+                    offering_id,
+                    source: ModelDefaultSource::ExternalProvider,
+                    scope: ModelDefaultScope::EffectiveCatalog,
+                }),
         });
     }
     let user = principal.user;
@@ -102,7 +108,7 @@ async fn effective_model_catalog(
             availability: ModelAccessAvailability::Ready,
         }],
         offerings,
-        provider_default_offering_id: None,
+        provider_default: None,
     })
 }
 
@@ -129,7 +135,7 @@ fn project_effective_model_access(
     project_model_access_with_default(
         catalog.declared,
         offerings,
-        catalog.provider_default_offering_id,
+        catalog.provider_default,
         observed_at,
     )
 }
@@ -288,7 +294,11 @@ mod tests {
                     offering("model-alpha", "Alpha"),
                     offering("model-beta", "Beta"),
                 ],
-                provider_default_offering_id: Some("model-beta".to_string()),
+                provider_default: Some(ModelDefaultCandidate {
+                    offering_id: "model-beta".to_string(),
+                    source: ModelDefaultSource::ExternalProvider,
+                    scope: ModelDefaultScope::EffectiveCatalog,
+                }),
             },
             "2026-08-06T00:00:00Z".to_string(),
         )
@@ -298,5 +308,45 @@ mod tests {
             projection.default_offering_id.as_deref(),
             Some("model-beta")
         );
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Selected {
+                source: ModelDefaultSource::ExternalProvider,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_external_catalog_default_keeps_manual_offerings_visible() {
+        let projection = project_effective_model_access(
+            EffectiveModelCatalog {
+                declared: vec![DeclaredModelAccess {
+                    id: "this-device".to_string(),
+                    kind: ModelAccessKind::ThisDevice,
+                    label: "This device".to_string(),
+                    execution_placement: ModelExecutionPlacement::Edge,
+                    availability: ModelAccessAvailability::Ready,
+                }],
+                offerings: vec![offering("model-valid", "Valid")],
+                provider_default: Some(ModelDefaultCandidate {
+                    offering_id: "model-disabled".to_string(),
+                    source: ModelDefaultSource::ExternalProvider,
+                    scope: ModelDefaultScope::EffectiveCatalog,
+                }),
+            },
+            "2026-08-10T00:00:00Z".to_string(),
+        )
+        .expect("invalid default must not poison the effective catalog");
+
+        assert_eq!(projection.offerings.len(), 1);
+        assert!(projection.default_offering_id.is_none());
+        assert!(matches!(
+            projection.default_resolution,
+            Some(ModelDefaultResolution::Invalid {
+                reason: ModelDefaultInvalidReason::NotEffectiveOffering,
+                ..
+            })
+        ));
     }
 }

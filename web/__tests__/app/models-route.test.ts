@@ -60,6 +60,7 @@ describe("/api/models route", () => {
         }],
         offerings: [],
         default_offering_id: null,
+        default_resolution: { state: "missing" },
         catalog_revision: "sha256:empty",
         observed_at: "2026-07-20T00:00:00Z",
       })) as never,
@@ -84,6 +85,7 @@ describe("/api/models route", () => {
         actions: ["contact_administrator"],
       }],
       defaultOfferingId: null,
+      defaultResolution: { state: "missing" },
       catalogRevision: "sha256:empty",
       observedAt: "2026-07-20T00:00:00Z",
       source: "astra",
@@ -101,6 +103,63 @@ describe("/api/models route", () => {
       error: "model_access_unavailable",
       detail: "sign in required",
       action: "sign_in_or_retry",
+    });
+  });
+
+  it("keeps valid Offerings visible when the provider default is invalid", async () => {
+    mockRequireRuntimeClient.mockResolvedValue(
+      runtimeClient("astra-access", vi.fn().mockResolvedValue({
+        accesses: [{
+          id: "this-device",
+          kind: "this_device",
+          label: "This device",
+          execution_placement: "edge",
+          status: "ready",
+          reason: null,
+          usable: true,
+          retry_after_seconds: null,
+          available_model_count: 1,
+          actions: [],
+        }],
+        offerings: [{
+          offering_id: "offer-valid",
+          access_id: "this-device",
+          access_kind: "this_device",
+          access_label: "This device",
+          execution_placement: "edge",
+          name: "valid-model",
+          provider: "moi",
+          description: null,
+          architecture: null,
+          context_window: 8192,
+          max_completion_tokens: null,
+          thinking_capability: null,
+          is_active: true,
+        }],
+        default_offering_id: null,
+        default_resolution: {
+          state: "invalid",
+          candidate: {
+            offering_id: "offer-disabled",
+            source: "external_provider",
+            scope: "effective_catalog",
+          },
+          reason: "not_effective_offering",
+        },
+        catalog_revision: "sha256:invalid-provider-default",
+        observed_at: "2026-08-10T00:00:00Z",
+      })) as never,
+    );
+
+    const response = await GET();
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.items).toEqual([expect.objectContaining({ id: "offer-valid" })]);
+    expect(body.defaultOfferingId).toBeNull();
+    expect(body.defaultResolution).toMatchObject({
+      state: "invalid",
+      reason: "not_effective_offering",
     });
   });
 });

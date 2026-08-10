@@ -650,11 +650,26 @@ Four gaps in the original `connect_via_proxy`:
 2. **GAP-2 `_by_scope` actions** must be implemented on the matrixflow side
    before astra-edge can fetch runtime context via HTTP.
 3. **GAP-3 `edge_agent` descriptor** must be populated by moi-core catalog.
-4. **External catalog default model rollout order:** deploy the Astra version
-   that accepts `default_model_id` before deploying Matrixflow Catalog that
-   emits it. `ExternalCatalogResponse` is deliberately strict
-   (`deny_unknown_fields`), so an older Astra server rejects this additive
-   provider field instead of silently choosing a potentially different default.
+4. **External catalog default semantics and rollout:** `default_model_id` is
+   not a repair for a missing or empty effective catalog.  Astra has always
+   selected its canonical first active Offering when no provider candidate is
+   supplied; this integration changes only which valid Offering is selected.
+   A provider value is carried as a scoped `external_provider` candidate and
+   resolved by Astra against the current effective catalog.  An invalid
+   candidate is reported as `default_resolution: invalid` with the typed
+   `not_effective_offering` reason; Astra does not silently substitute another
+   Offering, while the valid Offerings remain available for an explicit user
+   selection.
+
+   `ExternalCatalogResponse` remains deliberately strict
+   (`deny_unknown_fields`), so an older Astra server rejects an additive
+   provider field rather than silently choosing a potentially different
+   default.  This is **not** independently evolvable mixed-version support:
+   current deployments must roll out the Astra catalog consumer before the
+   Matrixflow producer.  Before canary or independently versioned deployment
+   is supported, the external `list_catalog` protocol must add an explicit
+   contract version/capability negotiation and Matrixflow must emit
+   `default_model_id` only when that capability is advertised.
 
 ---
 
