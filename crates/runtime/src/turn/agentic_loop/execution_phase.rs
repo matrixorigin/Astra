@@ -1698,6 +1698,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                     sess.recovery.record_ptl_error();
                 }
 
+                let rewrite_permit = state.begin_canonical_rewrite();
                 let outcome = super::super::compaction_replay::try_compact_for_retry_checked(
                     &mut state.messages,
                     &mut state.compaction_effectiveness,
@@ -1707,6 +1708,7 @@ pub(crate) async fn execute_turn_and_ingest_phase<H: AgenticLoopHost>(
                 );
                 match outcome {
                     super::super::compaction_replay::CompactionReplayOutcome::Compacted(result) => {
+                        state.finish_canonical_rewrite(rewrite_permit);
                         let tier_label = result.tier.to_string();
                         // Feed compaction stats into pipeline for reserve estimation.
                         if let Some(ref mut sess) = state.pipeline_session {
@@ -2643,6 +2645,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
     if !state.budget_wrapup_injected
         && state.compaction_effectiveness.attempt_count < MAX_REACTIVE_BUDGET_COMPACTION_ATTEMPTS
     {
+        let rewrite_permit = state.begin_canonical_rewrite();
         let budget = super::super::TokenBudget {
             max_prompt_tokens: state.max_turn_input_tokens,
             last_measured_tokens: measured,
@@ -2692,6 +2695,7 @@ async fn handle_token_budget<H: AgenticLoopHost>(
         }
 
         if total_freed > 0 {
+            state.finish_canonical_rewrite(rewrite_permit);
             let pressure = measured as f64 / state.max_turn_input_tokens as f64;
             state.context_compression_triggered = true;
             state.step_recorder.record_compaction_with_kind(

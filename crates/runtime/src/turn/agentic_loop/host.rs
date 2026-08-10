@@ -1965,6 +1965,15 @@ pub fn runtime_volatile_injections_edge_profile_value(
 
 /// Created by the CLI/host from session parameters; mutated by the runtime
 /// during multi-turn execution. Consumed at the end to produce results.
+/// Opaque runtime-owned authority for canonical history rewrites.
+///
+/// External loop hosts can construct an empty state, but only the runtime can
+/// initialize or advance the contained proof.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalRewriteState {
+    proof: Option<crate::turn::canonical_commit::CanonicalRewriteProof>,
+}
+
 pub struct AgenticLoopState {
     // ── Message context ──
     pub messages: Vec<Value>,
@@ -2205,6 +2214,10 @@ pub struct AgenticLoopState {
     /// user turn. This is observability state only; unlike the budget wrap-up
     /// flag it must never change execution policy.
     pub context_compression_triggered: bool,
+    /// Typed authority proving that persisted canonical history was rewritten
+    /// only by an explicit compaction operation. Observability flags must not
+    /// authorize a canonical Replace commit.
+    pub canonical_rewrite_state: CanonicalRewriteState,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -2413,6 +2426,47 @@ pub fn runtime_manifest_for_model(
 }
 
 impl AgenticLoopState {
+    pub(crate) fn initialize_canonical_rewrite_proof(
+        &mut self,
+        admitted_prefix: &[Value],
+        base_root: &str,
+        base_compaction_generation: u64,
+    ) {
+        self.canonical_rewrite_state.proof =
+            Some(crate::turn::canonical_commit::CanonicalRewriteProof::new(
+                admitted_prefix,
+                base_root,
+                base_compaction_generation,
+            ));
+    }
+
+    pub(crate) fn canonical_rewrite_proof(
+        &self,
+    ) -> Option<&crate::turn::canonical_commit::CanonicalRewriteProof> {
+        self.canonical_rewrite_state.proof.as_ref()
+    }
+
+    pub(crate) fn begin_canonical_rewrite(
+        &self,
+    ) -> Option<crate::turn::canonical_commit::CanonicalRewritePermit> {
+        self.canonical_rewrite_state
+            .proof
+            .as_ref()
+            .map(|proof| proof.begin(&self.messages))
+    }
+
+    pub(crate) fn finish_canonical_rewrite(
+        &mut self,
+        permit: Option<crate::turn::canonical_commit::CanonicalRewritePermit>,
+    ) {
+        let Some(permit) = permit else {
+            return;
+        };
+        if let Some(proof) = self.canonical_rewrite_state.proof.as_mut() {
+            proof.finish(permit, &self.messages);
+        }
+    }
+
     /// Begin recording selected prompt-history items for a child run's
     /// canonical transcript. The caller chooses the initial visible child
     /// items, excluding inherited/system context that is not part of the
@@ -3607,6 +3661,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         max_turn_input_tokens: 0,
         budget_wrapup_injected: false,
         context_compression_triggered: false,
+        canonical_rewrite_state: Default::default(),
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
@@ -4469,6 +4524,7 @@ pub(crate) mod tests {
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
+            canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

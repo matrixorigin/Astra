@@ -1,8 +1,8 @@
 use crate::auth::DatabaseUserRecord;
 use crate::auth::session::SessionRecord;
 use astra_core::{
-    DedicatedPool, ErrorResponse, MatrixOneSettings, connect_matrixone, identity::USER_ID_MAX_LEN,
-    internal_error,
+    ErrorResponse, MatrixOneSettings, connect_matrixone, identity::USER_ID_MAX_LEN, internal_error,
+    release_global_connections,
 };
 use axum::{Json, http::StatusCode};
 use sha2::Digest;
@@ -37,6 +37,76 @@ const EDGE_PENDING_DISPATCH_LEGACY_ARCHIVE_TABLE: &str =
     "edge_pending_dispatch_legacy_owner_request_v1";
 const TOOL_INVOCATION_LEDGER_REQUIRED_COLUMNS: &[&str] = &["identity_key"];
 const TOOL_INVOCATION_LEDGER_REQUIRED_VARCHAR_WIDTHS: &[(&str, u64)] = &[("identity_key", 71)];
+
+/// Sole owner of a short-lived MatrixOne bootstrap pool.
+///
+/// MatrixOne does not complete SQLx's MySQL shutdown handshake. Teardown
+/// therefore waits for every checked-out connection to return, detaches each
+/// socket from SQLx, drops it synchronously, and only then returns the global
+/// connection reservation. Keeping this type private prevents bootstrap code
+/// from cloning the pool beyond that ownership boundary.
+struct BootstrapPool {
+    pool: sqlx::Pool<MySql>,
+    max_connections: u64,
+    released: bool,
+}
+
+impl BootstrapPool {
+    fn new(pool: sqlx::Pool<MySql>, max_connections: u64) -> Self {
+        Self {
+            pool,
+            max_connections,
+            released: false,
+        }
+    }
+
+    fn pool(&self) -> &sqlx::Pool<MySql> {
+        &self.pool
+    }
+
+    async fn release(mut self) -> Result<(), sqlx::Error> {
+        while self.pool.size() > 0 {
+            let connection = self.pool.acquire().await?;
+            drop(connection.detach());
+        }
+        release_global_connections(self.max_connections);
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for BootstrapPool {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        if self.pool.size() == 0 {
+            release_global_connections(self.max_connections);
+            self.released = true;
+        } else {
+            tracing::error!(
+                target: "astra_services::storage",
+                live_connections = self.pool.size(),
+                reserved_connections = self.max_connections,
+                "bootstrap pool dropped with live connections; retaining global quota reservation"
+            );
+        }
+    }
+}
+
+fn finish_bootstrap_operation<T>(
+    operation: Result<T, sqlx::Error>,
+    release: Result<(), sqlx::Error>,
+) -> Result<T, sqlx::Error> {
+    match (operation, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(operation_error), Err(release_error)) => Err(sqlx::Error::Protocol(format!(
+            "bootstrap operation failed: {operation_error}; pool teardown also failed: {release_error}"
+        ))),
+    }
+}
 
 /// Standard column width for `agent_id` across all tables.
 /// All `agent_id`, `edge_agent_id`, `holder_agent_id`, and `parent_agent_id`
@@ -893,9 +963,11 @@ async fn wait_for_core_schema_visibility(settings: &MatrixOneSettings) -> Result
     verify_settings.db_pool_min_connections = 0;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let verify_pool = DedicatedPool::new(connect_matrixone(&verify_settings).await?, 1);
-        let visibility_result = verify_core_schema_visible(&verify_pool, &settings.database).await;
-        verify_pool.close().await;
+        let verify_pool = BootstrapPool::new(connect_matrixone(&verify_settings).await?, 1);
+        let visibility_result =
+            verify_core_schema_visible(verify_pool.pool(), &settings.database).await;
+        let visibility_result =
+            finish_bootstrap_operation(visibility_result, verify_pool.release().await);
         match visibility_result {
             Ok(CoreSchemaVisibility::Visible) => return Ok(()),
             Ok(CoreSchemaVisibility::Lag(_)) if tokio::time::Instant::now() < deadline => {
@@ -1269,14 +1341,13 @@ async fn ensure_matrixone_database_exists(
     admin_settings.database = bootstrap_catalog.to_string();
     admin_settings.db_pool_max_connections = 1;
     admin_settings.db_pool_min_connections = 0;
-    let admin_pool = DedicatedPool::new(connect_matrixone(&admin_settings).await?, 1);
+    let admin_pool = BootstrapPool::new(connect_matrixone(&admin_settings).await?, 1);
     let ddl = format!(
         "CREATE DATABASE IF NOT EXISTS {}",
         crate::snapshot_sql::quote_mysql_identifier(&settings.database)
     );
-    let create_result = query(&ddl).execute(&*admin_pool).await.map(|_| ());
-    admin_pool.close().await;
-    create_result
+    let create_result = query(&ddl).execute(admin_pool.pool()).await.map(|_| ());
+    finish_bootstrap_operation(create_result, admin_pool.release().await)
 }
 
 fn validate_schema_identifier(raw: &str, kind: &str) -> Result<(), sqlx::Error> {
@@ -2423,28 +2494,30 @@ pub async fn ensure_core_schema(
     let mut schema_settings = settings.clone();
     schema_settings.db_pool_max_connections = 1;
     schema_settings.db_pool_min_connections = 0;
-    let pool = DedicatedPool::new(connect_matrixone(&schema_settings).await?, 1);
+    let pool = BootstrapPool::new(connect_matrixone(&schema_settings).await?, 1);
     let lease_pool = match connect_matrixone(&schema_settings).await {
-        Ok(lease_pool) => DedicatedPool::new(lease_pool, 1),
+        Ok(lease_pool) => BootstrapPool::new(lease_pool, 1),
         Err(error) => {
-            pool.close().await;
-            return Err(error);
+            return finish_bootstrap_operation(Err(error), pool.release().await);
         }
     };
-    let database_lease = match CoreSchemaDatabaseLease::acquire(&lease_pool).await {
+    let database_lease = match CoreSchemaDatabaseLease::acquire(lease_pool.pool()).await {
         Ok(lease) => lease,
         Err(error) => {
-            lease_pool.close().await;
-            pool.close().await;
-            return Err(error);
+            let lease_release = lease_pool.release().await;
+            let pool_release = pool.release().await;
+            return finish_bootstrap_operation(
+                finish_bootstrap_operation(Err(error), lease_release),
+                pool_release,
+            );
         }
     };
     let schema_result =
-        ensure_core_schema_while_leased(settings, (*pool).clone(), database_lease.holder_id())
+        ensure_core_schema_while_leased(settings, pool.pool().clone(), database_lease.holder_id())
             .await;
     let release_result = database_lease.release().await;
-    lease_pool.close().await;
-    pool.close().await;
+    let lease_pool_release = lease_pool.release().await;
+    let pool_release = pool.release().await;
     let bootstrap_result = match (schema_result, release_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(schema_error), Ok(())) => Err(schema_error),
@@ -2453,6 +2526,8 @@ pub async fn ensure_core_schema(
             "core schema bootstrap failed: {schema_error}; bootstrap lease release also failed: {release_error}"
         ))),
     };
+    let bootstrap_result = finish_bootstrap_operation(bootstrap_result, lease_pool_release);
+    let bootstrap_result = finish_bootstrap_operation(bootstrap_result, pool_release);
     match bootstrap_result {
         Ok(()) => wait_for_core_schema_visibility(settings).await,
         Err(error) => Err(error),
@@ -8450,6 +8525,80 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires ASTRA_TEST_DB_IT=1 and a real MySQL/MatrixOne instance"]
+    async fn bootstrap_pool_release_waits_for_checked_out_connection() {
+        let _ = dotenvy::dotenv();
+        assert_eq!(
+            std::env::var("ASTRA_TEST_DB_IT").as_deref(),
+            Ok("1"),
+            "set ASTRA_TEST_DB_IT=1 for the real connection test"
+        );
+        let mut settings = MatrixOneSettings::from_env();
+        settings.database = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        settings.db_pool_max_connections = 1;
+        settings.db_pool_min_connections = 0;
+        let pool = BootstrapPool::new(
+            connect_matrixone(&settings)
+                .await
+                .expect("connect a real one-slot bootstrap pool"),
+            1,
+        );
+        let mut checked_out = pool
+            .pool()
+            .acquire()
+            .await
+            .expect("check out the real connection");
+        let connection_id: u64 = sqlx::query_scalar("SELECT CONNECTION_ID()")
+            .fetch_one(&mut *checked_out)
+            .await
+            .expect("read the checked-out server connection id");
+        let observer = sqlx::mysql::MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&settings.database_url_with_password())
+            .await
+            .expect("connect an independent server-side observer");
+
+        let started = tokio::time::Instant::now();
+        let release = tokio::spawn(pool.release());
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !release.is_finished(),
+            "teardown must retain the quota while a connection is checked out"
+        );
+        let live_before_return: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE conn_id = ?",
+        )
+        .bind(connection_id)
+        .fetch_one(&observer)
+        .await
+        .expect("observe the checked-out server connection");
+        assert_eq!(live_before_return, 1);
+
+        drop(checked_out);
+        release
+            .await
+            .expect("teardown task")
+            .expect("release waits for return, then detaches the socket");
+        let live_after_release: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE conn_id = ?",
+        )
+        .bind(connection_id)
+        .fetch_one(&observer)
+        .await
+        .expect("observe server connection teardown");
+
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(100),
+            "quota must not be returned while a connection remains checked out"
+        );
+        assert_eq!(
+            live_after_release, 0,
+            "detached socket must be gone server-side"
+        );
+    }
 
     #[tokio::test]
     async fn dropping_schema_lease_cancels_heartbeat_task() {

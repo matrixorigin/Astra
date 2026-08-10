@@ -174,9 +174,8 @@ fn try_allocate_with_cap(max: u64, cap: u64) -> Result<(), ConnectionQuotaError>
 
 /// Release `max` connections back to the global counter.
 ///
-/// Callers that obtain a pool via [`connect_matrixone`] and later call
-/// `.close()` on it should invoke this immediately after closing so the
-/// quota is recycled.
+/// Callers that obtain a raw pool via [`connect_matrixone`] must invoke this
+/// only after every connection owned by that pool has been closed.
 pub fn release_global_connections(max: u64) {
     loop {
         let current = GLOBAL_CONNECTION_ALLOCATED.load(Ordering::Acquire);
@@ -647,11 +646,12 @@ impl std::error::Error for InvalidTransition {}
 
 /// Create an explicit one-shot connection pool.
 ///
-/// **Prefer [`DedicatedPool`] or [`SharedPool`] instead.**  This function
+/// **Prefer [`SharedPool`] instead for long-lived runtime wiring.**  This function
 /// allocates from the global connection quota but the caller is responsible
 /// for calling [`release_global_connections`] after closing the pool —
-/// forgetting to do so permanently leaks quota.  `DedicatedPool` automates
-/// release on drop, and `SharedPool` manages the lifecycle completely.
+/// forgetting to do so permanently leaks quota. `SharedPool` manages the
+/// lifecycle completely; bounded bootstrap owners must close their sockets
+/// before returning the reservation.
 ///
 /// This is for call sites that intentionally want a dedicated pool.
 /// Long-lived runtime wiring should inject [`SharedPool`] instead of
@@ -688,72 +688,6 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
             release_global_connections(max);
             Err(e)
         }
-    }
-}
-
-/// A short-lived pool that releases its global connection quota on drop.
-///
-/// Prefer this over calling [`connect_matrixone`] directly when the pool
-/// has a bounded lifetime.  The wrapper calls [`release_global_connections`]
-/// in its [`Drop`] impl so the quota is automatically recycled.
-///
-/// Call [`DedicatedPool::close`] explicitly before drop to close
-/// connections promptly.  `Drop` is a safety net that releases the
-/// quota counter but cannot `.await` [`Pool::close`][sqlx::Pool::close].
-/// For long-lived pools prefer [`SharedPool`].
-pub struct DedicatedPool {
-    pub(crate) pool: Pool<MySql>,
-    pub(crate) max_connections: u64,
-    /// Prevents double-release of global connection quota across
-    /// `close()` + `Drop` paths.
-    quota_released: Arc<AtomicBool>,
-}
-
-impl DedicatedPool {
-    /// Build a `DedicatedPool` from an already-allocated pool.
-    ///
-    /// The caller must have already reserved `max_connections` via
-    /// [`try_allocate_global_connections`] (which [`connect_matrixone`]
-    /// does internally).
-    pub fn new(pool: Pool<MySql>, max_connections: u64) -> Self {
-        Self {
-            pool,
-            max_connections,
-            quota_released: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    /// Close the pool and release the global connection quota.
-    ///
-    /// Prefer calling this explicitly before drop to ensure connections
-    /// are released back to the database promptly.  `Drop` is a safety
-    /// net that only releases the quota counter; it cannot `.await`
-    /// [`Pool::close`].
-    pub async fn close(self) {
-        self.pool.close().await;
-        self.release_quota();
-    }
-
-    /// Release the global connection quota exactly once.
-    fn release_quota(&self) {
-        if !self.quota_released.swap(true, Ordering::AcqRel) {
-            release_global_connections(self.max_connections);
-        }
-    }
-
-    // Access the underlying pool via Deref — DedicatedPool derefs to Pool<MySql>.
-}
-
-impl std::ops::Deref for DedicatedPool {
-    type Target = Pool<MySql>;
-    fn deref(&self) -> &Self::Target {
-        &self.pool
-    }
-}
-
-impl Drop for DedicatedPool {
-    fn drop(&mut self) {
-        self.release_quota();
     }
 }
 

@@ -347,7 +347,11 @@ impl BridgeCanonicalAdmission {
             )
             .map_err(|error| format!("bridge result has invalid turn semantics: {error}"))?;
         let Some((mode, logical_segments)) = crate::turn::canonical_commit::canonical_commit_delta(
-            0, false, &canonical, false, false,
+            &[],
+            false,
+            &canonical,
+            None,
+            false,
         )?
         else {
             return Err("bridge terminal result produced no canonical delta".into());

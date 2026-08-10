@@ -77,11 +77,11 @@ fn canonical_segment_packing_bounds_ordinary_groups_without_reordering() {
 fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
     let prior = vec![json!({"role": "user", "content": "already committed"})];
     assert_eq!(
-        canonical_commit_delta(1, true, &prior, false, true).unwrap(),
+        canonical_commit_delta(&prior, true, &prior, None, true).unwrap(),
         None
     );
     assert!(
-        canonical_commit_delta(1, true, &prior, false, false)
+        canonical_commit_delta(&prior, true, &prior, None, false)
             .unwrap_err()
             .contains("no committable messages")
     );
@@ -89,11 +89,16 @@ fn cancelled_turn_without_a_delta_does_not_become_a_commit_failure() {
 
 #[test]
 fn compaction_commits_the_complete_replacement_projection() {
+    let prior = vec![json!({"role": "user", "content": "old"})];
+    let base_root = astra_turn_types::canonical_conversation_root(&prior);
+    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let permit = proof.begin(&prior);
     let compacted = vec![
         json!({"role": "user", "content": "summary"}),
         json!({"role": "assistant", "content": "current"}),
     ];
-    let (mode, packs) = canonical_commit_delta(20, true, &compacted, true, false)
+    proof.finish(permit, &compacted);
+    let (mode, packs) = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false)
         .unwrap()
         .unwrap();
 
@@ -103,11 +108,42 @@ fn compaction_commits_the_complete_replacement_projection() {
 
 #[test]
 fn unexplained_canonical_prefix_shrink_remains_rejected() {
+    let prior = vec![json!({"role": "user", "content": "committed"})];
     let shortened = vec![json!({"role": "user", "content": "unexpected tail"})];
 
-    let error = canonical_commit_delta(20, true, &shortened, false, false).unwrap_err();
+    let error = canonical_commit_delta(&prior, true, &shortened, None, false).unwrap_err();
 
-    assert!(error.contains("shorter than the admitted prefix"));
+    assert!(error.contains("without a verified compaction rewrite"));
+}
+
+#[test]
+fn unrelated_prefix_mutation_after_compaction_is_rejected() {
+    let prior = vec![json!({"role": "user", "content": "committed"})];
+    let compacted = vec![json!({"role": "system", "content": "summary"})];
+    let base_root = astra_turn_types::canonical_conversation_root(&prior);
+    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let permit = proof.begin(&prior);
+    proof.finish(permit, &compacted);
+
+    let mutated = vec![json!({"role": "system", "content": "unrelated mutation"})];
+    let error = canonical_commit_delta(&prior, true, &mutated, Some(&proof), false).unwrap_err();
+
+    assert!(error.contains("without a verified compaction rewrite"));
+}
+
+#[test]
+fn compaction_cannot_authorize_an_already_mutated_prefix() {
+    let prior = vec![json!({"role": "user", "content": "committed"})];
+    let mutated_before_compaction = vec![json!({"role": "user", "content": "unrelated mutation"})];
+    let compacted = vec![json!({"role": "system", "content": "summary"})];
+    let base_root = astra_turn_types::canonical_conversation_root(&prior);
+    let mut proof = CanonicalRewriteProof::new(&prior, &base_root, 0);
+    let permit = proof.begin(&mutated_before_compaction);
+    proof.finish(permit, &compacted);
+
+    let error = canonical_commit_delta(&prior, true, &compacted, Some(&proof), false).unwrap_err();
+
+    assert!(error.contains("without a verified compaction rewrite"));
 }
 
 #[test]

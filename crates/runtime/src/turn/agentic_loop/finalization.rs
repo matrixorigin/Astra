@@ -2203,7 +2203,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_finalization_preserves_compression_for_canonical_commit() {
+    fn turn_finalization_preserves_compression_observability() {
         let mut state = make_state();
         state.context_compression_triggered = true;
 
@@ -2211,7 +2211,7 @@ mod tests {
 
         assert!(
             state.context_compression_triggered,
-            "canonical commit runs after finalization and must still observe a prefix rewrite"
+            "turn tracing must retain whether provider-visible compaction occurred"
         );
     }
 
