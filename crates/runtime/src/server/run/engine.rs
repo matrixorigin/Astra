@@ -150,6 +150,7 @@ pub struct RunStartContext {
     pub interactive_client: Option<bool>,
     pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub agent_binding_ids: Vec<String>,
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
@@ -417,6 +418,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "provider_request_fingerprint".to_string(),
             serde_json::Value::String(fingerprint.clone()),
+        );
+    }
+    if !context.agent_binding_ids.is_empty() {
+        data.insert(
+            "agent_binding_ids".to_string(),
+            serde_json::json!(context.agent_binding_ids),
         );
     }
     if let Some(agent_binding_id) = context.agent_binding_id.as_ref() {
@@ -3165,6 +3172,24 @@ mod tests {
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
     }
 
+    #[test]
+    fn run_started_event_records_complete_ordered_binding_set() {
+        let event = run_started_event_data(&RunStartContext {
+            agent_binding_ids: vec![
+                "binding-foundation".to_string(),
+                "binding-extension".to_string(),
+            ],
+            agent_binding_id: Some("binding-extension".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            event["agent_binding_ids"],
+            serde_json::json!(["binding-foundation", "binding-extension"])
+        );
+        assert_eq!(event["agent_binding_id"], "binding-extension");
+    }
+
     #[tokio::test]
     async fn start_run_with_context_persists_admitted_offering_identity_without_route_fields() {
         let engine = test_engine();
@@ -3396,6 +3421,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
             full_llm_capture: false,
@@ -3406,6 +3432,7 @@ mod tests {
             admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
                 id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
                 capability_server_refs: astra_services::runs::CapabilityServerRefs {

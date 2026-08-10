@@ -223,28 +223,45 @@ pub(crate) fn binding_snapshot_events(
 pub(crate) fn run_start_context_from_request(
     request: &astra_services::runs::ChatRequestData,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
-    agent_binding: Option<&astra_services::AgentBindingRecord>,
+    agent_bindings: Option<&[astra_services::AgentBindingRecord]>,
 ) -> RunStartContext {
+    let resolved_primary_binding = agent_bindings.and_then(|bindings| bindings.last());
+    let requested_primary_binding = request
+        .agent_bindings
+        .last()
+        .or(request.agent_binding.as_ref());
+    let agent_binding_ids = agent_bindings
+        .filter(|bindings| !bindings.is_empty())
+        .map(|bindings| bindings.iter().map(|binding| binding.id.clone()).collect())
+        .unwrap_or_else(|| {
+            request
+                .agent_bindings
+                .iter()
+                .map(|binding| binding.id.clone())
+                .chain(
+                    request
+                        .agent_binding
+                        .iter()
+                        .map(|binding| binding.id.clone()),
+                )
+                .collect()
+        });
     RunStartContext {
         interaction_mode: request.interaction_mode,
         interactive_client: Some(request.interactive_client),
         turn_intent_policy: request.execution_policy.turn_intent,
         execution_metadata: execution_bindings
             .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
-        agent_binding_id: agent_binding.map(|binding| binding.id.clone()).or_else(|| {
-            request
-                .agent_binding
-                .as_ref()
-                .map(|binding| binding.id.clone())
-        }),
-        agent_binding_name: agent_binding.map(|binding| binding.binding_name.clone()),
-        agent_binding_schema_version: agent_binding
+        agent_binding_ids,
+        agent_binding_id: resolved_primary_binding
+            .map(|binding| binding.id.clone())
+            .or_else(|| requested_primary_binding.map(|binding| binding.id.clone())),
+        agent_binding_name: resolved_primary_binding.map(|binding| binding.binding_name.clone()),
+        agent_binding_schema_version: resolved_primary_binding
             .map(|binding| binding.binding_schema_version.clone()),
         model_selection: request.model_selection.clone(),
         resolved_model_selection: request.resolved_model_selection.clone(),
-        capability_server_refs: request
-            .agent_binding
-            .as_ref()
+        capability_server_refs: requested_primary_binding
             .map(|binding| binding.capability_server_refs.clone()),
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
@@ -254,7 +271,7 @@ pub(crate) fn run_start_context_from_request(
 fn effective_runtime_profile(
     request: &astra_services::runs::ChatRequestData,
 ) -> Option<astra_services::runs::RuntimeProfileRequest> {
-    if request.agent_binding.is_some() {
+    if request.has_agent_binding_runtime() {
         return Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry);
     }
     if !request.runtime_mcp_bindings.is_empty()
@@ -564,6 +581,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
             full_llm_capture: false,
@@ -574,6 +592,7 @@ mod tests {
             admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: None,
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -616,6 +635,38 @@ mod tests {
         assert_eq!(
             context.runtime_profile,
             Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry)
+        );
+    }
+
+    #[test]
+    fn run_start_context_records_ordered_binding_set_and_extension_primary() {
+        let mut request = test_request("hello");
+        request.agent_bindings = vec![
+            astra_services::runs::AgentBindingRuntimeRequest {
+                id: "binding-foundation".to_string(),
+                capability_server_refs: astra_services::runs::CapabilityServerRefs {
+                    mcp: "tools".to_string(),
+                    skills: "skills".to_string(),
+                },
+            },
+            astra_services::runs::AgentBindingRuntimeRequest {
+                id: "binding-extension".to_string(),
+                capability_server_refs: astra_services::runs::CapabilityServerRefs {
+                    mcp: "tools".to_string(),
+                    skills: "skills".to_string(),
+                },
+            },
+        ];
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.agent_binding_ids,
+            vec!["binding-foundation", "binding-extension"]
+        );
+        assert_eq!(
+            context.agent_binding_id.as_deref(),
+            Some("binding-extension")
         );
     }
 

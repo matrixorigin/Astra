@@ -119,6 +119,7 @@ async fn inject_edge_registration_runtime_context_body(
     object.remove("runtime_profile");
     object.remove("runtime_mcp_bindings");
     object.remove("runtime_skill_binding");
+    object.remove("stable_runtime_system_prompt");
     object.remove("runtime_system_prompt");
 
     let requested_model_id = match object
@@ -296,7 +297,7 @@ fn apply_provider_supplied_runtime_context(
                 "agent_binding_runtime_auth_missing",
             )
         })?;
-    let agent_binding_mode = request.agent_binding.is_some();
+    let agent_binding_mode = request.has_agent_binding_runtime();
     if let Some(mcp) = descriptors.mcp.as_ref() {
         astra_services::auth::provider_request::validate_runtime_capability_descriptor(mcp, "mcp")?;
         if !agent_binding_mode {
@@ -339,7 +340,13 @@ fn apply_provider_supplied_runtime_context(
 fn reject_unauthorized_capability_descriptors(
     request: &astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if request.capability_descriptors.is_some() {
+    // The legacy singular agent_binding field remains on its existing auth
+    // path during the protocol migration. The new Binding Set and stable
+    // runtime policy are provider-owned inputs and require provider auth.
+    if request.capability_descriptors.is_some()
+        || request.stable_runtime_system_prompt.is_some()
+        || !request.agent_bindings.is_empty()
+    {
         return Err(provider_runtime_authorization_required());
     }
     Ok(())

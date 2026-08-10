@@ -532,6 +532,7 @@ pub struct ChatRequestData {
     pub user_intent: Option<String>,
     pub parts: Vec<serde_json::Value>,
     pub attachments: Vec<serde_json::Value>,
+    pub stable_runtime_system_prompt: Option<String>,
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     pub full_llm_capture: bool,
@@ -544,6 +545,7 @@ pub struct ChatRequestData {
     pub admitted_model_execution: Option<AdmittedModelExecution>,
     pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     pub provider_runtime_authorized: bool,
+    pub agent_bindings: Vec<AgentBindingRuntimeRequest>,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_skill_binding: Option<RuntimeSkillBindingRequest>,
@@ -604,6 +606,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("user_intent", &self.user_intent)
             .field("parts", &self.parts)
             .field("attachments", &self.attachments)
+            .field(
+                "stable_runtime_system_prompt",
+                &self.stable_runtime_system_prompt,
+            )
             .field("runtime_system_prompt", &self.runtime_system_prompt)
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
@@ -619,6 +625,7 @@ impl std::fmt::Debug for ChatRequestData {
                 "provider_runtime_authorized",
                 &self.provider_runtime_authorized,
             )
+            .field("agent_bindings", &self.agent_bindings)
             .field("agent_binding", &self.agent_binding)
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_skill_binding", &self.runtime_skill_binding)
@@ -656,6 +663,13 @@ impl std::fmt::Debug for ChatRequestData {
             .field("interaction_mode", &self.interaction_mode)
             .field("interactive_client", &self.interactive_client)
             .finish()
+    }
+}
+
+impl ChatRequestData {
+    #[must_use]
+    pub fn has_agent_binding_runtime(&self) -> bool {
+        self.agent_binding.is_some() || !self.agent_bindings.is_empty()
     }
 }
 
@@ -11170,6 +11184,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
@@ -11195,6 +11210,7 @@ mod tests {
             }),
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: None,
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -11255,6 +11271,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
@@ -11269,6 +11286,7 @@ mod tests {
             admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: None,
             runtime_auth: Some(RuntimeAuthRequest {
                 authorization: "Bearer secret-runtime-token".to_string(),
@@ -11348,6 +11366,7 @@ mod tests {
                     user_intent: None,
                     parts: Vec::new(),
                     attachments: Vec::new(),
+                    stable_runtime_system_prompt: None,
                     runtime_system_prompt: None,
                     session_id: None,
                     agent_id: None,
@@ -11357,6 +11376,7 @@ mod tests {
                     admitted_model_execution: None,
                     capability_descriptors: None,
                     provider_runtime_authorized: false,
+                    agent_bindings: Vec::new(),
                     agent_binding: None,
                     runtime_auth: None,
                     runtime_skill_binding: None,

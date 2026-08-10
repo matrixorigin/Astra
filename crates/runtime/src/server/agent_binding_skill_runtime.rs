@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::{Json, http::StatusCode};
+use futures_util::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,6 +24,13 @@ struct SkillListRequest<'a> {
     jsonrpc: &'a str,
     id: &'a str,
     method: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<SkillListParams<'a>>,
+}
+
+#[derive(Serialize)]
+struct SkillListParams<'a> {
+    agent_binding_id: &'a str,
 }
 
 #[derive(Serialize)]
@@ -35,6 +43,8 @@ struct SkillReadRequest<'a> {
 
 #[derive(Serialize)]
 struct SkillReadParams<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_binding_id: Option<&'a str>,
     id: &'a str,
 }
 
@@ -110,6 +120,7 @@ struct DiscoveredSkill {
 
 #[derive(Clone)]
 struct AgentBindingSkillEntry {
+    agent_binding_id: Option<String>,
     info: SkillToolInfo,
     resolved: ResolvedSkill,
 }
@@ -136,6 +147,7 @@ impl AgentBindingSkillResolver {
 
     async fn read_skill_instructions(
         &self,
+        agent_binding_id: Option<&str>,
         skill_id: &str,
     ) -> Result<String, crate::skills::SkillError> {
         let _permit = crate::capability_endpoint_pool::try_acquire_endpoint_permit(
@@ -154,7 +166,10 @@ impl AgentBindingSkillResolver {
                 jsonrpc: "2.0",
                 id: SKILL_READ_REQUEST_ID,
                 method: "skills/read",
-                params: SkillReadParams { id: skill_id },
+                params: SkillReadParams {
+                    agent_binding_id,
+                    id: skill_id,
+                },
             })
             .send()
             .await
@@ -220,13 +235,22 @@ impl SkillResolver for AgentBindingSkillResolver {
         &self,
         name: &str,
     ) -> Result<ResolvedSkill, crate::skills::SkillError> {
-        let mut resolved = self.entry(name)?.resolved.clone();
-        resolved.instructions = self.read_skill_instructions(&resolved.name).await?;
+        let entry = self.entry(name)?;
+        let mut resolved = entry.resolved.clone();
+        resolved.instructions = self
+            .read_skill_instructions(entry.agent_binding_id.as_deref(), &resolved.name)
+            .await?;
         Ok(resolved)
     }
 
     fn available_skills(&self) -> Vec<SkillToolInfo> {
-        self.skills.iter().map(|entry| entry.info.clone()).collect()
+        let mut skills = self
+            .skills
+            .iter()
+            .map(|entry| entry.info.clone())
+            .collect::<Vec<_>>();
+        skills.sort_by(|left, right| left.name.cmp(&right.name));
+        skills
     }
 }
 
@@ -458,85 +482,133 @@ fn validate_discovered_skill(
     Ok(())
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentBindingSkillCatalog {
+    pub(crate) agent_binding_id: String,
+    pub(crate) skills: Vec<SkillToolInfo>,
+}
+
+pub(crate) struct PreparedAgentBindingSkills {
+    pub(crate) resolver: Option<Arc<dyn SkillResolver>>,
+    pub(crate) catalogs: Vec<AgentBindingSkillCatalog>,
+}
+
 fn build_resolver(
     server_id: &str,
     endpoint_url: &str,
     authorization: &str,
     skills: Vec<DiscoveredSkill>,
 ) -> Result<Option<Arc<dyn SkillResolver>>, (StatusCode, Json<ErrorResponse>)> {
-    if skills.is_empty() {
-        return Ok(None);
-    }
-
-    let mut entries = Vec::with_capacity(skills.len());
-    let mut by_name = HashMap::new();
-    let mut seen = HashSet::new();
-
-    for skill in skills {
-        validate_discovered_skill(&skill)?;
-        for candidate in std::iter::once(&skill.name).chain(skill.aliases.iter()) {
-            let normalized = normalize_skill_lookup_key(candidate);
-            if !seen.insert(normalized.clone()) {
-                return Err(skill_error(
-                    StatusCode::BAD_GATEWAY,
-                    format!("duplicate Agent Binding skill name or alias: {candidate}"),
-                    "agent_binding_schema_invalid",
-                ));
-            }
-        }
-
-        let info = SkillToolInfo {
-            name: skill.name.clone(),
-            description: skill.description.clone(),
-            when_to_use: skill.when_to_use.clone(),
-            source: SkillSourceKind::Plugin,
-            aliases: skill.aliases.clone(),
-            category: skill.category.clone(),
-            tags: skill.tags.clone(),
-        };
-        let resolved = ResolvedSkill {
-            name: skill.name.clone(),
-            instructions: String::new(),
-            max_tokens: skill.max_tokens,
-            allowed_tools: skill.allowed_tools.clone(),
-            execution_context: ExecutionContext::Inline,
-            hooks: Default::default(),
-            skill_dir: None,
-            source: SkillSourceKind::Plugin,
-            success_criteria: Vec::new(),
-            composition: None,
-            input_schema: skill.input_schema.clone(),
-            output_schema: skill.output_schema.clone(),
-            remote_url: None,
-            forward_headers: Vec::new(),
-            required_headers: Vec::new(),
-            aliases: skill.aliases.clone(),
-            effort: None,
-            agent_type: None,
-            trust_tier: TrustTier::Verified,
-        };
-        let index = entries.len();
-        by_name.insert(normalize_skill_lookup_key(&skill.name), index);
-        for alias in &skill.aliases {
-            by_name.insert(normalize_skill_lookup_key(alias), index);
-        }
-        entries.push(AgentBindingSkillEntry { info, resolved });
-    }
-
-    Ok(Some(Arc::new(AgentBindingSkillResolver {
-        server_id: server_id.to_string(),
-        endpoint_url: endpoint_url.to_string(),
-        authorization: authorization.to_string(),
-        skills: entries,
-        by_name,
-    })))
+    build_resolver_from_catalogs(server_id, endpoint_url, authorization, vec![(None, skills)])
+        .map(|prepared| prepared.resolver)
 }
 
-pub(crate) async fn prepare_agent_binding_skill_resolver(
+fn build_resolver_from_catalogs(
     server_id: &str,
     endpoint_url: &str,
     authorization: &str,
-) -> Result<Option<Arc<dyn SkillResolver>>, (StatusCode, Json<ErrorResponse>)> {
+    catalogs: Vec<(Option<String>, Vec<DiscoveredSkill>)>,
+) -> Result<PreparedAgentBindingSkills, (StatusCode, Json<ErrorResponse>)> {
+    let total_skills = catalogs.iter().map(|(_, skills)| skills.len()).sum();
+
+    let mut entries = Vec::with_capacity(total_skills);
+    let mut by_name = HashMap::new();
+    let mut seen = HashMap::<String, Option<String>>::new();
+    let mut prepared_catalogs = Vec::with_capacity(catalogs.len());
+
+    for (agent_binding_id, skills) in catalogs {
+        let mut catalog_skills = Vec::with_capacity(skills.len());
+        for skill in skills {
+            validate_discovered_skill(&skill)?;
+            for candidate in std::iter::once(&skill.name).chain(skill.aliases.iter()) {
+                let normalized = normalize_skill_lookup_key(candidate);
+                if let Some(existing_binding_id) = seen.get(&normalized) {
+                    let cross_binding = existing_binding_id != &agent_binding_id;
+                    return Err(skill_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("duplicate Agent Binding skill name or alias: {candidate}"),
+                        if cross_binding {
+                            "agent_binding_skill_conflict"
+                        } else {
+                            "agent_binding_schema_invalid"
+                        },
+                    ));
+                }
+                seen.insert(normalized, agent_binding_id.clone());
+            }
+
+            let info = SkillToolInfo {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+                when_to_use: skill.when_to_use.clone(),
+                source: SkillSourceKind::Plugin,
+                aliases: skill.aliases.clone(),
+                category: skill.category.clone(),
+                tags: skill.tags.clone(),
+            };
+            let resolved = ResolvedSkill {
+                name: skill.name.clone(),
+                instructions: String::new(),
+                max_tokens: skill.max_tokens,
+                allowed_tools: skill.allowed_tools.clone(),
+                execution_context: ExecutionContext::Inline,
+                hooks: Default::default(),
+                skill_dir: None,
+                source: SkillSourceKind::Plugin,
+                success_criteria: Vec::new(),
+                composition: None,
+                input_schema: skill.input_schema.clone(),
+                output_schema: skill.output_schema.clone(),
+                remote_url: None,
+                forward_headers: Vec::new(),
+                required_headers: Vec::new(),
+                aliases: skill.aliases.clone(),
+                effort: None,
+                agent_type: None,
+                trust_tier: TrustTier::Verified,
+            };
+            let index = entries.len();
+            by_name.insert(normalize_skill_lookup_key(&skill.name), index);
+            for alias in &skill.aliases {
+                by_name.insert(normalize_skill_lookup_key(alias), index);
+            }
+            catalog_skills.push(info.clone());
+            entries.push(AgentBindingSkillEntry {
+                agent_binding_id: agent_binding_id.clone(),
+                info,
+                resolved,
+            });
+        }
+        if let Some(agent_binding_id) = agent_binding_id {
+            catalog_skills.sort_by(|left, right| left.name.cmp(&right.name));
+            prepared_catalogs.push(AgentBindingSkillCatalog {
+                agent_binding_id,
+                skills: catalog_skills,
+            });
+        }
+    }
+
+    let resolver = (!entries.is_empty()).then(|| {
+        Arc::new(AgentBindingSkillResolver {
+            server_id: server_id.to_string(),
+            endpoint_url: endpoint_url.to_string(),
+            authorization: authorization.to_string(),
+            skills: entries,
+            by_name,
+        }) as Arc<dyn SkillResolver>
+    });
+    Ok(PreparedAgentBindingSkills {
+        resolver,
+        catalogs: prepared_catalogs,
+    })
+}
+
+async fn discover_skill_catalog(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+    agent_binding_id: Option<&str>,
+) -> Result<Vec<DiscoveredSkill>, (StatusCode, Json<ErrorResponse>)> {
     validate_skill_endpoint(endpoint_url)?;
     let _permit = crate::capability_endpoint_pool::try_acquire_endpoint_permit(endpoint_url)
         .map_err(|detail| {
@@ -553,6 +625,7 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
             jsonrpc: "2.0",
             id: SKILL_LIST_REQUEST_ID,
             method: "skills/list",
+            params: agent_binding_id.map(|agent_binding_id| SkillListParams { agent_binding_id }),
         })
         .send()
         .await
@@ -594,7 +667,27 @@ pub(crate) async fn prepare_agent_binding_skill_resolver(
     }
 
     let response = decode_skill_list_response(&body)?;
-    build_resolver(server_id, endpoint_url, authorization, response.skills)
+    Ok(response.skills)
+}
+
+pub(crate) async fn prepare_agent_binding_skill_resolver(
+    server_id: &str,
+    endpoint_url: &str,
+    authorization: &str,
+    agent_binding_ids: &[String],
+) -> Result<PreparedAgentBindingSkills, (StatusCode, Json<ErrorResponse>)> {
+    let catalogs = try_join_all(agent_binding_ids.iter().map(|agent_binding_id| async move {
+        let skills = discover_skill_catalog(
+            server_id,
+            endpoint_url,
+            authorization,
+            Some(agent_binding_id),
+        )
+        .await?;
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>((Some(agent_binding_id.clone()), skills))
+    }))
+    .await?;
+    build_resolver_from_catalogs(server_id, endpoint_url, authorization, catalogs)
 }
 
 pub(crate) async fn prepare_runtime_skill_resolver(
@@ -602,13 +695,30 @@ pub(crate) async fn prepare_runtime_skill_resolver(
     endpoint_url: &str,
     authorization: &str,
 ) -> Result<Option<Arc<dyn SkillResolver>>, (StatusCode, Json<ErrorResponse>)> {
-    prepare_agent_binding_skill_resolver(server_id, endpoint_url, authorization).await
+    let skills = discover_skill_catalog(server_id, endpoint_url, authorization, None).await?;
+    build_resolver(server_id, endpoint_url, authorization, skills)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn discovered_skill(name: &str, description: &str) -> DiscoveredSkill {
+        DiscoveredSkill {
+            name: name.to_string(),
+            description: description.to_string(),
+            when_to_use: None,
+            aliases: Vec::new(),
+            category: None,
+            tags: Vec::new(),
+            model: None,
+            max_tokens: None,
+            allowed_tools: Vec::new(),
+            input_schema: None,
+            output_schema: None,
+        }
+    }
 
     #[test]
     fn build_resolver_maps_discovered_skill_to_lazy_catalog_entry() {
@@ -743,12 +853,16 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/skills");
 
-        let resolver =
-            prepare_agent_binding_skill_resolver("skills", &endpoint, "Bearer runtime-grant")
-                .await
-                .expect("empty Agent Binding skill discovery should be allowed");
+        let resolver = prepare_agent_binding_skill_resolver(
+            "skills",
+            &endpoint,
+            "Bearer runtime-grant",
+            &["binding-1".to_string()],
+        )
+        .await
+        .expect("empty Agent Binding skill discovery should be allowed");
 
-        assert!(resolver.is_none());
+        assert!(resolver.resolver.is_none());
         assert_eq!(
             capture.authorization.lock().await.as_deref(),
             Some("Bearer runtime-grant")
@@ -758,7 +872,8 @@ mod tests {
             Some(&json!({
                 "jsonrpc": "2.0",
                 "id": SKILL_LIST_REQUEST_ID,
-                "method": "skills/list"
+                "method": "skills/list",
+                "params": {"agent_binding_id": "binding-1"}
             }))
         );
         server.abort();
@@ -833,17 +948,23 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/skills");
 
-        let resolver =
-            prepare_agent_binding_skill_resolver("moi-skills", &endpoint, "Bearer runtime-grant")
-                .await
-                .expect("skill discovery should succeed")
-                .expect("skill resolver");
+        let resolver = prepare_agent_binding_skill_resolver(
+            "moi-skills",
+            &endpoint,
+            "Bearer runtime-grant",
+            &["binding-1".to_string()],
+        )
+        .await
+        .expect("skill discovery should succeed")
+        .resolver
+        .expect("skill resolver");
         assert_eq!(
             capture.bodies.lock().await.as_slice(),
             &[json!({
                 "jsonrpc": "2.0",
                 "id": SKILL_LIST_REQUEST_ID,
-                "method": "skills/list"
+                "method": "skills/list",
+                "params": {"agent_binding_id": "binding-1"}
             })],
             "preparation must fetch summaries only"
         );
@@ -873,13 +994,14 @@ mod tests {
                 json!({
                     "jsonrpc": "2.0",
                     "id": SKILL_LIST_REQUEST_ID,
-                    "method": "skills/list"
+                    "method": "skills/list",
+                    "params": {"agent_binding_id": "binding-1"}
                 }),
                 json!({
                     "jsonrpc": "2.0",
                     "id": SKILL_READ_REQUEST_ID,
                     "method": "skills/read",
-                    "params": {"id": "xlsx"}
+                    "params": {"agent_binding_id": "binding-1", "id": "xlsx"}
                 })
             ]
         );
@@ -888,6 +1010,154 @@ mod tests {
             &["Bearer runtime-grant", "Bearer runtime-grant"]
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_binding_skill_discovery_and_read_preserve_owning_binding() {
+        use axum::{Router, extract::State, routing::post};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        #[derive(Default)]
+        struct Capture {
+            bodies: Mutex<Vec<Value>>,
+        }
+
+        async fn handler(
+            State(capture): State<Arc<Capture>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            capture.bodies.lock().await.push(body.clone());
+            let binding_id = body
+                .pointer("/params/agent_binding_id")
+                .and_then(Value::as_str)
+                .expect("binding-scoped skill request");
+            match body.get("method").and_then(Value::as_str) {
+                Some("skills/list") => {
+                    let skill = match binding_id {
+                        "binding-foundation" => json!({
+                            "name": "moi.agent.momo.skill.pdf",
+                            "description": "Work with PDF documents"
+                        }),
+                        "binding-extension" => json!({
+                            "name": "financial-analysis",
+                            "description": "Analyze financial statements"
+                        }),
+                        other => panic!("unexpected binding id: {other}"),
+                    };
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": SKILL_LIST_REQUEST_ID,
+                        "result": {"skills": [skill]}
+                    }))
+                }
+                Some("skills/read") => {
+                    let skill_id = body
+                        .pointer("/params/id")
+                        .and_then(Value::as_str)
+                        .expect("skill id");
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": SKILL_READ_REQUEST_ID,
+                        "result": {
+                            "skill": {
+                                "id": skill_id,
+                                "instruction": {"body": "Use the extension's financial workflow."}
+                            }
+                        }
+                    }))
+                }
+                other => panic!("unexpected method: {other:?}"),
+            }
+        }
+
+        let capture = Arc::new(Capture::default());
+        let app = Router::new()
+            .route("/skills", post(handler))
+            .with_state(capture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let prepared = prepare_agent_binding_skill_resolver(
+            "moi-skills",
+            &format!("http://{addr}/skills"),
+            "Bearer runtime-grant",
+            &[
+                "binding-foundation".to_string(),
+                "binding-extension".to_string(),
+            ],
+        )
+        .await
+        .expect("two-binding discovery");
+        assert_eq!(prepared.catalogs.len(), 2);
+        assert_eq!(prepared.catalogs[0].agent_binding_id, "binding-foundation");
+        assert_eq!(prepared.catalogs[1].agent_binding_id, "binding-extension");
+
+        let result = crate::turn::skill_tool::execute_skill_direct(
+            prepared.resolver.as_deref().expect("combined resolver"),
+            None,
+            "financial-analysis",
+            "",
+            None,
+            &crate::turn::skill_tool::SkillContext::default(),
+        )
+        .await;
+        assert!(
+            result.success,
+            "selected extension skill: {}",
+            result.output
+        );
+
+        let bodies = capture.bodies.lock().await;
+        let list_binding_ids = bodies
+            .iter()
+            .filter(|body| body.get("method") == Some(&Value::String("skills/list".to_string())))
+            .filter_map(|body| {
+                body.pointer("/params/agent_binding_id")
+                    .and_then(Value::as_str)
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            list_binding_ids,
+            std::collections::HashSet::from(["binding-foundation", "binding-extension"])
+        );
+        let read = bodies
+            .iter()
+            .find(|body| body.get("method") == Some(&Value::String("skills/read".to_string())))
+            .expect("lazy skill read");
+        assert_eq!(read["params"]["agent_binding_id"], "binding-extension");
+        assert_eq!(read["params"]["id"], "financial-analysis");
+        server.abort();
+    }
+
+    #[test]
+    fn multi_binding_skill_discovery_rejects_cross_binding_name_conflicts() {
+        let error = build_resolver_from_catalogs(
+            "moi-skills",
+            "https://skills.example.test",
+            "Bearer runtime-grant",
+            vec![
+                (
+                    Some("binding-foundation".to_string()),
+                    vec![discovered_skill("pdf", "Foundation PDF")],
+                ),
+                (
+                    Some("binding-extension".to_string()),
+                    vec![discovered_skill("pdf", "Extension PDF")],
+                ),
+            ],
+        )
+        .err()
+        .expect("ambiguous exact skill names must fail loudly");
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("agent_binding_skill_conflict")
+        );
     }
 
     #[tokio::test]
@@ -919,13 +1189,17 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/skills");
 
-        let err =
-            match prepare_agent_binding_skill_resolver("skills", &endpoint, "Bearer runtime-grant")
-                .await
-            {
-                Ok(_) => panic!("JSON-RPC error skill discovery must fail"),
-                Err(err) => err,
-            };
+        let err = match prepare_agent_binding_skill_resolver(
+            "skills",
+            &endpoint,
+            "Bearer runtime-grant",
+            &["binding-1".to_string()],
+        )
+        .await
+        {
+            Ok(_) => panic!("JSON-RPC error skill discovery must fail"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -958,13 +1232,17 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/skills");
 
-        let err =
-            match prepare_agent_binding_skill_resolver("skills", &endpoint, "Bearer runtime-grant")
-                .await
-            {
-                Ok(_) => panic!("non-2xx skill discovery must fail"),
-                Err(err) => err,
-            };
+        let err = match prepare_agent_binding_skill_resolver(
+            "skills",
+            &endpoint,
+            "Bearer runtime-grant",
+            &["binding-1".to_string()],
+        )
+        .await
+        {
+            Ok(_) => panic!("non-2xx skill discovery must fail"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -999,11 +1277,17 @@ mod tests {
         });
         let endpoint = format!("http://{addr}/skills");
 
-        let err =
-            match prepare_agent_binding_skill_resolver("skills", &endpoint, "Bearer abc").await {
-                Ok(_) => panic!("non-2xx skill discovery must fail"),
-                Err(err) => err,
-            };
+        let err = match prepare_agent_binding_skill_resolver(
+            "skills",
+            &endpoint,
+            "Bearer abc",
+            &["binding-1".to_string()],
+        )
+        .await
+        {
+            Ok(_) => panic!("non-2xx skill discovery must fail"),
+            Err(err) => err,
+        };
 
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(

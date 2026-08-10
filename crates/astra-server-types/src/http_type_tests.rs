@@ -157,6 +157,17 @@ fn chat_request_all_fields() {
             }
         ],
         "context": {"key": "value"},
+        "stable_runtime_system_prompt": "Extension instructions take precedence on semantic overlap.",
+        "agent_bindings": [
+            {
+                "id": "binding-foundation",
+                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
+            },
+            {
+                "id": "binding-extension",
+                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
+            }
+        ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "execution_policy": {"turn_intent": "fixed_default"},
         "explain": true
@@ -187,6 +198,13 @@ fn chat_request_all_fields() {
             .map(String::as_str),
         Some("Bearer runtime-token")
     );
+    assert_eq!(
+        req.stable_runtime_system_prompt.as_deref(),
+        Some("Extension instructions take precedence on semantic overlap.")
+    );
+    assert_eq!(req.agent_bindings.len(), 2);
+    assert_eq!(req.agent_bindings[0].id, "binding-foundation");
+    assert_eq!(req.agent_bindings[1].id, "binding-extension");
     assert_eq!(
         req.execution_budget,
         Some(ExecutionBudget {
@@ -1227,6 +1245,7 @@ fn chat_request_into_data_maps_all_fields() {
         user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
+        stable_runtime_system_prompt: Some("Prefer extension skills on semantic overlap.".into()),
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
@@ -1238,6 +1257,7 @@ fn chat_request_into_data_maps_all_fields() {
             model_name: "gpt-4".into(),
         }),
         capability_descriptors: None,
+        agent_bindings: Vec::new(),
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
@@ -1282,6 +1302,10 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(
         data.attachments,
         vec![json!({"id": "att-1", "kind": "file"})]
+    );
+    assert_eq!(
+        data.stable_runtime_system_prompt.as_deref(),
+        Some("Prefer extension skills on semantic overlap.")
     );
     assert_eq!(
         data.runtime_system_prompt.as_deref(),
@@ -1370,12 +1394,14 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
+        stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
         agent_id: None,
         model_selection: None,
         resolved_model_selection: None,
         capability_descriptors: None,
+        agent_bindings: Vec::new(),
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
