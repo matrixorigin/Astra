@@ -10356,6 +10356,10 @@ mod tests {
     /// (b) `ToolExecutor::new` never panics when those envs are set — which
     /// was the actual risk if a caller forgot to call `apply_env_proxy` and
     /// reqwest rejected a malformed env URL at build time.
+    // serial_test: proxy env mutations race with any parallel test whose
+    // HTTP client is env-proxy-aware (e.g. cloud_sync's remote-target
+    // clients after the client_builder_for_target policy).
+    #[serial_test::serial]
     #[test]
     fn github_client_honours_proxy_env_without_panicking() {
         let dir = tempfile::tempdir().unwrap();

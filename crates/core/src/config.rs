@@ -344,6 +344,72 @@ pub struct AuthConfig {
     pub token_encryption_key: Option<String>,
     /// Local authentication rules for provider-originated API calls.
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
+    /// Edge-registration token verification (MOI sandbox/runner edge agents).
+    pub edge_token_auth: EdgeTokenAuthConfig,
+    /// External providers serving the model catalog / runtime-context scope
+    /// callbacks for edge-registration principals (e.g. MOI's
+    /// /api/v1/astra/external-catalog).
+    pub external_providers: Vec<ExternalProviderEntryConfig>,
+}
+
+/// One external provider entry for edge-scope catalog callbacks.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct ExternalProviderEntryConfig {
+    /// Provider id ("moi" is looked up first by the auth service).
+    pub id: String,
+    /// Display name (defaults to the id when empty).
+    pub display_name: String,
+    /// Callback endpoint receiving the {action, provider_id, ...} POSTs.
+    pub external_auth_endpoint: String,
+    /// Optional bearer key sent as `Authorization: Bearer <key>` on callback
+    /// requests. Supports `${ENV}` placeholder resolution. Callbacks that mint
+    /// runtime credentials (issue_runtime_context_by_scope) should always be
+    /// key-protected.
+    pub auth_key: String,
+}
+
+impl std::fmt::Debug for ExternalProviderEntryConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalProviderEntryConfig")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("external_auth_endpoint", &self.external_auth_endpoint)
+            .field(
+                "auth_key",
+                &if self.auth_key.is_empty() {
+                    ""
+                } else {
+                    "[REDACTED]"
+                },
+            )
+            .finish()
+    }
+}
+
+/// Edge-registration token verification (MOI sandbox/runner edge agents).
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct EdgeTokenAuthConfig {
+    /// Shared HMAC key for moi-user-token-v1 edge tokens (= MOI jwt_secret).
+    /// Supports `${ASTRA_EDGE_TOKEN_HMAC_KEY}` placeholder resolution.
+    pub key: String,
+    /// moi-core revocation-check endpoint, required whenever `key` is set
+    /// (e.g. https://catalog/api/v1/astra/edge-tokens/check). `validate()` rejects
+    /// a key without it so revocation cannot be silently skipped. Astra checks jti
+    /// revocation on every surface that accepts an edge token (WS connect + every
+    /// HTTP request; fail-closed).
+    pub check_endpoint: String,
+}
+
+impl fmt::Debug for EdgeTokenAuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EdgeTokenAuthConfig")
+            .field("key", &(!self.key.is_empty()).then_some("[REDACTED]"))
+            .field("check_endpoint", &self.check_endpoint)
+            .finish()
+    }
 }
 
 /// Server-side provider request authentication configuration.
@@ -385,6 +451,8 @@ impl fmt::Debug for AuthConfig {
                 &self.token_encryption_key.as_ref().map(|_| "[REDACTED]"),
             )
             .field("provider_request_auth", &self.provider_request_auth)
+            .field("edge_token_auth", &self.edge_token_auth)
+            .field("external_providers", &self.external_providers)
             .finish()
     }
 }
@@ -403,6 +471,19 @@ impl AuthConfig {
         if !other.provider_request_auth.is_empty() {
             self.provider_request_auth = other.provider_request_auth.clone();
         }
+        // Field-merge so a layer overriding only one field (e.g. user config
+        // sets check_endpoint) does not clear a field (key) set by a lower
+        // layer — replacing the whole struct would blank the untouched field
+        // and fail startup.
+        if !other.edge_token_auth.key.is_empty() {
+            self.edge_token_auth.key = other.edge_token_auth.key.clone();
+        }
+        if !other.edge_token_auth.check_endpoint.is_empty() {
+            self.edge_token_auth.check_endpoint = other.edge_token_auth.check_endpoint.clone();
+        }
+        if !other.external_providers.is_empty() {
+            self.external_providers = other.external_providers.clone();
+        }
     }
     fn apply_env_overrides(&mut self) {
         apply_env_override_str(&mut self.jwt_secret, "ASTRA_JWT_SECRET");
@@ -413,6 +494,10 @@ impl AuthConfig {
         apply_env_override_str(&mut self.token_encryption_key, "ASTRA_TOKEN_ENCRYPTION_KEY");
         for request_auth in &mut self.provider_request_auth {
             apply_env_override_placeholder(&mut request_auth.key);
+        }
+        apply_env_override_placeholder(&mut self.edge_token_auth.key);
+        for provider in &mut self.external_providers {
+            apply_env_override_placeholder(&mut provider.auth_key);
         }
     }
 
@@ -444,6 +529,52 @@ impl AuthConfig {
                     request_auth.provider
                 ));
             }
+        }
+        if !self.edge_token_auth.key.is_empty()
+            && let Some(env_name) = exact_env_placeholder(&self.edge_token_auth.key)
+        {
+            return Err(format!(
+                "auth.edge_token_auth.key references an unset environment variable: {env_name}"
+            ));
+        }
+        let mut external_ids = std::collections::HashSet::new();
+        for provider in &self.external_providers {
+            validate_exact_non_empty("auth.external_providers[].id", &provider.id)?;
+            validate_exact_non_empty(
+                "auth.external_providers[].external_auth_endpoint",
+                &provider.external_auth_endpoint,
+            )?;
+            // Reject duplicate ids: runtime lookup uses .find() and would
+            // silently pick the first, making the endpoint/auth key depend on
+            // list order. Mirror provider_request_auth's duplicate rejection.
+            if !external_ids.insert(provider.id.as_str()) {
+                return Err(format!(
+                    "auth.external_providers id '{}' is duplicated",
+                    provider.id
+                ));
+            }
+            if !provider.auth_key.is_empty()
+                && let Some(env_name) = exact_env_placeholder(&provider.auth_key)
+            {
+                return Err(format!(
+                    "auth.external_providers[].auth_key references an unset environment variable: {env_name}"
+                ));
+            }
+        }
+        if !self.edge_token_auth.check_endpoint.is_empty() && self.edge_token_auth.key.is_empty() {
+            return Err(
+                "auth.edge_token_auth.check_endpoint requires auth.edge_token_auth.key".to_string(),
+            );
+        }
+        // Fail closed: accepting long-lived edge-registration tokens without a
+        // revocation endpoint means a token revoked in MOI keeps working until
+        // it expires (up to 30 days). If the HMAC key is configured, the
+        // revocation endpoint is mandatory — a config omission must not
+        // silently disable revocation.
+        if !self.edge_token_auth.key.is_empty() && self.edge_token_auth.check_endpoint.is_empty() {
+            return Err(
+                "auth.edge_token_auth.check_endpoint is required when auth.edge_token_auth.key is set (edge token revocation must fail closed)".to_string(),
+            );
         }
         Ok(())
     }
@@ -838,6 +969,8 @@ pub struct AppSettings {
     pub bridge_secret: String,
     pub token_encryption_key: Option<String>,
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
+    pub edge_token_auth: EdgeTokenAuthConfig,
+    pub external_providers: Vec<ExternalProviderEntryConfig>,
     pub database_bootstrap_catalog: String,
     /// Deployment-declared provider capabilities.
     pub provider_capabilities: HashMap<String, Vec<String>>,
@@ -919,6 +1052,8 @@ impl AppSettings {
         settings.provider_capabilities = sc.deployment.provider_capabilities.clone();
         settings.provider_allowed_tools = sc.deployment.provider_allowed_tools.clone();
         settings.provider_request_auth = sc.auth.provider_request_auth.clone();
+        settings.edge_token_auth = sc.auth.edge_token_auth.clone();
+        settings.external_providers = sc.auth.external_providers.clone();
         validate_provider_capabilities(&settings.provider_capabilities)
             .map_err(ConfigError::Validation)?;
         validate_tool_offer_ids(&settings.disabled_tool_offers).map_err(ConfigError::Validation)?;
@@ -1006,6 +1141,8 @@ impl AppSettings {
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             provider_request_auth: Vec::new(),
+            edge_token_auth: EdgeTokenAuthConfig::default(),
+            external_providers: Vec::new(),
             disabled_tool_offers: Self::disabled_tool_offers_from_lookup(&lookup),
             provider_capabilities: HashMap::new(),
             provider_allowed_tools: HashMap::new(),
@@ -2146,6 +2283,68 @@ auth_mode = "legacy"
                 err.contains("auth.provider_request_auth provider 'moi'.key references an unset environment variable")
             );
         });
+    }
+
+    #[test]
+    fn server_config_env_override_edge_token_hmac_key() {
+        temp_env::with_var(
+            "ASTRA_EDGE_TOKEN_HMAC_KEY",
+            Some("env-edge-token-hmac-key"),
+            || {
+                let mut config = ServerConfig::default();
+                config.auth.edge_token_auth.key = "${ASTRA_EDGE_TOKEN_HMAC_KEY}".to_string();
+                // check_endpoint is mandatory whenever the key is set (revocation
+                // must fail closed).
+                config.auth.edge_token_auth.check_endpoint =
+                    "http://catalog/api/v1/astra/edge-tokens/check".to_string();
+                config.apply_env_overrides();
+                assert_eq!(config.auth.edge_token_auth.key, "env-edge-token-hmac-key");
+                config.auth.validate().expect("auth config should validate");
+            },
+        );
+    }
+
+    #[test]
+    fn server_config_validate_rejects_unresolved_edge_token_hmac_key_env() {
+        temp_env::with_var("ASTRA_EDGE_TOKEN_HMAC_KEY", None::<&str>, || {
+            let mut config = ServerConfig::default();
+            config.auth.edge_token_auth.key = "${ASTRA_EDGE_TOKEN_HMAC_KEY}".to_string();
+            config.apply_env_overrides();
+            let err = config
+                .auth
+                .validate()
+                .expect_err("unresolved edge token key env should be rejected");
+            assert!(
+                err.contains("auth.edge_token_auth.key references an unset environment variable")
+            );
+        });
+    }
+
+    #[test]
+    fn server_config_validate_rejects_check_endpoint_without_key() {
+        let mut config = ServerConfig::default();
+        config.auth.edge_token_auth.check_endpoint =
+            "http://catalog/api/v1/astra/edge-tokens/check".to_string();
+        let err = config
+            .auth
+            .validate()
+            .expect_err("check_endpoint without key should be rejected");
+        assert!(
+            err.contains("auth.edge_token_auth.check_endpoint requires auth.edge_token_auth.key")
+        );
+    }
+
+    #[test]
+    fn server_config_validate_rejects_key_without_check_endpoint() {
+        let mut config = ServerConfig::default();
+        config.auth.edge_token_auth.key = "edge-hmac-key".to_string();
+        let err = config
+            .auth
+            .validate()
+            .expect_err("edge token key without check_endpoint must fail closed");
+        assert!(err.contains(
+            "auth.edge_token_auth.check_endpoint is required when auth.edge_token_auth.key is set"
+        ));
     }
 
     #[test]

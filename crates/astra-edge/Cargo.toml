@@ -32,6 +32,7 @@ base64 = { workspace = true }
 fastrand = "2"
 fs2.workspace = true
 reqwest = { workspace = true }
+tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
 astra-tools.workspace = true
@@ -40,4 +41,6 @@ astra-turn-types.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+# `test-util` enables `#[tokio::test(start_paused = true)]` and virtual-time
+# advancement used by the token-renewal retry-schedule test.
+tokio = { workspace = true, features = ["test-util"] }

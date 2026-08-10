@@ -1127,9 +1127,11 @@ Hooked body."#;
         std::fs::create_dir_all(project.join(".git")).unwrap();
 
         let paths = isolated_project_skill_search_paths(&cwd);
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
 
-        assert!(paths.contains(&project.join(".astra/skills")));
-        assert!(!paths.contains(&home.join(".astra/skills")));
+        assert!(paths.contains(&canonical_project.join(".astra/skills")));
+        assert!(!paths.contains(&canonical_home.join(".astra/skills")));
     }
 
     #[test]
@@ -1141,9 +1143,11 @@ Hooked body."#;
         std::fs::create_dir_all(cwd.join(".astra/skills")).unwrap();
 
         let paths = isolated_project_skill_search_paths(&cwd);
+        let canonical_cwd = std::fs::canonicalize(&cwd).unwrap();
+        let canonical_parent = std::fs::canonicalize(&parent).unwrap();
 
-        assert!(paths.contains(&cwd.join(".astra/skills")));
-        assert!(!paths.contains(&parent.join(".astra/skills")));
+        assert!(paths.contains(&canonical_cwd.join(".astra/skills")));
+        assert!(!paths.contains(&canonical_parent.join(".astra/skills")));
     }
 
     #[test]

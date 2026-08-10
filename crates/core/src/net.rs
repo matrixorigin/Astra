@@ -1,17 +1,27 @@
 //! Shared HTTP networking utilities.
 //!
-//! # Proxy policy (commit 3e3d6fa8)
+//! # Proxy policy
 //!
-//! Only **external** HTTP traffic — the LLM client and provider connectivity
-//! probes — is allowed to honour `HTTPS_PROXY` / `ALL_PROXY`. All other reqwest
-//! clients in the workspace are considered internal (edge ↔ services, memoria,
-//! durable task, app state, etc.) and MUST call `.no_proxy()` on their
-//! builders. See `astra_runtime::turn::llm_client` module docs for the full
-//! rationale.
+//! Three tiers, by traffic destination — pick the matching helper instead of
+//! hand-rolling proxy handling:
 //!
-//! [`apply_env_proxy`] is the single authoritative implementation. Both the
-//! LLM client and `validate_connectivity` in `astra-services` call it. Do not
-//! duplicate this logic elsewhere — add a new caller instead.
+//! 1. **Server-internal, always-local traffic** (runtime ↔ services on the
+//!    same host: memoria, durable task, app state, ...): MUST bypass env
+//!    proxies — use [`build_internal_http_client`].
+//! 2. **Target-dependent traffic** (astra-cli / edge clients that may talk to
+//!    either a local or a REMOTE astra server): use
+//!    [`client_builder_for_target`] — loopback targets bypass proxies, remote
+//!    targets honour the environment. Mandatory-egress-proxy sandboxes
+//!    (OpenShell) depend on this: an unconditional `.no_proxy()` there makes
+//!    remote calls hang.
+//! 3. **External provider traffic** (the LLM client, provider connectivity
+//!    probes): honours `HTTPS_PROXY`/`ALL_PROXY` via [`apply_env_proxy`] — the
+//!    single authoritative env-proxy implementation; add callers rather than
+//!    duplicating it.
+//!
+//! The historical rule "everything except the LLM client must .no_proxy()"
+//! (commit 3e3d6fa8) applies ONLY to tier 1; tier 2 superseded it for client
+//! code that can target remote servers.
 
 /// Build an internal `reqwest` client that must never honor env proxy vars.
 ///
@@ -97,6 +107,64 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
         }
     }
     builder
+}
+
+/// Returns `true` when `url` targets the local host (`localhost`,
+/// `*.localhost`, or a loopback IP literal).
+pub fn url_is_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .strip_suffix(".localhost")
+            .is_some_and(|prefix| !prefix.is_empty())
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Start a `reqwest` client builder whose proxy policy is decided by the
+/// target URL: loopback targets are process-local control-plane calls and
+/// always bypass env proxies; remote targets keep reqwest's
+/// environment-aware proxy behavior (`HTTP(S)_PROXY` / `NO_PROXY`).
+///
+/// Mandatory-egress-proxy environments (e.g. OpenShell sandboxes) block
+/// direct remote connections, so clients that may talk to a remote service
+/// must never force `.no_proxy()` unconditionally — use this helper instead.
+pub fn client_builder_for_target(url: &str) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if url_is_loopback(url) {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
+#[cfg(test)]
+mod client_builder_for_target_tests {
+    use super::url_is_loopback;
+
+    #[test]
+    fn loopback_targets_are_detected() {
+        assert!(url_is_loopback("http://localhost:8080/x"));
+        assert!(url_is_loopback("http://api.localhost/x"));
+        assert!(url_is_loopback("http://127.0.0.1:17001/x"));
+        assert!(url_is_loopback("http://[::1]:17001/x"));
+    }
+
+    #[test]
+    fn remote_and_invalid_targets_are_not_loopback() {
+        assert!(!url_is_loopback("http://astra.example.com/x"));
+        assert!(!url_is_loopback("http://10.0.0.8:17001/x"));
+        assert!(!url_is_loopback("not a url"));
+        assert!(!url_is_loopback("http://.localhost/x"));
+    }
 }
 
 #[cfg(test)]

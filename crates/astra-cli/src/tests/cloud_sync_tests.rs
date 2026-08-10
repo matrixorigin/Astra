@@ -180,6 +180,7 @@ fn display_sync_status_no_crash_full_data() {
     slash_health::display_sync_status(&status);
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn slash_health_offline_shows_cloud_section() {
     let api = astra_thin_client::ThinClient::new("http://unused", None).unwrap();
@@ -709,6 +710,7 @@ async fn drain_empty_sync_outbox_does_not_require_cloud_credentials() {
     assert_eq!(report.user_notice(), None);
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn try_cloud_pull_returns_empty_without_matrixone() {
     unsafe {
@@ -721,6 +723,7 @@ async fn try_cloud_pull_returns_empty_without_matrixone() {
     );
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
     unsafe {
@@ -732,6 +735,7 @@ async fn try_cloud_pull_preferences_is_noop_without_matrixone() {
     assert!(keys.is_empty());
 }
 
+#[serial_test::serial]
 #[tokio::test]
 async fn try_cloud_push_preferences_is_noop_without_matrixone() {
     unsafe {

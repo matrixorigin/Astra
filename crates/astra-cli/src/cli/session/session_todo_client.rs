@@ -137,9 +137,8 @@ fn build_request(
     url: &str,
     token: Option<&str>,
 ) -> Result<reqwest::RequestBuilder, String> {
-    let client = reqwest::Client::builder()
+    let client = astra_core::net::client_builder_for_target(url)
         .timeout(std::time::Duration::from_secs(TODOS_HTTP_TIMEOUT_SECS))
-        .no_proxy()
         .build()
         .map_err(|e| format!("http client init: {e}"))?;
     let mut req = client.request(method, url);
