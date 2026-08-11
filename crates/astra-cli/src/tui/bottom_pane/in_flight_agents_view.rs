@@ -1065,9 +1065,6 @@ fn selected_runtime_detail(row: &AgentRow) -> [String; 2] {
     if row.run_id.as_deref().is_none_or(str::is_empty) {
         details.push("live transcript opens now · run identity and controls are syncing".into());
     }
-    if let Some(refs) = row.runtime.capability_server_refs.as_ref() {
-        details.push(format!("mcp {} · skills {}", refs.mcp, refs.skills));
-    }
     if let Some(facts) = row.runtime.permission.as_ref() {
         let health = if facts.has_issues {
             "permission issues"
@@ -2037,10 +2034,6 @@ mod tests {
             runtime_profile: Some("agent_binding_registry".into()),
             model_name: Some("gpt-5".into()),
             agent_binding_name: Some("Reviewer".into()),
-            capability_server_refs: Some(astra_thin_client::SessionRunCapabilityServerRefs {
-                mcp: "mcp-main".into(),
-                skills: "skills-main".into(),
-            }),
             ..Default::default()
         };
         let parent_run_id = hierarchy[0].run_id.clone();

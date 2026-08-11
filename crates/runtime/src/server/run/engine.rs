@@ -36,13 +36,12 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
-        CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunEventDelta, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-        DurableRunListPage, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
-        GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
-        RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
-        RunListCursor, RunStateStore, RuntimeProfileRequest, TurnIntentExecutionPolicy,
-        durable_run_status_kind,
+        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
+        DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
+        DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, GuardedRunStatusTransition,
+        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
+        RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
+        RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -156,7 +155,6 @@ pub struct RunStartContext {
     pub agent_binding_schema_version: Option<String>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
-    pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
 }
@@ -454,11 +452,6 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     {
         data.insert("resolved_model_selection".to_string(), value);
     }
-    if let Some(capability_server_refs) = context.capability_server_refs.as_ref()
-        && let Ok(value) = serde_json::to_value(capability_server_refs)
-    {
-        data.insert("capability_server_refs".to_string(), value);
-    }
     if let Some(runtime_profile) = context.runtime_profile {
         data.insert(
             "runtime_profile".to_string(),
@@ -723,19 +716,6 @@ impl RunEngine {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
         let (model_offering_id, resolved_model_name) = durable_model_identity(&context)?;
-        let capability_server_refs_json =
-            context.capability_server_refs.as_ref().and_then(|refs| {
-                serde_json::to_string(refs)
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            target: "astra_runtime::engine",
-                            run_id = %run_id,
-                            error = %e,
-                            "failed to serialize capability_server_refs for durable run record"
-                        );
-                    })
-                    .ok()
-            });
         let runtime_profile = context
             .runtime_profile
             .map(runtime_profile_label)
@@ -772,7 +752,6 @@ impl RunEngine {
             agent_binding_schema_version: context.agent_binding_schema_version,
             model_offering_id,
             resolved_model_name,
-            capability_server_refs_json,
             runtime_profile,
             provider_request_fingerprint: context.provider_request_fingerprint,
             events: vec![serde_json::json!({
@@ -3435,10 +3414,6 @@ mod tests {
             agent_bindings: Vec::new(),
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
                 id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
-                capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                    mcp: "tools".to_string(),
-                    skills: "skills".to_string(),
-                },
             }),
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -5122,7 +5097,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 provider_request_fingerprint: None,
                 events: vec![serde_json::json!({"event_type":"run_started","data":{}})],

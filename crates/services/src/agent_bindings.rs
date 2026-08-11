@@ -3,7 +3,7 @@ use axum::{Json, http::StatusCode};
 use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Row, query};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::registry_payload::{
@@ -17,51 +17,11 @@ use astra_core::{
 
 const BINDING_ID_INSERT_MAX_ATTEMPTS: usize = 5;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityServerType {
-    Mcp,
-    Skill,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityServerTransport {
-    StreamableHttp,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityServerEndpoint {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub server_type: CapabilityServerType,
-    pub transport: CapabilityServerTransport,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint_url: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolMode {
-    McpGateway,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimePolicy {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_steps: Option<u32>,
-    pub tool_mode: ToolMode,
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentBindingPayload {
     pub binding_name: String,
     pub agent_md: String,
-    pub capability_servers: Vec<CapabilityServerEndpoint>,
-    pub runtime_policy: RuntimePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     pub binding_schema_version: String,
@@ -104,8 +64,6 @@ pub struct AgentBindingRecord {
     pub idempotency_key: String,
     pub status: AgentBindingStatus,
     pub agent_md: String,
-    pub capability_servers: Vec<CapabilityServerEndpoint>,
-    pub runtime_policy: RuntimePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     pub binding_schema_version: String,
@@ -115,16 +73,13 @@ pub struct AgentBindingRecord {
 }
 
 const AGENT_BINDING_COLUMNS: &str = "id, binding_name, idempotency_key, status, agent_md, \
-     capability_servers_json, runtime_policy_json, metadata_json, binding_schema_version, \
-     created_at, disabled_at";
+     metadata_json, binding_schema_version, created_at, disabled_at";
 
 impl AgentBindingRecord {
     pub fn payload(&self) -> AgentBindingPayload {
         AgentBindingPayload {
             binding_name: self.binding_name.clone(),
             agent_md: self.agent_md.clone(),
-            capability_servers: self.capability_servers.clone(),
-            runtime_policy: self.runtime_policy.clone(),
             metadata: self.metadata.clone(),
             binding_schema_version: self.binding_schema_version.clone(),
         }
@@ -270,8 +225,6 @@ impl AgentBindingService for InMemoryAgentBindingService {
             idempotency_key: request.idempotency_key.clone(),
             status: AgentBindingStatus::Active,
             agent_md: request.binding.agent_md,
-            capability_servers: request.binding.capability_servers,
-            runtime_policy: request.binding.runtime_policy,
             metadata: request.binding.metadata,
             binding_schema_version: request.binding.binding_schema_version,
             created_at: now,
@@ -379,28 +332,20 @@ impl AgentBindingService for DatabaseAgentBindingService {
             ));
         }
 
-        let capability_servers_json = json_string(
-            &request.binding.capability_servers,
-            "capability_servers_json",
-        )?;
-        let runtime_policy_json =
-            json_string(&request.binding.runtime_policy, "runtime_policy_json")?;
         let metadata_json = optional_json_string(request.binding.metadata.as_ref())?;
 
         for attempt in 0..BINDING_ID_INSERT_MAX_ATTEMPTS {
             let id = new_binding_id();
             let insert_result = query(
                 "INSERT INTO agent_bindings \
-                 (id, binding_name, idempotency_key, status, agent_md, capability_servers_json, \
-                  runtime_policy_json, metadata_json, binding_schema_version, created_at) \
-                 VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, NOW(6))",
+                 (id, binding_name, idempotency_key, status, agent_md, metadata_json, \
+                  binding_schema_version, created_at) \
+                 VALUES (?, ?, ?, 'active', ?, ?, ?, NOW(6))",
             )
             .bind(&id)
             .bind(&request.binding.binding_name)
             .bind(&request.idempotency_key)
             .bind(&request.binding.agent_md)
-            .bind(&capability_servers_json)
-            .bind(&runtime_policy_json)
             .bind(metadata_json.clone())
             .bind(&request.binding.binding_schema_version)
             .execute(&pool)
@@ -532,87 +477,8 @@ pub fn validate_agent_binding_payload(
             "agent_binding_invalid",
         ));
     }
-    if payload.capability_servers.is_empty() {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "capability_servers must not be empty",
-            "agent_binding_invalid",
-        ));
-    }
-    if payload.runtime_policy.tool_mode != ToolMode::McpGateway {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "runtime_policy.tool_mode must be mcp_gateway",
-            "agent_binding_policy_invalid",
-        ));
-    }
-    if let Some(max_steps) = payload.runtime_policy.max_steps
-        && max_steps == 0
-    {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "runtime_policy.max_steps must be positive",
-            "agent_binding_policy_invalid",
-        ));
-    }
-    if let Some(max_steps) = payload.runtime_policy.max_steps {
-        let max_allowed = astra_config::runtime_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(false);
-        if (max_steps as usize) > max_allowed {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "runtime_policy.max_steps must not exceed server max_turns ({max_allowed})"
-                ),
-                "agent_binding_policy_invalid",
-            ));
-        }
-    }
     if let Some(metadata) = &payload.metadata {
         reject_secret_like_json("metadata", metadata, "agent_binding_invalid")?;
-    }
-    validate_capability_servers(&payload.capability_servers)
-}
-
-fn validate_capability_servers(
-    servers: &[CapabilityServerEndpoint],
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let mut ids = HashSet::new();
-    let mut has_mcp = false;
-    let mut has_skill = false;
-    for server in servers {
-        exact_id_string(
-            "capability_servers[].id",
-            &server.id,
-            128,
-            "agent_binding_invalid",
-        )?;
-        if !ids.insert(server.id.as_str()) {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "capability_servers[].id must be unique inside the binding",
-                "agent_binding_invalid",
-            ));
-        }
-        if server.endpoint_url.is_some() {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "capability_servers[].endpoint_url must not be set; provide runtime endpoints in capability_descriptors",
-                "agent_binding_invalid",
-            ));
-        }
-        match server.server_type {
-            CapabilityServerType::Mcp => has_mcp = true,
-            CapabilityServerType::Skill => has_skill = true,
-        }
-    }
-    if !has_mcp || !has_skill {
-        return Err(error_response_coded(
-            StatusCode::BAD_REQUEST,
-            "binding v1 requires at least one mcp server and one skill server",
-            "agent_binding_invalid",
-        ));
     }
     Ok(())
 }
@@ -639,19 +505,6 @@ fn agent_binding_not_found() -> (StatusCode, Json<ErrorResponse>) {
         "agent binding not found",
         "agent_binding_not_found",
     )
-}
-
-fn json_string<T: Serialize>(
-    value: &T,
-    column: &'static str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-    serde_json::to_string(value).map_err(|_| {
-        error_response_coded(
-            StatusCode::BAD_REQUEST,
-            format!("{column} must be valid JSON"),
-            "agent_binding_invalid",
-        )
-    })
 }
 
 fn optional_json_string(
@@ -709,10 +562,6 @@ async fn load_binding_by_name(
 fn agent_binding_from_row(
     row: sqlx::mysql::MySqlRow,
 ) -> Result<AgentBindingRecord, (StatusCode, Json<ErrorResponse>)> {
-    let servers_json: String = row
-        .try_get("capability_servers_json")
-        .map_err(internal_error)?;
-    let runtime_policy_json: String = row.try_get("runtime_policy_json").map_err(internal_error)?;
     let metadata_json: Option<String> = row.try_get("metadata_json").map_err(internal_error)?;
     let metadata = metadata_json
         .as_deref()
@@ -730,8 +579,6 @@ fn agent_binding_from_row(
             &row.try_get::<String, _>("status").map_err(internal_error)?,
         )?,
         agent_md: row.try_get("agent_md").map_err(internal_error)?,
-        capability_servers: serde_json::from_str(&servers_json).map_err(internal_error)?,
-        runtime_policy: serde_json::from_str(&runtime_policy_json).map_err(internal_error)?,
         metadata,
         binding_schema_version: row
             .try_get("binding_schema_version")
@@ -769,24 +616,6 @@ mod tests {
             binding: AgentBindingPayload {
                 binding_name: "binding-01".into(),
                 agent_md: "You are a test agent.".into(),
-                capability_servers: vec![
-                    CapabilityServerEndpoint {
-                        id: "tools".into(),
-                        server_type: CapabilityServerType::Mcp,
-                        transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: None,
-                    },
-                    CapabilityServerEndpoint {
-                        id: "skills".into(),
-                        server_type: CapabilityServerType::Skill,
-                        transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: None,
-                    },
-                ],
-                runtime_policy: RuntimePolicy {
-                    max_steps: Some(5),
-                    tool_mode: ToolMode::McpGateway,
-                },
                 metadata: None,
                 binding_schema_version: "v1".into(),
             },
@@ -849,58 +678,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binding_rejects_missing_skill_server() {
-        let svc = InMemoryAgentBindingService::new();
-        let mut request = valid_request();
-        request
-            .binding
-            .capability_servers
-            .retain(|server| server.server_type != CapabilityServerType::Skill);
-        let err = svc.create_binding(request).await.unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));
-    }
-
-    #[tokio::test]
-    async fn binding_rejects_runtime_endpoint_url() {
-        let svc = InMemoryAgentBindingService::new();
-        let mut request = valid_request();
-        request.binding.capability_servers[0].endpoint_url =
-            Some("https://capabilities.example.com/mcp".into());
-        let err = svc.create_binding(request).await.unwrap_err();
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));
-    }
-
-    #[test]
-    fn binding_deserializes_legacy_runtime_endpoint_url() {
-        let servers: Vec<CapabilityServerEndpoint> = serde_json::from_value(serde_json::json!([
-            {
-                "id": "tools",
-                "type": "mcp",
-                "transport": "streamable_http",
-                "endpoint_url": "http://legacy-catalog.local/mcp"
-            },
-            {
-                "id": "skills",
-                "type": "skill",
-                "transport": "streamable_http",
-                "endpoint_url": "http://legacy-catalog.local/skills"
-            }
-        ]))
-        .expect("legacy capability_servers_json should remain readable");
-
-        assert_eq!(
-            servers[0].endpoint_url.as_deref(),
-            Some("http://legacy-catalog.local/mcp")
-        );
-        assert_eq!(
-            servers[1].endpoint_url.as_deref(),
-            Some("http://legacy-catalog.local/skills")
-        );
-    }
-
-    #[tokio::test]
     async fn binding_rejects_agent_md_above_configured_byte_limit() {
         let svc = InMemoryAgentBindingService::new();
         let mut request = valid_request();
@@ -923,23 +700,5 @@ mod tests {
         let err = svc.create_binding(request).await.unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1.error_code.as_deref(), Some("agent_binding_invalid"));
-    }
-
-    #[tokio::test]
-    async fn binding_rejects_max_steps_above_server_ceiling() {
-        let svc = InMemoryAgentBindingService::new();
-        let mut request = valid_request();
-        let max_allowed = astra_config::runtime_config::RuntimeConfig::cached()
-            .runtime_limits
-            .resolve_turn_ceiling(false);
-        request.binding.runtime_policy.max_steps = Some((max_allowed as u32).saturating_add(1));
-
-        let err = svc.create_binding(request).await.unwrap_err();
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert_eq!(
-            err.1.error_code.as_deref(),
-            Some("agent_binding_policy_invalid")
-        );
     }
 }

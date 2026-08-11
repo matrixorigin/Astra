@@ -45,14 +45,13 @@ use astra_core::{
 use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
-    AgentBindingRuntimeRequest, CancelRunRecord, CapabilityServerRefs, ChatRequestData,
-    ChatRunRecord, ChatStreamRecord, DurableRunEventDelta, DurableRunRecord, DurableRunStartClaim,
-    DurableRunStatusKind, RequestedTurnInteractionMode, ResolvedModelSelection,
-    RunContinuationRecord, RunLifecycleService, RunListCursor, RunListRecord,
-    RunMutationDisposition, RunMutationRecord, RunProjectionCheckpointRecord, RunProjectionRecord,
-    RunStatusRecord, RunUserIntentData, RunUserIntentRecord, RuntimeAuthRequest,
-    RuntimeProfileRequest, durable_run_status_blocks_session, durable_run_status_is_terminal,
-    durable_run_status_kind,
+    AgentBindingRuntimeRequest, CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord,
+    DurableRunEventDelta, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
+    RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
+    RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
+    RunProjectionCheckpointRecord, RunProjectionRecord, RunStatusRecord, RunUserIntentData,
+    RunUserIntentRecord, RuntimeAuthRequest, RuntimeProfileRequest,
+    durable_run_status_blocks_session, durable_run_status_is_terminal, durable_run_status_kind,
 };
 use astra_services::session_audit::{RUNTIME_PROMOTION_EVENT_TYPE, RuntimePromotionEventData};
 use astra_services::session_restore::{
@@ -2514,8 +2513,6 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
 #[derive(Clone)]
 struct ResolvedAgentBindingRuntime {
     binding: astra_services::AgentBindingRecord,
-    mcp_server: astra_services::CapabilityServerEndpoint,
-    skill_server: astra_services::CapabilityServerEndpoint,
 }
 
 #[derive(Clone, Default)]
@@ -5508,14 +5505,7 @@ impl AgenticRunLifecycleService {
         &self,
         request: &AgentBindingRuntimeRequest,
     ) -> Result<ResolvedAgentBindingRuntime, (StatusCode, Json<ErrorResponse>)> {
-        exact_runtime_id(
-            "agent_binding.capability_server_refs.mcp",
-            &request.capability_server_refs.mcp,
-        )?;
-        exact_runtime_id(
-            "agent_binding.capability_server_refs.skills",
-            &request.capability_server_refs.skills,
-        )?;
+        exact_runtime_id("agent_binding.id", &request.id)?;
         let binding = self
             .agent_binding_service
             .get_binding(request.id.clone())
@@ -5538,51 +5528,7 @@ impl AgenticRunLifecycleService {
             }
         }
 
-        let mcp = binding
-            .capability_servers
-            .iter()
-            .find(|server| server.id == request.capability_server_refs.mcp)
-            .cloned()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding.capability_server_refs.mcp does not exist in binding",
-                    "agent_binding_capability_ref_missing",
-                )
-            })?;
-        if mcp.server_type != astra_services::CapabilityServerType::Mcp {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "agent_binding.capability_server_refs.mcp does not reference an mcp server",
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
-
-        let skills = binding
-            .capability_servers
-            .iter()
-            .find(|server| server.id == request.capability_server_refs.skills)
-            .cloned()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding.capability_server_refs.skills does not exist in binding",
-                    "agent_binding_capability_ref_missing",
-                )
-            })?;
-        if skills.server_type != astra_services::CapabilityServerType::Skill {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "agent_binding.capability_server_refs.skills does not reference a skill server",
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
-
-        Ok(ResolvedAgentBindingRuntime {
-            binding,
-            mcp_server: mcp,
-            skill_server: skills,
-        })
+        Ok(ResolvedAgentBindingRuntime { binding })
     }
 
     fn requested_agent_bindings(
@@ -5623,7 +5569,6 @@ impl AgenticRunLifecycleService {
     fn agent_binding_runtime_descriptor<'a>(
         label: &'static str,
         descriptor: Option<&'a astra_services::runs::RuntimeCapabilityDescriptorRequest>,
-        expected_id: &str,
         expected_type: &str,
     ) -> Result<
         &'a astra_services::runs::RuntimeCapabilityDescriptorRequest,
@@ -5640,13 +5585,6 @@ impl AgenticRunLifecycleService {
             descriptor,
             expected_type,
         )?;
-        if descriptor.id != expected_id {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                format!("{label}.id must match agent_binding capability server ref"),
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
         Ok(descriptor)
     }
 
@@ -5685,29 +5623,6 @@ impl AgenticRunLifecycleService {
                 .map(|binding| self.resolve_agent_binding_runtime(binding)),
         )
         .await?;
-        let first_request = agent_bindings[0];
-        if agent_bindings
-            .iter()
-            .skip(1)
-            .any(|binding| binding.capability_server_refs != first_request.capability_server_refs)
-        {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "all agent_bindings must use the same capability_server_refs",
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
-        if resolved
-            .iter()
-            .skip(1)
-            .any(|binding| binding.binding.runtime_policy != resolved[0].binding.runtime_policy)
-        {
-            return Err(error_response_coded(
-                StatusCode::CONFLICT,
-                "all agent_bindings must use the same runtime_policy",
-                "agent_binding_policy_conflict",
-            ));
-        }
         let runtime_auth = request.runtime_auth.as_ref().ok_or_else(|| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -5725,26 +5640,23 @@ impl AgenticRunLifecycleService {
         let mcp_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.mcp",
             descriptors.mcp.as_ref(),
-            &resolved[0].mcp_server.id,
             "mcp",
         )?;
         let mcp_endpoint_url = mcp_descriptor.endpoint_url.clone();
-        let skill_endpoint_url = Self::agent_binding_runtime_descriptor(
+        let skill_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.skills",
             descriptors.skills.as_ref(),
-            &resolved[0].skill_server.id,
             "skills",
-        )?
-        .endpoint_url
-        .clone();
+        )?;
+        let skill_endpoint_url = skill_descriptor.endpoint_url.clone();
         tracing::debug!(
             binding_ids = ?resolved.iter().map(|binding| binding.binding.id.as_str()).collect::<Vec<_>>(),
-            mcp_server_id = %resolved[0].mcp_server.id,
-            skill_server_id = %resolved[0].skill_server.id,
-            "resolved Agent Binding Set capability servers"
+            mcp_descriptor_id = %mcp_descriptor.id,
+            skill_descriptor_id = %skill_descriptor.id,
+            "resolved Agent Binding Set runtime capabilities"
         );
         let bundle = runtime_mcp::prepare_agent_binding_mcp_bundle(
-            &resolved[0].mcp_server.id,
+            &mcp_descriptor.id,
             &mcp_endpoint_url,
             &runtime_auth.authorization,
             mcp_descriptor.semantic_read.as_ref(),
@@ -5755,7 +5667,7 @@ impl AgenticRunLifecycleService {
             .map(|binding| binding.binding.id.clone())
             .collect::<Vec<_>>();
         let prepared_skills = agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
-            &resolved[0].skill_server.id,
+            &skill_descriptor.id,
             &skill_endpoint_url,
             &runtime_auth.authorization,
             &binding_ids,
@@ -5922,23 +5834,6 @@ impl AgenticRunLifecycleService {
                 .as_ref()
                 .map(|bundle| bundle.schemas.clone())
                 .unwrap_or_default();
-            let binding_requests = if request.agent_bindings.is_empty() {
-                request.agent_binding.iter().collect::<Vec<_>>()
-            } else {
-                request.agent_bindings.iter().collect::<Vec<_>>()
-            };
-            if binding_requests.len() != binding_context.bindings.len()
-                || binding_requests
-                    .iter()
-                    .zip(&binding_context.bindings)
-                    .any(|(requested, resolved)| requested.id != resolved.id)
-            {
-                return Err(error_response_coded(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "resolved Agent Binding Set does not match the requested set",
-                    "agent_binding_set_inconsistent",
-                ));
-            }
             let skill_catalogs = binding_context
                 .skill_catalogs
                 .iter()
@@ -5948,8 +5843,7 @@ impl AgenticRunLifecycleService {
                 binding_context
                     .bindings
                     .iter()
-                    .zip(binding_requests)
-                    .map(|(binding, binding_request)| {
+                    .map(|binding| {
                         let discovered_skills = skill_catalogs
                             .get(binding.id.as_str())
                             .into_iter()
@@ -5970,11 +5864,6 @@ impl AgenticRunLifecycleService {
                             "binding_name": &binding.binding_name,
                             "binding_schema_version": &binding.binding_schema_version,
                             "agent_md": &binding.agent_md,
-                            "runtime_policy": &binding.runtime_policy,
-                            "selected_capability_server_refs": {
-                                "mcp": &binding_request.capability_server_refs.mcp,
-                                "skills": &binding_request.capability_server_refs.skills
-                            },
                             "discovered_skills": discovered_skills,
                         })
                     })
@@ -7058,28 +6947,12 @@ impl AgenticRunLifecycleService {
         let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
-        let mut requested_budget = request.execution_budget.as_ref().map(|budget| {
+        let requested_budget = request.execution_budget.as_ref().map(|budget| {
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
                 initial_turns: budget.initial_turns.map(|value| value as usize),
                 hard_turn_limit: budget.hard_turn_limit.map(|value| value as usize),
             }
         });
-        if let Some(max_steps) = agent_binding_context
-            .and_then(|context| context.bindings.first())
-            .and_then(|binding| binding.runtime_policy.max_steps)
-        {
-            let max_steps = max_steps as usize;
-            let initial_turns = requested_budget
-                .as_ref()
-                .and_then(|budget| budget.initial_turns)
-                .map(|initial| initial.min(max_steps));
-            requested_budget = Some(
-                astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                    initial_turns,
-                    hard_turn_limit: Some(max_steps),
-                },
-            );
-        }
         let agentic_turn_budget =
             astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
                 task_profile,

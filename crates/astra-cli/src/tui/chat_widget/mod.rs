@@ -227,7 +227,6 @@ struct RuntimeFactSources {
     agent_binding_id: Option<AgentProjectionSource>,
     agent_binding_name: Option<AgentProjectionSource>,
     agent_binding_schema_version: Option<AgentProjectionSource>,
-    capability_server_refs: Option<AgentProjectionSource>,
     background: Option<AgentProjectionSource>,
     permission: Option<AgentProjectionSource>,
 }
@@ -433,7 +432,6 @@ impl AgentRunProjection {
         merge_fact!(agent_binding_id);
         merge_fact!(agent_binding_name);
         merge_fact!(agent_binding_schema_version);
-        merge_fact!(capability_server_refs);
         merge_fact!(background);
         merge_fact!(permission);
     }
@@ -1095,7 +1093,6 @@ fn merge_agent_projections(target: &mut AgentRunProjection, source: AgentRunProj
     merge_runtime_fact_from_projection!(agent_binding_id);
     merge_runtime_fact_from_projection!(agent_binding_name);
     merge_runtime_fact_from_projection!(agent_binding_schema_version);
-    merge_runtime_fact_from_projection!(capability_server_refs);
     merge_runtime_fact_from_projection!(background);
     merge_runtime_fact_from_projection!(permission);
 

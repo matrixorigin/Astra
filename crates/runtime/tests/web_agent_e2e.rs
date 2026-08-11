@@ -28,10 +28,9 @@ use astra_services::skills::{
 };
 use astra_services::{
     AgentBindingCreateRequestData, AgentBindingPayload, AgentBindingService,
-    AuthProviderAuthorizedRequestContext, CapabilityServerEndpoint, CapabilityServerTransport,
-    CapabilityServerType, InMemoryAgentBindingService, ModelCreateRequestData, ModelListItem,
-    ModelRecord, ModelService, ModelUpdateRequestData, ProviderRequestDescriptor,
-    ResolvedActiveLlmModel, ResolvedModelOffering, RuntimePolicy, ToolMode,
+    AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService, ModelCreateRequestData,
+    ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData, ProviderRequestDescriptor,
+    ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use async_trait::async_trait;
 use axum::{
@@ -823,24 +822,6 @@ async fn create_e2e_agent_binding(
             binding: AgentBindingPayload {
                 binding_name: binding_name.to_string(),
                 agent_md: agent_md.to_string(),
-                capability_servers: vec![
-                    CapabilityServerEndpoint {
-                        id: "moi-tools".to_string(),
-                        server_type: CapabilityServerType::Mcp,
-                        transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: None,
-                    },
-                    CapabilityServerEndpoint {
-                        id: "moi-skills".to_string(),
-                        server_type: CapabilityServerType::Skill,
-                        transport: CapabilityServerTransport::StreamableHttp,
-                        endpoint_url: None,
-                    },
-                ],
-                runtime_policy: RuntimePolicy {
-                    max_steps: Some(5),
-                    tool_mode: ToolMode::McpGateway,
-                },
                 metadata: None,
                 binding_schema_version: "v1".to_string(),
             },
@@ -980,14 +961,8 @@ fn agent_binding_chat_payload(
             "model_name": "test-model"
         },
         "agent_bindings": [
-            {
-                "id": foundation_binding_id,
-                "capability_server_refs": {"mcp": "moi-tools", "skills": "moi-skills"}
-            },
-            {
-                "id": extension_binding_id,
-                "capability_server_refs": {"mcp": "moi-tools", "skills": "moi-skills"}
-            }
+            {"id": foundation_binding_id},
+            {"id": extension_binding_id}
         ],
         "runtime_auth": {"authorization": "Bearer runtime-grant"},
         "capability_descriptors": {

@@ -20,8 +20,8 @@ pub mod sse;
 pub use astra_server_types::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
-    SessionRunCapabilityServerRefs, SessionRunLifecycleStatus, SessionRunNode,
-    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
+    SessionRunTreeSnapshot,
 };
 pub use client::ThinClient;
 pub use device_proof::{

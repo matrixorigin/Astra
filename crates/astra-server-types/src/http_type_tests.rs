@@ -159,14 +159,8 @@ fn chat_request_all_fields() {
         "context": {"key": "value"},
         "stable_runtime_system_prompt": "Extension instructions take precedence on semantic overlap.",
         "agent_bindings": [
-            {
-                "id": "binding-foundation",
-                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
-            },
-            {
-                "id": "binding-extension",
-                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
-            }
+            {"id": "binding-foundation"},
+            {"id": "binding-extension"}
         ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "execution_policy": {"turn_intent": "fixed_default"},
@@ -283,17 +277,18 @@ fn chat_request_rejects_runtime_auth_credentials_map() {
 }
 
 #[test]
-fn chat_request_rejects_agent_binding_model_capability_ref() {
+fn chat_request_rejects_removed_agent_binding_capability_refs() {
     let result = serde_json::from_str::<ChatRequest>(
         r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
     );
     assert!(
         result.is_err(),
-        "agent_binding.capability_server_refs.models must be rejected"
+        "agent_binding.capability_server_refs must be rejected"
     );
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("unknown field `models`"),
+        err.to_string()
+            .contains("unknown field `capability_server_refs`"),
         "unexpected error: {err}"
     );
 }

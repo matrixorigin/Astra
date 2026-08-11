@@ -2211,11 +2211,7 @@ mod tests {
                         "runtime_profile": "edge",
                         "model_name": "gpt-5",
                         "model_gateway": "primary",
-                        "agent_binding_id": "reviewer-v2",
-                        "capability_server_refs": {
-                            "mcp": "mcp-edge",
-                            "skills": "skills-edge"
-                        }
+                        "agent_binding_id": "reviewer-v2"
                     },
                     "available_actions": ["cancel"],
                     "created_at": "2026-07-11T00:00:00Z",
@@ -2243,10 +2239,6 @@ mod tests {
         assert_eq!(runtime.runtime_profile.as_deref(), Some("edge"));
         assert_eq!(runtime.model_name.as_deref(), Some("gpt-5"));
         assert_eq!(runtime.agent_binding_id.as_deref(), Some("reviewer-v2"));
-        assert_eq!(
-            runtime.capability_server_refs.as_ref().unwrap().mcp,
-            "mcp-edge"
-        );
     }
 
     #[tokio::test]
