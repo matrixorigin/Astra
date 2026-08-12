@@ -4361,6 +4361,8 @@ impl ServerAgenticLoopHost {
                 selected_offer: None,
                 policy: ToolPolicySnapshot::default(),
                 runtime_file_transfer: None,
+                runtime_edge_dispatch_authorization: None,
+                runtime_edge_dispatch_authorization_required: false,
             };
             let binding = request.runtime_environment_binding(&registry);
             match serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(

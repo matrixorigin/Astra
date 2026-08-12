@@ -523,7 +523,10 @@ fn tool_transport_from_request(
         astra_services::runs::ToolTransportKindRequest::ServerLocal => {
             ToolTransportKind::ServerLocal
         }
-        astra_services::runs::ToolTransportKindRequest::EdgeWs => ToolTransportKind::EdgeWs,
+        astra_services::runs::ToolTransportKindRequest::EdgeWs
+        | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized => {
+            ToolTransportKind::EdgeWs
+        }
         astra_services::runs::ToolTransportKindRequest::EdgeLedger => ToolTransportKind::EdgeLedger,
         astra_services::runs::ToolTransportKindRequest::GatewayRelay => {
             ToolTransportKind::GatewayRelay

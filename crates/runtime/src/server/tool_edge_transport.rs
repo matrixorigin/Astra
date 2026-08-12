@@ -42,6 +42,16 @@ pub(crate) async fn execute_edge_bound(
             ));
         }
     };
+    if plan.runtime_edge_dispatch_authorization_required()
+        && plan.runtime_edge_dispatch_authorization().is_none()
+    {
+        return edge_admission_rejected_result(
+            &request,
+            binding,
+            "edge-authorization",
+            "provider executor authorization context is unavailable",
+        );
+    }
 
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
@@ -62,7 +72,9 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    if plan.runtime_file_transfer().is_none() {
+    if plan.runtime_file_transfer().is_none()
+        && plan.runtime_edge_dispatch_authorization().is_none()
+    {
         match try_edge_dispatch(
             &request,
             binding,
@@ -95,6 +107,11 @@ pub(crate) async fn execute_edge_bound(
                     .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
             }
         }
+    } else if plan.runtime_edge_dispatch_authorization().is_some() {
+        diagnostics.push(
+            "edge-dispatch: provider-authorized executor requires live reauthorization and cannot use durable relay"
+                .to_string(),
+        );
     } else {
         diagnostics.push(
             "edge-dispatch: request-scoped transfer credentials require live websocket delivery"
@@ -327,6 +344,16 @@ async fn try_edge_websocket(
             }
         }
     };
+    if let Some(authorization) = plan.runtime_edge_dispatch_authorization() {
+        if authorization.executor_id != edge.edge_agent_id {
+            return EdgeTransportAttempt::AdmissionRejected(
+                "selected edge does not match the provider authorization scope".to_string(),
+            );
+        }
+        if let Err(error) = authorize_edge_dispatch(authorization, request).await {
+            return EdgeTransportAttempt::AdmissionRejected(error);
+        }
+    }
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
         &request.session_id,
@@ -413,6 +440,41 @@ async fn try_edge_websocket(
         ToolTransportKind::EdgeWs,
         edge_result.tool_result_fields,
     ))
+}
+
+async fn authorize_edge_dispatch(
+    authorization: &astra_services::runs::RuntimeEdgeDispatchAuthorizationContext,
+    request: &ToolExecutionRequest,
+) -> Result<(), String> {
+    let client = astra_core::net::client_builder_for_target(&authorization.endpoint_url)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| "runtime executor authorization client is unavailable".to_string())?;
+    let response = client
+        .post(&authorization.endpoint_url)
+        .header(reqwest::header::AUTHORIZATION, &authorization.authorization)
+        .json(&serde_json::json!({
+            "task_id": authorization.task_id,
+            "executor_id": authorization.executor_id,
+            "run_id": request.run_id,
+            "turn_chain_id": request.turn_chain_id,
+            "tool_call_id": request.tool_call_id,
+        }))
+        .send()
+        .await
+        .map_err(|_| "runtime executor authorization service is unavailable".to_string())?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+    ) {
+        return Err("current runtime executor authorization was denied".to_string());
+    }
+    Err("runtime executor authorization service did not confirm dispatch".to_string())
 }
 
 async fn try_edge_dispatch(
@@ -719,7 +781,7 @@ fn edge_transport_failure_message(
     }
 }
 
-fn edge_admission_rejected_result(
+pub(crate) fn edge_admission_rejected_result(
     request: &ToolExecutionRequest,
     binding: &astra_runtime_env::RunBinding,
     transport: &str,

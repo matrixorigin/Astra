@@ -529,6 +529,9 @@ pub struct RuntimeToolExecutor {
     /// Hidden RuntimeGrant-backed byte-transfer context for managed Edge
     /// tools. It is attached after model admission and never merged into args.
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    /// Provider-owned live authorization callback for the selected Edge.
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
 }
 
 impl RuntimeToolExecutor {
@@ -613,6 +616,7 @@ impl RuntimeToolExecutor {
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
             runtime_file_transfer: None,
+            runtime_edge_dispatch_authorization: None,
         }
     }
 
@@ -650,6 +654,14 @@ impl RuntimeToolExecutor {
         context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     ) -> Self {
         self.runtime_file_transfer = context;
+        self
+    }
+
+    pub fn with_runtime_edge_dispatch_authorization(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    ) -> Self {
+        self.runtime_edge_dispatch_authorization = context;
         self
     }
 
@@ -1921,6 +1933,10 @@ impl RuntimeToolExecutor {
             request = request.with_selected_offer(offer);
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_edge_dispatch_authorization =
+            self.runtime_edge_dispatch_authorization.clone();
+        request.runtime_edge_dispatch_authorization_required =
+            self.runtime_edge_dispatch_authorization.is_some();
         request
     }
 
@@ -1938,6 +1954,10 @@ impl RuntimeToolExecutor {
             request = request.with_selected_offer(offer);
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_edge_dispatch_authorization =
+            self.runtime_edge_dispatch_authorization.clone();
+        request.runtime_edge_dispatch_authorization_required =
+            self.runtime_edge_dispatch_authorization.is_some();
         request
     }
 

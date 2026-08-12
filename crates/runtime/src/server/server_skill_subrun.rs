@@ -63,6 +63,8 @@ pub struct ServerSkillSubRunExecutor {
     /// Workspace/executor/runtime binding inherited from the parent run.
     execution_binding_snapshot: Option<ExecutionBindingSnapshot>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
     /// Skill resolver inherited from parent — enables nested inline skills.
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     /// Parent cancellation token — propagated so stop/cancel interrupts sub-runs.
@@ -119,6 +121,7 @@ impl ServerSkillSubRunExecutor {
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
             runtime_file_transfer: None,
+            runtime_edge_dispatch_authorization: None,
             skill_resolver: None,
             cancel_token: None,
             forward_headers: HashMap::new(),
@@ -199,6 +202,14 @@ impl ServerSkillSubRunExecutor {
         context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     ) -> Self {
         self.runtime_file_transfer = context;
+        self
+    }
+
+    pub fn with_runtime_edge_dispatch_authorization(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    ) -> Self {
+        self.runtime_edge_dispatch_authorization = context;
         self
     }
 
@@ -608,6 +619,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ))
             .with_cancel_token(self.cancel_token.clone())
             .with_runtime_file_transfer(self.runtime_file_transfer.clone())
+            .with_runtime_edge_dispatch_authorization(
+                self.runtime_edge_dispatch_authorization.clone(),
+            )
             .with_tool_execution_service(builder.build());
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());

@@ -354,6 +354,10 @@ pub enum ExecutorBindingRequestKind {
 pub enum ToolTransportKindRequest {
     ServerLocal,
     EdgeWs,
+    /// Live edge WebSocket delivery guarded by a provider callback immediately
+    /// before each dispatch. This is intentionally a distinct wire value so an
+    /// older runtime fails closed instead of treating it as ordinary edge_ws.
+    EdgeWsAuthorized,
     EdgeLedger,
     GatewayRelay,
     SandboxResidentAgent,
@@ -506,6 +510,28 @@ impl std::fmt::Debug for RuntimeFileTransferContext {
             .field("task_id", &self.task_id)
             .field("root", &self.root)
             .field("attachment_count", &self.attachments.len())
+            .finish()
+    }
+}
+
+/// Request-scoped provider callback used to reauthorize a selected Edge
+/// executor immediately before dispatch. The bearer is deliberately skipped
+/// by durable tool snapshots and redacted from Debug output.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeEdgeDispatchAuthorizationContext {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub task_id: String,
+    pub executor_id: String,
+}
+
+impl std::fmt::Debug for RuntimeEdgeDispatchAuthorizationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeEdgeDispatchAuthorizationContext")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("task_id", &self.task_id)
+            .field("executor_id", &self.executor_id)
             .finish()
     }
 }

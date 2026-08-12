@@ -419,6 +419,8 @@ mod tests {
             workspace_record: None,
             runtime: None,
             runtime_file_transfer: None,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,
             policy: crate::server::tool_transport::ToolPolicySnapshot::default(),
         }

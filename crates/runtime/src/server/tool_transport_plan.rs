@@ -30,6 +30,9 @@ pub(crate) struct EdgeBoundExecutionPlan {
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_edge_dispatch_authorization:
+        Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
+    runtime_edge_dispatch_authorization_required: bool,
 }
 
 impl EdgeBoundExecutionPlan {
@@ -66,6 +69,11 @@ impl EdgeBoundExecutionPlan {
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
             runtime_file_transfer: request.runtime_file_transfer.clone(),
+            runtime_edge_dispatch_authorization: request
+                .runtime_edge_dispatch_authorization
+                .clone(),
+            runtime_edge_dispatch_authorization_required: request
+                .runtime_edge_dispatch_authorization_required,
         })
     }
 
@@ -90,6 +98,16 @@ impl EdgeBoundExecutionPlan {
         &self,
     ) -> Option<&astra_services::runs::RuntimeFileTransferContext> {
         self.runtime_file_transfer.as_deref()
+    }
+
+    pub(crate) fn runtime_edge_dispatch_authorization(
+        &self,
+    ) -> Option<&astra_services::runs::RuntimeEdgeDispatchAuthorizationContext> {
+        self.runtime_edge_dispatch_authorization.as_deref()
+    }
+
+    pub(crate) fn runtime_edge_dispatch_authorization_required(&self) -> bool {
+        self.runtime_edge_dispatch_authorization_required
     }
 
     pub(crate) fn wait_timeout(&self) -> Duration {

@@ -5861,6 +5861,106 @@ fn runtime_file_transfer_rejects_edge_invalid_attachment_inventory_at_request_bo
     }
 }
 
+fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
+    let mut request = prepared_test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Runner".to_string()),
+        root: Some("/workspace".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/workspace".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("runner-r1".to_string()),
+        display_name: Some("Runner".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    let mut descriptor = test_runtime_descriptor(
+        "runner-r1",
+        "edge_agent",
+        "http://127.0.0.1/api/v1/runtime-executors/authorize",
+    );
+    descriptor.transport = "edge_ws".to_string();
+    descriptor.protocol = "moi_edge_dispatch_authorization_v1".to_string();
+    descriptor.metadata = json!({
+        "contract_version": 1,
+        "task_id": "task-1",
+        "executor_id": "runner-r1"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: None,
+            mcp: None,
+            skills: None,
+            edge_agent: Some(descriptor),
+            file_transfer: None,
+        });
+    request
+}
+
+#[test]
+fn runtime_executor_authorization_requires_versioned_transport_and_matching_scope() {
+    let request = authorized_edge_dispatch_request();
+    let context = AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(&request)
+        .expect("valid authorization descriptor")
+        .expect("authorization context");
+    assert_eq!(context.task_id, "task-1");
+    assert_eq!(context.executor_id, "runner-r1");
+
+    let mut server_sandbox = request.clone();
+    server_sandbox.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+        display_name: Some("Server sandbox".to_string()),
+        root: None,
+        source: None,
+        authority: None,
+    });
+    assert_eq!(
+        AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(&server_sandbox)
+            .expect_err("authorized edge transport must not bind to a server workspace"),
+        "runtime executor authorization requires an edge_workspace binding"
+    );
+
+    let mut ordinary_transport = request.clone();
+    ordinary_transport
+        .executor_binding
+        .as_mut()
+        .expect("executor binding")
+        .transport = Some(astra_services::runs::ToolTransportKindRequest::EdgeWs);
+    assert!(
+        AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(
+            &ordinary_transport
+        )
+        .is_err(),
+        "ordinary edge_ws must not silently accept the authorization descriptor"
+    );
+
+    let mut mismatched_executor = request;
+    mismatched_executor
+        .executor_binding
+        .as_mut()
+        .expect("executor binding")
+        .executor_id = Some("runner-r2".to_string());
+    assert!(
+        AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(
+            &mismatched_executor
+        )
+        .is_err(),
+        "descriptor scope must match the selected executor"
+    );
+}
+
 #[tokio::test]
 async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_gateway() {
     let service = test_service();

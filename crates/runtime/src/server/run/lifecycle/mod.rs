@@ -87,6 +87,14 @@ struct RuntimeFileTransferMetadata {
     attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeEdgeDispatchAuthorizationMetadata {
+    contract_version: u32,
+    task_id: String,
+    executor_id: String,
+}
+
 const MAX_RUNTIME_ATTACHMENT_NAME_BYTES: usize = 240;
 
 fn valid_runtime_attachment_name(name: &str) -> bool {
@@ -2136,6 +2144,9 @@ fn build_server_skill_executor(
     edge_profile: &Map<String, Value>,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_edge_dispatch_authorization: Option<
+        Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>,
+    >,
     forward_headers: &HashMap<String, String>,
     request_constraints: RequestConstraints,
     inherited_permissions: InheritedPermissions,
@@ -2166,6 +2177,7 @@ fn build_server_skill_executor(
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_runtime_file_transfer(runtime_file_transfer)
+    .with_runtime_edge_dispatch_authorization(runtime_edge_dispatch_authorization)
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
     .with_inherited_permissions(inherited_permissions)
@@ -4939,6 +4951,13 @@ impl AgenticRunLifecycleService {
                 "runtime_file_transfer_invalid",
             )
         })?;
+        Self::runtime_edge_dispatch_authorization_context(request).map_err(|detail| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                detail,
+                "runtime_executor_authorization_invalid",
+            )
+        })?;
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -5071,6 +5090,93 @@ impl AgenticRunLifecycleService {
                 scratch_dir: metadata.scratch_dir,
                 max_file_bytes: metadata.max_file_bytes,
                 attachments: metadata.attachments,
+            },
+        )))
+    }
+
+    fn runtime_edge_dispatch_authorization_context(
+        request: &ChatRequestData,
+    ) -> Result<Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>, String>
+    {
+        let authorized_transport = request.executor_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.transport,
+                Some(astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized)
+            )
+        });
+        let descriptor = request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.edge_agent.as_ref());
+        let authorization_descriptor = descriptor
+            .filter(|descriptor| descriptor.protocol == "moi_edge_dispatch_authorization_v1");
+        if !authorized_transport && authorization_descriptor.is_none() {
+            return Ok(None);
+        }
+        if !authorized_transport || authorization_descriptor.is_none() {
+            return Err(
+                "authorized edge transport and dispatch authorization descriptor must be provided together"
+                    .to_string(),
+            );
+        }
+        if !request.workspace_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.kind,
+                astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+            )
+        }) {
+            return Err(
+                "runtime executor authorization requires an edge_workspace binding".to_string(),
+            );
+        }
+        if !request.provider_runtime_authorized {
+            return Err(
+                "runtime executor authorization requires provider-authorized runtime context"
+                    .to_string(),
+            );
+        }
+        let binding = request.executor_binding.as_ref().ok_or_else(|| {
+            "runtime executor authorization requires executor_binding".to_string()
+        })?;
+        let executor_id = binding
+            .executor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "runtime executor authorization requires executor_id".to_string())?;
+        let descriptor = authorization_descriptor.expect("checked above");
+        if descriptor.id != executor_id
+            || descriptor.descriptor_type != "edge_agent"
+            || descriptor.transport != "edge_ws"
+            || !(descriptor.endpoint_url.starts_with("http://")
+                || descriptor.endpoint_url.starts_with("https://"))
+        {
+            return Err(
+                "runtime executor authorization descriptor contract is invalid".to_string(),
+            );
+        }
+        let metadata: RuntimeEdgeDispatchAuthorizationMetadata = serde_json::from_value(
+            Value::Object(descriptor.metadata.clone()),
+        )
+        .map_err(|error| format!("runtime executor authorization metadata is invalid: {error}"))?;
+        if metadata.contract_version != 1
+            || metadata.task_id.trim().is_empty()
+            || metadata.task_id.contains('/')
+            || metadata.task_id.contains('\\')
+            || metadata.executor_id != executor_id
+        {
+            return Err("runtime executor authorization metadata contract is invalid".to_string());
+        }
+        let auth = request
+            .runtime_auth
+            .as_ref()
+            .ok_or_else(|| "runtime executor authorization requires runtime_auth".to_string())?;
+        Ok(Some(Arc::new(
+            astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+                endpoint_url: descriptor.endpoint_url.clone(),
+                authorization: auth.authorization.clone(),
+                task_id: metadata.task_id,
+                executor_id: metadata.executor_id,
             },
         )))
     }
@@ -7073,6 +7179,8 @@ impl AgenticRunLifecycleService {
             execution_bindings,
             Self::runtime_file_transfer_context(request)
                 .expect("runtime file transfer was validated before state construction"),
+            Self::runtime_edge_dispatch_authorization_context(request)
+                .expect("runtime executor authorization was validated before state construction"),
             &request.forward_headers,
             request_constraints.clone(),
             root_permissions.clone(),
@@ -8785,6 +8893,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_runtime_file_transfer(
                 Self::runtime_file_transfer_context(&request)
                     .expect("runtime file transfer was validated before run start"),
+            )
+            .with_runtime_edge_dispatch_authorization(
+                Self::runtime_edge_dispatch_authorization_context(&request)
+                    .expect("runtime executor authorization was validated before run start"),
             );
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(loop_state.cancellation.token.clone())
@@ -10432,6 +10544,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_runtime_file_transfer(
                 Self::runtime_file_transfer_context(&request)
                     .expect("runtime file transfer was validated before streaming run start"),
+            )
+            .with_runtime_edge_dispatch_authorization(
+                Self::runtime_edge_dispatch_authorization_context(&request).expect(
+                    "runtime executor authorization was validated before streaming run start",
+                ),
             );
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(state.cancellation.token.clone())
