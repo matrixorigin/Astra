@@ -1,5 +1,8 @@
-use std::io::{Read as _, Write as _};
+use std::io::{Read as _, Seek as _};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(test)]
+use std::io::Write as _;
 
 use astra_server_types::edge_ws_protocol::{
     RuntimeFileTransferAttachment, RuntimeFileTransferContext,
@@ -10,6 +13,8 @@ use md5::{Digest as _, Md5};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::Sha256;
+use tokio::io::AsyncWriteExt as _;
+use tokio_util::io::ReaderStream;
 
 pub(crate) async fn execute(
     tool: &str,
@@ -61,11 +66,11 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
             &trusted_root,
             max_file_bytes,
         )
-        .map(|artifact| artifact.content)
+        .map(|artifact| (artifact.size, artifact.md5))
     })
     .await
-        && existing.len() as i64 == attachment.size
-        && md5_hex(&existing) == attachment.md5
+        && existing.0 == attachment.size
+        && existing.1 == attachment.md5
     {
         return materialized_result(attachment, &destination);
     }
@@ -108,41 +113,20 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
             "attachment download exceeds the runtime transfer limit".to_string(),
         );
     }
-    let mut content = Vec::with_capacity(attachment.size.max(0) as usize);
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = match chunk {
-            Ok(chunk) => chunk,
-            Err(error) => {
-                return ToolResult::error(format!("attachment download body failed: {error}"));
-            }
-        };
-        if content.len().saturating_add(chunk.len()) > context.max_file_bytes as usize {
-            return ToolResult::error(
-                "attachment download exceeds the runtime transfer limit".to_string(),
-            );
-        }
-        content.extend_from_slice(&chunk);
-    }
-    if content.len() as u64 > context.max_file_bytes
-        || content.len() as i64 != attachment.size
-        || md5_hex(&content) != attachment.md5
-    {
-        return ToolResult::error(
-            "attachment content failed size or digest verification".to_string(),
-        );
-    }
     let catalog_root = PathBuf::from(&context.catalog_dir);
     let trusted_root = trusted_sandbox_root(context);
-    let destination_name = filename.clone();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        atomic_write_beneath(&trusted_root, &catalog_root, &destination_name, &content)
-    })
+    if let Err(error) = stream_attachment_beneath(
+        response,
+        &trusted_root,
+        &catalog_root,
+        &filename,
+        context.max_file_bytes,
+        attachment.size,
+        &attachment.md5,
+    )
     .await
-    .map_err(|error| format!("attachment staging task failed: {error}"))
-    .and_then(|result| result)
     {
-        return ToolResult::error(format!("attachment atomic publish failed: {error}"));
+        return ToolResult::error(error);
     }
     materialized_result(attachment, &destination)
 }
@@ -234,11 +218,11 @@ async fn publish(
         Ok(Err(error)) => return ToolResult::error(error),
         Err(error) => return ToolResult::error(format!("artifact read task failed: {error}")),
     };
-    let content = opened.content;
-    let digest = format!("sha256:{:x}", Sha256::digest(&content));
-    let content_md5 = md5_hex(&content);
-    let content_size = content.len() as i64;
+    let digest = opened.sha256;
+    let content_md5 = opened.md5;
+    let content_size = opened.size;
     let filename = opened.filename;
+    let upload = ReaderStream::new(tokio::fs::File::from_std(opened.file));
     let mut url = match reqwest::Url::parse(&context.endpoint_url) {
         Ok(url) => url,
         Err(error) => {
@@ -252,13 +236,14 @@ async fn publish(
         .post(url)
         .header(reqwest::header::AUTHORIZATION, &context.authorization)
         .header("X-MOI-Content-SHA256", &digest)
+        .header(reqwest::header::CONTENT_LENGTH, content_size)
         .header(
             reqwest::header::CONTENT_TYPE,
             args.content_type
                 .as_deref()
                 .unwrap_or("application/octet-stream"),
         )
-        .body(content)
+        .body(reqwest::Body::wrap_stream(upload))
         .send()
         .await
     {
@@ -493,15 +478,71 @@ fn create_dir_all_beneath(_trusted_root: &Path, _path: &Path) -> Result<(), Stri
 }
 
 #[cfg(unix)]
-fn atomic_write_beneath(
+struct AtomicStagedFile {
+    root_fd: std::os::fd::OwnedFd,
+    temporary: String,
+    destination: String,
+    file: Option<std::fs::File>,
+    committed: bool,
+}
+
+#[cfg(unix)]
+impl AtomicStagedFile {
+    fn take_file(&mut self) -> Result<std::fs::File, String> {
+        self.file
+            .take()
+            .ok_or_else(|| "attachment staging file is unavailable".to_string())
+    }
+
+    fn restore_file(&mut self, file: std::fs::File) {
+        self.file = Some(file);
+    }
+
+    fn commit(mut self) -> Result<(), String> {
+        use nix::fcntl::renameat;
+
+        let staged = self
+            .file
+            .take()
+            .ok_or_else(|| "attachment staging file is unavailable".to_string())?;
+        staged
+            .sync_all()
+            .map_err(|error| format!("attachment staging sync failed: {error}"))?;
+        drop(staged);
+        renameat(
+            &self.root_fd,
+            self.temporary.as_str(),
+            &self.root_fd,
+            self.destination.as_str(),
+        )
+        .map_err(|error| format!("attachment rename failed: {error}"))?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AtomicStagedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            use nix::unistd::{UnlinkatFlags, unlinkat};
+            let _ = unlinkat(
+                &self.root_fd,
+                self.temporary.as_str(),
+                UnlinkatFlags::NoRemoveDir,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn begin_atomic_write_beneath(
     trusted_root: &Path,
     root: &Path,
     filename: &str,
-    content: &[u8],
-) -> Result<(), String> {
-    use nix::fcntl::{OFlag, openat, renameat};
+) -> Result<AtomicStagedFile, String> {
+    use nix::fcntl::{OFlag, openat};
     use nix::sys::stat::Mode;
-    use nix::unistd::{UnlinkatFlags, unlinkat};
 
     let relative_root = path_beneath_trusted_root(trusted_root, root)?;
     let trusted_fd = open_trusted_root(trusted_root)?;
@@ -515,27 +556,108 @@ fn atomic_write_beneath(
         Mode::from_bits_truncate(0o600),
     )
     .map_err(|error| format!("attachment staging open failed: {error}"))?;
-    let mut staged = std::fs::File::from(staged_fd);
-    if let Err(error) = staged.write_all(content).and_then(|()| staged.sync_all()) {
-        let _ = unlinkat(&root_fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
-        return Err(format!("attachment staging write failed: {error}"));
-    }
-    drop(staged);
-    if let Err(error) = renameat(&root_fd, temporary.as_str(), &root_fd, filename) {
-        let _ = unlinkat(&root_fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
-        return Err(format!("attachment rename failed: {error}"));
-    }
-    Ok(())
+    Ok(AtomicStagedFile {
+        root_fd,
+        temporary,
+        destination: filename.to_string(),
+        file: Some(std::fs::File::from(staged_fd)),
+        committed: false,
+    })
 }
 
 #[cfg(not(unix))]
-fn atomic_write_beneath(
+fn begin_atomic_write_beneath(
     _trusted_root: &Path,
     _root: &Path,
     _filename: &str,
-    _content: &[u8],
 ) -> Result<(), String> {
     Err("secure attachment materialization is unsupported on this platform".to_string())
+}
+
+#[cfg(unix)]
+async fn stream_attachment_beneath(
+    response: reqwest::Response,
+    trusted_root: &Path,
+    catalog_root: &Path,
+    filename: &str,
+    max_file_bytes: u64,
+    expected_size: i64,
+    expected_md5: &str,
+) -> Result<(), String> {
+    let trusted_root = trusted_root.to_path_buf();
+    let catalog_root = catalog_root.to_path_buf();
+    let filename = filename.to_string();
+    let mut staged = tokio::task::spawn_blocking(move || {
+        begin_atomic_write_beneath(&trusted_root, &catalog_root, &filename)
+    })
+    .await
+    .map_err(|error| format!("attachment staging task failed: {error}"))??;
+    let mut file = tokio::fs::File::from_std(staged.take_file()?);
+    let mut received = 0_u64;
+    let mut md5 = Md5::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("attachment download body failed: {error}"))?;
+        received = received
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| "attachment download exceeds the runtime transfer limit".to_string())?;
+        if received > max_file_bytes {
+            return Err("attachment download exceeds the runtime transfer limit".to_string());
+        }
+        md5.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("attachment staging write failed: {error}"))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("attachment staging write failed: {error}"))?;
+    staged.restore_file(file.into_std().await);
+    if received as i64 != expected_size || format!("{:x}", md5.finalize()) != expected_md5 {
+        return Err("attachment content failed size or digest verification".to_string());
+    }
+    tokio::task::spawn_blocking(move || staged.commit())
+        .await
+        .map_err(|error| format!("attachment staging task failed: {error}"))?
+        .map_err(|error| format!("attachment atomic publish failed: {error}"))
+}
+
+#[cfg(not(unix))]
+async fn stream_attachment_beneath(
+    _response: reqwest::Response,
+    _trusted_root: &Path,
+    _catalog_root: &Path,
+    _filename: &str,
+    _max_file_bytes: u64,
+    _expected_size: i64,
+    _expected_md5: &str,
+) -> Result<(), String> {
+    Err("secure attachment materialization is unsupported on this platform".to_string())
+}
+
+#[cfg(test)]
+fn atomic_write_beneath(
+    trusted_root: &Path,
+    root: &Path,
+    filename: &str,
+    content: &[u8],
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let mut staged = begin_atomic_write_beneath(trusted_root, root, filename)?;
+        staged
+            .file
+            .as_mut()
+            .ok_or_else(|| "attachment staging file is unavailable".to_string())?
+            .write_all(content)
+            .map_err(|error| format!("attachment staging write failed: {error}"))?;
+        staged.commit()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (trusted_root, root, filename, content);
+        Err("secure attachment materialization is unsupported on this platform".to_string())
+    }
 }
 
 fn safe_filename(name: &str) -> Option<&str> {
@@ -569,13 +691,17 @@ fn materialized_filename(
     Some(format!("{}-{filename}", &id_hash[..12]))
 }
 
+#[cfg(test)]
 fn md5_hex(content: &[u8]) -> String {
     format!("{:x}", Md5::digest(content))
 }
 
 struct ScopedArtifact {
     filename: String,
-    content: Vec<u8>,
+    file: std::fs::File,
+    size: i64,
+    md5: String,
+    sha256: String,
 }
 
 fn read_scoped_artifact(
@@ -621,18 +747,38 @@ fn read_scoped_artifact(
             "artifact must be between 1 and {max_file_bytes} bytes"
         ));
     }
-    let mut content = Vec::with_capacity(metadata.len() as usize);
-    std::io::Read::by_ref(&mut file)
-        .take(max_file_bytes.saturating_add(1))
-        .read_to_end(&mut content)
-        .map_err(|error| format!("artifact read failed: {error}"))?;
-    if content.is_empty()
-        || content.len() as u64 > max_file_bytes
-        || content.len() as u64 != metadata.len()
-    {
+    let mut md5 = Md5::new();
+    let mut sha256 = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("artifact read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| "artifact changed size while it was being read".to_string())?;
+        if size > max_file_bytes {
+            return Err("artifact changed size while it was being read".to_string());
+        }
+        md5.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
+    }
+    if size == 0 || size != metadata.len() {
         return Err("artifact changed size while it was being read".to_string());
     }
-    Ok(ScopedArtifact { filename, content })
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("artifact rewind failed: {error}"))?;
+    Ok(ScopedArtifact {
+        filename,
+        file,
+        size: size as i64,
+        md5: format!("{:x}", md5.finalize()),
+        sha256: format!("sha256:{:x}", sha256.finalize()),
+    })
 }
 
 #[cfg(target_os = "linux")]

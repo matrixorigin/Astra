@@ -21,7 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "signal", "time"] }
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
 tokio-tungstenite = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }

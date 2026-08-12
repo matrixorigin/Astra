@@ -623,10 +623,18 @@ fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
         // Treating a source outside the workspace as a write target rejected
         // safe staging such as `cp ../catalog/input.pdf ./input.pdf`.
         "cp" => positional.last().copied().into_iter().collect(),
-        "rsync" => rsync_write_option_targets(arguments)
-            .into_iter()
-            .chain(positional.last().copied())
-            .collect(),
+        "rsync" => {
+            let removes_sources = arguments.iter().any(|argument| {
+                argument.trim_matches(['"', '\'', ';', '&']) == "--remove-source-files"
+            });
+            let mut targets = rsync_write_option_targets(arguments);
+            if removes_sources {
+                targets.extend(positional);
+            } else if let Some(destination) = positional.last() {
+                targets.push(*destination);
+            }
+            targets
+        }
         "install"
             if !arguments.iter().any(|argument| {
                 matches!(
@@ -1320,6 +1328,36 @@ mod tests {
                 .iter()
                 .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
             "read-only rsync compare source must remain allowed: {risks:?}"
+        );
+    }
+
+    #[test]
+    fn rsync_remove_source_files_treats_sources_as_mutations() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let command = format!(
+            "rsync --remove-source-files '{}/input.txt' reports/dst",
+            outside.display()
+        );
+        let risks = analyze_command_risks_in_workspace(&command, &workspace);
+        assert!(
+            risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "rsync source deletion outside the workspace must be rejected: {risks:?}"
+        );
+
+        let copy_only = format!("rsync '{}/input.txt' reports/dst", outside.display());
+        let risks = analyze_command_risks_in_workspace(&copy_only, &workspace);
+        assert!(
+            !risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "read-only rsync sources must remain allowed: {risks:?}"
         );
     }
 
