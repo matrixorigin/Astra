@@ -1522,6 +1522,16 @@ async fn drop_column_if_present(
     Ok(())
 }
 
+async fn migrate_legacy_agent_binding_runtime_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    for column in ["capability_servers_json", "runtime_policy_json"] {
+        drop_column_if_present(pool, database, "agent_bindings", column).await?;
+    }
+    Ok(())
+}
+
 async fn add_index_if_missing(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2621,6 +2631,11 @@ async fn ensure_core_schema_while_leased(
     pool: sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    // These runtime-owned columns were removed without changing the core
+    // schema contract version. Reconcile that exact legacy shape before the
+    // contract fast path so existing v24 databases receive the migration.
+    migrate_legacy_agent_binding_runtime_columns(&pool, &settings.database).await?;
+
     if core_schema_contract_is_current(&pool).await? {
         verify_core_schema_catalog(&pool, &settings.database).await?;
         verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
@@ -6552,21 +6567,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-    drop_column_if_present(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        "capability_servers_json",
-    )
-    .await?;
-    drop_column_if_present(
-        &pool,
-        &settings.database,
-        "agent_bindings",
-        "runtime_policy_json",
-    )
-    .await?;
-
     core_schema_create!(
         pool,
         "mcp_servers",
