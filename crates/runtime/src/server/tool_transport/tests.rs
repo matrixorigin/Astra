@@ -1566,6 +1566,48 @@ fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
 }
 
 #[test]
+fn validated_transfer_context_authorizes_edge_interceptor_support() {
+    let mut request = request(
+        "materialize_attachment",
+        WorkspaceBinding::edge_workspace(
+            "Managed sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-selected",
+            "Managed sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.runtime_file_transfer = Some(std::sync::Arc::new(
+        astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            task_id: "task-1".to_string(),
+            root: "/sandbox/.moi/runtime/task-1".to_string(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        },
+    ));
+    let agent = edge_agent_record("edge-selected");
+
+    let selected = super::super::tool_edge_selection::select_capable_edge_agent(
+        std::slice::from_ref(&agent),
+        Some("edge-selected"),
+        &request,
+        &astra_runtime_env::ToolRegistry::builtins(),
+    )
+    .expect("validated transfer context must authorize the edge interceptor");
+
+    assert!(selected.is_some());
+}
+
+#[test]
 fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(

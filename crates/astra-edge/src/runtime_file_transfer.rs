@@ -50,11 +50,6 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
         return ToolResult::error("attachment exceeds the runtime transfer limit".to_string());
     }
     let destination = Path::new(&context.catalog_dir).join(&filename);
-    if let Err(error) = tokio::fs::create_dir_all(&context.catalog_dir).await {
-        return ToolResult::error(format!(
-            "failed to create runtime catalog directory: {error}"
-        ));
-    }
     let catalog_root = PathBuf::from(&context.catalog_dir);
     let trusted_root = trusted_sandbox_root(context);
     let cached_filename = filename.clone();

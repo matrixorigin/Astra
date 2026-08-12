@@ -1920,7 +1920,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_file_transfer = self.runtime_file_transfer.clone();
+        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request
     }
 
@@ -1937,8 +1937,17 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_file_transfer = self.runtime_file_transfer.clone();
+        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request
+    }
+
+    fn runtime_file_transfer_for_tool(
+        &self,
+        name: &str,
+    ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
+        matches!(name, "materialize_attachment" | "publish_artifact")
+            .then(|| self.runtime_file_transfer.clone())
+            .flatten()
     }
 
     fn selected_offer_for_request(
@@ -4032,6 +4041,39 @@ mod tests {
         assert!(!names.contains("bash"));
         assert!(!names.contains("read_file"));
         assert!(!exec.supports_server_tool_name("bash"));
+    }
+
+    #[test]
+    fn transfer_credentials_are_attached_only_to_transfer_tools() {
+        let (exec, _dir) = test_executor();
+        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            task_id: "task-1".to_string(),
+            root: "/sandbox/.moi/runtime/task-1".to_string(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        });
+        let exec = exec.with_runtime_file_transfer(Some(context));
+
+        assert!(
+            exec.tool_execution_request("materialize_attachment", &Value::Null)
+                .runtime_file_transfer
+                .is_some()
+        );
+        assert!(
+            exec.tool_execution_request("publish_artifact", &Value::Null)
+                .runtime_file_transfer
+                .is_some()
+        );
+        assert!(
+            exec.tool_execution_request("bash", &json!({"command": "pwd"}))
+                .runtime_file_transfer
+                .is_none()
+        );
     }
 
     #[test]

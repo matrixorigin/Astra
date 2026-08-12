@@ -154,6 +154,36 @@ pub trait EdgeDispatchService: Send + Sync {
         Ok(true)
     }
 
+    /// Atomically admit a durable row and reserve it for direct socket
+    /// delivery. Durable implementations must prevent relay polling from
+    /// observing a newly admitted request between these two state changes.
+    async fn admit_and_claim_direct_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload_json: &str,
+    ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
+        match self
+            .admit_dispatch(identity, edge_agent_id, payload_json)
+            .await?
+        {
+            EdgeDispatchAdmission::Terminal(result) => {
+                Ok(EdgeDirectDispatchAdmission::Terminal(result))
+            }
+            EdgeDispatchAdmission::Pending => self
+                .claim_direct_dispatch(identity, edge_agent_id)
+                .await
+                .map(|claimed| {
+                    if claimed {
+                        EdgeDirectDispatchAdmission::Claimed
+                    } else {
+                        EdgeDirectDispatchAdmission::Observing
+                    }
+                })
+                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown),
+        }
+    }
+
     /// Poll for pending dispatches targeting the given (user, agent) pairs.
     /// Returns dispatches that are still 'pending' and not yet dispatched.
     async fn poll_pending(
@@ -205,6 +235,13 @@ pub trait EdgeDispatchService: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EdgeDispatchAdmission {
     Pending,
+    Terminal(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EdgeDirectDispatchAdmission {
+    Claimed,
+    Observing,
     Terminal(String),
 }
 
@@ -905,6 +942,174 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 identity.request_id
             ))),
         }
+    }
+
+    async fn admit_and_claim_direct_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+        payload_json: &str,
+    ) -> Result<EdgeDirectDispatchAdmission, EdgeDispatchAdmissionError> {
+        if !identity.is_complete() {
+            return Err(EdgeDispatchAdmissionError::Rejected(
+                "edge_dispatch direct admit: incomplete dispatch identity".to_string(),
+            ));
+        }
+        if edge_agent_id.trim().is_empty() {
+            return Err(EdgeDispatchAdmissionError::Rejected(
+                "edge_dispatch direct admit: edge_agent_id is required".to_string(),
+            ));
+        }
+        serde_json::from_str::<serde_json::Value>(payload_json).map_err(|error| {
+            EdgeDispatchAdmissionError::Rejected(format!(
+                "edge_dispatch direct admit: payload is invalid JSON: {error}"
+            ))
+        })?;
+
+        let mut tx = self.pool.begin().await.map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch direct admit begin: {error}"
+            ))
+        })?;
+        let inserted = match sqlx::query(
+            "INSERT IGNORE INTO edge_pending_dispatch \
+             (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+              payload_json, status, dispatched_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched', NOW(6))",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(edge_agent_id)
+        .bind(&identity.request_id)
+        .bind(payload_json)
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(result) => result.rows_affected() > 0,
+            Err(error) => {
+                rollback_edge_dispatch_tx(tx, "direct admit insert").await;
+                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                    "edge_dispatch direct admit INSERT: {error}"
+                )));
+            }
+        };
+        let row = match sqlx::query(
+            "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, \
+                    status, CAST(result_json AS CHAR) AS result_json \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? \
+               AND turn_chain_id = ? AND request_id = ? FOR UPDATE",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                rollback_edge_dispatch_tx(tx, "direct admit missing row").await;
+                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(
+                    "edge_dispatch direct admitted row disappeared".to_string(),
+                ));
+            }
+            Err(error) => {
+                rollback_edge_dispatch_tx(tx, "direct admit select").await;
+                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                    "edge_dispatch direct admit SELECT: {error}"
+                )));
+            }
+        };
+        let persisted_edge: String = row.try_get("edge_agent_id").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch direct admit edge decode: {error}"
+            ))
+        })?;
+        let persisted_payload: String = row.try_get("payload_json").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch direct admit payload decode: {error}"
+            ))
+        })?;
+        if persisted_edge != edge_agent_id
+            || !json_payloads_match(&persisted_payload, payload_json)
+                .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
+        {
+            rollback_edge_dispatch_tx(tx, "direct admit conflict").await;
+            return Err(EdgeDispatchAdmissionError::Rejected(format!(
+                "edge_dispatch identity {} conflicts with its durable edge owner or payload",
+                identity.request_id
+            )));
+        }
+        let status: String = row.try_get("status").map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch direct admit status decode: {error}"
+            ))
+        })?;
+        let outcome = match status.as_str() {
+            "pending" => {
+                let updated = sqlx::query(
+                    "UPDATE edge_pending_dispatch SET status = 'dispatched', dispatched_at = NOW(6) \
+                     WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+                       AND request_id = ? AND edge_agent_id = ? AND status = 'pending'",
+                )
+                .bind(&identity.user_id)
+                .bind(&identity.session_id)
+                .bind(&identity.run_id)
+                .bind(&identity.turn_chain_id)
+                .bind(&identity.request_id)
+                .bind(edge_agent_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                        "edge_dispatch direct admit UPDATE: {error}"
+                    ))
+                })?;
+                if updated.rows_affected() != 1 {
+                    rollback_edge_dispatch_tx(tx, "direct admit update count").await;
+                    return Err(EdgeDispatchAdmissionError::OutcomeUnknown(
+                        "edge_dispatch direct admit did not claim exactly one pending row"
+                            .to_string(),
+                    ));
+                }
+                EdgeDirectDispatchAdmission::Claimed
+            }
+            "dispatched" if inserted => EdgeDirectDispatchAdmission::Claimed,
+            "dispatched" => EdgeDirectDispatchAdmission::Observing,
+            "completed" | "failed" => row
+                .try_get::<Option<String>, _>("result_json")
+                .map_err(|error| {
+                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                        "edge_dispatch direct admit result decode: {error}"
+                    ))
+                })?
+                .map(EdgeDirectDispatchAdmission::Terminal)
+                .ok_or_else(|| {
+                    EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                        "edge_dispatch terminal identity {} has no result evidence",
+                        identity.request_id
+                    ))
+                })?,
+            other => {
+                rollback_edge_dispatch_tx(tx, "direct admit unsupported status").await;
+                return Err(EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                    "edge_dispatch direct admit observed unsupported status {other}"
+                )));
+            }
+        };
+        tx.commit().await.map_err(|error| {
+            EdgeDispatchAdmissionError::OutcomeUnknown(format!(
+                "edge_dispatch direct admit commit: {error}"
+            ))
+        })?;
+        if inserted && let Some(ref metrics) = self.metrics {
+            metrics.dispatch_queue_depth.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(outcome)
     }
 
     async fn subscribe_pending_wakeup(
@@ -1683,6 +1888,43 @@ mod tests {
             error.contains("claimed 2 rows but updated 1"),
             "error should identify claim/update mismatch: {error}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn matrixone_direct_admission_is_never_visible_to_relay_polling() {
+        let pool = setup_edge_dispatch_db_it().await;
+        let direct = DatabaseEdgeDispatchService::from_shared(&pool);
+        let relay = DatabaseEdgeDispatchService::from_shared(&pool);
+        let unique = Uuid::new_v4().to_string();
+        let user_id = format!("direct-user-{unique}");
+        let edge_agent_id = format!("direct-edge-{unique}");
+        let identity = EdgeDispatchIdentity::new(
+            &user_id,
+            format!("session-{unique}"),
+            format!("run-{unique}"),
+            format!("chain-{unique}"),
+            format!("request-{unique}"),
+        );
+        cleanup_edge_dispatch_fixture(&pool, &identity).await;
+        let payload = json!({"request_id": identity.request_id, "tool": "materialize_attachment"})
+            .to_string();
+
+        let admission = direct
+            .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)
+            .await
+            .expect("direct admission");
+
+        assert_eq!(admission, EdgeDirectDispatchAdmission::Claimed);
+        assert!(
+            relay
+                .poll_pending(&user_id, &edge_agent_id)
+                .await
+                .expect("relay poll")
+                .is_empty(),
+            "directly claimed credentials-free payload must never reach relay delivery"
+        );
+        cleanup_edge_dispatch_fixture(&pool, &identity).await;
     }
 
     #[tokio::test]

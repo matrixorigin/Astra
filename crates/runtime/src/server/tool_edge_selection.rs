@@ -117,6 +117,18 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
+    // Managed transfer tools are implemented by the Edge transport
+    // interceptor and are intentionally absent from the generic runtime tool
+    // surface. A validated request-scoped transfer context is the explicit
+    // capability grant for these two calls.
+    if request.runtime_file_transfer.is_some()
+        && matches!(
+            request.tool_name.as_str(),
+            "materialize_attachment" | "publish_artifact"
+        )
+    {
+        return Ok(());
+    }
     astra_runtime_env::CapabilityResolver
         .check_tool_call_for_surface(
             registry,

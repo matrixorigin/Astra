@@ -1477,6 +1477,7 @@ mod tests {
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).expect("create edge workspace");
         let transfer_root = temp.path().join("runtime/task-1");
+        std::fs::create_dir_all(&transfer_root).expect("create trusted transfer root");
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             "user-1",
             "session-1",

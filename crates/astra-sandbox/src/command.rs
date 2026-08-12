@@ -582,10 +582,16 @@ fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec
                 (!target.is_empty()).then_some(target)
             })
     });
-    if matches!(command.to_ascii_lowercase().as_str(), "cp" | "install")
-        && let Some(target) = target_directory
-    {
-        return vec![target];
+    if let Some(target) = target_directory {
+        match command.to_ascii_lowercase().as_str() {
+            "cp" | "install" => return vec![target],
+            "mv" => {
+                let mut targets = write_command_positionals(command, arguments);
+                targets.push(target);
+                return targets;
+            }
+            _ => {}
+        }
     }
 
     let positional = write_command_positionals(command, arguments);
@@ -1238,6 +1244,8 @@ mod tests {
                 "install input.txt '{}/output.txt' --mode 0644",
                 outside.display()
             ),
+            format!("mv -t '{}' input.txt", outside.display()),
+            format!("mv input.txt -t'{}'", outside.display()),
         ] {
             let risks = analyze_command_risks_in_workspace(&command, &workspace);
             assert!(

@@ -343,26 +343,11 @@ async fn try_edge_websocket(
         }
     };
     match dispatch
-        .admit_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
+        .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
         .await
     {
-        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Pending) => {}
-        Ok(astra_services::multi_agent::EdgeDispatchAdmission::Terminal(result_json)) => {
-            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
-        }
-        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
-            return EdgeTransportAttempt::AdmissionRejected(error);
-        }
-        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
-            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
-        }
-    }
-    match dispatch
-        .claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed) => {}
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Observing) => {
             return match dispatch
                 .wait_result(&dispatch_identity, plan.wait_timeout())
                 .await
@@ -373,7 +358,15 @@ async fn try_edge_websocket(
                 Ok(None) | Err(_) => EdgeTransportAttempt::TransportDisconnected,
             };
         }
-        Err(_) => return EdgeTransportAttempt::TransportDisconnected,
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Terminal(result_json)) => {
+            return delivered_dispatch_result(plan, &result_json, ToolTransportKind::EdgeLedger);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::Rejected(error)) => {
+            return EdgeTransportAttempt::AdmissionRejected(error);
+        }
+        Err(astra_services::multi_agent::EdgeDispatchAdmissionError::OutcomeUnknown(error)) => {
+            return EdgeTransportAttempt::AdmissionOutcomeUnknown(error);
+        }
     }
     tracing::info!(
         target: "astra_runtime::edge_dispatch_diag",
