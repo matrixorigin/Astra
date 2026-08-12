@@ -88,7 +88,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 SelectResolution::Found {
                     schema: tool,
                     canonical_name,
-                    matched_by_prefix,
+                    matched_by,
                 } => {
                     let Some(func) = tool.get("function") else {
                         missing.push(name.clone());
@@ -112,9 +112,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     {
                         obj.insert("parameters".to_string(), compact_select_parameters(params));
                     }
-                    if matched_by_prefix && let Some(obj) = entry.as_object_mut() {
+                    if let Some(matched_by) = matched_by
+                        && let Some(obj) = entry.as_object_mut()
+                    {
                         obj.insert("requested".to_string(), json!(name));
-                        obj.insert("matched_by".to_string(), json!("unique_prefix"));
+                        obj.insert("matched_by".to_string(), json!(matched_by));
                     }
                     resolved.push(canonical_name.to_string());
                     found.push(entry);
@@ -239,7 +241,7 @@ enum SelectResolution<'a> {
     Found {
         schema: &'a Value,
         canonical_name: &'a str,
-        matched_by_prefix: bool,
+        matched_by: Option<&'static str>,
     },
     Ambiguous {
         candidates: Vec<String>,
@@ -254,7 +256,7 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         return SelectResolution::Found {
             schema,
             canonical_name: tool_schema_name(schema).expect("valid schema has name"),
-            matched_by_prefix: false,
+            matched_by: None,
         };
     }
 
@@ -270,7 +272,42 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         [(schema, name)] => SelectResolution::Found {
             schema,
             canonical_name: name,
-            matched_by_prefix: true,
+            matched_by: Some("unique_prefix"),
+        },
+        [] => resolve_qualified_segment_tool(schemas, requested),
+        matches => SelectResolution::Ambiguous {
+            candidates: matches
+                .iter()
+                .map(|(_, name)| (*name).to_string())
+                .collect(),
+        },
+    }
+}
+
+// MCP and other qualified producers expose canonical names such as
+// `mcp__server__tool__instance`. Skills and capability contracts refer to the
+// producer-owned `tool` segment because server and instance qualifiers are
+// runtime details. Resolve that unqualified name only when it identifies one
+// canonical tool; multiple instances remain explicitly ambiguous.
+fn resolve_qualified_segment_tool<'a>(
+    schemas: &'a [&'a Value],
+    requested: &str,
+) -> SelectResolution<'a> {
+    let mut matches: Vec<(&'a Value, &'a str)> = schemas
+        .iter()
+        .copied()
+        .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
+        .filter(|(_, name)| {
+            name.split("__")
+                .any(|segment| segment.eq_ignore_ascii_case(requested))
+        })
+        .collect();
+    matches.sort_by_key(|(_, name)| *name);
+    match matches.as_slice() {
+        [(schema, name)] => SelectResolution::Found {
+            schema,
+            canonical_name: name,
+            matched_by: Some("qualified_segment"),
         },
         [] => SelectResolution::Missing,
         matches => SelectResolution::Ambiguous {
@@ -661,6 +698,80 @@ mod tests {
         );
         assert_eq!(parsed["matches"][0]["requested"].as_str(), Some("gitH"));
         assert!(field_strings(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn select_mode_resolves_unique_unqualified_mcp_tool_name() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__moi-tools__moi_github_authenticated_user__ch_23f40bed5331",
+                "description": "Return the authenticated GitHub user"
+            }
+        })];
+        let parsed = parse_result(&tool_search(
+            &schemas,
+            &json!({"query": "select:moi_github_authenticated_user"}),
+        ));
+
+        assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
+        assert_eq!(
+            field_strings(&parsed, "resolved"),
+            strings(&["mcp__moi-tools__moi_github_authenticated_user__ch_23f40bed5331"])
+        );
+        assert_eq!(
+            parsed["matches"][0]["matched_by"].as_str(),
+            Some("qualified_segment")
+        );
+        assert_eq!(
+            parsed["matches"][0]["requested"].as_str(),
+            Some("moi_github_authenticated_user")
+        );
+        assert!(field_strings(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn select_mode_rejects_ambiguous_unqualified_mcp_tool_name() {
+        let schemas = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__moi-tools__moi_github_authenticated_user__ch_primary",
+                    "description": "Primary GitHub account"
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
+                    "description": "Secondary GitHub account"
+                }
+            }),
+        ];
+        let parsed = parse_result(&tool_search(
+            &schemas,
+            &json!({"query": "select:moi_github_authenticated_user"}),
+        ));
+
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
+        assert!(match_names(&parsed).is_empty());
+        assert_eq!(
+            field_strings(&parsed, "missing"),
+            strings(&["moi_github_authenticated_user"])
+        );
+        let candidates = parsed["ambiguous"][0]["candidates"]
+            .as_array()
+            .expect("ambiguous candidates must be present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            vec![
+                "mcp__moi-tools__moi_github_authenticated_user__ch_primary",
+                "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
+            ]
+        );
     }
 
     #[test]
