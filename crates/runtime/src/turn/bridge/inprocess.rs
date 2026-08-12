@@ -6861,7 +6861,10 @@ mod tests {
     async fn wait_for_journal_events(session_id: &str) -> Vec<Value> {
         for _ in 0..100 {
             let events = read_journal_events(session_id);
-            if !events.is_empty() {
+            if events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("llm_round"))
+            {
                 return events;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
