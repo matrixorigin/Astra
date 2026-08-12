@@ -168,6 +168,65 @@ struct PublishArgs {
     description: Option<String>,
 }
 
+fn validate_publish_args(args: &mut PublishArgs) -> Result<(), String> {
+    normalize_optional_metadata(&mut args.title);
+    normalize_optional_metadata(&mut args.artifact_kind);
+    normalize_optional_metadata(&mut args.content_type);
+    normalize_optional_metadata(&mut args.description);
+
+    if let Some(title) = &args.title {
+        validate_short_metadata(title, "title", 160)?;
+    }
+    if let Some(description) = &args.description {
+        validate_short_metadata(description, "description", 1000)?;
+    }
+    if let Some(artifact_kind) = &mut args.artifact_kind {
+        validate_short_metadata(artifact_kind, "artifact_kind", 64)?;
+        if !artifact_kind
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return Err(
+                "Error: artifact_kind may only contain ASCII letters, digits, '_', '-', or '.'"
+                    .to_string(),
+            );
+        }
+        artifact_kind.make_ascii_lowercase();
+    }
+    if let Some(content_type) = &mut args.content_type {
+        validate_short_metadata(content_type, "content_type", 128)?;
+        if !content_type.contains('/') || content_type.contains(';') {
+            return Err(
+                "Error: content_type must be a simple MIME type such as image/png".to_string(),
+            );
+        }
+        content_type.make_ascii_lowercase();
+    }
+    Ok(())
+}
+
+fn normalize_optional_metadata(value: &mut Option<String>) {
+    let Some(raw) = value.take() else {
+        return;
+    };
+    let normalized = raw.trim();
+    if !normalized.is_empty() {
+        *value = Some(normalized.to_string());
+    }
+}
+
+fn validate_short_metadata(value: &str, field: &str, max_len: usize) -> Result<(), String> {
+    if value.len() > max_len {
+        return Err(format!("Error: {field} must be at most {max_len} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!(
+            "Error: {field} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct UploadResponse {
     file_id: String,
@@ -190,12 +249,15 @@ async fn publish(
     if let Err(error) = prepare_scope_dirs(context).await {
         return ToolResult::error(error);
     }
-    let args: PublishArgs = match serde_json::from_value(args.clone()) {
+    let mut args: PublishArgs = match serde_json::from_value(args.clone()) {
         Ok(args) => args,
         Err(error) => {
             return ToolResult::error(format!("publish_artifact arguments are invalid: {error}"));
         }
     };
+    if let Err(error) = validate_publish_args(&mut args) {
+        return ToolResult::error(error);
+    }
     let requested = PathBuf::from(&args.path);
     let requested = if requested.is_absolute() {
         requested
@@ -984,6 +1046,74 @@ mod tests {
             result.metadata.as_ref().and_then(|m| m.get("file_id")),
             Some(&Value::String("out-1".to_string()))
         );
+    }
+
+    #[test]
+    fn publish_metadata_validation_matches_server_local_limits() {
+        for (field, invalid, expected) in [
+            ("title", "x".repeat(161), "title must be at most 160 bytes"),
+            (
+                "description",
+                "x".repeat(1001),
+                "description must be at most 1000 bytes",
+            ),
+            (
+                "artifact_kind",
+                "unsafe/kind".to_string(),
+                "artifact_kind may only contain",
+            ),
+            (
+                "content_type",
+                "text/plain; charset=utf-8".to_string(),
+                "content_type must be a simple MIME type",
+            ),
+        ] {
+            let mut request = json!({"path": "report.txt"});
+            request[field] = Value::String(invalid);
+            let mut args: PublishArgs = serde_json::from_value(request).unwrap();
+            let error = validate_publish_args(&mut args).unwrap_err();
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+
+        let mut args: PublishArgs = serde_json::from_value(json!({
+            "path": "report.txt",
+            "title": "  Report  ",
+            "description": "  Summary  ",
+            "artifact_kind": "Report.JSON",
+            "content_type": "APPLICATION/JSON"
+        }))
+        .unwrap();
+        validate_publish_args(&mut args).unwrap();
+        assert_eq!(args.title.as_deref(), Some("Report"));
+        assert_eq!(args.description.as_deref(), Some("Summary"));
+        assert_eq!(args.artifact_kind.as_deref(), Some("report.json"));
+        assert_eq!(args.content_type.as_deref(), Some("application/json"));
+    }
+
+    #[tokio::test]
+    async fn publish_rejects_invalid_metadata_before_upload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let temp = tempfile::tempdir().unwrap();
+        let mut transfer = context(temp.path());
+        transfer.endpoint_url = format!("{}/api/v1/runtime-files", server.uri());
+        prepare_scope_dirs(&transfer).await.unwrap();
+        std::fs::write(temp.path().join("session/report.txt"), b"report").unwrap();
+
+        let result = publish(
+            &json!({"path": "report.txt", "title": "x".repeat(161)}),
+            Some(&transfer),
+            "call-1",
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("title must be at most 160 bytes"));
+        server.verify().await;
     }
 
     #[tokio::test]
