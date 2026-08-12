@@ -17,6 +17,10 @@ pub enum ToolLoadPolicy {
     AlwaysLoad,
     /// Advertised through the deferred catalog and activated with `tool_search`.
     Deferred,
+    /// Public schema installed only after a request-scoped authority validates
+    /// the capability that backs it. Generic runtime providers must not
+    /// advertise these tools merely because they can execute workspace tools.
+    RequestScoped,
     /// Runtime implementation detail. The model should not see this as a
     /// standalone public schema.
     Internal,
@@ -24,7 +28,10 @@ pub enum ToolLoadPolicy {
 
 impl ToolLoadPolicy {
     pub const fn is_public_schema_policy(self) -> bool {
-        matches!(self, Self::AlwaysLoad | Self::Deferred)
+        matches!(
+            self,
+            Self::AlwaysLoad | Self::Deferred | Self::RequestScoped
+        )
     }
 }
 
@@ -300,6 +307,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         shared_network("web_search", ToolLoadPolicy::Deferred),
         shared_network("web_fetch", ToolLoadPolicy::Deferred),
         server_network_credentials("github", ToolLoadPolicy::Deferred),
+        project_write("materialize_attachment", ToolLoadPolicy::RequestScoped),
         project_write("publish_artifact", ToolLoadPolicy::Deferred),
         project_read("read_file", ToolLoadPolicy::AlwaysLoad),
         project_read("list_dir", ToolLoadPolicy::AlwaysLoad),
@@ -1631,6 +1639,18 @@ mod tests {
                 "{name} must not require deferred discovery"
             );
         }
+    }
+
+    #[test]
+    fn managed_attachment_tool_requires_request_scoped_installation() {
+        let registry = registry();
+        let spec = registry
+            .get("materialize_attachment")
+            .expect("managed attachment tool registered");
+
+        assert_eq!(spec.load_policy, ToolLoadPolicy::RequestScoped);
+        assert!(spec.load_policy.is_public_schema_policy());
+        assert!(!spec.requires_explicit_user_enablement());
     }
 
     #[test]

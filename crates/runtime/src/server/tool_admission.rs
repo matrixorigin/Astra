@@ -78,6 +78,10 @@ pub(crate) struct ToolAdmissionContext {
     pub server_service_provider_ready: bool,
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
+    /// A validated per-request file-transfer descriptor is present. This
+    /// authorizes the bound runtime provider to offer the managed transfer
+    /// tool without adding it to every generic runtime catalog.
+    pub request_scoped_file_transfer_provider_ready: bool,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub runtime_declared_tool_names: Option<HashSet<String>>,
     pub provider_capabilities: HashMap<String, HashSet<String>>,
@@ -91,6 +95,7 @@ impl Default for ToolAdmissionContext {
             server_service_provider_ready: true,
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
+            request_scoped_file_transfer_provider_ready: false,
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             runtime_declared_tool_names: None,
             provider_capabilities: HashMap::new(),
@@ -431,6 +436,14 @@ pub(crate) fn active_provider_declarations_for_binding(
                 .retain(|name, _| runtime_declared_tool_names.contains(name));
         }
         providers.push(runtime_provider);
+
+        if context.request_scoped_file_transfer_provider_ready {
+            providers.push(CapacityProviderDeclaration::new(
+                capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
+                runtime_execution_provider_id_for_executor(executor),
+                ["materialize_attachment".to_string()],
+            ));
+        }
     }
 
     if context.request_scoped_mcp_provider_ready
@@ -962,6 +975,55 @@ mod tests {
         assert_eq!(
             server_candidate.reason,
             ToolOfferCandidateReason::CurrentProviderPreferred
+        );
+    }
+
+    #[test]
+    fn managed_file_transfer_requires_validated_request_provider() {
+        let workspace = WorkspaceBinding::edge_workspace(
+            "Managed sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let executor = ExecutorBinding::edge_agent(
+            "edge-managed",
+            "Managed sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        );
+
+        let unavailable = resolve_tool_admission_for_binding_with_context(
+            "materialize_attachment",
+            &[],
+            &workspace,
+            &executor,
+            None,
+            &registry(),
+            ToolAdmissionContext::default(),
+        );
+        assert!(!unavailable.visible);
+        assert_eq!(
+            unavailable.hidden_reason,
+            Some(ToolHiddenReason::NoProvider)
+        );
+
+        let available = resolve_tool_admission_for_binding_with_context(
+            "materialize_attachment",
+            &[],
+            &workspace,
+            &executor,
+            None,
+            &registry(),
+            ToolAdmissionContext {
+                request_scoped_file_transfer_provider_ready: true,
+                ..ToolAdmissionContext::default()
+            },
+        );
+        assert!(available.visible);
+        assert_eq!(available.route, ToolExecutionRouteKind::EdgeBound);
+        assert_eq!(
+            available.selected_offer_id(),
+            Some("materialize_attachment@edge-managed")
         );
     }
 

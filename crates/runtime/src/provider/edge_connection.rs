@@ -179,6 +179,7 @@ impl CapabilityProvider for EdgeConnectionProvider {
             runtime: None,
             selected_offer: None,
             policy: ToolPolicySnapshot::default(),
+            runtime_file_transfer: None,
         };
 
         // Resolve the runtime environment binding.

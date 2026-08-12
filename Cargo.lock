@@ -290,6 +290,8 @@ dependencies = [
  "fs2",
  "futures-util",
  "hostname",
+ "md-5",
+ "nix 0.31.2",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -303,6 +305,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webpki-roots 0.26.11",
+ "wiremock",
 ]
 
 [[package]]

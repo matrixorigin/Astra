@@ -273,6 +273,7 @@ mod tests {
             },
             workspace_record: None,
             runtime: None,
+            runtime_file_transfer: None,
             selected_offer: None,
             policy: ToolPolicySnapshot::default(),
         }

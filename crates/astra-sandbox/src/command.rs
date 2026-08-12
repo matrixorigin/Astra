@@ -447,29 +447,247 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         return Some(target);
     }
 
-    let tokens: Vec<&str> = command.split_whitespace().collect();
-    let write_commands = ["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"];
-    let mut iter = tokens.iter();
-    while let Some(token) = iter.next() {
-        let command = token.trim_matches([';', '|', '&']);
-        if !write_commands
-            .iter()
-            .any(|candidate| command.eq_ignore_ascii_case(candidate))
-        {
+    let commands = super::bash_ast::simple_command_words(command)?;
+    for words in commands {
+        let Some((executable, arguments)) = effective_write_command(&words) else {
+            continue;
+        };
+        if !matches!(
+            executable.to_ascii_lowercase().as_str(),
+            "cp" | "mv" | "touch" | "mkdir" | "install" | "tee" | "rsync"
+        ) {
             continue;
         }
-        for arg in iter.clone() {
-            let target = arg.trim_matches(['"', '\'', ';', '&']);
-            if target.starts_with('-') {
-                continue;
-            }
+        for target in write_targets_for_command(executable, &arguments) {
             if is_workspace_out_path(target, workspace_root) {
                 return Some(target.to_string());
             }
         }
-        break;
     }
     None
+}
+
+/// Resolve the executable that a simple shell command will actually launch.
+///
+/// `command`, `env`, and `exec` are transparent launchers for the write-boundary
+/// analysis. Their supported options and `NAME=value` operands are skipped so
+/// they cannot hide an external write from the effective command matcher.
+fn effective_write_command(words: &[String]) -> Option<(&str, Vec<&str>)> {
+    let mut index = 0;
+    loop {
+        let executable = normalize_shell_token(words.get(index)?);
+        let executable_name = Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(executable);
+        index += 1;
+        match executable_name {
+            "command" => {
+                while let Some(argument) =
+                    words.get(index).map(|value| normalize_shell_token(value))
+                {
+                    if argument == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if matches!(argument, "-p" | "-v" | "-V") {
+                        index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "env" => {
+                while let Some(argument) =
+                    words.get(index).map(|value| normalize_shell_token(value))
+                {
+                    if argument == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if matches!(argument, "-u" | "--unset" | "-C" | "--chdir") {
+                        index = index.saturating_add(2);
+                        continue;
+                    }
+                    if argument == "-i"
+                        || argument == "--ignore-environment"
+                        || argument.starts_with("--unset=")
+                        || argument.starts_with("--chdir=")
+                        || is_shell_assignment(argument)
+                    {
+                        index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "exec" => {
+                while let Some(argument) =
+                    words.get(index).map(|value| normalize_shell_token(value))
+                {
+                    if argument == "--" {
+                        index += 1;
+                        break;
+                    }
+                    if argument == "-a" {
+                        index = index.saturating_add(2);
+                        continue;
+                    }
+                    if matches!(argument, "-c" | "-l" | "-cl" | "-lc") {
+                        index += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            _ => {
+                let arguments = words[index..]
+                    .iter()
+                    .map(|argument| argument.as_str())
+                    .collect();
+                return Some((executable_name, arguments));
+            }
+        }
+    }
+}
+
+fn is_shell_assignment(value: &str) -> bool {
+    let Some((name, _)) = value.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
+    let target_directory = arguments.iter().enumerate().find_map(|(index, argument)| {
+        let argument = argument.trim_matches(['"', '\'', ';', '&']);
+        if matches!(argument, "-t" | "--target-directory") {
+            return arguments
+                .get(index + 1)
+                .map(|target| target.trim_matches(['"', '\'', ';', '&']));
+        }
+        if let Some(target) = argument.strip_prefix("-t")
+            && !target.is_empty()
+        {
+            return Some(target.trim_matches(['"', '\'']));
+        }
+        argument
+            .strip_prefix("--target-directory=")
+            .and_then(|target| {
+                let target = target.trim_matches(['"', '\'']);
+                (!target.is_empty()).then_some(target)
+            })
+    });
+    if matches!(command.to_ascii_lowercase().as_str(), "cp" | "install")
+        && let Some(target) = target_directory
+    {
+        return vec![target];
+    }
+
+    let positional = write_command_positionals(command, arguments);
+
+    match command.to_ascii_lowercase().as_str() {
+        // These commands read every positional operand except the last one.
+        // Treating a source outside the workspace as a write target rejected
+        // safe staging such as `cp ../catalog/input.pdf ./input.pdf`.
+        "cp" | "rsync" => positional.last().copied().into_iter().collect(),
+        "install"
+            if !arguments.iter().any(|argument| {
+                matches!(
+                    argument.trim_matches(['"', '\'', ';', '&']),
+                    "-d" | "--directory"
+                )
+            }) =>
+        {
+            positional.last().copied().into_iter().collect()
+        }
+        // mv removes its sources, so every positional operand is a mutation.
+        // touch/mkdir/tee and install -d also write every positional operand.
+        "mv" | "touch" | "mkdir" | "install" | "tee" => positional,
+        _ => Vec::new(),
+    }
+}
+
+/// Return operands after removing options and their values. GNU utilities
+/// accept options after operands, so merely dropping dash-prefixed words can
+/// make an option value look like the destination.
+fn write_command_positionals<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
+    let mut positional = Vec::new();
+    let mut index = 0;
+    let mut options = true;
+    while let Some(argument) = arguments.get(index).copied() {
+        let argument = argument.trim_matches(['"', '\'', ';', '&']);
+        if options && argument == "--" {
+            options = false;
+            index += 1;
+            continue;
+        }
+        if options && argument.starts_with('-') && argument != "-" {
+            if write_option_takes_separate_value(command, argument) {
+                index = index.saturating_add(2);
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if !argument.is_empty() {
+            positional.push(argument);
+        }
+        index += 1;
+    }
+    positional
+}
+
+fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
+    if option.contains('=') {
+        return false;
+    }
+    match command.to_ascii_lowercase().as_str() {
+        "cp" | "mv" => matches!(
+            option,
+            "-S" | "--suffix" | "-t" | "--target-directory" | "--context"
+        ),
+        "install" => matches!(
+            option,
+            "-g" | "--group"
+                | "-m"
+                | "--mode"
+                | "-o"
+                | "--owner"
+                | "-S"
+                | "--suffix"
+                | "-t"
+                | "--target-directory"
+                | "--context"
+        ),
+        "touch" => matches!(
+            option,
+            "-d" | "--date" | "-r" | "--reference" | "-t" | "--time"
+        ),
+        "mkdir" => matches!(option, "-m" | "--mode" | "--context"),
+        "rsync" => matches!(
+            option,
+            "-e" | "--rsh"
+                | "--rsync-path"
+                | "--password-file"
+                | "--files-from"
+                | "--exclude"
+                | "--include"
+                | "--filter"
+                | "--backup-dir"
+                | "--suffix"
+                | "--temp-dir"
+                | "--compare-dest"
+                | "--copy-dest"
+                | "--link-dest"
+        ),
+        "tee" => false,
+        _ => false,
+    }
 }
 
 fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
@@ -912,6 +1130,167 @@ mod tests {
                     .iter()
                     .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
                 "{command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_source_is_not_misclassified_as_a_write_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let catalog = temp.path().join("catalog");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&catalog).unwrap();
+
+        let command = format!(
+            "cp '{}/input.pdf' '{}/input.pdf'",
+            catalog.display(),
+            workspace.display()
+        );
+        let risks = analyze_command_risks_in_workspace(&command, &workspace);
+        assert!(
+            !risks
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "read-only copy source must not be classified as a write: {risks:?}"
+        );
+    }
+
+    #[test]
+    fn copy_destination_still_enforces_the_workspace_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for command in [
+            format!("cp input.pdf '{}/input.pdf'", outside.display()),
+            format!("cp -t '{}' input.pdf", outside.display()),
+            format!("cp --target-directory='{}' input.pdf", outside.display()),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "copy destination outside the workspace must be rejected: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_launchers_cannot_hide_workspace_out_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for command in [
+            format!("command cp input.txt '{}/output.txt'", outside.display()),
+            format!("exec cp input.txt '{}/output.txt'", outside.display()),
+            format!(
+                "exec -a copy /bin/cp input.txt '{}/output.txt'",
+                outside.display()
+            ),
+            format!(
+                "command -- env -i cp input.txt '{}/output.txt'",
+                outside.display()
+            ),
+            format!(
+                "env -u HOME MODE=test /bin/cp input.txt '{}/output.txt'",
+                outside.display()
+            ),
+            format!(
+                "env --chdir /tmp cp input.txt '{}/output.txt'",
+                outside.display()
+            ),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "launcher-wrapped write must be rejected: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_option_values_cannot_hide_the_real_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for command in [
+            format!(
+                "cp input.txt '{}/output.txt' --suffix .bak",
+                outside.display()
+            ),
+            format!(
+                "cp --suffix .bak input.txt '{}/output.txt'",
+                outside.display()
+            ),
+            format!(
+                "install input.txt '{}/output.txt' --mode 0644",
+                outside.display()
+            ),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "value-taking options must not hide the destination: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_after_copy_in_a_command_chain_is_still_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for separator in [";", "&&", "|"] {
+            let command = format!(
+                "cp input.pdf output.pdf{separator} touch '{}/outside.txt'",
+                outside.display()
+            );
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "write after copy must still be checked: {command}: {risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_shell_separators_and_cp_target_options_cannot_bypass_write_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        for command in [
+            format!("true&&touch '{}/created.txt'", outside.display()),
+            format!("cp -t'{}' input.txt", outside.display()),
+            format!("cp --target-directory='{}' input.txt", outside.display()),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "compact shell syntax must not bypass the workspace boundary: {command}: {risks:?}"
             );
         }
     }

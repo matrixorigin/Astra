@@ -38,6 +38,19 @@ pub const EDGE_WS_CHANNEL_CAPACITY: usize = 256;
 /// Sender half that pushes frames into an edge agent's WebSocket write loop.
 pub type EdgeWsSender = mpsc::Sender<EdgeServerMessage>;
 
+/// Request-scoped values needed to deliver one already-admitted invocation.
+/// Grouping them keeps the transport API explicit without a long positional
+/// argument list whose adjacent string fields are easy to swap.
+pub struct DurablyAdmittedEdgeInvocation<'a> {
+    pub connection_user_id: &'a str,
+    pub identity: &'a ToolInvocationIdentity,
+    pub edge_agent_id: &'a str,
+    pub tool: &'a str,
+    pub args: &'a serde_json::Value,
+    pub runtime_file_transfer: Option<&'a astra_services::runs::RuntimeFileTransferContext>,
+    pub cancel_token: Option<&'a CancellationToken>,
+}
+
 /// Information about a tool request dispatched to an edge, stored for
 /// reconnection deduplication. When an edge reconnects, cloud can check
 /// its pending requests against completed request IDs reported by the edge.
@@ -574,12 +587,15 @@ impl EdgeConnectionPool {
         cancel_token: Option<&CancellationToken>,
     ) -> Option<EdgeToolResult> {
         self.execute_durably_admitted_invocation_on_connection_with_cancel(
-            &identity.user_id,
-            identity,
-            edge_agent_id,
-            tool,
-            args,
-            cancel_token,
+            DurablyAdmittedEdgeInvocation {
+                connection_user_id: &identity.user_id,
+                identity,
+                edge_agent_id,
+                tool,
+                args,
+                runtime_file_transfer: None,
+                cancel_token,
+            },
         )
         .await
     }
@@ -593,13 +609,17 @@ impl EdgeConnectionPool {
     /// request and result protocol.
     pub async fn execute_durably_admitted_invocation_on_connection_with_cancel(
         &self,
-        connection_user_id: &str,
-        identity: &ToolInvocationIdentity,
-        edge_agent_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        cancel_token: Option<&CancellationToken>,
+        invocation: DurablyAdmittedEdgeInvocation<'_>,
     ) -> Option<EdgeToolResult> {
+        let DurablyAdmittedEdgeInvocation {
+            connection_user_id,
+            identity,
+            edge_agent_id,
+            tool,
+            args,
+            runtime_file_transfer,
+            cancel_token,
+        } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
@@ -647,6 +667,7 @@ impl EdgeConnectionPool {
             delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
+            runtime_file_transfer: runtime_file_transfer.map(|context| Box::new(context.into())),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
         };
 

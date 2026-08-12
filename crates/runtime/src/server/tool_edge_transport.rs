@@ -62,36 +62,44 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    match try_edge_dispatch(
-        &request,
-        binding,
-        &plan,
-        edge_dispatch_service.clone(),
-        edge_registry_service.as_ref(),
-        tool_registry,
-        cancel_token.clone(),
-    )
-    .await
-    {
-        EdgeTransportAttempt::Delivered(result) => return result,
-        EdgeTransportAttempt::AdmissionRejected(error) => {
-            return edge_admission_rejected_result(&request, binding, "edge-dispatch", &error);
+    if plan.runtime_file_transfer().is_none() {
+        match try_edge_dispatch(
+            &request,
+            binding,
+            &plan,
+            edge_dispatch_service.clone(),
+            edge_registry_service.as_ref(),
+            tool_registry,
+            cancel_token.clone(),
+        )
+        .await
+        {
+            EdgeTransportAttempt::Delivered(result) => return result,
+            EdgeTransportAttempt::AdmissionRejected(error) => {
+                return edge_admission_rejected_result(&request, binding, "edge-dispatch", &error);
+            }
+            EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
+                diagnostics.push(format!(
+                    "edge-dispatch: admission outcome is unknown: {error}"
+                ));
+                return edge_transport_failure_result(&request, binding, diagnostics, true);
+            }
+            EdgeTransportAttempt::TransportDisconnected => {
+                diagnostics.push(
+                    "edge-dispatch: outcome may be unknown after durable dispatch".to_string(),
+                );
+                return edge_transport_failure_result(&request, binding, diagnostics, true);
+            }
+            EdgeTransportAttempt::Unavailable => {
+                diagnostics
+                    .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
+            }
         }
-        EdgeTransportAttempt::AdmissionOutcomeUnknown(error) => {
-            diagnostics.push(format!(
-                "edge-dispatch: admission outcome is unknown: {error}"
-            ));
-            return edge_transport_failure_result(&request, binding, diagnostics, true);
-        }
-        EdgeTransportAttempt::TransportDisconnected => {
-            diagnostics
-                .push("edge-dispatch: outcome may be unknown after durable dispatch".to_string());
-            return edge_transport_failure_result(&request, binding, diagnostics, true);
-        }
-        EdgeTransportAttempt::Unavailable => {
-            diagnostics
-                .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
-        }
+    } else {
+        diagnostics.push(
+            "edge-dispatch: request-scoped transfer credentials require live websocket delivery"
+                .to_string(),
+        );
     }
     let mut outcome_may_be_unknown = false;
     match try_edge_websocket(
@@ -377,12 +385,15 @@ async fn try_edge_websocket(
     );
     let edge_result = pool
         .execute_durably_admitted_invocation_on_connection_with_cancel(
-            &edge_owner_user_id,
-            plan.identity(),
-            &edge.edge_agent_id,
-            &request.tool_name,
-            &request.args,
-            cancel_token,
+            astra_server_types::edge_connection_pool::DurablyAdmittedEdgeInvocation {
+                connection_user_id: &edge_owner_user_id,
+                identity: plan.identity(),
+                edge_agent_id: &edge.edge_agent_id,
+                tool: &request.tool_name,
+                args: &request.args,
+                runtime_file_transfer: plan.runtime_file_transfer(),
+                cancel_token,
+            },
         )
         .await;
     tracing::info!(

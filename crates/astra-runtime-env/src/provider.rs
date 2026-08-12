@@ -476,10 +476,11 @@ pub fn server_service_provider(
         provider_id,
         registry,
         |spec| {
-            matches!(
-                spec.required.executor,
-                RequiredExecutor::ServiceExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
-            )
+            spec.load_policy != crate::ToolLoadPolicy::RequestScoped
+                && matches!(
+                    spec.required.executor,
+                    RequiredExecutor::ServiceExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
+                )
         },
     )
 }
@@ -492,7 +493,10 @@ pub fn control_plane_provider(
         CapacityProviderType::ControlPlane,
         provider_id,
         registry,
-        |spec| matches!(spec.required.executor, RequiredExecutor::ControlPlane),
+        |spec| {
+            spec.load_policy != crate::ToolLoadPolicy::RequestScoped
+                && matches!(spec.required.executor, RequiredExecutor::ControlPlane)
+        },
     )
 }
 
@@ -503,10 +507,12 @@ pub fn runtime_workspace_provider(
     platform: RuntimePlatform,
 ) -> CapacityProviderDeclaration {
     CapacityProviderDeclaration::from_registry(provider_type, provider_id, registry, |spec| {
-        matches!(
-            spec.required.executor,
-            RequiredExecutor::RuntimeExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
-        ) && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str(), platform)
+        spec.load_policy != crate::ToolLoadPolicy::RequestScoped
+            && matches!(
+                spec.required.executor,
+                RequiredExecutor::RuntimeExecutor | RequiredExecutor::ServiceOrRuntimeExecutor
+            )
+            && runtime_workspace_provider_declares_tool(provider_type, spec.name.as_str(), platform)
     })
 }
 
@@ -811,6 +817,20 @@ mod tests {
                 .to_string()
                 .contains("MCP provider tool name must be namespaced")
         );
+    }
+
+    #[test]
+    fn generic_runtime_provider_does_not_claim_request_scoped_file_transfer_tool() {
+        let registry = ToolRegistry::builtins();
+        let provider = runtime_workspace_provider(
+            CapacityProviderType::Sandbox,
+            "sandbox",
+            &registry,
+            RuntimePlatform::Linux,
+        );
+
+        assert!(!provider.declares_tool("materialize_attachment"));
+        assert!(provider.declares_tool("read_file"));
     }
 
     #[test]

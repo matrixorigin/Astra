@@ -229,6 +229,12 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("apply_patch", MU, A.union(FI)),
     tool("create_file", MU, A.union(FI)),
     tool("delete_file", MU, A.union(FI)),
+    tool_idem(
+        "materialize_attachment",
+        MU,
+        A.union(FI),
+        ToolIdempotency::IdempotentWrite,
+    ),
     tool("publish_artifact", MU, A.union(FI)),
     tool("notebook_edit", MU, OR),
     // ── Mutating — rollback ──────────────────────────────────────────

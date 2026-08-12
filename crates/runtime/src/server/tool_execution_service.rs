@@ -1287,6 +1287,7 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            runtime_file_transfer: None,
             selected_offer: Some(
                 super::super::tool_execution_binding::SelectedToolOfferSnapshot {
                     offer_id: "read_file@provider-a".to_string(),
@@ -1380,6 +1381,7 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: Some(runtime),
+            runtime_file_transfer: None,
             selected_offer: None,
             policy: Default::default(),
         };

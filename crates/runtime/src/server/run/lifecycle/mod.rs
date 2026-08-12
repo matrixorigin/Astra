@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use axum::Json;
 use axum::http::StatusCode;
 use futures_util::FutureExt;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, RwLock, broadcast, mpsc, oneshot};
@@ -72,6 +73,36 @@ use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskStore};
 use astra_tools::task_mgmt_matrixone::MatrixOneTaskStore;
 use astra_turn_types::ModelSelection;
 use sqlx::Row;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeFileTransferMetadata {
+    contract_version: u32,
+    task_id: String,
+    root: String,
+    catalog_dir: String,
+    session_dir: String,
+    scratch_dir: String,
+    max_file_bytes: u64,
+    attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
+}
+
+const MAX_RUNTIME_ATTACHMENT_NAME_BYTES: usize = 240;
+
+fn valid_runtime_attachment_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_RUNTIME_ATTACHMENT_NAME_BYTES
+        && name.trim() == name
+        && !name.contains('\0')
+        && Path::new(name).file_name().and_then(|part| part.to_str()) == Some(name)
+}
+
+fn valid_lowercase_md5(md5: &str) -> bool {
+    md5.len() == 32
+        && md5
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -2104,6 +2135,7 @@ fn build_server_skill_executor(
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
+    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     forward_headers: &HashMap<String, String>,
     request_constraints: RequestConstraints,
     inherited_permissions: InheritedPermissions,
@@ -2133,6 +2165,7 @@ fn build_server_skill_executor(
     .with_admitted_model_execution(admitted_model_execution.cloned())
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
+    .with_runtime_file_transfer(runtime_file_transfer)
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
     .with_inherited_permissions(inherited_permissions)
@@ -4899,6 +4932,13 @@ impl AgenticRunLifecycleService {
         Self::validate_resolved_model_selection(request)?;
         self.validate_runtime_profile_shape(request)?;
         Self::validate_runtime_auth_shape(request)?;
+        Self::runtime_file_transfer_context(request).map_err(|detail| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                detail,
+                "runtime_file_transfer_invalid",
+            )
+        })?;
         let provider_model_descriptor = Self::provider_model_descriptor(request)?;
         if provider_model_descriptor.is_some() {
             Self::validate_provider_runtime_authorized(request)?;
@@ -4955,6 +4995,84 @@ impl AgenticRunLifecycleService {
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
         }
         Ok(request_constraints)
+    }
+
+    fn runtime_file_transfer_context(
+        request: &ChatRequestData,
+    ) -> Result<Option<Arc<astra_services::runs::RuntimeFileTransferContext>>, String> {
+        let Some(descriptor) = request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.file_transfer.as_ref())
+        else {
+            return Ok(None);
+        };
+        if !request.provider_runtime_authorized {
+            return Err("file_transfer requires provider-authorized runtime context".to_string());
+        }
+        if descriptor.id != "moi-runtime-files"
+            || descriptor.descriptor_type != "file_transfer"
+            || descriptor.transport != "http"
+            || descriptor.protocol != "moi_runtime_files_v1"
+            || !(descriptor.endpoint_url.starts_with("http://")
+                || descriptor.endpoint_url.starts_with("https://"))
+        {
+            return Err("file_transfer descriptor contract is invalid".to_string());
+        }
+        let auth = request
+            .runtime_auth
+            .as_ref()
+            .ok_or_else(|| "file_transfer requires runtime_auth".to_string())?;
+        let metadata: RuntimeFileTransferMetadata =
+            serde_json::from_value(Value::Object(descriptor.metadata.clone()))
+                .map_err(|error| format!("file_transfer metadata is invalid: {error}"))?;
+        if metadata.contract_version != 1
+            || metadata.task_id.trim().is_empty()
+            || Path::new(&metadata.task_id)
+                .file_name()
+                .and_then(|value| value.to_str())
+                != Some(metadata.task_id.as_str())
+            || metadata.max_file_bytes == 0
+            || metadata.max_file_bytes > 32 * 1024 * 1024
+        {
+            return Err("file_transfer metadata contract is unsupported".to_string());
+        }
+        let root = Path::new(&metadata.root);
+        let expected_root = Path::new("/sandbox/.moi/runtime").join(&metadata.task_id);
+        let session = Path::new(&metadata.session_dir);
+        if root != expected_root
+            || Path::new(&metadata.catalog_dir) != root.join("catalog")
+            || Path::new(&metadata.scratch_dir) != root.join("scratch")
+            || session.parent() != Some(Path::new("/sandbox/.moi/sessions"))
+            || session.file_name().is_none()
+        {
+            return Err("file_transfer directory scope is invalid".to_string());
+        }
+        let mut file_ids = HashSet::new();
+        for attachment in &metadata.attachments {
+            if attachment.file_id.trim().is_empty()
+                || !valid_runtime_attachment_name(&attachment.name)
+                || attachment.size < 0
+                || attachment.size as u64 > metadata.max_file_bytes
+                || !valid_lowercase_md5(&attachment.md5)
+                || !file_ids.insert(attachment.file_id.clone())
+            {
+                return Err("file_transfer attachment inventory is invalid".to_string());
+            }
+        }
+        Ok(Some(Arc::new(
+            astra_services::runs::RuntimeFileTransferContext {
+                endpoint_url: descriptor.endpoint_url.clone(),
+                authorization: auth.authorization.clone(),
+                task_id: metadata.task_id,
+                root: metadata.root,
+                catalog_dir: metadata.catalog_dir,
+                session_dir: metadata.session_dir,
+                scratch_dir: metadata.scratch_dir,
+                max_file_bytes: metadata.max_file_bytes,
+                attachments: metadata.attachments,
+            },
+        )))
     }
 
     async fn validate_optional_tool_availability(
@@ -6953,6 +7071,8 @@ impl AgenticRunLifecycleService {
             &edge_tools,
             &edge_profile,
             execution_bindings,
+            Self::runtime_file_transfer_context(request)
+                .expect("runtime file transfer was validated before state construction"),
             &request.forward_headers,
             request_constraints.clone(),
             root_permissions.clone(),
@@ -8462,6 +8582,12 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &snapshot.executor,
             )));
         }
+        if Self::runtime_file_transfer_context(&request)
+            .expect("runtime file transfer was validated before host construction")
+            .is_some()
+        {
+            host.install_managed_file_transfer_tool_schemas();
+        }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
@@ -8655,6 +8781,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
+            )
+            .with_runtime_file_transfer(
+                Self::runtime_file_transfer_context(&request)
+                    .expect("runtime file transfer was validated before run start"),
             );
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(loop_state.cancellation.token.clone())
@@ -10094,6 +10224,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
 
+        if Self::runtime_file_transfer_context(&request)
+            .expect("runtime file transfer was validated before streaming host construction")
+            .is_some()
+        {
+            host.install_managed_file_transfer_tool_schemas();
+        }
+
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
@@ -10291,6 +10428,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
+            )
+            .with_runtime_file_transfer(
+                Self::runtime_file_transfer_context(&request)
+                    .expect("runtime file transfer was validated before streaming run start"),
             );
             executor = wire_reflect_service_into_executor(executor, &self.reflect_service)
                 .with_cancel_token(state.cancellation.token.clone())

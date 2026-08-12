@@ -185,7 +185,13 @@ impl ToolSurface {
         // resulting vectors come out sorted for free.
         let mut always_load: Vec<Value> = Vec::new();
         let mut deferred: Vec<DeferredEntry> = Vec::new();
+        let registry = astra_runtime_env::ToolRegistry::builtins();
         for (name, schema) in by_name {
+            if registry.get(&name).is_some_and(|spec| {
+                spec.load_policy == astra_runtime_env::ToolLoadPolicy::RequestScoped
+            }) {
+                continue;
+            }
             if always_load_names.contains(&name) {
                 always_load.push(schema);
             } else {

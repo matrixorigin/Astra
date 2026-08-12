@@ -10,6 +10,48 @@ pub fn parse_bash(command: &str) -> Option<Tree> {
     parser.parse(command, None)
 }
 
+/// Return command invocations as the shell parser sees them. Each entry is
+/// `[executable, argument, ...]`; command separators are therefore never
+/// fused into executable or argument text.
+pub(crate) fn simple_command_words(command: &str) -> Option<Vec<Vec<String>>> {
+    let tree = parse_bash(command)?;
+    let mut commands = Vec::new();
+    collect_simple_commands(tree.root_node(), command, &mut commands);
+    Some(commands)
+}
+
+fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<String>>) {
+    if matches!(node.kind(), "command" | "simple_command") {
+        let mut words = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "command_name"
+                | "word"
+                | "string"
+                | "raw_string"
+                | "concatenation"
+                | "command_substitution"
+                | "expansion" => {
+                    let text = child.utf8_text(source.as_bytes()).unwrap_or("").trim();
+                    if !text.is_empty() {
+                        words.push(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !words.is_empty() {
+            commands.push(words);
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_simple_commands(child, source, commands);
+    }
+}
+
 /// AST-level bash risk analysis.
 ///
 /// This is intentionally conservative: it focuses on high-signal primitives

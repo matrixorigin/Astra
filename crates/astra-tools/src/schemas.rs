@@ -710,15 +710,30 @@ fn all_tool_schemas_core() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "materialize_attachment",
+                "description": "Copy one current-turn MOI attachment into the managed runtime catalog directory. Use the exact file_id from the current attachment inventory before opening the file with local tools.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "file_id": {"type": "string", "description": "Exact file_id from the current-turn attachment inventory."}
+                    },
+                    "required": ["file_id"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "publish_artifact",
-                "description": "Publish a file that was already generated in the current session workspace or /tmp so the web UI can preview and download it. Use this after creating images, PDFs, CSVs, Markdown, HTML, or other files with bash/write_file/run_script. Do not use this to generate content directly; first create the file, then publish its path.",
+                "description": "Publish a file that was already generated in the current runtime workspace so the web UI can preview and download it. Managed runtimes accept only their declared catalog/session/scratch directories; server-local runtimes may also allow /tmp. Use this after creating the file; do not use it to generate content directly.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "path": {
                             "type": "string",
-                            "description": "Path of the generated file. Relative paths are resolved under the session workspace. Absolute paths are allowed only under the session workspace or /tmp."
+                            "description": "Path of the generated file. Relative paths are resolved under the runtime workspace. Absolute paths must satisfy the current host's declared path policy."
                         },
                         "title": {"type": "string", "description": "Optional short display title for the artifact."},
                         "artifact_kind": {"type": "string", "description": "Optional stable kind such as image, pdf, markdown, html, data, text, code, archive, or file. If omitted, Astra infers it from the filename/content type."},

@@ -389,18 +389,33 @@ async fn load_run_prompt_observability(
 pub(crate) async fn stream_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Query(query): Query<RunStreamQuery>,
 ) -> Response {
-    let user = match state.auth_service.current_user(&headers).await {
-        Ok(user) => user,
+    let principal = match state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/chat/runs/{run_id}/stream",
+                &Bytes::new(),
+            ),
+        )
+        .await
+    {
+        Ok(principal) => principal,
         Err((status, error)) => return sse_error_response(status, error.0.detail),
     };
 
     match state
         .execution
         .run_lifecycle_service
-        .stream_run_live(run_id.clone(), user.user_id, query.last_index)
+        .stream_run_live(run_id.clone(), principal.user.user_id, query.last_index)
         .await
     {
         Ok(mut stream) => {
@@ -1325,6 +1340,99 @@ mod tests {
         assert!(
             text.contains("\"type\":\"run_finished\""),
             "terminal lifecycle event should still reach the client: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_run_accepts_provider_request_principal() {
+        use crate::server::run::engine::RunEngine;
+        use crate::server::run::lifecycle::AgenticRunLifecycleService;
+        use astra_services::runs::InMemoryRunStateStore;
+
+        let engine = RunEngine::new(Arc::new(InMemoryRunStateStore::new()));
+        engine
+            .start_run(
+                "run-provider-stream",
+                "provider-user-1",
+                "session-provider-stream",
+            )
+            .await
+            .expect("start provider-owned run");
+        engine
+            .append_event(
+                "provider-user-1",
+                "run-provider-stream",
+                json!({"event_type": "run_finished", "data": {"status": "completed"}}),
+            )
+            .await
+            .expect("persist run_finished");
+        engine
+            .persist_status(
+                "provider-user-1",
+                "run-provider-stream",
+                astra_core::STATUS_COMPLETED,
+                None,
+                None,
+            )
+            .await
+            .expect("mark completed");
+
+        let lifecycle = AgenticRunLifecycleService::new(
+            test_matrixone(),
+            Arc::new(
+                crate::FernetTokenEncryptor::new("0123456789abcdef")
+                    .expect("test encryptor should initialize"),
+            ),
+            Arc::new(TokioMutex::new(HashMap::new())),
+            engine,
+        );
+        let descriptor = Arc::new(Mutex::new(None));
+        let app = build_app(
+            AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+                .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                    descriptor: Arc::clone(&descriptor),
+                }))
+                .with_run_lifecycle_service(Arc::new(lifecycle)),
+        );
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/chat/runs/run-provider-stream/stream?last_index=0")
+                    .header("authorization", "Bearer provider-token")
+                    .header("x-request-id", "provider-stream-request")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("response should be returned");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("sse should be utf8");
+        assert!(text.contains("\"type\":\"run_finished\""), "SSE = {text}");
+
+        let descriptor = descriptor
+            .lock()
+            .expect("descriptor lock")
+            .clone()
+            .expect("provider request descriptor");
+        assert_eq!(descriptor.method, "GET");
+        assert_eq!(descriptor.path, "/chat/runs/run-provider-stream/stream");
+        assert_eq!(
+            descriptor.route.as_deref(),
+            Some("/chat/runs/{run_id}/stream")
+        );
+        assert_eq!(
+            descriptor.request_id.as_deref(),
+            Some("provider-stream-request")
+        );
+        assert_eq!(
+            descriptor.body_digest.as_deref(),
+            Some("sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         );
     }
 

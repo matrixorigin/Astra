@@ -116,6 +116,22 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 35,
     },
     ToolMeta {
+        name: "materialize_attachment",
+        description: "Copy an authorized MOI attachment into the managed runtime workspace",
+        triggers: &[
+            "attachment",
+            "attached file",
+            "materialize",
+            "附件",
+            "上传的文件",
+        ],
+        intents: &[IntentType::CodeRead, IntentType::CodeEdit],
+        scope: Scope::Local,
+        requires: &[],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 35,
+    },
+    ToolMeta {
         name: "publish_artifact",
         description: "Publish a generated workspace or /tmp file for web preview and download",
         triggers: &[

@@ -7,8 +7,9 @@
 //!   1. Default T1 (always_load) candidate members come from
 //!      `ToolSpec.load_policy`; final visibility is provider/binding gated.
 //!   2. User config can add extra tools to the default always_load set.
-//!   3. Every non-T1 tool appears in the deferred list as `name + short_desc`
-//!      (no schema, no parameters).
+//!   3. Every non-T1, non-request-scoped tool appears in the deferred list as
+//!      `name + short_desc` (no schema, no parameters). Request-scoped tools
+//!      remain absent until their request capability is validated.
 //!   4. `tools[]` bytes are stable across two successive builds with the
 //!      same inputs — the Anthropic prompt-cache invariant.
 //!   5. Registering a plugin does not perturb `tools[]` bytes; the new
@@ -355,7 +356,7 @@ fn unknown_tool_name_in_config_is_ignored_not_panic() {
 // ── 3. Deferred manifest ────────────────────────────────────────────────────
 
 #[test]
-fn deferred_list_contains_every_non_always_load_tool() {
+fn surface_partitions_static_tools_and_excludes_request_scoped_tools() {
     let cfg = ToolSurfaceConfig::default();
     let schemas = catalog_schemas();
     let schema_names = names(&schemas);
@@ -365,14 +366,20 @@ fn deferred_list_contains_every_non_always_load_tool() {
         names(&surface.always_load_schemas()).into_iter().collect();
     let deferred: std::collections::HashSet<String> =
         surface.deferred().iter().map(|e| e.name.clone()).collect();
+    let registry = astra_runtime_env::ToolRegistry::builtins();
 
-    // Partition: every canonical schema is in exactly one of the two.
+    // Static tools partition into always-load or deferred. Request-scoped
+    // tools are deliberately absent until the owning capability is validated.
     for tool_name in schema_names {
         let in_always_load = always_load.contains(&tool_name);
         let in_deferred = deferred.contains(&tool_name);
+        let request_scoped = registry.get(&tool_name).is_some_and(|spec| {
+            spec.load_policy == astra_runtime_env::ToolLoadPolicy::RequestScoped
+        });
         assert!(
-            in_always_load ^ in_deferred,
-            "{} must be in exactly one of {{always_load, deferred}}; always_load={in_always_load} deferred={in_deferred}",
+            usize::from(in_always_load) + usize::from(in_deferred) + usize::from(request_scoped)
+                == 1,
+            "{} must be in exactly one of {{always_load, deferred, request_scoped}}; always_load={in_always_load} deferred={in_deferred} request_scoped={request_scoped}",
             tool_name
         );
     }

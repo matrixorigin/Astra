@@ -526,6 +526,9 @@ pub struct RuntimeToolExecutor {
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Tool names explicitly admitted for edge dispatch (bypass capability check).
     edge_admitted_tools: HashSet<String>,
+    /// Hidden RuntimeGrant-backed byte-transfer context for managed Edge
+    /// tools. It is attached after model admission and never merged into args.
+    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
 }
 
 impl RuntimeToolExecutor {
@@ -609,6 +612,7 @@ impl RuntimeToolExecutor {
             invocation_ledger: None,
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
+            runtime_file_transfer: None,
         }
     }
 
@@ -638,6 +642,14 @@ impl RuntimeToolExecutor {
     /// so that multiple executors share the same disabled tool-offer set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
+        self
+    }
+
+    pub fn with_runtime_file_transfer(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    ) -> Self {
+        self.runtime_file_transfer = context;
         self
     }
 
@@ -1269,6 +1281,7 @@ impl RuntimeToolExecutor {
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
+        context.request_scoped_file_transfer_provider_ready = self.runtime_file_transfer.is_some();
         context
     }
 
@@ -1907,6 +1920,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.runtime_file_transfer = self.runtime_file_transfer.clone();
         request
     }
 
@@ -1923,6 +1937,7 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
+        request.runtime_file_transfer = self.runtime_file_transfer.clone();
         request
     }
 

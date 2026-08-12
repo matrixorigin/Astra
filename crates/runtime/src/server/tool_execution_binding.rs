@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -268,6 +269,10 @@ pub struct ToolExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_offer: Option<SelectedToolOfferSnapshot>,
     pub policy: ToolPolicySnapshot,
+    /// Request-scoped managed Edge transfer material. Skipped by generic
+    /// serialization so credentials cannot enter durable tool snapshots.
+    #[serde(skip)]
+    pub runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
 }
 
 struct ToolExecutionIdentityParts<'a> {
@@ -487,6 +492,7 @@ impl ExecutionBindingState {
             runtime: self.runtime.clone(),
             selected_offer: None,
             policy: ToolPolicySnapshot::default(),
+            runtime_file_transfer: None,
         }
     }
 }

@@ -538,6 +538,7 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
+            runtime_file_transfer: None,
             selected_offer: None,
             policy: Default::default(),
         }

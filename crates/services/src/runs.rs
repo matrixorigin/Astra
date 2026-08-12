@@ -471,6 +471,43 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_transfer: Option<RuntimeCapabilityDescriptorRequest>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferAttachment {
+    pub file_id: String,
+    pub name: String,
+    pub size: i64,
+    pub md5: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferContext {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub task_id: String,
+    pub root: String,
+    pub catalog_dir: String,
+    pub session_dir: String,
+    pub scratch_dir: String,
+    pub max_file_bytes: u64,
+    pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+impl std::fmt::Debug for RuntimeFileTransferContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeFileTransferContext")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("task_id", &self.task_id)
+            .field("root", &self.root)
+            .field("attachment_count", &self.attachments.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

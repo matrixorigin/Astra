@@ -913,6 +913,7 @@ fn request(
         workspace_record: None,
         executor,
         runtime: None,
+        runtime_file_transfer: None,
         selected_offer: None,
         policy: ToolPolicySnapshot::default(),
     }
@@ -1523,6 +1524,45 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
     assert_eq!(metadata["executor"]["kind"], "edge_agent");
     assert_eq!(metadata["executor"]["transport"], "edge_ledger");
     assert_eq!(metadata["transport"], "edge_ledger");
+}
+
+#[test]
+fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
+    let mut request = request(
+        "materialize_attachment",
+        WorkspaceBinding::edge_workspace(
+            "Managed sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Managed sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.runtime_file_transfer = Some(std::sync::Arc::new(
+        astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer durable-secret-must-not-appear".to_string(),
+            task_id: "task-1".to_string(),
+            root: "/sandbox/.moi/runtime/task-1".to_string(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        },
+    ));
+
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let payload = plan.dispatch_payload_json().expect("dispatch payload");
+    let parsed: Value = serde_json::from_str(&payload).expect("payload json");
+
+    assert!(!payload.contains("durable-secret-must-not-appear"));
+    assert_eq!(parsed["runtime_file_transfer"], Value::Null);
+    assert!(plan.runtime_file_transfer().is_some());
 }
 
 #[test]
@@ -4428,6 +4468,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         },
         workspace_record: None,
         runtime: None,
+        runtime_file_transfer: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -4464,6 +4505,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         },
         workspace_record: None,
         runtime: None,
+        runtime_file_transfer: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),
@@ -4500,6 +4542,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         },
         workspace_record: None,
         runtime: None,
+        runtime_file_transfer: None,
         tool_name: "bash".to_string(),
         args: serde_json::json!({"cmd": "ls"}),
         user_id: "test-user".to_string(),

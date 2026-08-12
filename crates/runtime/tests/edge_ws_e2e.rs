@@ -583,6 +583,7 @@ async fn edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay() {
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
+        runtime_file_transfer: None,
         timeout_secs: 30,
     };
     dispatch
@@ -641,6 +642,7 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
+        runtime_file_transfer: None,
         timeout_secs: 30,
     };
     dispatch

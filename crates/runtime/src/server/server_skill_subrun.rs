@@ -62,6 +62,7 @@ pub struct ServerSkillSubRunExecutor {
     edge_profile: Map<String, Value>,
     /// Workspace/executor/runtime binding inherited from the parent run.
     execution_binding_snapshot: Option<ExecutionBindingSnapshot>,
+    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     /// Skill resolver inherited from parent — enables nested inline skills.
     skill_resolver: Option<Arc<dyn crate::turn::skill_tool::SkillResolver>>,
     /// Parent cancellation token — propagated so stop/cancel interrupts sub-runs.
@@ -117,6 +118,7 @@ impl ServerSkillSubRunExecutor {
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
+            runtime_file_transfer: None,
             skill_resolver: None,
             cancel_token: None,
             forward_headers: HashMap::new(),
@@ -189,6 +191,14 @@ impl ServerSkillSubRunExecutor {
 
     pub fn with_execution_binding_snapshot(mut self, snapshot: ExecutionBindingSnapshot) -> Self {
         self.execution_binding_snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn with_runtime_file_transfer(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    ) -> Self {
+        self.runtime_file_transfer = context;
         self
     }
 
@@ -597,6 +607,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 self.reflect_service.is_configured(),
             ))
             .with_cancel_token(self.cancel_token.clone())
+            .with_runtime_file_transfer(self.runtime_file_transfer.clone())
             .with_tool_execution_service(builder.build());
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());

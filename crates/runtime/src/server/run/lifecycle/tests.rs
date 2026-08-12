@@ -5793,6 +5793,74 @@ fn test_runtime_descriptor(
     }
 }
 
+fn file_transfer_request_with_attachment(
+    attachment: Value,
+) -> astra_services::runs::ChatRequestData {
+    let mut request = prepared_test_request("hello");
+    request.provider_runtime_authorized = true;
+    request.runtime_auth = Some(RuntimeAuthRequest {
+        authorization: "Bearer runtime-grant".to_string(),
+    });
+    let mut descriptor = test_runtime_descriptor(
+        "moi-runtime-files",
+        "file_transfer",
+        "http://127.0.0.1/runtime-files",
+    );
+    descriptor.protocol = "moi_runtime_files_v1".to_string();
+    descriptor.metadata = json!({
+        "contract_version": 1,
+        "task_id": "task-1",
+        "root": "/sandbox/.moi/runtime/task-1",
+        "catalog_dir": "/sandbox/.moi/runtime/task-1/catalog",
+        "session_dir": "/sandbox/.moi/sessions/session-1",
+        "scratch_dir": "/sandbox/.moi/runtime/task-1/scratch",
+        "max_file_bytes": 1024,
+        "attachments": [attachment]
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    request.capability_descriptors =
+        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
+            model_gateway: None,
+            mcp: None,
+            skills: None,
+            edge_agent: None,
+            file_transfer: Some(descriptor),
+        });
+    request
+}
+
+#[test]
+fn runtime_file_transfer_rejects_edge_invalid_attachment_inventory_at_request_boundary() {
+    let valid = json!({
+        "file_id": "file-1",
+        "name": "paper.pdf",
+        "size": 512,
+        "md5": "0123456789abcdef0123456789abcdef"
+    });
+    assert!(
+        AgenticRunLifecycleService::runtime_file_transfer_context(
+            &file_transfer_request_with_attachment(valid.clone())
+        )
+        .unwrap()
+        .is_some()
+    );
+
+    for invalid in [
+        json!({"file_id": "file-1", "name": "../paper.pdf", "size": 512, "md5": "0123456789abcdef0123456789abcdef"}),
+        json!({"file_id": "file-1", "name": "paper.pdf", "size": 1025, "md5": "0123456789abcdef0123456789abcdef"}),
+        json!({"file_id": "file-1", "name": "paper.pdf", "size": 512, "md5": "0123456789ABCDEF0123456789ABCDEF"}),
+        json!({"file_id": "file-1", "name": "x".repeat(241), "size": 512, "md5": "0123456789abcdef0123456789abcdef"}),
+    ] {
+        let error = AgenticRunLifecycleService::runtime_file_transfer_context(
+            &file_transfer_request_with_attachment(invalid),
+        )
+        .expect_err("invalid inventory must be rejected before edge dispatch");
+        assert_eq!(error, "file_transfer attachment inventory is invalid");
+    }
+}
+
 #[tokio::test]
 async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_gateway() {
     let service = test_service();
@@ -5812,6 +5880,7 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
+            file_transfer: None,
         });
 
     let prepared = service
@@ -5855,6 +5924,7 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
+            file_transfer: None,
         });
 
     let err = service
@@ -10213,6 +10283,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
                 &format!("http://{addr}/skills"),
             )),
             edge_agent: None,
+            file_transfer: None,
         });
 
     let capabilities = service

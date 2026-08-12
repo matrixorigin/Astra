@@ -327,6 +327,12 @@ fn apply_provider_supplied_runtime_context(
                 });
         }
     }
+    if let Some(file_transfer) = descriptors.file_transfer.as_ref() {
+        astra_services::auth::provider_request::validate_runtime_capability_descriptor(
+            file_transfer,
+            "file_transfer",
+        )?;
+    }
     if let Some(model_gateway) = descriptors.model_gateway.as_ref() {
         astra_services::auth::provider_request::validate_runtime_capability_descriptor(
             model_gateway,

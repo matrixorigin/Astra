@@ -401,6 +401,8 @@ pub struct ExternalRuntimeCapabilityDescriptors {
     pub mcp: Option<ExternalRuntimeCapabilityDescriptor>,
     #[serde(default)]
     pub skills: Option<ExternalRuntimeCapabilityDescriptor>,
+    #[serde(default)]
+    pub file_transfer: Option<ExternalRuntimeCapabilityDescriptor>,
 }
 
 impl ExternalRuntimeCapabilityDescriptors {
@@ -419,6 +421,10 @@ impl ExternalRuntimeCapabilityDescriptors {
                 .as_ref()
                 .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
             edge_agent: None,
+            file_transfer: self
+                .file_transfer
+                .as_ref()
+                .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
         }
     }
 }
@@ -1084,6 +1090,9 @@ pub fn validate_provider_runtime_context(
     if let Some(skills) = context.capability_descriptors.skills.as_ref() {
         validate_capability_descriptor(provider, skills, "skills")?;
     }
+    if let Some(file_transfer) = context.capability_descriptors.file_transfer.as_ref() {
+        validate_capability_descriptor(provider, file_transfer, "file_transfer")?;
+    }
     Ok(())
 }
 
@@ -1589,6 +1598,37 @@ mod tests {
         assert_eq!(
             err.1.error_code.as_deref(),
             Some("external_provider_runtime_context_invalid")
+        );
+    }
+
+    #[test]
+    fn external_file_transfer_descriptor_is_preserved_for_runtime_admission() {
+        let descriptor = ExternalRuntimeCapabilityDescriptor {
+            id: "moi-runtime-files".to_string(),
+            descriptor_type: "file_transfer".to_string(),
+            transport: "http".to_string(),
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            protocol: "moi_runtime_files_v1".to_string(),
+            semantic_read: None,
+            metadata: serde_json::Map::from_iter([("contract_version".to_string(), json!(1))]),
+        };
+        let descriptors = ExternalRuntimeCapabilityDescriptors {
+            file_transfer: Some(descriptor),
+            ..Default::default()
+        };
+
+        let request = descriptors.to_request_descriptors();
+
+        assert_eq!(
+            request.file_transfer.as_ref().map(|item| item.id.as_str()),
+            Some("moi-runtime-files")
+        );
+        assert_eq!(
+            request
+                .file_transfer
+                .as_ref()
+                .map(|item| item.protocol.as_str()),
+            Some("moi_runtime_files_v1")
         );
     }
 

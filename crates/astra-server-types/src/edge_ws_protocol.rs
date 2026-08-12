@@ -27,6 +27,70 @@ use serde_json::{Map, Value};
 
 pub use astra_turn_types::ToolInvocationIdentity;
 
+/// Host-owned file-transfer contract sent to an edge agent.  This wire type
+/// intentionally lives with the WebSocket protocol so the edge-only build
+/// does not depend on server services.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferAttachment {
+    pub file_id: String,
+    pub name: String,
+    pub size: i64,
+    pub md5: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferContext {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub task_id: String,
+    pub root: String,
+    pub catalog_dir: String,
+    pub session_dir: String,
+    pub scratch_dir: String,
+    pub max_file_bytes: u64,
+    pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+impl std::fmt::Debug for RuntimeFileTransferContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeFileTransferContext")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("task_id", &self.task_id)
+            .field("root", &self.root)
+            .field("attachment_count", &self.attachments.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<&astra_services::runs::RuntimeFileTransferContext> for RuntimeFileTransferContext {
+    fn from(context: &astra_services::runs::RuntimeFileTransferContext) -> Self {
+        Self {
+            endpoint_url: context.endpoint_url.clone(),
+            authorization: context.authorization.clone(),
+            task_id: context.task_id.clone(),
+            root: context.root.clone(),
+            catalog_dir: context.catalog_dir.clone(),
+            session_dir: context.session_dir.clone(),
+            scratch_dir: context.scratch_dir.clone(),
+            max_file_bytes: context.max_file_bytes,
+            attachments: context
+                .attachments
+                .iter()
+                .map(|attachment| RuntimeFileTransferAttachment {
+                    file_id: attachment.file_id.clone(),
+                    name: attachment.name.clone(),
+                    size: attachment.size,
+                    md5: attachment.md5.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
@@ -95,6 +159,11 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
+        /// Host-owned transfer credentials and path contract. This field is
+        /// never part of model-visible tool arguments or the invocation
+        /// journal; its Debug implementation redacts authorization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_file_transfer: Option<Box<RuntimeFileTransferContext>>,
         /// Maximum execution time in seconds.
         #[serde(default = "default_tool_timeout_secs")]
         timeout_secs: u64,
@@ -216,12 +285,56 @@ mod tests {
             delivery_generation: 1,
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
+            runtime_file_transfer: None,
             timeout_secs: 120,
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_tool_request");
         assert_eq!(v["tool"], "bash");
         assert_eq!(v["timeout_secs"], 120);
+    }
+
+    #[test]
+    fn edge_tool_request_round_trips_hidden_file_transfer_context() {
+        let msg = EdgeServerMessage::ToolRequest {
+            request_id: "req-transfer".into(),
+            identity: identity(),
+            delivery_generation: 1,
+            tool: "materialize_attachment".into(),
+            args: json!({"file_id": "file-1"}),
+            runtime_file_transfer: Some(Box::new(RuntimeFileTransferContext {
+                endpoint_url: "https://moi.example/runtime-files".into(),
+                authorization: "Bearer runtime-grant".into(),
+                task_id: "task-1".into(),
+                root: "/sandbox/.moi/runtime/task-1".into(),
+                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
+                session_dir: "/sandbox/.moi/sessions/session-1".into(),
+                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".into(),
+                max_file_bytes: 1024,
+                attachments: vec![RuntimeFileTransferAttachment {
+                    file_id: "file-1".into(),
+                    name: "paper.pdf".into(),
+                    size: 10,
+                    md5: "0123456789abcdef0123456789abcdef".into(),
+                }],
+            })),
+            timeout_secs: 120,
+        };
+
+        let encoded = serde_json::to_string(&msg).unwrap();
+        let decoded: EdgeServerMessage = serde_json::from_str(&encoded).unwrap();
+
+        match decoded {
+            EdgeServerMessage::ToolRequest {
+                runtime_file_transfer: Some(context),
+                ..
+            } => {
+                assert_eq!(context.task_id, "task-1");
+                assert_eq!(context.attachments[0].file_id, "file-1");
+                assert_eq!(context.authorization, "Bearer runtime-grant");
+            }
+            other => panic!("expected tool request with transfer context, got {other:?}"),
+        }
     }
 
     #[test]
