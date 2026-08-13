@@ -1,5 +1,6 @@
 use std::io::{Read as _, Seek as _};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(test)]
 use std::io::Write as _;
@@ -8,6 +9,9 @@ use astra_server_types::edge_ws_protocol::{
     RuntimeFileTransferAttachment, RuntimeFileTransferContext,
 };
 use astra_tools::ToolResult;
+use astra_tools::artifact_metadata::{
+    NormalizedArtifactFileMetadata, normalize_artifact_file_metadata, validate_short_token,
+};
 use futures_util::StreamExt;
 use md5::{Digest as _, Md5};
 use serde::Deserialize;
@@ -15,6 +19,9 @@ use serde_json::{Map, Value, json};
 use sha2::Sha256;
 use tokio::io::AsyncWriteExt as _;
 use tokio_util::io::ReaderStream;
+
+const RUNTIME_FILE_TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_FILE_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) async fn execute(
     tool: &str,
@@ -90,7 +97,11 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
             );
         }
     }
-    let response = match reqwest::Client::new()
+    let client = match runtime_file_transfer_http_client(&url) {
+        Ok(client) => client,
+        Err(error) => return ToolResult::error(error),
+    };
+    let response = match client
         .get(url)
         .header(reqwest::header::AUTHORIZATION, &context.authorization)
         .send()
@@ -168,41 +179,27 @@ struct PublishArgs {
     description: Option<String>,
 }
 
-fn validate_publish_args(args: &mut PublishArgs) -> Result<(), String> {
+fn validate_publish_args(
+    args: &mut PublishArgs,
+    path: &Path,
+) -> Result<NormalizedArtifactFileMetadata, String> {
     normalize_optional_metadata(&mut args.title);
-    normalize_optional_metadata(&mut args.artifact_kind);
-    normalize_optional_metadata(&mut args.content_type);
     normalize_optional_metadata(&mut args.description);
 
     if let Some(title) = &args.title {
-        validate_short_metadata(title, "title", 160)?;
+        validate_short_token(title, "title", 160)?;
     }
     if let Some(description) = &args.description {
-        validate_short_metadata(description, "description", 1000)?;
+        validate_short_token(description, "description", 1000)?;
     }
-    if let Some(artifact_kind) = &mut args.artifact_kind {
-        validate_short_metadata(artifact_kind, "artifact_kind", 64)?;
-        if !artifact_kind
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-        {
-            return Err(
-                "Error: artifact_kind may only contain ASCII letters, digits, '_', '-', or '.'"
-                    .to_string(),
-            );
-        }
-        artifact_kind.make_ascii_lowercase();
-    }
-    if let Some(content_type) = &mut args.content_type {
-        validate_short_metadata(content_type, "content_type", 128)?;
-        if !content_type.contains('/') || content_type.contains(';') {
-            return Err(
-                "Error: content_type must be a simple MIME type such as image/png".to_string(),
-            );
-        }
-        content_type.make_ascii_lowercase();
-    }
-    Ok(())
+    let normalized = normalize_artifact_file_metadata(
+        path,
+        args.content_type.as_deref(),
+        args.artifact_kind.as_deref(),
+    )?;
+    args.content_type = Some(normalized.content_type.clone());
+    args.artifact_kind = Some(normalized.artifact_kind.clone());
+    Ok(normalized)
 }
 
 fn normalize_optional_metadata(value: &mut Option<String>) {
@@ -213,18 +210,6 @@ fn normalize_optional_metadata(value: &mut Option<String>) {
     if !normalized.is_empty() {
         *value = Some(normalized.to_string());
     }
-}
-
-fn validate_short_metadata(value: &str, field: &str, max_len: usize) -> Result<(), String> {
-    if value.len() > max_len {
-        return Err(format!("Error: {field} must be at most {max_len} bytes"));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(format!(
-            "Error: {field} must not contain control characters"
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -255,14 +240,15 @@ async fn publish(
             return ToolResult::error(format!("publish_artifact arguments are invalid: {error}"));
         }
     };
-    if let Err(error) = validate_publish_args(&mut args) {
-        return ToolResult::error(error);
-    }
     let requested = PathBuf::from(&args.path);
     let requested = if requested.is_absolute() {
         requested
     } else {
         Path::new(&context.session_dir).join(requested)
+    };
+    let normalized_metadata = match validate_publish_args(&mut args, &requested) {
+        Ok(metadata) => metadata,
+        Err(error) => return ToolResult::error(error),
     };
     let allowed_roots = [
         PathBuf::from(&context.catalog_dir),
@@ -294,16 +280,18 @@ async fn publish(
     url.query_pairs_mut()
         .append_pair("call_id", call_id)
         .append_pair("filename", &filename);
-    let response = match reqwest::Client::new()
+    let client = match runtime_file_transfer_http_client(&url) {
+        Ok(client) => client,
+        Err(error) => return ToolResult::error(error),
+    };
+    let response = match client
         .post(url)
         .header(reqwest::header::AUTHORIZATION, &context.authorization)
         .header("X-MOI-Content-SHA256", &digest)
         .header(reqwest::header::CONTENT_LENGTH, content_size)
         .header(
             reqwest::header::CONTENT_TYPE,
-            args.content_type
-                .as_deref()
-                .unwrap_or("application/octet-stream"),
+            &normalized_metadata.content_type,
         )
         .body(reqwest::Body::wrap_stream(upload))
         .send()
@@ -332,7 +320,7 @@ async fn publish(
     let artifact = json!({
         "artifact_id": artifact_id,
         "name": uploaded.filename,
-        "type": args.artifact_kind.as_deref().unwrap_or("file"),
+        "type": normalized_metadata.artifact_kind.clone(),
         "description": args.description.as_deref().unwrap_or("Managed runtime artifact"),
         "parts": [{
             "kind": if uploaded.content_type.starts_with("image/") { "image" } else { "file" },
@@ -370,9 +358,7 @@ async fn publish(
         ),
         (
             "artifact_kind".to_string(),
-            args.artifact_kind
-                .map(Value::String)
-                .unwrap_or_else(|| Value::String("file".to_string())),
+            Value::String(normalized_metadata.artifact_kind),
         ),
         (
             "description".to_string(),
@@ -386,6 +372,17 @@ async fn publish(
         is_error: false,
         exit_semantics: None,
     }
+}
+
+fn runtime_file_transfer_http_client(url: &reqwest::Url) -> Result<reqwest::Client, String> {
+    astra_core::net::client_builder_for_target(url.as_str())
+        // Transfer credentials and request bodies must never be forwarded to
+        // another origin by an HTTP redirect.
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(RUNTIME_FILE_TRANSFER_CONNECT_TIMEOUT)
+        .timeout(RUNTIME_FILE_TRANSFER_REQUEST_TIMEOUT)
+        .build()
+        .map_err(|_| "runtime file transfer HTTP client is unavailable".to_string())
 }
 
 async fn bounded_json_response<T: for<'de> Deserialize<'de>>(
@@ -1004,26 +1001,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_uploads_relative_session_artifact_with_bounded_response() {
+    async fn publish_uploads_relative_session_artifact_with_inferred_metadata() {
         let server = MockServer::start().await;
-        let content = b"report";
+        let content = b"%PDF-report";
         let sha256 = format!("sha256:{:x}", Sha256::digest(content));
         let md5 = md5_hex(content);
         Mock::given(method("POST"))
             .and(path("/api/v1/runtime-files"))
             .and(query_param("call_id", "call-1"))
-            .and(query_param("filename", "report.txt"))
+            .and(query_param("filename", "report.pdf"))
             .and(header(
                 "authorization",
                 "Bearer secret-that-must-be-redacted",
             ))
+            .and(header("content-type", "application/pdf"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "file_id": "out-1",
-                "filename": "report.txt",
+                "filename": "report.pdf",
                 "size": content.len(),
                 "md5": md5,
                 "sha256": sha256,
-                "content_type": "text/plain",
+                "content_type": "application/pdf",
                 "download_url": "https://example.invalid/out-1"
             })))
             .mount(&server)
@@ -1032,19 +1030,21 @@ mod tests {
         let mut transfer = context(temp.path());
         transfer.endpoint_url = format!("{}/api/v1/runtime-files", server.uri());
         prepare_scope_dirs(&transfer).await.unwrap();
-        std::fs::write(temp.path().join("session/report.txt"), content).unwrap();
+        std::fs::write(temp.path().join("session/report.pdf"), content).unwrap();
 
-        let result = publish(
-            &json!({"path": "report.txt", "content_type": "text/plain"}),
-            Some(&transfer),
-            "call-1",
-        )
-        .await;
+        let result = publish(&json!({"path": "report.pdf"}), Some(&transfer), "call-1").await;
 
         assert!(!result.is_error, "{result:?}");
         assert_eq!(
             result.metadata.as_ref().and_then(|m| m.get("file_id")),
             Some(&Value::String("out-1".to_string()))
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("artifact_kind")),
+            Some(&Value::String("pdf".to_string()))
         );
     }
 
@@ -1071,7 +1071,7 @@ mod tests {
             let mut request = json!({"path": "report.txt"});
             request[field] = Value::String(invalid);
             let mut args: PublishArgs = serde_json::from_value(request).unwrap();
-            let error = validate_publish_args(&mut args).unwrap_err();
+            let error = validate_publish_args(&mut args, Path::new("report.txt")).unwrap_err();
             assert!(error.contains(expected), "{field}: {error}");
         }
 
@@ -1083,7 +1083,7 @@ mod tests {
             "content_type": "APPLICATION/JSON"
         }))
         .unwrap();
-        validate_publish_args(&mut args).unwrap();
+        validate_publish_args(&mut args, Path::new("report.txt")).unwrap();
         assert_eq!(args.title.as_deref(), Some("Report"));
         assert_eq!(args.description.as_deref(), Some("Summary"));
         assert_eq!(args.artifact_kind.as_deref(), Some("report.json"));

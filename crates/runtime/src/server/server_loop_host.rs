@@ -2423,7 +2423,11 @@ impl ServerAgenticLoopHost {
         self.request_scoped_file_transfer_provider_ready = true;
         for schema in astra_tools::schemas::all_tool_schemas()
             .into_iter()
-            .filter(|schema| tool_schema_name(schema) == Some("materialize_attachment"))
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES.contains(&name)
+                })
+            })
         {
             append_tool_schemas_unique(&mut self.admission_tool_schemas, vec![schema.clone()]);
             let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
@@ -8020,6 +8024,35 @@ mod tests {
             selected.is_empty(),
             "request-scoped MCP tools must not be delivered to the edge ledger"
         );
+    }
+
+    #[test]
+    fn managed_file_transfer_install_adds_both_request_scoped_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-transfer".to_string(),
+            "s-transfer".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_service_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .build();
+
+        host.install_managed_file_transfer_tool_schemas();
+
+        let installed = schema_names(&host.tool_schemas);
+        let admission = schema_names(&host.admission_tool_schemas);
+        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
+            assert!(installed.contains(*tool_name), "missing {tool_name} schema");
+            assert!(
+                admission.contains(*tool_name),
+                "missing {tool_name} admission schema"
+            );
+            assert!(host.valid_tool_names().contains(*tool_name));
+        }
     }
 
     #[test]

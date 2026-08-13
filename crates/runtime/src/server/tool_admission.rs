@@ -441,7 +441,9 @@ pub(crate) fn active_provider_declarations_for_binding(
             providers.push(CapacityProviderDeclaration::new(
                 capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
                 runtime_execution_provider_id_for_executor(executor),
-                ["materialize_attachment".to_string()],
+                astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES
+                    .iter()
+                    .map(|name| (*name).to_string()),
             ));
         }
     }
@@ -1007,24 +1009,28 @@ mod tests {
             Some(ToolHiddenReason::NoProvider)
         );
 
-        let available = resolve_tool_admission_for_binding_with_context(
-            "materialize_attachment",
-            &[],
-            &workspace,
-            &executor,
-            None,
-            &registry(),
-            ToolAdmissionContext {
-                request_scoped_file_transfer_provider_ready: true,
-                ..ToolAdmissionContext::default()
-            },
-        );
-        assert!(available.visible);
-        assert_eq!(available.route, ToolExecutionRouteKind::EdgeBound);
-        assert_eq!(
-            available.selected_offer_id(),
-            Some("materialize_attachment@edge-managed")
-        );
+        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
+            let available = resolve_tool_admission_for_binding_with_context(
+                tool_name,
+                &[],
+                &workspace,
+                &executor,
+                None,
+                &registry(),
+                ToolAdmissionContext {
+                    request_scoped_file_transfer_provider_ready: true,
+                    runtime_declared_tool_names: Some(HashSet::from(["bash".to_string()])),
+                    ..ToolAdmissionContext::default()
+                },
+            );
+            assert!(available.visible, "{tool_name} must be request-scoped");
+            assert_eq!(available.route, ToolExecutionRouteKind::EdgeBound);
+            let expected_offer_id = format!("{tool_name}@edge-managed");
+            assert_eq!(
+                available.selected_offer_id(),
+                Some(expected_offer_id.as_str())
+            );
+        }
     }
 
     #[test]

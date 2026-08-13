@@ -6,6 +6,13 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use astra_services::{SessionArtifactJsonRecord, SessionArtifactJsonStore, StoredSessionArtifact};
+#[cfg(test)]
+use astra_tools::artifact_metadata::{
+    infer_artifact_kind, infer_content_type, validate_artifact_kind, validate_content_type,
+};
+use astra_tools::artifact_metadata::{
+    normalize_artifact_file_metadata, should_store_artifact_as_text, validate_short_token,
+};
 use astra_turn_core::file_edit_journal::{EditType, FileEditJournal, UndoResult};
 
 use crate::server::tool_workspace_path_guard::unique_path_variants;
@@ -99,112 +106,6 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-}
-
-pub(crate) fn validate_short_token(value: &str, field: &str, max_len: usize) -> Result<(), String> {
-    if value.len() > max_len {
-        return Err(format!("Error: {field} must be at most {max_len} bytes"));
-    }
-    if value.chars().any(|ch| ch.is_control()) {
-        return Err(format!(
-            "Error: {field} must not contain control characters"
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_artifact_kind(value: &str) -> Result<String, String> {
-    validate_short_token(value, "artifact_kind", 64)?;
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
-    {
-        return Err(
-            "Error: artifact_kind may only contain ASCII letters, digits, '_', '-', or '.'"
-                .to_string(),
-        );
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-pub(crate) fn validate_content_type(value: &str) -> Result<String, String> {
-    validate_short_token(value, "content_type", 128)?;
-    if !value.contains('/') || value.contains(';') {
-        return Err("Error: content_type must be a simple MIME type such as image/png".to_string());
-    }
-    Ok(value.to_ascii_lowercase())
-}
-
-pub(crate) fn infer_content_type(path: &Path) -> &'static str {
-    match path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("svg") => "image/svg+xml",
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("avif") => "image/avif",
-        Some("pdf") => "application/pdf",
-        Some("html") | Some("htm") => "text/html",
-        Some("md") | Some("markdown") => "text/markdown",
-        Some("txt") | Some("log") => "text/plain",
-        Some("json") => "application/json",
-        Some("jsonl") => "application/x-ndjson",
-        Some("csv") => "text/csv",
-        Some("tsv") => "text/tab-separated-values",
-        Some("yaml") | Some("yml") => "application/yaml",
-        Some("toml") => "application/toml",
-        Some("xml") => "application/xml",
-        Some("zip") => "application/zip",
-        Some("tar") => "application/x-tar",
-        Some("gz") | Some("tgz") => "application/gzip",
-        Some("parquet") => "application/vnd.apache.parquet",
-        _ => "application/octet-stream",
-    }
-}
-
-pub(crate) fn infer_artifact_kind(path: &Path, content_type: &str) -> &'static str {
-    if content_type.starts_with("image/") {
-        return "image";
-    }
-    match content_type {
-        "application/pdf" => "pdf",
-        "text/html" => "html",
-        "text/markdown" => "markdown",
-        "application/json"
-        | "application/x-ndjson"
-        | "text/csv"
-        | "text/tab-separated-values"
-        | "application/yaml"
-        | "application/toml" => "data",
-        "text/plain" => "text",
-        "application/zip" | "application/x-tar" | "application/gzip" => "archive",
-        _ => match path.extension().and_then(|ext| ext.to_str()) {
-            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh") => "code",
-            _ => "file",
-        },
-    }
-}
-
-pub(crate) fn should_store_artifact_as_text(content_type: &str, path: &Path) -> bool {
-    content_type.starts_with("text/")
-        || matches!(
-            content_type,
-            "image/svg+xml"
-                | "application/json"
-                | "application/x-ndjson"
-                | "application/yaml"
-                | "application/toml"
-                | "application/xml"
-        )
-        || matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("rs" | "go" | "py" | "ts" | "tsx" | "js" | "jsx" | "sql" | "sh")
-        )
 }
 
 pub(crate) fn undo_file_with_candidates(
@@ -442,14 +343,13 @@ pub(crate) fn prepare_publish_artifact_record(
         ));
     }
 
-    let content_type = match string_arg(args, "content_type") {
-        Some(value) => validate_content_type(value)?,
-        None => infer_content_type(path).to_string(),
-    };
-    let artifact_kind = match string_arg(args, "artifact_kind") {
-        Some(value) => validate_artifact_kind(value)?,
-        None => infer_artifact_kind(path, &content_type).to_string(),
-    };
+    let normalized_metadata = normalize_artifact_file_metadata(
+        path,
+        string_arg(args, "content_type"),
+        string_arg(args, "artifact_kind"),
+    )?;
+    let content_type = normalized_metadata.content_type;
+    let artifact_kind = normalized_metadata.artifact_kind;
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())

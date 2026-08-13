@@ -449,7 +449,7 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
 
     let commands = super::bash_ast::simple_command_words(command)?;
     for words in commands {
-        let Some((executable, arguments)) = effective_write_command(&words) else {
+        let Some((executable, arguments)) = effective_mutation_command(&words) else {
             continue;
         };
         if executable == "__astra_unsupported_env_split_string" {
@@ -461,12 +461,6 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
                     .to_string(),
             );
         }
-        if !matches!(
-            executable.to_ascii_lowercase().as_str(),
-            "cp" | "mv" | "touch" | "mkdir" | "install" | "tee" | "rsync"
-        ) {
-            continue;
-        }
         if let Some(option) = unsupported_abbreviated_write_option(executable, &arguments) {
             return Some(option.to_string());
         }
@@ -477,6 +471,31 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         }
     }
     None
+}
+
+/// Find a supported mutating command even when an unrecognized launcher
+/// precedes it. This is deliberately not a launcher allowlist: utilities such
+/// as `nice`, `timeout`, and project-specific wrappers must not make a known
+/// filesystem mutation invisible to the hard write-boundary check.
+fn effective_mutation_command(words: &[String]) -> Option<(&str, Vec<&str>)> {
+    for index in 0..words.len() {
+        let Some((executable, arguments)) = effective_write_command(&words[index..]) else {
+            continue;
+        };
+        if executable == "__astra_unsupported_env_split_string"
+            || is_supported_write_command(executable)
+        {
+            return Some((executable, arguments));
+        }
+    }
+    None
+}
+
+fn is_supported_write_command(executable: &str) -> bool {
+    matches!(
+        executable.to_ascii_lowercase().as_str(),
+        "cp" | "mv" | "touch" | "mkdir" | "install" | "tee" | "rsync"
+    )
 }
 
 /// Resolve the executable that a simple shell command will actually launch.
@@ -1268,18 +1287,31 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::create_dir_all(&catalog).unwrap();
 
-        let command = format!(
-            "cp '{}/input.pdf' '{}/input.pdf'",
-            catalog.display(),
-            workspace.display()
-        );
-        let risks = analyze_command_risks_in_workspace(&command, &workspace);
-        assert!(
-            !risks
-                .iter()
-                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
-            "read-only copy source must not be classified as a write: {risks:?}"
-        );
+        for command in [
+            format!(
+                "cp '{}/input.pdf' '{}/input.pdf'",
+                catalog.display(),
+                workspace.display()
+            ),
+            format!(
+                "nice cp '{}/input.pdf' '{}/input.pdf'",
+                catalog.display(),
+                workspace.display()
+            ),
+            format!(
+                "timeout 5 cp '{}/input.pdf' '{}/input.pdf'",
+                catalog.display(),
+                workspace.display()
+            ),
+        ] {
+            let risks = analyze_command_risks_in_workspace(&command, &workspace);
+            assert!(
+                !risks
+                    .iter()
+                    .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+                "read-only copy source must not be classified as a write: {command}: {risks:?}"
+            );
+        }
     }
 
     #[test]
@@ -1341,6 +1373,12 @@ mod tests {
             format!(
                 "env --split-string='touch {}'",
                 outside.join("output.txt").display()
+            ),
+            format!("nice cp input.txt '{}/output.txt'", outside.display()),
+            format!("timeout 5 mv input.txt '{}/output.txt'", outside.display()),
+            format!(
+                "project-launcher --mode safe cp input.txt '{}/output.txt'",
+                outside.display()
             ),
         ] {
             let risks = analyze_command_risks_in_workspace(&command, &workspace);
