@@ -1028,6 +1028,7 @@ fn existing_durable_run_start_claim(
 pub enum DurableRunInteractionKind {
     Approval,
     AskUser,
+    Provider,
 }
 
 impl DurableRunInteractionKind {
@@ -1035,6 +1036,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval_required",
             Self::AskUser => "ask_user_prompted",
+            Self::Provider => "provider_interaction_required",
         }
     }
 
@@ -1042,6 +1044,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval_resolved",
             Self::AskUser => "ask_user_resolved",
+            Self::Provider => "provider_interaction_resolved",
         }
     }
 
@@ -1049,6 +1052,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "tool_approval",
             Self::AskUser => "user_input",
+            Self::Provider => "provider_interaction",
         }
     }
 
@@ -1056,6 +1060,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval",
             Self::AskUser => "ask_user",
+            Self::Provider => "provider_interaction",
         }
     }
 }
@@ -7023,6 +7028,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "approval_required",
     "approval_batch_required",
     "user_prompt_required",
+    "provider_interaction_required",
+    "provider_interaction_resolved",
     // Run lifecycle + framing.
     "run_started",
     "run_error",
@@ -7427,6 +7434,24 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
         }
         "ask_user_prompted" | "user_prompt_required" => {
             let mut out = serde_json::json!({ "type": "user_prompt_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "provider_interaction_required" => {
+            let mut out = serde_json::json!({ "type": "provider_interaction_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "provider_interaction_resolved" => {
+            let mut out = serde_json::json!({ "type": "provider_interaction_resolved" });
             if let Some(obj) = out.as_object_mut() {
                 for (k, v) in &data {
                     obj.insert(k.clone(), v.clone());

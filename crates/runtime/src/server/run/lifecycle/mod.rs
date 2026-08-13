@@ -348,6 +348,8 @@ fn attached_stream_event_requires_reliable_delivery(event: &Value) -> bool {
                 | "tool_request"
                 | "ask_user_prompted"
                 | "user_prompt_required"
+                | "provider_interaction_required"
+                | "provider_interaction_resolved"
                 | "stream_gap"
                 | "agent_live_gap"
         )
@@ -1003,6 +1005,36 @@ fn ask_user_decision_from_shared_event(event: &Value) -> astra_tools::AskUserDec
     }
 }
 
+fn provider_interaction_decision_from_shared_event(
+    event: &Value,
+) -> astra_tools::ProviderInteractionDecision {
+    let data = event.get("data").unwrap_or(event);
+    match data
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("error")
+    {
+        "submitted" => data
+            .get("payload")
+            .filter(|payload| payload.is_object())
+            .cloned()
+            .map(astra_tools::ProviderInteractionDecision::Submitted)
+            .unwrap_or_else(|| {
+                astra_tools::ProviderInteractionDecision::Error(
+                    "durable provider interaction response contains invalid payload".to_string(),
+                )
+            }),
+        "cancelled" => astra_tools::ProviderInteractionDecision::Cancelled,
+        "timed_out" => astra_tools::ProviderInteractionDecision::Timeout,
+        _ => astra_tools::ProviderInteractionDecision::Error(
+            data.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("durable provider interaction failed")
+                .to_string(),
+        ),
+    }
+}
+
 /// Approval gate for a durable server-owned run.
 ///
 /// A server-owned run may outlive every currently attached client.  Treating
@@ -1638,6 +1670,141 @@ impl astra_tools::AskUserGate for DurableRunUserPromptGate {
             }
             Err(error) => astra_tools::AskUserDecision::Error(format!(
                 "ask_user deadline could not be closed durably: {error}"
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
+    async fn request_interaction(
+        &self,
+        request: &astra_turn_types::ProviderInteractionRequest,
+    ) -> astra_tools::ProviderInteractionDecision {
+        let event = json!({
+            "event_type": "provider_interaction_required",
+            "data": {
+                "request_id": &request.request_id,
+                "session_id": &self.context.session_id,
+                "run_id": &self.context.run_id,
+                "interaction": request,
+                "delivery": "durable",
+                "timeout_ms": request
+                    .timeout_ms
+                    .unwrap_or(self.timeout.as_millis() as u64),
+            }
+        });
+        match self
+            .project_transition(
+                &[STATUS_RUNNING],
+                RunStatus::Waiting,
+                Some("provider_interaction"),
+                event,
+            )
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return astra_tools::ProviderInteractionDecision::Error(
+                    "provider interaction response arrived after this run stopped waiting"
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::run_lifecycle",
+                    run_id = %self.context.run_id,
+                    request_id = %request.request_id,
+                    error = %error,
+                    "failed to persist durable provider interaction wait"
+                );
+                return astra_tools::ProviderInteractionDecision::Error(
+                    "provider interaction could not be recorded durably".to_string(),
+                );
+            }
+        }
+
+        let timeout = request
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(self.timeout);
+        let resolved = if let Some(cancel_token) = &self.cancel_token {
+            tokio::select! {
+                _ = cancel_token.cancelled() => return astra_tools::ProviderInteractionDecision::Cancelled,
+                resolved = wait_for_shared_run_interaction(
+                    &self.run_engine,
+                    &self.user_id,
+                    &self.context.run_id,
+                    &request.request_id,
+                    astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
+                    astra_services::runs::DurableRunInteractionKind::Provider.waiting_for(),
+                    timeout,
+                ) => resolved,
+            }
+        } else {
+            wait_for_shared_run_interaction(
+                &self.run_engine,
+                &self.user_id,
+                &self.context.run_id,
+                &request.request_id,
+                astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
+                astra_services::runs::DurableRunInteractionKind::Provider.waiting_for(),
+                timeout,
+            )
+            .await
+        };
+        if let Some(resolved) = resolved {
+            project_shared_run_interaction_resolution(
+                &self.run_engine,
+                &self.runs,
+                &self.user_id,
+                &self.context.run_id,
+                &request.request_id,
+                astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
+                self.stream_event_tx.as_ref(),
+            )
+            .await;
+            return provider_interaction_decision_from_shared_event(&resolved);
+        }
+
+        let timeout_data = json!({
+            "request_id": &request.request_id,
+            "outcome": "timed_out",
+        });
+        match self
+            .run_engine
+            .resolve_run_interaction(
+                &self.user_id,
+                &self.context.run_id,
+                &request.request_id,
+                astra_services::runs::DurableRunInteractionKind::Provider,
+                timeout_data,
+            )
+            .await
+        {
+            Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(event))
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(event))
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(event)) => {
+                project_shared_run_interaction_resolution(
+                    &self.run_engine,
+                    &self.runs,
+                    &self.user_id,
+                    &self.context.run_id,
+                    &request.request_id,
+                    astra_services::runs::DurableRunInteractionKind::Provider.resolved_event_type(),
+                    self.stream_event_tx.as_ref(),
+                )
+                .await;
+                provider_interaction_decision_from_shared_event(&event)
+            }
+            Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest)
+            | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+                astra_tools::ProviderInteractionDecision::Error(
+                    "provider interaction is no longer waiting for a response".to_string(),
+                )
+            }
+            Err(error) => astra_tools::ProviderInteractionDecision::Error(format!(
+                "provider interaction deadline could not be closed durably: {error}"
             )),
         }
     }
@@ -8884,7 +9051,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     None,
                 )
                 .with_cancel_token(llm_cancel_token.clone());
-                executor.set_ask_user_gate(std::sync::Arc::new(user_prompt_gate));
+                let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
+                executor.set_ask_user_gate(user_prompt_gate.clone());
+                executor.set_provider_interaction_gate(user_prompt_gate);
                 self.user_prompt_channels
                     .lock()
                     .await
@@ -8915,7 +9084,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .with_cancel_token(llm_cancel_token.clone()),
                 ));
-                executor.set_ask_user_gate(std::sync::Arc::new(
+                let user_prompt_gate = std::sync::Arc::new(
                     DurableRunUserPromptGate::new(
                         user_id.clone(),
                         session_id.clone(),
@@ -8927,7 +9096,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         None,
                     )
                     .with_cancel_token(llm_cancel_token.clone()),
-                ));
+                );
+                executor.set_ask_user_gate(user_prompt_gate.clone());
+                executor.set_provider_interaction_gate(user_prompt_gate);
             }
 
             wire_executor_into_state(executor, &mut loop_state);
@@ -10515,7 +10686,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Some(event_tx.clone()),
                 )
                 .with_cancel_token(llm_cancel_token.clone());
-                executor.set_ask_user_gate(std::sync::Arc::new(user_prompt_gate));
+                let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
+                executor.set_ask_user_gate(user_prompt_gate.clone());
+                executor.set_provider_interaction_gate(user_prompt_gate);
                 self.user_prompt_channels
                     .lock()
                     .await
@@ -10545,7 +10718,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     )
                     .with_cancel_token(llm_cancel_token.clone()),
                 ));
-                executor.set_ask_user_gate(std::sync::Arc::new(
+                let user_prompt_gate = std::sync::Arc::new(
                     DurableRunUserPromptGate::new(
                         user_id.clone(),
                         session_id.clone(),
@@ -10557,7 +10730,9 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         Some(event_tx.clone()),
                     )
                     .with_cancel_token(llm_cancel_token.clone()),
-                ));
+                );
+                executor.set_ask_user_gate(user_prompt_gate.clone());
+                executor.set_provider_interaction_gate(user_prompt_gate);
             }
             wire_executor_into_state(executor, &mut state);
         }
@@ -13642,7 +13817,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                     )
                     .with_cancel_token(local_cancel_token.clone()),
                 ));
-                executor.set_ask_user_gate(Arc::new(
+                let user_prompt_gate = Arc::new(
                     DurableRunUserPromptGate::new(
                         config.user_id.clone(),
                         config.session_id.clone(),
@@ -13654,7 +13829,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None,
                     )
                     .with_cancel_token(local_cancel_token.clone()),
-                ));
+                );
+                executor.set_ask_user_gate(user_prompt_gate.clone());
+                executor.set_provider_interaction_gate(user_prompt_gate);
             }
 
             if let Some(pool) = self.shared_pool.as_ref() {

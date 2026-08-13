@@ -450,6 +450,8 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "approval_batch_required"
                 | "ask_user_prompted"
                 | "user_prompt_required"
+                | "provider_interaction_required"
+                | "provider_interaction_resolved"
                 | "user_input"
                 | "user_intent"
                 | "compaction"

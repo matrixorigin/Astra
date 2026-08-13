@@ -60,9 +60,11 @@ pub use memory_structure::{
     should_store_persistent_memory, validate_persistent_memory_content,
 };
 pub use provider_contract::{
-    DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
-    ProviderClaim, ProviderClaimSource, ProviderClaimTrust, ProviderContractError,
-    ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderRejection,
+    DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
+    ProviderCallPayload, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
+    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionOutcome,
+    ProviderInteractionRequest, ProviderInteractionResponse, ProviderProtocolId, ProviderRejection,
     ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
     ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
     ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,

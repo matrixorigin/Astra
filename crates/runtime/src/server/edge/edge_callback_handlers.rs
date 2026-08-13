@@ -955,6 +955,190 @@ pub(crate) async fn post_user_prompt_respond_handler(
     })))
 }
 
+/// Resolve an opaque provider-owned interaction for a durable run.
+///
+/// This boundary authenticates the run and validates only Astra's generic
+/// envelope. Business payload validation remains the provider's
+/// responsibility when the suspended tool invocation resumes.
+pub(crate) async fn post_provider_interaction_respond_handler(
+    Extension(trace): Extension<RequestTrace>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<astra_thin_client::ProviderInteractionRespondRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let user = state.auth_service.current_user(&headers).await?;
+    let run_id = body.run_id.as_str();
+    let session_id = body.session_id.as_str();
+    let request_id = body.request_id.as_str();
+    if run_id.is_empty()
+        || request_id.is_empty()
+        || run_id != run_id.trim()
+        || session_id != session_id.trim()
+        || request_id != request_id.trim()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "run_id, session_id, and request_id must not be empty or contain surrounding whitespace",
+        ));
+    }
+    if let Err(error) = validate_session_id(session_id) {
+        return Err(error_response(StatusCode::BAD_REQUEST, error));
+    }
+    if body.cancelled == body.payload.is_some() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "exactly one of cancelled=true or payload is required",
+        ));
+    }
+    if body
+        .payload
+        .as_ref()
+        .is_some_and(|payload| !payload.is_object())
+    {
+        return Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "provider interaction payload must be an object",
+        ));
+    }
+
+    let target = state
+        .execution
+        .run_lifecycle_service
+        .get_run_status(run_id.to_string(), user.user_id.clone())
+        .await?;
+    if target.session_id != session_id {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "Provider interaction not found in this session",
+        ));
+    }
+    let required = match state
+        .execution
+        .run_lifecycle_service
+        .get_run_interaction_event(
+            run_id.to_string(),
+            user.user_id.clone(),
+            request_id.to_string(),
+            "provider_interaction_required".to_string(),
+        )
+        .await
+    {
+        Ok(Some(required)) => required,
+        Ok(None) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Provider interaction not found for this run",
+            ));
+        }
+        Err((_, error)) => {
+            tracing::warn!(
+                target: "astra_runtime::edge_callback",
+                user_id = %user.user_id,
+                session_id,
+                run_id,
+                request_id,
+                error = %error.0.detail,
+                "provider interaction lookup failed"
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Provider interaction lookup failed",
+            ));
+        }
+    };
+    let canonical: astra_turn_types::ProviderInteractionRequest = serde_json::from_value(
+        required
+            .pointer("/data/interaction")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        error_response(
+            StatusCode::CONFLICT,
+            format!("Provider interaction has an invalid canonical envelope: {error}"),
+        )
+    })?;
+    canonical.validate().map_err(|error| {
+        error_response(
+            StatusCode::CONFLICT,
+            format!("Provider interaction has an invalid canonical envelope: {error}"),
+        )
+    })?;
+    if canonical.request_id != request_id {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "Provider interaction request identity does not match its durable event",
+        ));
+    }
+
+    let response_data = serde_json::json!({
+        "request_id": request_id,
+        "outcome": if body.cancelled { "cancelled" } else { "submitted" },
+        "payload": body.payload,
+    });
+    match state
+        .execution
+        .run_lifecycle_service
+        .resolve_run_interaction(
+            run_id.to_string(),
+            user.user_id.clone(),
+            request_id.to_string(),
+            astra_services::runs::DurableRunInteractionKind::Provider,
+            response_data,
+        )
+        .await
+    {
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
+        | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(existing)) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                format!(
+                    "provider interaction response already recorded for request {} run {} as {}",
+                    request_id,
+                    run_id,
+                    existing
+                        .pointer("/data/outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+            ));
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest) => {
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "Provider interaction not found for this run",
+            ));
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
+            return Err(error_response(
+                StatusCode::CONFLICT,
+                "Provider interaction is no longer waiting for a response",
+            ));
+        }
+        Err((_, error)) => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("provider interaction resolution failed: {}", error.0.detail),
+            ));
+        }
+    }
+
+    tracing::info!(
+        target: "astra_runtime::edge_callback",
+        request_id = %trace.request_id,
+        user_id = %user.user_id,
+        callback_request_id = %request_id,
+        kind = "provider_interaction_respond",
+        "durable provider interaction callback committed"
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "request_id": request_id,
+        "durable": true,
+    })))
+}
+
 /// `POST /agents/edge` — upsert `edge_agent_registry` (Phase 3).
 pub(crate) async fn post_agents_edge_register_handler(
     State(state): State<AppState>,
@@ -1094,7 +1278,8 @@ mod edge_callback_insert_tests {
 
     use super::{
         EdgeRegisterRequest, LedgerInsertError, insert_ledger_entry, post_approval_respond_handler,
-        post_tool_result_handler, post_user_prompt_respond_handler,
+        post_provider_interaction_respond_handler, post_tool_result_handler,
+        post_user_prompt_respond_handler,
     };
     use crate::server::RequestTrace;
     use crate::{AppState, HealthChecker, ServiceInfo};
@@ -1759,6 +1944,64 @@ mod edge_callback_insert_tests {
         )
         .await
         .expect_err("late conflicting answer must not overwrite the durable response");
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_interaction_handler_resolves_only_the_matching_durable_request() {
+        let state = approval_callback_state_with_required(
+            "run-provider-interaction",
+            "sess-provider-interaction",
+            "req-provider-interaction",
+            "provider_interaction_required",
+            json!({
+                "request_id": "req-provider-interaction",
+                "interaction": {
+                    "request_id": "req-provider-interaction",
+                    "payload": {
+                        "type": "provider.opaque.select",
+                        "options": [{"id": "opaque-1"}]
+                    },
+                    "timeout_ms": 60_000
+                }
+            }),
+        );
+
+        let response = post_provider_interaction_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-provider-interaction".into(),
+            }),
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(astra_thin_client::ProviderInteractionRespondRequest {
+                request_id: "req-provider-interaction".into(),
+                session_id: "sess-provider-interaction".into(),
+                run_id: "run-provider-interaction".into(),
+                cancelled: false,
+                payload: Some(json!({"selected": "opaque-1"})),
+            }),
+        )
+        .await
+        .expect("matching provider interaction response should resolve durably");
+        assert_eq!(response.0["ok"], true);
+        assert_eq!(response.0["durable"], true);
+
+        let conflict = post_provider_interaction_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-provider-interaction-late".into(),
+            }),
+            State(state),
+            HeaderMap::new(),
+            Json(astra_thin_client::ProviderInteractionRespondRequest {
+                request_id: "req-provider-interaction".into(),
+                session_id: "sess-provider-interaction".into(),
+                run_id: "run-provider-interaction".into(),
+                cancelled: true,
+                payload: None,
+            }),
+        )
+        .await
+        .expect_err("a conflicting late response must not replace the durable outcome");
         assert_eq!(conflict.0, StatusCode::CONFLICT);
     }
 

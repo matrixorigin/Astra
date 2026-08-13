@@ -20,9 +20,10 @@ use crate::error::ThinClientError;
 use crate::paths;
 use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
-    EdgeRegisterRequest, RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest,
-    SessionTranscriptPage, SessionTranscriptReadScope, SessionUpdateRequest, StreamEvent,
-    TaskLeaseMutationRequest, ToolResultRequest, UserPromptRespondRequest,
+    EdgeRegisterRequest, ProviderInteractionRespondRequest, RunUserIntentRequest,
+    RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage, SessionTranscriptReadScope,
+    SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
+    UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
 
@@ -1656,6 +1657,23 @@ impl ThinClient {
         body: &UserPromptRespondRequest,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::USER_PROMPT_RESPOND)?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(self.auth_headers_for(bearer_override))
+            .json(body)
+            .send()
+            .await?;
+        Self::json_or_error(resp).await
+    }
+
+    /// Submit a response to a durable provider interaction.
+    pub async fn post_provider_interaction_response(
+        &self,
+        bearer_override: Option<&str>,
+        body: &ProviderInteractionRespondRequest,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::PROVIDER_INTERACTION_RESPOND)?;
         let resp = self
             .http
             .post(url)

@@ -35,13 +35,18 @@ use astra_tools::task_mgmt::{
     TaskStore,
 };
 use astra_tools::tool_engine::ToolEngine;
-use astra_tools::{AskUserGate, ToolExecutor};
+use astra_tools::{
+    AskUserGate, ProviderInteractionDecision, ProviderInteractionGate, ToolExecutor,
+};
 use astra_turn_core::capability::Capability;
 use astra_turn_core::sync_utils::{rwlock_read_clone_or_default, rwlock_write_reset_on_poison};
 use astra_turn_core::tool::schema::{
     prompt_schema_conflicting_tool_names, retain_tool_schemas_by_names, tool_schema_name,
 };
-use astra_turn_types::{ProviderCallOutcome, ProviderCallPayload};
+use astra_turn_types::{
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderCallOutcome, ProviderCallPayload,
+    ProviderInteractionOutcome, ProviderInteractionResponse,
+};
 use async_trait::async_trait;
 
 const TOOL_RESULT_ARTIFACT_MAX_BYTES: usize = 16 * 1024 * 1024;
@@ -520,6 +525,8 @@ pub struct RuntimeToolExecutor {
     approval_gate: Option<Arc<dyn astra_tools::ToolApprovalGate>>,
     /// Optional ask_user gate for interactive client prompts.
     ask_user_gate: Option<Arc<dyn AskUserGate>>,
+    /// Optional gate for provider-owned interactions returned by MCP tools.
+    provider_interaction_gate: Option<Arc<dyn ProviderInteractionGate>>,
     /// Optional progress callback for streaming tool output.
     progress_callback: Option<Arc<dyn astra_tools::ToolProgressCallback>>,
     /// Optional auxiliary event writer for ask_user-specific audit events.
@@ -576,6 +583,7 @@ impl RuntimeToolExecutor {
             reflect_service: Arc::new(astra_services::UnconfiguredReflectService),
             approval_gate: None,
             ask_user_gate: None,
+            provider_interaction_gate: None,
             progress_callback: None,
             auxiliary_event_writer: None,
             resource_governor: None,
@@ -1153,46 +1161,100 @@ impl RuntimeToolExecutor {
         tool_call_id: Option<&str>,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
     ) -> astra_tools::ToolResult {
-        if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
-            let Some(tool_call_id) = tool_call_id else {
-                return astra_tools::ToolResult::error(format!(
-                    "Agent Binding MCP tool '{name}' is missing its trusted tool call identity."
-                ));
+        let mut interaction_response: Option<ProviderInteractionResponse> = None;
+        loop {
+            let result = if let Some(agent_binding_mcp) = &self.agent_binding_mcp {
+                let Some(tool_call_id) = tool_call_id else {
+                    return astra_tools::ToolResult::error(format!(
+                        "Agent Binding MCP tool '{name}' is missing its trusted tool call identity."
+                    ));
+                };
+                agent_binding_mcp
+                    .call_tool_by_mcp_name(
+                        name,
+                        args,
+                        tool_call_id,
+                        semantic_read_condition,
+                        interaction_response.as_ref(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        mcp_call_error_result(
+                            super::runtime_mcp::redact_mcp_error_text(&format!(
+                                "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
+                                agent_binding_mcp.server_name()
+                            )),
+                            error.side_effects_maybe(),
+                            error.is_timeout(),
+                        )
+                    })
+            } else {
+                let Some(mgr) = &self.mcp_manager else {
+                    return astra_tools::ToolResult::error(format!(
+                        "Error: Tool '{name}' is not available — no MCP manager configured."
+                    ));
+                };
+                let protocol_metadata = interaction_response.as_ref().map(|response| {
+                    Map::from_iter([(
+                        PROVIDER_INTERACTION_RESPONSE_METADATA_KEY.to_string(),
+                        serde_json::to_value(response)
+                            .expect("provider interaction response must serialize"),
+                    )])
+                });
+                mgr.read()
+                    .await
+                    .call_tool_by_mcp_name_with_metadata(name, args.clone(), protocol_metadata)
+                    .await
+                    .map_err(|error| {
+                        mcp_call_error_result(
+                            super::runtime_mcp::redact_mcp_error_text(&format!(
+                                "MCP tool '{name}' failed: {error}"
+                            )),
+                            error.side_effects_maybe(),
+                            error.is_timeout(),
+                        )
+                    })
             };
-            return match agent_binding_mcp
-                .call_tool_by_mcp_name(name, args, tool_call_id, semantic_read_condition)
-                .await
-            {
-                Ok(result) => tool_result_from_mcp_tool_call_result(result),
-                Err(error) => mcp_call_error_result(
-                    super::runtime_mcp::redact_mcp_error_text(&format!(
-                        "Agent Binding MCP tool '{name}' failed on server '{}': {error}",
-                        agent_binding_mcp.server_name()
-                    )),
-                    error.side_effects_maybe(),
-                    error.is_timeout(),
-                ),
+            let result = match result {
+                Ok(result) => result,
+                Err(result) => return result,
             };
-        }
-        let Some(mgr) = &self.mcp_manager else {
-            return astra_tools::ToolResult::error(format!(
-                "Error: Tool '{name}' is not available — no MCP manager configured."
-            ));
-        };
-        match mgr
-            .read()
-            .await
-            .call_tool_by_mcp_name(name, args.clone())
-            .await
-        {
-            Ok(result) => tool_result_from_mcp_tool_call_result(result),
-            Err(error) => mcp_call_error_result(
-                super::runtime_mcp::redact_mcp_error_text(&format!(
-                    "MCP tool '{name}' failed: {error}"
-                )),
-                error.side_effects_maybe(),
-                error.is_timeout(),
-            ),
+            match result.into_provider_outcome() {
+                ProviderCallOutcome::InteractionRequired(request) => {
+                    let Some(gate) = self.provider_interaction_gate.as_ref() else {
+                        return astra_tools::ToolResult::error(
+                            "Provider requested user interaction, but no provider interaction gate is configured."
+                                .to_string(),
+                        );
+                    };
+                    interaction_response = Some(match gate.request_interaction(&request).await {
+                        ProviderInteractionDecision::Submitted(payload) => {
+                            ProviderInteractionResponse {
+                                request_id: request.request_id.clone(),
+                                outcome: ProviderInteractionOutcome::Submitted,
+                                payload: Some(payload),
+                            }
+                        }
+                        ProviderInteractionDecision::Cancelled => {
+                            return astra_tools::ToolResult::error(
+                                "Provider interaction was cancelled by the user.".to_string(),
+                            );
+                        }
+                        ProviderInteractionDecision::Timeout => {
+                            return astra_tools::ToolResult::error(
+                                "Provider interaction timed out before the user responded."
+                                    .to_string(),
+                            );
+                        }
+                        ProviderInteractionDecision::Error(error) => {
+                            return astra_tools::ToolResult::error(format!(
+                                "Provider interaction failed: {error}"
+                            ));
+                        }
+                    });
+                }
+                outcome => return tool_result_from_provider_outcome(outcome),
+            }
         }
     }
 
@@ -1684,6 +1746,12 @@ impl RuntimeToolExecutor {
     /// Set the ask_user gate for interactive user prompts.
     pub fn set_ask_user_gate(&mut self, gate: Arc<dyn AskUserGate>) {
         self.ask_user_gate = Some(gate);
+    }
+
+    /// Set the durable gate used when a provider pauses a tool invocation for
+    /// user input. The interaction payload remains opaque to Astra.
+    pub fn set_provider_interaction_gate(&mut self, gate: Arc<dyn ProviderInteractionGate>) {
+        self.provider_interaction_gate = Some(gate);
     }
 
     /// Set the progress callback for streaming tool output.
@@ -3286,8 +3354,13 @@ impl ToolExecutor for RuntimeToolExecutor {
     }
 }
 
+#[cfg(test)]
 fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_tools::ToolResult {
-    let (payload, is_error) = match result.into_provider_outcome() {
+    tool_result_from_provider_outcome(result.into_provider_outcome())
+}
+
+fn tool_result_from_provider_outcome(outcome: ProviderCallOutcome) -> astra_tools::ToolResult {
+    let (payload, is_error) = match outcome {
         ProviderCallOutcome::Success(payload) => (payload, false),
         ProviderCallOutcome::ToolFailure(payload) => (payload, true),
         ProviderCallOutcome::Rejected(rejection) => {
@@ -3300,6 +3373,11 @@ fn tool_result_from_mcp_tool_call_result(result: McpToolCallResult) -> astra_too
                 }),
             )]));
             return result;
+        }
+        ProviderCallOutcome::InteractionRequired(_) => {
+            return astra_tools::ToolResult::error(
+                "Provider interaction escaped the runtime interaction gate.".to_string(),
+            );
         }
     };
     tool_result_from_provider_payload(payload, is_error)

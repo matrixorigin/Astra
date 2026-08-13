@@ -795,6 +795,100 @@ pub struct ProviderCallPayload {
     pub protocol_metadata: Option<Value>,
 }
 
+/// Namespaced MCP result metadata carrying a provider-owned user interaction.
+///
+/// Astra persists and transports this envelope without interpreting `payload`.
+/// The provider remains the sole owner of the interaction's business meaning
+/// and validates the submitted response when the same tool call is resumed.
+pub const PROVIDER_INTERACTION_REQUEST_METADATA_KEY: &str = "astra/providerInteraction";
+
+/// Namespaced MCP request metadata carrying the response to a previously
+/// requested provider interaction.
+pub const PROVIDER_INTERACTION_RESPONSE_METADATA_KEY: &str = "astra/providerInteractionResponse";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInteractionRequest {
+    pub request_id: String,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl ProviderInteractionRequest {
+    pub const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
+
+    pub fn validate(&self) -> Result<(), ProviderContractError> {
+        if self.request_id.is_empty() || self.request_id != self.request_id.trim() {
+            return Err(ProviderContractError::InvalidProviderInteraction(
+                "request_id must be a non-empty string without surrounding whitespace".into(),
+            ));
+        }
+        if !self.payload.is_object() {
+            return Err(ProviderContractError::InvalidProviderInteraction(
+                "payload must be an object".into(),
+            ));
+        }
+        if self
+            .timeout_ms
+            .is_some_and(|timeout| timeout == 0 || timeout > Self::MAX_TIMEOUT_MS)
+        {
+            return Err(ProviderContractError::InvalidProviderInteraction(format!(
+                "timeout_ms must be between 1 and {}",
+                Self::MAX_TIMEOUT_MS
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderInteractionOutcome {
+    Submitted,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInteractionResponse {
+    pub request_id: String,
+    pub outcome: ProviderInteractionOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
+impl ProviderInteractionResponse {
+    pub fn validate_for(
+        &self,
+        request: &ProviderInteractionRequest,
+    ) -> Result<(), ProviderContractError> {
+        if self.request_id != request.request_id {
+            return Err(ProviderContractError::InvalidProviderInteraction(
+                "response request_id does not match the pending request".into(),
+            ));
+        }
+        match self.outcome {
+            ProviderInteractionOutcome::Submitted => {
+                if !self.payload.as_ref().is_some_and(Value::is_object) {
+                    return Err(ProviderContractError::InvalidProviderInteraction(
+                        "a submitted response requires an object payload".into(),
+                    ));
+                }
+            }
+            ProviderInteractionOutcome::Cancelled | ProviderInteractionOutcome::TimedOut => {
+                if self.payload.is_some() {
+                    return Err(ProviderContractError::InvalidProviderInteraction(
+                        "cancelled and timed_out responses must not carry a payload".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A provider acknowledged the request but declined to execute it. This is
 /// distinct from an Astra admission rejection and from a transport failure.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -827,13 +921,14 @@ pub enum ProviderCallOutcome {
     Success(ProviderCallPayload),
     ToolFailure(ProviderCallPayload),
     Rejected(ProviderRejection),
+    InteractionRequired(ProviderInteractionRequest),
 }
 
 impl ProviderCallOutcome {
     pub fn payload(&self) -> Option<&ProviderCallPayload> {
         match self {
             Self::Success(payload) | Self::ToolFailure(payload) => Some(payload),
-            Self::Rejected(_) => None,
+            Self::Rejected(_) | Self::InteractionRequired(_) => None,
         }
     }
 
@@ -846,6 +941,8 @@ impl ProviderCallOutcome {
 pub enum ProviderContractError {
     #[error("{kind} must not be empty")]
     EmptyIdentifier { kind: &'static str },
+    #[error("invalid provider interaction: {0}")]
+    InvalidProviderInteraction(String),
     #[error("duplicate native tool id '{native_tool_id}' in provider snapshot")]
     DuplicateNativeToolId { native_tool_id: String },
     #[error("tool '{native_tool_id}' {field} must be a JSON object")]
@@ -1135,5 +1232,56 @@ mod tests {
         );
         assert!(rejection.is_error());
         assert_eq!(rejection.payload(), None);
+    }
+
+    #[test]
+    fn provider_interaction_contract_keeps_business_payload_opaque() {
+        let request = ProviderInteractionRequest {
+            request_id: "call-1:select-instance".to_string(),
+            payload: json!({
+                "type": "provider.example.select",
+                "version": 7,
+                "options": [{"opaque": "value"}],
+            }),
+            timeout_ms: Some(600_000),
+        };
+        request.validate().unwrap();
+
+        ProviderInteractionResponse {
+            request_id: request.request_id.clone(),
+            outcome: ProviderInteractionOutcome::Submitted,
+            payload: Some(json!({"provider_owned_response": {"id": "opaque-1"}})),
+        }
+        .validate_for(&request)
+        .unwrap();
+    }
+
+    #[test]
+    fn provider_interaction_response_requires_matching_identity_and_outcome_shape() {
+        let request = ProviderInteractionRequest {
+            request_id: "interaction-1".to_string(),
+            payload: json!({}),
+            timeout_ms: None,
+        };
+
+        for response in [
+            ProviderInteractionResponse {
+                request_id: "interaction-2".to_string(),
+                outcome: ProviderInteractionOutcome::Submitted,
+                payload: Some(json!({})),
+            },
+            ProviderInteractionResponse {
+                request_id: request.request_id.clone(),
+                outcome: ProviderInteractionOutcome::Submitted,
+                payload: None,
+            },
+            ProviderInteractionResponse {
+                request_id: request.request_id.clone(),
+                outcome: ProviderInteractionOutcome::Cancelled,
+                payload: Some(json!({})),
+            },
+        ] {
+            assert!(response.validate_for(&request).is_err());
+        }
     }
 }

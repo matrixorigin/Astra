@@ -1270,6 +1270,7 @@ impl AgentBindingMcpRuntime {
         args: &Value,
         tool_call_id: &str,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
+        provider_interaction_response: Option<&astra_turn_types::ProviderInteractionResponse>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(
@@ -1285,10 +1286,22 @@ impl AgentBindingMcpRuntime {
             "arguments": agent_binding_tool_call_arguments(args),
             "call_id": tool_call_id,
         });
+        let mut protocol_metadata = serde_json::Map::new();
         if let Some(condition) = semantic_read_condition {
-            params["_meta"] = json!({
-                (AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY): condition,
-            });
+            protocol_metadata.insert(
+                AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY.to_string(),
+                serde_json::to_value(condition).expect("semantic read condition must serialize"),
+            );
+        }
+        if let Some(response) = provider_interaction_response {
+            protocol_metadata.insert(
+                astra_turn_types::PROVIDER_INTERACTION_RESPONSE_METADATA_KEY.to_string(),
+                serde_json::to_value(response)
+                    .expect("provider interaction response must serialize"),
+            );
+        }
+        if !protocol_metadata.is_empty() {
+            params["_meta"] = Value::Object(protocol_metadata);
         }
         let payload = json!({
             "jsonrpc": "2.0",
@@ -2193,6 +2206,7 @@ mod tests {
                     &json!({"q": "hello"}),
                     invalid_tool_call_id,
                     None,
+                    None,
                 )
                 .await
                 .expect_err("a blank tool call identity must fail before transport");
@@ -2220,6 +2234,7 @@ mod tests {
                 &json!({"q": "hello"}),
                 "model-tool-call-42",
                 None,
+                None,
             )
             .await
             .expect("tool call should succeed");
@@ -2234,10 +2249,28 @@ mod tests {
             Some(1)
         );
 
+        bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .call_tool_by_mcp_name(
+                "mcp__tools__query",
+                &json!({"q": "hello"}),
+                "model-tool-call-42",
+                None,
+                Some(&astra_turn_types::ProviderInteractionResponse {
+                    request_id: "model-tool-call-42:select".to_string(),
+                    outcome: astra_turn_types::ProviderInteractionOutcome::Submitted,
+                    payload: Some(json!({"selected": "opaque-1"})),
+                }),
+            )
+            .await
+            .expect("resumed tool call should preserve its identity and protocol metadata");
+
         let calls = calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, "Bearer runtime-grant");
         assert_eq!(calls[0].1["method"], "tools/list");
         assert_eq!(calls[1].0, "Bearer runtime-grant");
@@ -2251,6 +2284,23 @@ mod tests {
         assert_ne!(
             calls[1].1["id"], calls[1].1["params"]["call_id"],
             "JSON-RPC correlation and the business tool call identity are independent"
+        );
+        assert_eq!(
+            calls[2].1.pointer("/params/call_id"),
+            Some(&json!("model-tool-call-42")),
+            "resuming a provider interaction must retry the same business tool call"
+        );
+        assert_eq!(
+            calls[2]
+                .1
+                .pointer("/params/_meta/astra~1providerInteractionResponse/request_id"),
+            Some(&json!("model-tool-call-42:select"))
+        );
+        assert_eq!(
+            calls[2]
+                .1
+                .pointer("/params/_meta/astra~1providerInteractionResponse/payload/selected"),
+            Some(&json!("opaque-1"))
         );
         server.abort();
     }
@@ -2374,6 +2424,7 @@ mod tests {
                 &json!({"a": 2, "z": 1}),
                 "semantic-read-call",
                 Some(&condition),
+                None,
             )
             .await
             .expect("conditioned tool call should succeed");

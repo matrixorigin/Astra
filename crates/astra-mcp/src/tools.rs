@@ -1,8 +1,9 @@
 use std::collections::HashSet;
 
 use astra_turn_types::{
-    NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload, ProviderClaim,
-    ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
+    NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY, ProviderBindingRef,
+    ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
+    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionRequest,
     ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
     ResolvedProviderSnapshot,
 };
@@ -30,6 +31,26 @@ impl McpToolCallResult {
     /// Convert the wire-specific MCP result into the provider-neutral outcome.
     /// The typed MCP flag is authoritative; result prose is never classified.
     pub fn into_provider_outcome(self) -> ProviderCallOutcome {
+        if !self.is_error
+            && let Some(raw) = self
+                .protocol_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(PROVIDER_INTERACTION_REQUEST_METADATA_KEY))
+        {
+            return match serde_json::from_value::<ProviderInteractionRequest>(raw.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|request| {
+                    request.validate().map_err(|error| error.to_string())?;
+                    Ok(request)
+                }) {
+                Ok(request) => ProviderCallOutcome::InteractionRequired(request),
+                Err(error) => ProviderCallOutcome::ToolFailure(ProviderCallPayload {
+                    text: format!("Provider interaction contract is invalid: {error}"),
+                    structured_content: None,
+                    protocol_metadata: None,
+                }),
+            };
+        }
         let payload = ProviderCallPayload {
             text: self.output,
             structured_content: self.structured_content,
@@ -551,6 +572,56 @@ mod tests {
             success.into_provider_outcome(),
             ProviderCallOutcome::Success(_)
         ));
+    }
+
+    #[test]
+    fn provider_interaction_metadata_becomes_a_typed_provider_outcome() {
+        let result = McpToolCallResult {
+            output: String::new(),
+            structured_content: None,
+            protocol_metadata: Some(serde_json::json!({
+                PROVIDER_INTERACTION_REQUEST_METADATA_KEY: {
+                    "request_id": "call-1:select",
+                    "payload": {"provider_owned": true},
+                    "timeout_ms": 1000,
+                }
+            })),
+            is_error: false,
+        };
+
+        assert!(matches!(
+            result.into_provider_outcome(),
+            ProviderCallOutcome::InteractionRequired(ProviderInteractionRequest {
+                request_id,
+                payload,
+                timeout_ms: Some(1000),
+            }) if request_id == "call-1:select" && payload == serde_json::json!({"provider_owned": true})
+        ));
+    }
+
+    #[test]
+    fn malformed_provider_interaction_metadata_is_a_tool_failure() {
+        let result = McpToolCallResult {
+            output: String::new(),
+            structured_content: None,
+            protocol_metadata: Some(serde_json::json!({
+                PROVIDER_INTERACTION_REQUEST_METADATA_KEY: {
+                    "request_id": " ",
+                    "payload": [],
+                }
+            })),
+            is_error: false,
+        };
+
+        let ProviderCallOutcome::ToolFailure(payload) = result.into_provider_outcome() else {
+            panic!("malformed interaction must fail the provider tool call");
+        };
+        assert!(
+            payload
+                .text
+                .contains("Provider interaction contract is invalid")
+        );
+        assert!(payload.protocol_metadata.is_none());
     }
 
     #[test]

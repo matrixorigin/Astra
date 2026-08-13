@@ -9,8 +9,9 @@ use rmcp::{
         ArgumentInfo, CallToolRequestParams, CallToolResult, ClientCapabilities, ClientRequest,
         CompleteRequestParams, CompleteResult, GetPromptRequestParams, GetPromptResult,
         Implementation, InitializeRequestParams, ListRootsResult, LoggingLevel, PingRequest,
-        Prompt, ReadResourceRequestParams, Reference, Resource, Root, RootsCapabilities,
-        SetLevelRequestParams, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+        Prompt, ReadResourceRequestParams, Reference, RequestParamsMeta, Resource, Root,
+        RootsCapabilities, SetLevelRequestParams, SubscribeRequestParams, Tool,
+        UnsubscribeRequestParams,
     },
     serve_client,
     service::{NotificationContext, RequestContext, RunningService, ServiceError},
@@ -236,6 +237,15 @@ impl McpConnection {
         name: &str,
         arguments: serde_json::Value,
     ) -> Result<CallToolResult, ServiceError> {
+        self.call_tool_with_metadata(name, arguments, None).await
+    }
+
+    pub async fn call_tool_with_metadata(
+        &self,
+        name: &str,
+        arguments: serde_json::Value,
+        protocol_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<CallToolResult, ServiceError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
 
@@ -247,11 +257,14 @@ impl McpConnection {
                 arguments,
             )])),
         };
-        let params = if let Some(args) = arguments {
+        let mut params = if let Some(args) = arguments {
             CallToolRequestParams::new(name.to_string()).with_arguments(args)
         } else {
             CallToolRequestParams::new(name.to_string())
         };
+        if let Some(protocol_metadata) = protocol_metadata {
+            *params.meta_mut() = Some(rmcp::model::Meta(protocol_metadata));
+        }
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(MCP_TOOL_CALL_TIMEOUT_SECS),
             self.peer.call_tool(params),
