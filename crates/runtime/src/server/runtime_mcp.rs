@@ -1247,13 +1247,22 @@ fn extract_agent_binding_mcp_tool_result(
 impl AgentBindingMcpRuntime {
     #[cfg(test)]
     pub(crate) fn for_tests(server_name: &str, public_tool_names: &[&str]) -> Self {
+        Self::for_tests_at_endpoint(server_name, public_tool_names, "http://127.0.0.1:1/mcp")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_at_endpoint(
+        server_name: &str,
+        public_tool_names: &[&str],
+        endpoint_url: &str,
+    ) -> Self {
         let tool_names_by_public_name = public_tool_names
             .iter()
             .map(|name| ((*name).to_string(), (*name).to_string()))
             .collect();
         Self {
             server_name: server_name.to_string(),
-            endpoint_url: "http://127.0.0.1:1/mcp".to_string(),
+            endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
             semantic_read_tools: Arc::new(HashSet::new()),

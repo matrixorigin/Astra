@@ -7,12 +7,11 @@ pub(crate) async fn inject_effective_runtime_context(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
-        // Thread provider_scope_id into the request so the run lifecycle can
-        // propagate it into ToolExecutionRequest.workspace_record, enabling
-        // workspace isolation checks on the edge transport path even when the
-        // turn carries no full WorkspaceRecord (MOI provider-authorized turns).
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
-            request.provider_workspace_id = Some(ctx.provider_scope_id.clone());
+            request.provider_run_owner = Some(astra_services::runs::ProviderRunOwner {
+                provider_id: ctx.provider_id.clone(),
+                provider_scope_id: ctx.provider_scope_id.clone(),
+            });
         }
         if principal.is_edge_registration() {
             hydrate_edge_registration_runtime_context(state, principal, request).await?;
@@ -620,7 +619,13 @@ mod tests {
             .expect("provider authorization should accept the supplied runtime context");
 
         assert!(request.provider_runtime_authorized);
-        assert_eq!(request.provider_workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(
+            request.provider_run_owner,
+            Some(astra_services::runs::ProviderRunOwner {
+                provider_id: "p1".to_string(),
+                provider_scope_id: "ws-1".to_string(),
+            })
+        );
         let resolved = request
             .resolved_model_selection
             .as_ref()

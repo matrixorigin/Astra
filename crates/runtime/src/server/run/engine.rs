@@ -157,6 +157,7 @@ pub struct RunStartContext {
     pub resolved_model_selection: Option<ResolvedModelSelection>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
+    pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
 }
 
 fn durable_model_identity(
@@ -184,7 +185,7 @@ fn durable_model_identity(
     }
 }
 
-fn inherit_parent_model_identity(
+fn inherit_parent_run_identity(
     context: &mut RunStartContext,
     parent: &DurableRunRecord,
 ) -> Result<(), String> {
@@ -222,6 +223,29 @@ fn inherit_parent_model_identity(
             }
         }
         _ => Err("durable parent run contains an incomplete model identity".to_string()),
+    }?;
+
+    let parent_provider_run_owner = parent
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "run_started")
+        .and_then(|event| event.pointer("/data/provider_run_owner"))
+        .cloned()
+        .map(serde_json::from_value::<astra_services::runs::ProviderRunOwner>)
+        .transpose()
+        .map_err(|error| format!("durable parent run has an invalid provider owner: {error}"))?;
+    match (
+        context.provider_run_owner.as_ref(),
+        parent_provider_run_owner,
+    ) {
+        (None, Some(parent_owner)) => {
+            context.provider_run_owner = Some(parent_owner);
+            Ok(())
+        }
+        (Some(child_owner), Some(parent_owner)) if child_owner != &parent_owner => {
+            Err("child run provider owner must match its durable parent".to_string())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -416,6 +440,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         data.insert(
             "provider_request_fingerprint".to_string(),
             serde_json::Value::String(fingerprint.clone()),
+        );
+    }
+    if let Some(owner) = context.provider_run_owner.as_ref() {
+        data.insert(
+            "provider_run_owner".to_string(),
+            serde_json::to_value(owner).expect("provider run owner must serialize"),
         );
     }
     if !context.agent_binding_ids.is_empty() {
@@ -704,7 +734,7 @@ impl RunEngine {
             let parent = self
                 .require_delegation_parent(user_id, session_id, parent_run_id)
                 .await?;
-            inherit_parent_model_identity(&mut context, &parent)?;
+            inherit_parent_run_identity(&mut context, &parent)?;
             let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
             let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
             (
@@ -3235,7 +3265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_run_inherits_parent_offering_identity() {
+    async fn delegated_run_inherits_parent_run_identity() {
         let engine = test_engine();
         engine
             .start_run_with_context(
@@ -3249,6 +3279,10 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                    }),
+                    provider_run_owner: Some(astra_services::runs::ProviderRunOwner {
+                        provider_id: "moi".to_string(),
+                        provider_scope_id: "workspace-a".to_string(),
                     }),
                     ..Default::default()
                 },
@@ -3278,6 +3312,13 @@ mod tests {
         assert_eq!(
             child.resolved_model_name.as_deref(),
             Some("provider-model-v2")
+        );
+        assert_eq!(
+            child.events[0]["data"]["provider_run_owner"],
+            serde_json::json!({
+                "provider_id": "moi",
+                "provider_scope_id": "workspace-a"
+            })
         );
     }
 
@@ -3436,7 +3477,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
         };
         let context = crate::server::run::binding_resolution::run_start_context_from_request(
             &request, None, None,

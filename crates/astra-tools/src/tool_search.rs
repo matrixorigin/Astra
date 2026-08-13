@@ -265,7 +265,10 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         .iter()
         .copied()
         .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
-        .filter(|(_, name)| name.to_ascii_lowercase().starts_with(&requested_lower))
+        .filter(|(_, name)| {
+            (!name.contains("__") || requested.contains("__"))
+                && name.to_ascii_lowercase().starts_with(&requested_lower)
+        })
         .collect();
     prefix_matches.sort_by_key(|(_, name)| *name);
     match prefix_matches.as_slice() {
@@ -284,11 +287,24 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
     }
 }
 
-// MCP and other qualified producers expose canonical names such as
+// MCP producers expose canonical names such as
 // `mcp__server__tool__instance`. Skills and capability contracts refer to the
 // producer-owned `tool` segment because server and instance qualifiers are
 // runtime details. Resolve that unqualified name only when it identifies one
 // canonical tool; multiple instances remain explicitly ambiguous.
+fn qualified_mcp_tool_component(name: &str) -> Option<&str> {
+    let segments = name.split("__").collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["mcp", server, tool] if !server.is_empty() && !tool.is_empty() => Some(*tool),
+        ["mcp", server, tool, instance]
+            if !server.is_empty() && !tool.is_empty() && !instance.is_empty() =>
+        {
+            Some(*tool)
+        }
+        _ => None,
+    }
+}
+
 fn resolve_qualified_segment_tool<'a>(
     schemas: &'a [&'a Value],
     requested: &str,
@@ -298,8 +314,8 @@ fn resolve_qualified_segment_tool<'a>(
         .copied()
         .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
         .filter(|(_, name)| {
-            name.split("__")
-                .any(|segment| segment.eq_ignore_ascii_case(requested))
+            qualified_mcp_tool_component(name)
+                .is_some_and(|tool| tool.eq_ignore_ascii_case(requested))
         })
         .collect();
     matches.sort_by_key(|(_, name)| *name);
@@ -772,6 +788,51 @@ mod tests {
                 "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
             ]
         );
+    }
+
+    #[test]
+    fn select_mode_matches_only_the_mcp_tool_component() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__github__search__primary",
+                "description": "Search GitHub"
+            }
+        })];
+
+        for qualifier in ["mcp", "github", "primary"] {
+            let parsed = parse_result(&tool_search(
+                &schemas,
+                &json!({"query": format!("select:{qualifier}")}),
+            ));
+            assert_eq!(
+                parsed["selection_status"].as_str(),
+                Some("not_found"),
+                "{qualifier} must not resolve a qualified tool"
+            );
+            assert!(match_names(&parsed).is_empty());
+        }
+
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:search"})));
+        assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
+        assert_eq!(
+            field_strings(&parsed, "resolved"),
+            strings(&["mcp__github__search__primary"])
+        );
+    }
+
+    #[test]
+    fn select_mode_fails_closed_for_malformed_qualified_names() {
+        let schemas = vec![
+            json!({"type": "function", "function": {"name": "mcp__github__search__primary__extra"}}),
+            json!({"type": "function", "function": {"name": "http__github__search"}}),
+            json!({"type": "function", "function": {"name": "mcp____search"}}),
+            json!({"type": "function", "function": {"name": "mcp__github__search__"}}),
+        ];
+
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:search"})));
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
+        assert!(match_names(&parsed).is_empty());
     }
 
     #[test]

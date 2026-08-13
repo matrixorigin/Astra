@@ -2043,6 +2043,7 @@ fn test_spawn_runtime_context(parent_run_id: &str, user_id: &str) -> ServerSpawn
         admitted_model_execution: Some(test_admitted_model_execution()),
         request_constraints: RequestConstraints::default(),
         execution_metadata: None,
+        provider_run_owner: None,
         spawner: std::sync::Weak::new(),
         pause_flag: None,
         cancel_token: None,
@@ -3985,7 +3986,7 @@ fn test_request(message: &str) -> ChatRequestData {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        provider_workspace_id: None,
+        provider_run_owner: None,
     }
 }
 
@@ -4091,12 +4092,14 @@ fn requested_agent_bindings_preserve_caller_order() {
     request.agent_bindings = vec![
         test_binding_request("binding-foundation"),
         test_binding_request("binding-extension"),
+        test_binding_request("binding-session"),
     ];
 
     let bindings = AgenticRunLifecycleService::requested_agent_bindings(&request)
-        .expect("valid two-binding request");
+        .expect("valid ordered binding request");
     assert_eq!(bindings[0].id, "binding-foundation");
     assert_eq!(bindings[1].id, "binding-extension");
+    assert_eq!(bindings[2].id, "binding-session");
 }
 
 #[test]
@@ -8199,6 +8202,57 @@ async fn cancelled_run_unblocks_durable_user_prompt_without_resuming_the_child()
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn provider_interaction_requires_an_authenticated_provider_run_owner() {
+    let svc = test_service();
+    svc.run_engine
+        .start_run(
+            "provider-interaction-unowned",
+            "user-1",
+            "server-only-session",
+        )
+        .await
+        .unwrap();
+    let gate = DurableRunUserPromptGate::new(
+        "user-1".into(),
+        "server-only-session".into(),
+        "provider-interaction-unowned".into(),
+        Some(4),
+        svc.run_engine.clone(),
+        svc.runs_handle(),
+        None,
+        None,
+    );
+    let decision = astra_tools::ProviderInteractionGate::request_interaction(
+        &gate,
+        &astra_turn_types::ProviderInteractionRequest {
+            request_id: "provider-interaction-request".into(),
+            payload: json!({"type": "provider.test.select"}),
+            timeout_ms: None,
+        },
+    )
+    .await;
+
+    assert!(matches!(
+        decision,
+        astra_tools::ProviderInteractionDecision::Error(ref message)
+            if message.contains("authenticated provider run owner")
+    ));
+    let durable = svc
+        .run_engine
+        .load_run("user-1", "provider-interaction-unowned")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(durable.status, STATUS_RUNNING);
+    assert!(
+        durable.events.iter().all(|event| {
+            event.get("event_type").and_then(Value::as_str) != Some("provider_interaction_required")
+        }),
+        "an unowned interaction must not create an unresolvable durable wait"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn server_only_user_prompt_wait_resumes_from_shared_interaction_state() {
     let svc = test_service();
     svc.run_engine
@@ -9182,7 +9236,7 @@ fn extract_edge_tools_from_context() {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        provider_workspace_id: None,
+        provider_run_owner: None,
     };
     let tools = AgenticRunLifecycleService::extract_edge_tools(&req).expect("edge tools");
     assert_eq!(tools.len(), 1);
@@ -9264,7 +9318,7 @@ fn extract_edge_profile_from_context() {
         explain: false,
         interaction_mode: None,
         interactive_client: false,
-        provider_workspace_id: None,
+        provider_run_owner: None,
     };
     let profile = AgenticRunLifecycleService::extract_edge_profile(&req).expect("edge profile");
     assert_eq!(profile["cwd"], "/tmp");

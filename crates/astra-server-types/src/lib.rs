@@ -1295,7 +1295,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         edge_executor_id,
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
-        provider_workspace_id: None,
+        provider_run_owner: None,
         execution_budget: request.execution_budget,
         execution_policy: request.execution_policy,
         explain: request.explain,

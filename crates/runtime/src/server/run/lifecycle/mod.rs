@@ -1409,6 +1409,7 @@ struct DurableRunUserPromptGate {
     /// remain parked in an input wait until its generic timeout.
     cancel_token: Option<Arc<CancellationToken>>,
     timeout: Duration,
+    provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
 }
 
 impl DurableRunUserPromptGate {
@@ -1435,7 +1436,16 @@ impl DurableRunUserPromptGate {
             stream_event_tx,
             cancel_token: None,
             timeout: Self::DEFAULT_TIMEOUT,
+            provider_run_owner: None,
         }
+    }
+
+    fn with_provider_run_owner(
+        mut self,
+        provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
+    ) -> Self {
+        self.provider_run_owner = provider_run_owner;
+        self
     }
 
     fn with_cancel_token(mut self, cancel_token: Arc<CancellationToken>) -> Self {
@@ -1681,6 +1691,11 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
         &self,
         request: &astra_turn_types::ProviderInteractionRequest,
     ) -> astra_tools::ProviderInteractionDecision {
+        let Some(provider_run_owner) = self.provider_run_owner.as_ref() else {
+            return astra_tools::ProviderInteractionDecision::Error(
+                "provider interaction requires an authenticated provider run owner".to_string(),
+            );
+        };
         let event = json!({
             "event_type": "provider_interaction_required",
             "data": {
@@ -1692,6 +1707,7 @@ impl astra_tools::ProviderInteractionGate for DurableRunUserPromptGate {
                 "timeout_ms": request
                     .timeout_ms
                     .unwrap_or(self.timeout.as_millis() as u64),
+                "provider_run_owner": provider_run_owner,
             }
         });
         match self
@@ -2707,6 +2723,7 @@ struct ServerSpawnRuntimeContext {
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
     request_constraints: RequestConstraints,
     execution_metadata: Option<Value>,
+    provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
     /// The session-owned dynamic-agent lifecycle.  Kept weak here because
     /// the spawner already owns this executor; retaining it would create an
     /// executor → context → spawner → executor reference cycle for every
@@ -4104,6 +4121,7 @@ impl AgenticRunLifecycleService {
                 admitted_model_execution: request.admitted_model_execution.clone(),
                 request_constraints: request_constraints.clone(),
                 execution_metadata: execution_metadata.clone(),
+                provider_run_owner: request.provider_run_owner.clone(),
                 spawner: Arc::downgrade(&entry.spawner),
                 pause_flag,
                 cancel_token,
@@ -5534,7 +5552,7 @@ impl AgenticRunLifecycleService {
             })
         });
         let provider_namespace = json!({
-            "provider_workspace_id": request.provider_workspace_id,
+            "provider_run_owner": request.provider_run_owner,
             "agent_bindings": request.agent_bindings,
             "agent_binding": request.agent_binding,
             "capability_descriptor_ids": descriptor_ids,
@@ -5623,7 +5641,7 @@ impl AgenticRunLifecycleService {
             "edge_executor_id": request.edge_executor_id,
             "capabilities": request.capabilities,
             "forward_headers": forward_headers,
-            "provider_workspace_id": request.provider_workspace_id,
+            "provider_run_owner": request.provider_run_owner,
             "execution_budget": request.execution_budget,
             "execution_policy": request.execution_policy,
             "explain": request.explain,
@@ -5711,13 +5729,6 @@ impl AgenticRunLifecycleService {
         let bindings = if request.agent_bindings.is_empty() {
             request.agent_binding.iter().collect::<Vec<_>>()
         } else {
-            if request.agent_bindings.len() > 2 {
-                return Err(error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_bindings must contain one or two bindings",
-                    "agent_binding_set_invalid",
-                ));
-            }
             request.agent_bindings.iter().collect::<Vec<_>>()
         };
         let mut ids = HashSet::with_capacity(bindings.len());
@@ -8425,17 +8436,15 @@ fn cloud_workspace_provision_error(
 
 /// Returns the effective WorkspaceRecord for tool execution:
 /// - If a cloud workspace record is present, use it (standard path).
-/// - Otherwise, if the request carries a provider_workspace_id (from the
-///   edge-registration token's provider_scope_id on MOI provider-authorized
-///   turns), synthesise a minimal WorkspaceRecord so that edge workspace
-///   isolation checks in the transport layer work correctly.
+/// - Otherwise, if the request carries an authenticated provider run owner,
+///   use its scope as the workspace identity for edge transport isolation.
 fn provider_effective_workspace_record(
     cloud: Option<&astra_runtime_env::WorkspaceRecord>,
-    provider_workspace_id: Option<&str>,
+    provider_run_owner: Option<&astra_services::runs::ProviderRunOwner>,
 ) -> Option<astra_runtime_env::WorkspaceRecord> {
     cloud.cloned().or_else(|| {
-        provider_workspace_id.map(|ws_id| astra_runtime_env::WorkspaceRecord {
-            workspace_id: ws_id.to_string(),
+        provider_run_owner.map(|owner| astra_runtime_env::WorkspaceRecord {
+            workspace_id: owner.provider_scope_id.clone(),
             owner_scope: astra_runtime_env::WorkspaceOwnerScope::None,
             kind: astra_runtime_env::WorkspaceBindingKind::None,
             authority: astra_runtime_env::WorkspaceAuthority::None,
@@ -8996,7 +9005,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             executor.set_execution_binding_snapshot(binding_snapshot);
             executor.set_workspace_record(provider_effective_workspace_record(
                 cloud_workspace_record.as_ref(),
-                request.provider_workspace_id.as_deref(),
+                request.provider_run_owner.as_ref(),
             ));
             host.set_execution_metadata(executor.binding_metadata());
 
@@ -9050,6 +9059,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Some(user_prompt_tx),
                     None,
                 )
+                .with_provider_run_owner(request.provider_run_owner.clone())
                 .with_cancel_token(llm_cancel_token.clone());
                 let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
                 executor.set_ask_user_gate(user_prompt_gate.clone());
@@ -9095,6 +9105,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         None,
                         None,
                     )
+                    .with_provider_run_owner(request.provider_run_owner.clone())
                     .with_cancel_token(llm_cancel_token.clone()),
                 );
                 executor.set_ask_user_gate(user_prompt_gate.clone());
@@ -10628,7 +10639,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             executor.set_execution_binding_snapshot(binding_snapshot);
             executor.set_workspace_record(provider_effective_workspace_record(
                 cloud_workspace_record.as_ref(),
-                request.provider_workspace_id.as_deref(),
+                request.provider_run_owner.as_ref(),
             ));
             host.set_execution_metadata(executor.binding_metadata());
             executor.set_work_surface_event_tx(event_tx.clone());
@@ -10685,6 +10696,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     Some(user_prompt_tx),
                     Some(event_tx.clone()),
                 )
+                .with_provider_run_owner(request.provider_run_owner.clone())
                 .with_cancel_token(llm_cancel_token.clone());
                 let user_prompt_gate = std::sync::Arc::new(user_prompt_gate);
                 executor.set_ask_user_gate(user_prompt_gate.clone());
@@ -10729,6 +10741,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         None,
                         Some(event_tx.clone()),
                     )
+                    .with_provider_run_owner(request.provider_run_owner.clone())
                     .with_cancel_token(llm_cancel_token.clone()),
                 );
                 executor.set_ask_user_gate(user_prompt_gate.clone());
@@ -12391,6 +12404,7 @@ impl ServerSpawnAgentExecutor {
                 .execution_metadata
                 .clone()
                 .or_else(|| parent.execution_metadata.clone()),
+            provider_run_owner: parent.provider_run_owner.clone(),
             spawner: parent.spawner.clone(),
             pause_flag: Some(pause_flag),
             cancel_token: Some(cancel_token),
@@ -12848,6 +12862,9 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             "trace_causal_chain_id".to_string(),
             json!(context.trace_context.causal_chain_id.clone()),
         );
+        if let Some(owner) = context.provider_run_owner.as_ref() {
+            subrun_context.insert("provider_run_owner".to_string(), json!(owner));
+        }
         subrun_context.insert(
             "trace_root_event_id".to_string(),
             json!(context.trace_context.root_event_id.clone()),
@@ -12938,6 +12955,17 @@ fn child_uses_client_tool_delivery(
         && bindings.is_some_and(|snapshot| {
             matches!(snapshot.executor.transport, ToolTransportKind::EdgeLedger)
         })
+}
+
+fn inherited_provider_run_owner(
+    context: &HashMap<String, Value>,
+) -> Result<Option<astra_services::runs::ProviderRunOwner>, String> {
+    context
+        .get("provider_run_owner")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("invalid inherited provider run owner: {error}"))
 }
 
 /// Production sub-run executor backed by [`ServerAgenticLoopHost`].
@@ -13121,6 +13149,7 @@ impl ServerSubRunExecutor {
                 None,
                 crate::server::run::engine::RunStartContext {
                     agent_binding_name: Some(config.agent_profile.name.clone()),
+                    provider_run_owner: inherited_provider_run_owner(&config.context)?,
                     model_selection: execution.map(|execution| ModelSelection {
                         offering_id: execution.offering_id.clone(),
                     }),
@@ -13828,6 +13857,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
                         None,
                         None,
                     )
+                    .with_provider_run_owner(inherited_provider_run_owner(&config.context)?)
                     .with_cancel_token(local_cancel_token.clone()),
                 );
                 executor.set_ask_user_gate(user_prompt_gate.clone());

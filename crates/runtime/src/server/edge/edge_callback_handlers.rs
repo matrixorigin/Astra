@@ -981,6 +981,20 @@ pub(crate) async fn post_provider_interaction_respond_handler(
             ),
         )
         .await?;
+    let callback_owner = match &principal.origin {
+        astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(context) => {
+            astra_services::runs::ProviderRunOwner {
+                provider_id: context.provider_id.clone(),
+                provider_scope_id: context.provider_scope_id.clone(),
+            }
+        }
+        astra_services::AuthPrincipalOrigin::Internal => {
+            return Err(error_response(
+                StatusCode::FORBIDDEN,
+                "Provider interaction responses require provider authorization",
+            ));
+        }
+    };
     let body =
         serde_json::from_slice::<astra_thin_client::ProviderInteractionRespondRequest>(&body)
             .map_err(|error| {
@@ -1091,6 +1105,24 @@ pub(crate) async fn post_provider_interaction_respond_handler(
         return Err(error_response(
             StatusCode::CONFLICT,
             "Provider interaction request identity does not match its durable event",
+        ));
+    }
+    let required_owner: astra_services::runs::ProviderRunOwner = serde_json::from_value(
+        required
+            .pointer("/data/provider_run_owner")
+            .cloned()
+            .unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        error_response(
+            StatusCode::CONFLICT,
+            format!("Provider interaction has an invalid owner boundary: {error}"),
+        )
+    })?;
+    if required_owner != callback_owner {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "Provider interaction is owned by a different provider scope",
         ));
     }
 
@@ -1387,6 +1419,8 @@ mod edge_callback_insert_tests {
     #[derive(Clone)]
     struct ProviderRequestOnlyAuthService {
         descriptor: Arc<Mutex<Option<astra_services::ProviderRequestDescriptor>>>,
+        provider_id: String,
+        provider_scope_id: String,
     }
 
     #[async_trait]
@@ -1432,12 +1466,24 @@ mod edge_callback_insert_tests {
             request: astra_services::ProviderRequestDescriptor,
         ) -> Result<crate::AuthPrincipal, (StatusCode, Json<crate::ErrorResponse>)> {
             *self.descriptor.lock().expect("descriptor lock") = Some(request);
-            Ok(crate::AuthPrincipal::internal(AuthUserRecord {
-                user_id: "u-approval".into(),
-                username: "approval-user".into(),
-                email: "approval@example.com".into(),
-                display_name: None,
-            }))
+            Ok(crate::AuthPrincipal {
+                user: AuthUserRecord {
+                    user_id: "u-approval".into(),
+                    username: "approval-user".into(),
+                    email: "approval@example.com".into(),
+                    display_name: None,
+                },
+                session_id: None,
+                origin: astra_services::AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                    astra_services::AuthProviderAuthorizedRequestContext {
+                        provider_id: self.provider_id.clone(),
+                        external_subject: "approval-subject".into(),
+                        provider_scope_id: self.provider_scope_id.clone(),
+                        request_authorization_id: "approval-request".into(),
+                        edge_agent_id: None,
+                    },
+                ),
+            })
         }
     }
 
@@ -2039,6 +2085,10 @@ mod edge_callback_insert_tests {
             "provider_interaction_required",
             json!({
                 "request_id": "req-provider-interaction",
+                "provider_run_owner": {
+                    "provider_id": "moi",
+                    "provider_scope_id": "workspace-a"
+                },
                 "interaction": {
                     "request_id": "req-provider-interaction",
                     "payload": {
@@ -2051,6 +2101,8 @@ mod edge_callback_insert_tests {
         )
         .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
             descriptor: Arc::clone(&descriptor),
+            provider_id: "moi".into(),
+            provider_scope_id: "workspace-a".into(),
         }));
 
         let response_body =
@@ -2062,6 +2114,28 @@ mod edge_callback_insert_tests {
                 payload: Some(json!({"selected": "opaque-1"})),
             })
             .expect("encode provider interaction response");
+
+        let wrong_scope = post_provider_interaction_respond_handler(
+            Extension(RequestTrace {
+                request_id: "trace-provider-interaction-wrong-scope".into(),
+            }),
+            State(
+                state
+                    .clone()
+                    .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+                        descriptor: Arc::clone(&descriptor),
+                        provider_id: "moi".into(),
+                        provider_scope_id: "workspace-b".into(),
+                    })),
+            ),
+            Method::POST,
+            Uri::from_static(astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND),
+            HeaderMap::new(),
+            Bytes::from(response_body.clone()),
+        )
+        .await
+        .expect_err("a different provider scope must not resolve this interaction");
+        assert_eq!(wrong_scope.0, StatusCode::FORBIDDEN);
 
         let response = post_provider_interaction_respond_handler(
             Extension(RequestTrace {

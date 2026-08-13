@@ -518,6 +518,18 @@ pub enum RuntimeProfileRequest {
     AgentBindingRegistry,
 }
 
+/// Authenticated provider boundary that owns a provider-authorized run.
+///
+/// This value is injected from the authenticated request principal and is
+/// never accepted from an HTTP chat payload. Durable provider interactions
+/// copy it into their required event so callbacks can enforce the same
+/// provider and scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRunOwner {
+    pub provider_id: String,
+    pub provider_scope_id: String,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
@@ -555,12 +567,9 @@ pub struct ChatRequestData {
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
-    /// Owning workspace from the provider-authorized turn's edge-registration
-    /// token (`provider_scope_id`).  Injected at the request-injection layer
-    /// and propagated into `ToolExecutionRequest.workspace_record` by the run
-    /// lifecycle so that edge workspace isolation checks work correctly on the
-    /// MOI provider-authorized turn path.
-    pub provider_workspace_id: Option<String>,
+    /// Provider and scope authenticated at the request boundary. Injected by
+    /// the runtime and never accepted from the client payload.
+    pub provider_run_owner: Option<ProviderRunOwner>,
     pub execution_budget: Option<ExecutionBudget>,
     pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
@@ -11239,7 +11248,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
             conversation_authority: None,
         };
 
@@ -11314,7 +11323,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
             conversation_authority: None,
         };
 
@@ -11405,7 +11414,7 @@ mod tests {
                     explain: false,
                     interaction_mode: None,
                     interactive_client: false,
-                    provider_workspace_id: None,
+                    provider_run_owner: None,
                     conversation_authority: None,
                 },
             )

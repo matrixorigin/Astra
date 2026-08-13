@@ -1273,7 +1273,7 @@ fn build_ws_chat_request(
         edge_executor_id: None,
         capabilities: Vec::new(),
         forward_headers: std::collections::HashMap::new(),
-        provider_workspace_id: None,
+        provider_run_owner: None,
         execution_budget,
         conversation_authority: None,
         execution_policy: Default::default(),

@@ -263,6 +263,7 @@ pub(crate) fn run_start_context_from_request(
         resolved_model_selection: request.resolved_model_selection.clone(),
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
+        provider_run_owner: request.provider_run_owner.clone(),
     }
 }
 
@@ -613,7 +614,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
         }
     }
 
