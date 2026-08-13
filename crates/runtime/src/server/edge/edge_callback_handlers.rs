@@ -963,10 +963,33 @@ pub(crate) async fn post_user_prompt_respond_handler(
 pub(crate) async fn post_provider_interaction_respond_handler(
     Extension(trace): Extension<RequestTrace>,
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
-    Json(body): Json<astra_thin_client::ProviderInteractionRespondRequest>,
+    body: Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND,
+                &body,
+            ),
+        )
+        .await?;
+    let body =
+        serde_json::from_slice::<astra_thin_client::ProviderInteractionRespondRequest>(&body)
+            .map_err(|error| {
+                error_response(
+                    StatusCode::BAD_REQUEST,
+                    format!("Provider interaction response payload is invalid: {error}"),
+                )
+            })?;
+    let user = principal.user;
     let run_id = body.run_id.as_str();
     let session_id = body.session_id.as_str();
     let request_id = body.request_id.as_str();
@@ -1282,6 +1305,7 @@ mod edge_callback_insert_tests {
         post_user_prompt_respond_handler,
     };
     use crate::server::RequestTrace;
+    use crate::server::hex_sha256;
     use crate::{AppState, HealthChecker, ServiceInfo};
     use astra_services::runs::{
         CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, RunLifecycleService,
@@ -1296,8 +1320,9 @@ mod edge_callback_insert_tests {
     use async_trait::async_trait;
     use axum::{
         Json,
+        body::Bytes,
         extract::{Extension, State},
-        http::{HeaderMap, StatusCode},
+        http::{HeaderMap, Method, StatusCode, Uri},
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -1356,6 +1381,63 @@ mod edge_callback_insert_tests {
                 email: "approval@example.com".into(),
                 display_name: None,
             })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ProviderRequestOnlyAuthService {
+        descriptor: Arc<Mutex<Option<astra_services::ProviderRequestDescriptor>>>,
+    }
+
+    #[async_trait]
+    impl AuthService for ProviderRequestOnlyAuthService {
+        async fn register(
+            &self,
+            _request: AuthRegisterRequestData,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn login(
+            &self,
+            _request: AuthLoginRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn refresh(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<AuthTokenRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn logout(
+            &self,
+            _request: AuthRefreshRequestData,
+        ) -> Result<(), (StatusCode, Json<crate::ErrorResponse>)> {
+            unimplemented!("not used")
+        }
+
+        async fn current_user(
+            &self,
+            _headers: &HeaderMap,
+        ) -> Result<AuthUserRecord, (StatusCode, Json<crate::ErrorResponse>)> {
+            panic!("provider interaction responses must use provider-request authentication")
+        }
+
+        async fn current_principal_for_request(
+            &self,
+            _headers: &HeaderMap,
+            request: astra_services::ProviderRequestDescriptor,
+        ) -> Result<crate::AuthPrincipal, (StatusCode, Json<crate::ErrorResponse>)> {
+            *self.descriptor.lock().expect("descriptor lock") = Some(request);
+            Ok(crate::AuthPrincipal::internal(AuthUserRecord {
+                user_id: "u-approval".into(),
+                username: "approval-user".into(),
+                email: "approval@example.com".into(),
+                display_name: None,
+            }))
         }
     }
 
@@ -1949,6 +2031,7 @@ mod edge_callback_insert_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn provider_interaction_handler_resolves_only_the_matching_durable_request() {
+        let descriptor = Arc::new(Mutex::new(None));
         let state = approval_callback_state_with_required(
             "run-provider-interaction",
             "sess-provider-interaction",
@@ -1965,40 +2048,73 @@ mod edge_callback_insert_tests {
                     "timeout_ms": 60_000
                 }
             }),
-        );
+        )
+        .with_auth_service(Arc::new(ProviderRequestOnlyAuthService {
+            descriptor: Arc::clone(&descriptor),
+        }));
+
+        let response_body =
+            serde_json::to_vec(&astra_thin_client::ProviderInteractionRespondRequest {
+                request_id: "req-provider-interaction".into(),
+                session_id: "sess-provider-interaction".into(),
+                run_id: "run-provider-interaction".into(),
+                cancelled: false,
+                payload: Some(json!({"selected": "opaque-1"})),
+            })
+            .expect("encode provider interaction response");
 
         let response = post_provider_interaction_respond_handler(
             Extension(RequestTrace {
                 request_id: "trace-provider-interaction".into(),
             }),
             State(state.clone()),
+            Method::POST,
+            Uri::from_static(astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND),
             HeaderMap::new(),
-            Json(astra_thin_client::ProviderInteractionRespondRequest {
-                request_id: "req-provider-interaction".into(),
-                session_id: "sess-provider-interaction".into(),
-                run_id: "run-provider-interaction".into(),
-                cancelled: false,
-                payload: Some(json!({"selected": "opaque-1"})),
-            }),
+            Bytes::from(response_body.clone()),
         )
         .await
         .expect("matching provider interaction response should resolve durably");
         assert_eq!(response.0["ok"], true);
         assert_eq!(response.0["durable"], true);
+        let authenticated = descriptor
+            .lock()
+            .expect("descriptor lock")
+            .clone()
+            .expect("provider request descriptor");
+        assert_eq!(authenticated.method, "POST");
+        assert_eq!(
+            authenticated.path,
+            astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND
+        );
+        assert_eq!(
+            authenticated.route.as_deref(),
+            Some(astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND)
+        );
+        assert_eq!(
+            authenticated.body_digest,
+            Some(format!("sha256:{}", hex_sha256(&response_body)))
+        );
+
+        let conflicting_body =
+            serde_json::to_vec(&astra_thin_client::ProviderInteractionRespondRequest {
+                request_id: "req-provider-interaction".into(),
+                session_id: "sess-provider-interaction".into(),
+                run_id: "run-provider-interaction".into(),
+                cancelled: true,
+                payload: None,
+            })
+            .expect("encode conflicting provider interaction response");
 
         let conflict = post_provider_interaction_respond_handler(
             Extension(RequestTrace {
                 request_id: "trace-provider-interaction-late".into(),
             }),
             State(state),
+            Method::POST,
+            Uri::from_static(astra_thin_client::paths::PROVIDER_INTERACTION_RESPOND),
             HeaderMap::new(),
-            Json(astra_thin_client::ProviderInteractionRespondRequest {
-                request_id: "req-provider-interaction".into(),
-                session_id: "sess-provider-interaction".into(),
-                run_id: "run-provider-interaction".into(),
-                cancelled: true,
-                payload: None,
-            }),
+            Bytes::from(conflicting_body),
         )
         .await
         .expect_err("a conflicting late response must not replace the durable outcome");
