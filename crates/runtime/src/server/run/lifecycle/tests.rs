@@ -5796,6 +5796,12 @@ fn test_runtime_descriptor(
 fn file_transfer_request_with_attachment(
     attachment: Value,
 ) -> astra_services::runs::ChatRequestData {
+    file_transfer_request_with_attachments(vec![attachment])
+}
+
+fn file_transfer_request_with_attachments(
+    attachments: Vec<Value>,
+) -> astra_services::runs::ChatRequestData {
     let mut request = prepared_test_request("hello");
     request.provider_runtime_authorized = true;
     request.runtime_auth = Some(RuntimeAuthRequest {
@@ -5815,7 +5821,7 @@ fn file_transfer_request_with_attachment(
         "session_dir": "/sandbox/.moi/sessions/session-1",
         "scratch_dir": "/sandbox/.moi/runtime/task-1/scratch",
         "max_file_bytes": 1024,
-        "attachments": [attachment]
+        "attachments": attachments
     })
     .as_object()
     .unwrap()
@@ -5829,6 +5835,35 @@ fn file_transfer_request_with_attachment(
             file_transfer: Some(descriptor),
         });
     request
+}
+
+#[test]
+fn runtime_file_transfer_assigns_pairwise_distinct_names_at_request_boundary() {
+    let request = file_transfer_request_with_attachments(vec![
+        json!({"file_id": "file-1", "name": "input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
+        json!({"file_id": "file-2", "name": "input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
+        json!({"file_id": "file-3", "name": "000000-input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
+    ]);
+    let context = AgenticRunLifecycleService::runtime_file_transfer_context(&request)
+        .expect("attachment inventory must be valid")
+        .expect("file transfer context");
+    let names = context
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| {
+            astra_server_types::edge_ws_protocol::runtime_attachment_destination_name(
+                index,
+                &attachment.name,
+            )
+            .expect("validated destination name")
+        })
+        .collect::<HashSet<_>>();
+
+    assert_eq!(names.len(), context.attachments.len());
+    assert!(names.contains("000000-input.txt"));
+    assert!(names.contains("000001-input.txt"));
+    assert!(names.contains("000002-000000-input.txt"));
 }
 
 #[test]

@@ -5068,13 +5068,20 @@ impl AgenticRunLifecycleService {
             return Err("file_transfer directory scope is invalid".to_string());
         }
         let mut file_ids = HashSet::new();
-        for attachment in &metadata.attachments {
+        let mut destination_names = HashSet::new();
+        for (index, attachment) in metadata.attachments.iter().enumerate() {
+            let destination_name =
+                astra_server_types::edge_ws_protocol::runtime_attachment_destination_name(
+                    index,
+                    &attachment.name,
+                );
             if attachment.file_id.trim().is_empty()
                 || !valid_runtime_attachment_name(&attachment.name)
                 || attachment.size < 0
                 || attachment.size as u64 > metadata.max_file_bytes
                 || !valid_lowercase_md5(&attachment.md5)
                 || !file_ids.insert(attachment.file_id.clone())
+                || !destination_name.is_some_and(|name| destination_names.insert(name))
             {
                 return Err("file_transfer attachment inventory is invalid".to_string());
             }

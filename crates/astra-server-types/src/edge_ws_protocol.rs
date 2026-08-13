@@ -27,6 +27,27 @@ use serde_json::{Map, Value};
 
 pub use astra_turn_types::ToolInvocationIdentity;
 
+/// Versioned Edge handshake capability required for request-scoped managed
+/// attachment materialization and artifact publication.
+pub const MANAGED_FILE_TRANSFER_V1_CAPABILITY: &str = "managed_file_transfer_v1";
+
+/// Produce the deterministic, collision-free catalog filename used for one
+/// attachment inventory entry. Every entry is namespaced by its stable
+/// inventory index, including entries whose original names are unique.
+pub fn runtime_attachment_destination_name(index: usize, name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    (!trimmed.is_empty()
+        && name.len() <= 240
+        && !name.contains('\0')
+        && trimmed == name
+        && std::path::Path::new(name)
+            .file_name()
+            .and_then(|part| part.to_str())
+            == Some(name))
+    .then(|| format!("{index:06}-{name}"))
+    .filter(|destination| destination.len() <= 255)
+}
+
 /// Host-owned file-transfer contract sent to an edge agent.  This wire type
 /// intentionally lives with the WebSocket protocol so the edge-only build
 /// does not depend on server services.

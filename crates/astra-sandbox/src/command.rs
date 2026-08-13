@@ -464,6 +464,15 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         if let Some(option) = unsupported_abbreviated_write_option(executable, &arguments) {
             return Some(option.to_string());
         }
+        if executable.eq_ignore_ascii_case("rsync")
+            && let Some(option) = unsupported_rsync_option(&arguments)
+        {
+            // rsync has options that write auxiliary files independently of
+            // its final destination. If an option is not in the audited
+            // allowlist, its mutation boundary is unproven and must fail
+            // closed instead of being mistaken for a source operand.
+            return Some(option.to_string());
+        }
         for target in write_targets_for_command(executable, &arguments) {
             if is_workspace_out_path(target, workspace_root) {
                 return Some(target.to_string());
@@ -662,6 +671,154 @@ fn write_long_options_affecting_targets(command: &str) -> &'static [&'static str
     }
 }
 
+fn unsupported_rsync_option<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
+    let mut options = true;
+    for argument in arguments {
+        let argument = argument.trim_matches(['"', '\'', ';', '&']);
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if !options || argument == "-" || !argument.starts_with('-') {
+            continue;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            if !matches!(
+                name,
+                "archive"
+                    | "atimes"
+                    | "backup"
+                    | "backup-dir"
+                    | "block-size"
+                    | "checksum"
+                    | "checksum-choice"
+                    | "chmod"
+                    | "compress"
+                    | "compress-choice"
+                    | "compress-level"
+                    | "compare-dest"
+                    | "copy-dest"
+                    | "copy-dirlinks"
+                    | "copy-links"
+                    | "copy-unsafe-links"
+                    | "delete"
+                    | "delete-after"
+                    | "delete-before"
+                    | "delete-delay"
+                    | "delete-during"
+                    | "delete-excluded"
+                    | "dirs"
+                    | "dry-run"
+                    | "exclude"
+                    | "exclude-from"
+                    | "existing"
+                    | "files-from"
+                    | "filter"
+                    | "group"
+                    | "hard-links"
+                    | "human-readable"
+                    | "ignore-existing"
+                    | "ignore-errors"
+                    | "ignore-missing-args"
+                    | "include"
+                    | "include-from"
+                    | "inplace"
+                    | "itemize-changes"
+                    | "keep-dirlinks"
+                    | "links"
+                    | "link-dest"
+                    | "list-only"
+                    | "log-file"
+                    | "log-file-format"
+                    | "max-size"
+                    | "min-size"
+                    | "mkpath"
+                    | "no-implied-dirs"
+                    | "numeric-ids"
+                    | "old-dirs"
+                    | "omit-dir-times"
+                    | "only-write-batch"
+                    | "out-format"
+                    | "owner"
+                    | "partial"
+                    | "partial-dir"
+                    | "password-file"
+                    | "perms"
+                    | "progress"
+                    | "prune-empty-dirs"
+                    | "quiet"
+                    | "recursive"
+                    | "relative"
+                    | "remove-source-files"
+                    | "safe-links"
+                    | "size-only"
+                    | "sparse"
+                    | "specials"
+                    | "suffix"
+                    | "temp-dir"
+                    | "times"
+                    | "update"
+                    | "verbose"
+                    | "whole-file"
+                    | "write-batch"
+                    | "xattrs"
+            ) {
+                return Some(argument);
+            }
+            continue;
+        }
+
+        let short = argument.trim_start_matches('-');
+        let mut chars = short.chars();
+        while let Some(flag) = chars.next() {
+            if flag == 'e' {
+                // A custom remote shell is an arbitrary local executable
+                // boundary and cannot be proven filesystem-safe here.
+                return Some(argument);
+            }
+            if matches!(flag, 'f' | 'T' | 'B') {
+                // The remainder is this option's attached value. A separate
+                // value is consumed later by write_command_positionals.
+                break;
+            }
+            if !matches!(
+                flag,
+                'a' | 'b'
+                    | 'c'
+                    | 'D'
+                    | 'd'
+                    | 'E'
+                    | 'g'
+                    | 'h'
+                    | 'H'
+                    | 'J'
+                    | 'l'
+                    | 'L'
+                    | 'n'
+                    | 'o'
+                    | 'O'
+                    | 'p'
+                    | 'q'
+                    | 'r'
+                    | 'R'
+                    | 's'
+                    | 't'
+                    | 'u'
+                    | 'v'
+                    | 'W'
+                    | 'x'
+                    | 'X'
+                    | 'y'
+                    | 'z'
+            ) {
+                return Some(argument);
+            }
+        }
+    }
+    None
+}
+
 fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
     let target_directory = arguments.iter().enumerate().find_map(|(index, argument)| {
         let argument = argument.trim_matches(['"', '\'', ';', '&']);
@@ -735,7 +892,15 @@ fn rsync_write_option_targets<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
     let mut index = 0;
     while let Some(argument) = arguments.get(index).copied() {
         let argument = argument.trim_matches(['"', '\'', ';', '&']);
-        if matches!(argument, "-T" | "--temp-dir" | "--backup-dir") {
+        if matches!(
+            argument,
+            "-T" | "--temp-dir"
+                | "--backup-dir"
+                | "--partial-dir"
+                | "--log-file"
+                | "--write-batch"
+                | "--only-write-batch"
+        ) {
             if let Some(target) = arguments.get(index + 1) {
                 targets.push(target.trim_matches(['"', '\'', ';', '&']));
             }
@@ -745,6 +910,10 @@ fn rsync_write_option_targets<'a>(arguments: &'a [&'a str]) -> Vec<&'a str> {
         if let Some(target) = argument
             .strip_prefix("--temp-dir=")
             .or_else(|| argument.strip_prefix("--backup-dir="))
+            .or_else(|| argument.strip_prefix("--partial-dir="))
+            .or_else(|| argument.strip_prefix("--log-file="))
+            .or_else(|| argument.strip_prefix("--write-batch="))
+            .or_else(|| argument.strip_prefix("--only-write-batch="))
         {
             if !target.is_empty() {
                 targets.push(target.trim_matches(['"', '\'', ';', '&']));
@@ -813,26 +982,56 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
             "-d" | "--date" | "-r" | "--reference" | "-t" | "--time"
         ),
         "mkdir" => matches!(option, "-m" | "--mode"),
-        "rsync" => matches!(
-            option,
-            "-e" | "--rsh"
-                | "-T"
-                | "--rsync-path"
-                | "--password-file"
-                | "--files-from"
-                | "--exclude"
-                | "--include"
-                | "--filter"
-                | "--backup-dir"
-                | "--suffix"
-                | "--temp-dir"
-                | "--compare-dest"
-                | "--copy-dest"
-                | "--link-dest"
-        ),
+        "rsync" => {
+            rsync_short_option_takes_separate_value(option)
+                || matches!(
+                    option,
+                    "-f" | "-B"
+                        | "-T"
+                        | "--password-file"
+                        | "--files-from"
+                        | "--exclude"
+                        | "--exclude-from"
+                        | "--include"
+                        | "--include-from"
+                        | "--filter"
+                        | "--backup-dir"
+                        | "--partial-dir"
+                        | "--log-file"
+                        | "--log-file-format"
+                        | "--write-batch"
+                        | "--only-write-batch"
+                        | "--block-size"
+                        | "--checksum-choice"
+                        | "--chmod"
+                        | "--compress-choice"
+                        | "--compress-level"
+                        | "--max-size"
+                        | "--min-size"
+                        | "--out-format"
+                        | "--suffix"
+                        | "--temp-dir"
+                        | "--compare-dest"
+                        | "--copy-dest"
+                        | "--link-dest"
+                )
+        }
         "tee" => false,
         _ => false,
     }
+}
+
+fn rsync_short_option_takes_separate_value(option: &str) -> bool {
+    if option.starts_with("--") || !option.starts_with('-') {
+        return false;
+    }
+    let mut flags = option.trim_start_matches('-').chars().peekable();
+    while let Some(flag) = flags.next() {
+        if matches!(flag, 'f' | 'T' | 'B') {
+            return flags.peek().is_none();
+        }
+    }
+    false
 }
 
 fn download_output_target(command: &str, workspace_root: Option<&Path>) -> Option<String> {
@@ -1403,6 +1602,15 @@ mod tests {
             format!("rsync --temp-dir '{}' src reports/dst", outside.display()),
             format!("rsync --backup-dir='{}' src reports/dst", outside.display()),
             format!("rsync -T'{}' src reports/dst", outside.display()),
+            format!("rsync --log-file '{}' src reports/dst", outside.display()),
+            format!(
+                "rsync --partial-dir='{}' src reports/dst",
+                outside.display()
+            ),
+            format!(
+                "rsync --write-batch '{}' src reports/dst",
+                outside.display()
+            ),
         ] {
             let risks = analyze_command_risks_in_workspace(&command, &workspace);
             assert!(
@@ -1425,6 +1633,35 @@ mod tests {
                 .iter()
                 .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
             "read-only rsync compare source must remain allowed: {risks:?}"
+        );
+    }
+
+    #[test]
+    fn rsync_unrecognized_options_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let risks = analyze_command_risks_in_workspace(
+            "rsync --future-output=/tmp/audit.log src reports/dst",
+            &workspace,
+        );
+        assert!(
+            risks.iter().any(
+                |risk| matches!(risk, CommandRisk::WorkspaceOutWrite(option) if option.starts_with("--future-output"))
+            ),
+            "an unreviewed rsync option must fail closed: {risks:?}"
+        );
+
+        let common = analyze_command_risks_in_workspace(
+            "rsync -avz --delete --progress src reports/dst",
+            &workspace,
+        );
+        assert!(
+            !common
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::WorkspaceOutWrite(_))),
+            "audited common rsync options must remain usable: {common:?}"
         );
     }
 

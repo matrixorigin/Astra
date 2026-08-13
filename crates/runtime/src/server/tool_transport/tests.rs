@@ -890,10 +890,14 @@ fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> Value {
         astra_runtime_env::PolicyIntent::local_developer(),
         &registry,
     );
-    serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
-        binding,
-    ))
-    .expect("serialize edge runtime environment advertisement")
+    let mut advertisement = serde_json::to_value(
+        astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding),
+    )
+    .expect("serialize edge runtime environment advertisement");
+    advertisement["protocol_capabilities"] = serde_json::json!({
+        astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+    });
+    advertisement
 }
 
 fn request(
@@ -1607,6 +1611,59 @@ fn validated_transfer_context_authorizes_edge_interceptor_support() {
     .expect("validated transfer context must authorize the edge interceptor");
 
     assert!(selected.is_some());
+}
+
+#[test]
+fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
+    let mut request = request(
+        "materialize_attachment",
+        WorkspaceBinding::edge_workspace(
+            "Managed sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-old",
+            "Managed sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.runtime_file_transfer = Some(std::sync::Arc::new(
+        astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            task_id: "task-1".to_string(),
+            root: "/sandbox/.moi/runtime/task-1".to_string(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        },
+    ));
+    let mut agent = edge_agent_record("edge-old");
+    agent.capabilities = agent.capabilities.map(|mut value| {
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_capabilities");
+        value
+    });
+
+    let denial = super::super::tool_edge_selection::select_capable_edge_agent(
+        std::slice::from_ref(&agent),
+        Some("edge-old"),
+        &request,
+        &astra_runtime_env::ToolRegistry::builtins(),
+    )
+    .expect_err("an older edge must not receive managed transfer requests");
+
+    assert!(matches!(
+        denial.1,
+        astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(ref reason)
+            if reason == "managed_file_transfer_v1_not_advertised"
+    ));
 }
 
 #[test]

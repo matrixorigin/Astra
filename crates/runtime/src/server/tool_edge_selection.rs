@@ -119,15 +119,30 @@ fn edge_advertised_tool_check(
     })?;
     // Managed transfer tools are implemented by the Edge transport
     // interceptor and are intentionally absent from the generic runtime tool
-    // surface. A validated request-scoped transfer context is the explicit
-    // capability grant for these two calls.
+    // surface. The request-scoped context proves authority; the independently
+    // advertised, versioned handshake capability proves implementation support.
     if request.runtime_file_transfer.is_some()
         && matches!(
             request.tool_name.as_str(),
             "materialize_attachment" | "publish_artifact"
         )
     {
-        return Ok(());
+        if capabilities
+            .get("protocol_capabilities")
+            .and_then(|value| {
+                value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
+            })
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        return Err(Box::new((
+            advert.binding,
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
+                "managed_file_transfer_v1_not_advertised".to_string(),
+            ),
+        )));
     }
     astra_runtime_env::CapabilityResolver
         .check_tool_call_for_surface(

@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::io::Write as _;
 
 use astra_server_types::edge_ws_protocol::{
-    RuntimeFileTransferAttachment, RuntimeFileTransferContext,
+    RuntimeFileTransferAttachment, RuntimeFileTransferContext, runtime_attachment_destination_name,
 };
 use astra_tools::ToolResult;
 use astra_tools::artifact_metadata::{
@@ -722,8 +722,8 @@ fn atomic_write_beneath(
 fn safe_filename(name: &str) -> Option<&str> {
     let trimmed = name.trim();
     (!trimmed.is_empty()
-        // Duplicate names receive a 13-byte hash prefix; keep the final path
-        // component below the common 255-byte filesystem limit.
+        // Materialized attachments receive an inventory namespace prefix;
+        // keep the final path component below the common 255-byte limit.
         && name.len() <= 240
         && !name.contains('\0')
         && trimmed == name
@@ -735,19 +735,11 @@ fn materialized_filename(
     context: &RuntimeFileTransferContext,
     attachment: &RuntimeFileTransferAttachment,
 ) -> Option<String> {
-    let filename = safe_filename(&attachment.name)?;
-    let duplicate = context
+    let index = context
         .attachments
         .iter()
-        .filter(|candidate| candidate.name == attachment.name)
-        .take(2)
-        .count()
-        > 1;
-    if !duplicate {
-        return Some(filename.to_string());
-    }
-    let id_hash = format!("{:x}", Sha256::digest(attachment.file_id.as_bytes()));
-    Some(format!("{}-{filename}", &id_hash[..12]))
+        .position(|candidate| candidate.file_id == attachment.file_id)?;
+    runtime_attachment_destination_name(index, &attachment.name)
 }
 
 #[cfg(test)]
@@ -1229,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_attachment_names_receive_stable_distinct_paths() {
+    fn every_attachment_name_uses_the_stable_inventory_namespace() {
         let temp = tempfile::tempdir().unwrap();
         let mut transfer = context(temp.path());
         transfer.attachments.push(RuntimeFileTransferAttachment {
@@ -1241,7 +1233,17 @@ mod tests {
         let first = materialized_filename(&transfer, &transfer.attachments[0]).unwrap();
         let second = materialized_filename(&transfer, &transfer.attachments[1]).unwrap();
         assert_ne!(first, second);
-        assert!(first.ends_with("-input.txt"));
-        assert!(second.ends_with("-input.txt"));
+        assert_eq!(first, "000000-input.txt");
+        assert_eq!(second, "000001-input.txt");
+
+        transfer.attachments.push(RuntimeFileTransferAttachment {
+            file_id: "file-3".to_string(),
+            name: "000000-input.txt".to_string(),
+            size: 5,
+            md5: md5_hex(b"third"),
+        });
+        let third = materialized_filename(&transfer, &transfer.attachments[2]).unwrap();
+        assert_eq!(third, "000002-000000-input.txt");
+        assert_ne!(first, third);
     }
 }

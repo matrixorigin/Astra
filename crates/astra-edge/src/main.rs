@@ -463,8 +463,12 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         &registry,
     );
 
-    serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
-        .expect("runtime environment advertisement serializes")
+    let mut advertisement = serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
+        .expect("runtime environment advertisement serializes");
+    advertisement["protocol_capabilities"] = json!({
+        astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+    });
+    advertisement
 }
 
 // ─── Proxy helpers ───────────────────────────────────────────────────────────
@@ -1712,6 +1716,11 @@ mod tests {
         );
         assert_eq!(
             value["binding"]["capabilities"]["runtime"]["runtime_has_git"],
+            true
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
             true
         );
         assert!(

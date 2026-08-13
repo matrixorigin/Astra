@@ -1365,6 +1365,13 @@ fn validate_edge_capabilities(
     _user_id: &str,
 ) -> Option<serde_json::Value> {
     let capabilities = capabilities?;
+    let managed_file_transfer_v1 = capabilities
+        .get("protocol_capabilities")
+        .and_then(|value| {
+            value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
+        })
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
 
     let mut advert = match serde_json::from_value::<
         astra_runtime_env::RuntimeEnvironmentAdvertisement,
@@ -1450,7 +1457,13 @@ fn validate_edge_capabilities(
         );
     }
 
-    serde_json::to_value(&advert).ok()
+    let mut sanitized = serde_json::to_value(&advert).ok()?;
+    if managed_file_transfer_v1 {
+        sanitized["protocol_capabilities"] = serde_json::json!({
+            astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+        });
+    }
+    Some(sanitized)
 }
 
 #[cfg(test)]
@@ -1694,6 +1707,29 @@ mod tests {
                 .iter()
                 .all(|denial| denial.tool_name == "write_file"),
             "edge capability denials should only describe edge-owned runtime tools"
+        );
+    }
+
+    #[test]
+    fn validate_edge_capabilities_preserves_known_protocol_versions_only() {
+        let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
+        capabilities["protocol_capabilities"] = serde_json::json!({
+            astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+            "unrecognized_future_protocol": true,
+        });
+
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("valid edge advertisement");
+
+        assert_eq!(
+            sanitized["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
+            true
+        );
+        assert!(
+            sanitized["protocol_capabilities"]
+                .get("unrecognized_future_protocol")
+                .is_none()
         );
     }
 
