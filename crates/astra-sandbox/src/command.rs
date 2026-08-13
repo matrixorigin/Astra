@@ -467,6 +467,9 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         ) {
             continue;
         }
+        if let Some(option) = unsupported_abbreviated_write_option(executable, &arguments) {
+            return Some(option.to_string());
+        }
         for target in write_targets_for_command(executable, &arguments) {
             if is_workspace_out_path(target, workspace_root) {
                 return Some(target.to_string());
@@ -582,6 +585,62 @@ fn is_shell_assignment(value: &str) -> bool {
         .next()
         .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+/// GNU coreutils accepts unambiguous long-option prefixes. The write-target
+/// parser intentionally supports only canonical option names; allowing an
+/// abbreviated target-affecting option through can either make its value look
+/// like an operand or change which operands are destinations. Reject those
+/// abbreviations before deriving write targets instead of guessing at their
+/// arity or semantics.
+fn unsupported_abbreviated_write_option<'a>(
+    command: &str,
+    arguments: &'a [&'a str],
+) -> Option<&'a str> {
+    let mut options = true;
+    for argument in arguments {
+        let argument = argument.trim_matches(['"', '\'', ';', '&']);
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if !options || !argument.starts_with("--") {
+            continue;
+        }
+        let option = argument
+            .split_once('=')
+            .map_or(argument, |(option, _)| option);
+        if option.len() > 2
+            && write_long_options_affecting_targets(command)
+                .iter()
+                .any(|canonical| option != *canonical && canonical.starts_with(option))
+        {
+            return Some(argument);
+        }
+    }
+    None
+}
+
+fn write_long_options_affecting_targets(command: &str) -> &'static [&'static str] {
+    match command.to_ascii_lowercase().as_str() {
+        "cp" => &[
+            "--no-preserve",
+            "--sparse",
+            "--suffix",
+            "--target-directory",
+        ],
+        "mv" => &["--suffix", "--target-directory"],
+        "install" => &[
+            "--directory",
+            "--group",
+            "--mode",
+            "--owner",
+            "--strip-program",
+            "--suffix",
+            "--target-directory",
+        ],
+        _ => &[],
+    }
 }
 
 fn write_targets_for_command<'a>(command: &str, arguments: &'a [&'a str]) -> Vec<&'a str> {
@@ -718,7 +777,7 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
     match command.to_ascii_lowercase().as_str() {
         "cp" | "mv" => matches!(
             option,
-            "-S" | "--suffix" | "-t" | "--target-directory" | "--context"
+            "-S" | "--suffix" | "-t" | "--target-directory"
         ),
         "install" => matches!(
             option,
@@ -731,13 +790,13 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
                 | "--suffix"
                 | "-t"
                 | "--target-directory"
-                | "--context"
+                | "--strip-program"
         ),
         "touch" => matches!(
             option,
             "-d" | "--date" | "-r" | "--reference" | "-t" | "--time"
         ),
-        "mkdir" => matches!(option, "-m" | "--mode" | "--context"),
+        "mkdir" => matches!(option, "-m" | "--mode"),
         "rsync" => matches!(
             option,
             "-e" | "--rsh"
@@ -1238,6 +1297,9 @@ mod tests {
             format!("cp input.pdf '{}/input.pdf'", outside.display()),
             format!("cp -t '{}' input.pdf", outside.display()),
             format!("cp --target-directory='{}' input.pdf", outside.display()),
+            format!("cp --target-d '{}' input.pdf", outside.display()),
+            format!("cp --target-d='{}' input.pdf", outside.display()),
+            format!("install --dir '{}' reports", outside.display()),
         ] {
             let risks = analyze_command_risks_in_workspace(&command, &workspace);
             assert!(
@@ -1380,6 +1442,10 @@ mod tests {
             ),
             format!(
                 "install input.txt '{}/output.txt' --mode 0644",
+                outside.display()
+            ),
+            format!(
+                "cp input.txt '{}/output.txt' --suf .bak",
                 outside.display()
             ),
             format!("mv -t '{}' input.txt", outside.display()),
