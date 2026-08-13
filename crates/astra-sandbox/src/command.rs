@@ -770,8 +770,7 @@ fn unsupported_rsync_option<'a>(arguments: &'a [&'a str]) -> Option<&'a str> {
         }
 
         let short = argument.trim_start_matches('-');
-        let mut chars = short.chars();
-        while let Some(flag) = chars.next() {
+        for flag in short.chars() {
             if flag == 'e' {
                 // A custom remote shell is an arbitrary local executable
                 // boundary and cannot be proven filesystem-safe here.
