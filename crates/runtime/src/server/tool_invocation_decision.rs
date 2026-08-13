@@ -37,6 +37,7 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
     pub runtime_file_transfer_required: bool,
+    pub runtime_edge_dispatch_authorization_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +212,8 @@ impl ToolInvocationDecisionSnapshot {
             }),
             admission,
             runtime_file_transfer_required: request.runtime_file_transfer_required,
+            runtime_edge_dispatch_authorization_required: request
+                .runtime_edge_dispatch_authorization_required,
         })
     }
 
@@ -344,6 +347,8 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
         request.runtime_file_transfer_required = self.runtime_file_transfer_required;
+        request.runtime_edge_dispatch_authorization_required =
+            self.runtime_edge_dispatch_authorization_required;
     }
 }
 
@@ -784,7 +789,29 @@ mod tests {
         let mut request = request();
         request.workspace.cwd = Some("/original".to_string());
         request.policy.max_output_bytes = Some(4096);
+        request.runtime_file_transfer = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeFileTransferContext {
+                endpoint_url: "https://moi.example/runtime-files".to_string(),
+                authorization: "Bearer transfer-secret-must-not-persist".to_string(),
+                task_id: "task-1".to_string(),
+                root: "/workspace/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/workspace/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/workspace/.moi/runtime/task-1/scratch".to_string(),
+                max_file_bytes: 1024,
+                attachments: Vec::new(),
+            },
+        ));
         request.runtime_file_transfer_required = true;
+        request.runtime_edge_dispatch_authorization = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+                endpoint_url: "https://moi.example/runtime-executors/authorize".to_string(),
+                authorization: "Bearer edge-secret-must-not-persist".to_string(),
+                task_id: "task-1".to_string(),
+                executor_id: "edge-1".to_string(),
+            },
+        ));
+        request.runtime_edge_dispatch_authorization_required = true;
         let original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
@@ -792,12 +819,18 @@ mod tests {
         )
         .unwrap();
         let durable = original.durable().unwrap();
+        let durable_json = durable.snapshot.to_string();
+        assert!(!durable_json.contains("transfer-secret-must-not-persist"));
+        assert!(!durable_json.contains("edge-secret-must-not-persist"));
 
         request.workspace.cwd = Some("/changed".to_string());
         request.workspace.authority = WorkspaceAuthority::None;
         request.executor.status = astra_runtime_env::ExecutorStatus::Offline;
         request.policy.max_output_bytes = Some(1);
+        request.runtime_file_transfer = None;
         request.runtime_file_transfer_required = false;
+        request.runtime_edge_dispatch_authorization = None;
+        request.runtime_edge_dispatch_authorization_required = false;
         request.policy.admission_snapshot = Some(Default::default());
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
         restored.apply_to_request(&mut request);
@@ -809,7 +842,10 @@ mod tests {
             astra_runtime_env::ExecutorStatus::Online
         );
         assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert!(request.runtime_file_transfer.is_none());
         assert!(request.runtime_file_transfer_required);
+        assert!(request.runtime_edge_dispatch_authorization.is_none());
+        assert!(request.runtime_edge_dispatch_authorization_required);
         assert_eq!(restored.route, ToolExecutionRouteKind::ServerLocal);
         assert_eq!(restored, original);
     }
