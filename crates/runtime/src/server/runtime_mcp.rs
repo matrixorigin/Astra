@@ -1844,6 +1844,99 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mcp_stable_alias_survives_discovery_resolution_and_tool_search() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "moi_qq_mail__ch_23f40bed5331",
+                "description": "Send QQ mail",
+                "inputSchema": {"type": "object"},
+                "_meta": {
+                    "astra/stableToolAlias": "moi_qq_mail"
+                }
+            }]
+        }))
+        .expect("valid discovery response");
+        let native_tools = tools
+            .iter()
+            .map(|tool| tool.tool.clone())
+            .collect::<Vec<_>>();
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("moi-tools").unwrap(),
+            ProviderBindingRef::new("moi-tools").unwrap(),
+            &native_tools,
+        )
+        .unwrap();
+        assert_eq!(
+            discovery.tool_declarations[0]
+                .stable_tool_alias
+                .as_ref()
+                .map(|alias| alias.as_str()),
+            Some("moi_qq_mail")
+        );
+
+        let resolved = resolve_mcp_snapshot("moi-tools", &discovery).unwrap();
+        let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+        let result: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+            &schemas,
+            &json!({"query": "select:moi_qq_mail"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["selection_status"], "ok");
+        assert_eq!(result["matches"][0]["matched_by"], "stable_alias");
+        assert_eq!(
+            result["resolved"][0],
+            "mcp__moi-tools__moi_qq_mail__ch_23f40bed5331"
+        );
+    }
+
+    #[test]
+    fn duplicate_explicit_mcp_stable_aliases_fail_closed_as_ambiguous_selection() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [
+                {
+                    "name": "moi_qq_mail__ch_primary",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"astra/stableToolAlias": "moi_qq_mail"}
+                },
+                {
+                    "name": "moi_qq_mail__ch_secondary",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"astra/stableToolAlias": "moi_qq_mail"}
+                }
+            ]
+        }))
+        .expect("valid discovery response");
+        let native_tools = tools
+            .iter()
+            .map(|tool| tool.tool.clone())
+            .collect::<Vec<_>>();
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("moi-tools").unwrap(),
+            ProviderBindingRef::new("moi-tools").unwrap(),
+            &native_tools,
+        )
+        .unwrap();
+        let resolved = resolve_mcp_snapshot("moi-tools", &discovery).unwrap();
+        let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+        let result: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+            &schemas,
+            &json!({"query": "select:moi_qq_mail"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["selection_status"], "not_found");
+        assert_eq!(result["ambiguous"][0]["requested"], "moi_qq_mail");
+        assert_eq!(
+            result["ambiguous"][0]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn agent_binding_discovery_preserves_terminal_control_metadata_by_public_name() {
         let tools = parse_agent_binding_mcp_tools(json!({
             "tools": [{

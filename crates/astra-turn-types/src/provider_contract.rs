@@ -18,6 +18,11 @@ use thiserror::Error;
 /// serialization.
 pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
 
+/// Namespaced MCP `_meta` field through which a provider publishes the stable
+/// alias used by capability contracts. Adapters validate and carry this value;
+/// consumers must never infer it from a runtime-qualified tool name.
+pub const STABLE_TOOL_ALIAS_METADATA_KEY: &str = "astra/stableToolAlias";
+
 macro_rules! non_empty_id {
     ($name:ident, $kind:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -73,6 +78,7 @@ non_empty_id!(NativeToolId, "native_tool_id");
 non_empty_id!(DescriptorVersion, "descriptor_version");
 non_empty_id!(ProviderRejectionCode, "provider_rejection_code");
 non_empty_id!(PublicToolAlias, "public_tool_alias");
+non_empty_id!(StableToolAlias, "stable_tool_alias");
 non_empty_id!(ProviderResolverVersion, "provider_resolver_version");
 
 /// Stable internal tool identity. Model-visible aliases are deliberately not
@@ -243,6 +249,8 @@ pub struct ResolvedToolDescriptorDraft {
     pub identity: ToolIdentity,
     pub native_tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_tool_alias: Option<StableToolAlias>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -261,6 +269,8 @@ pub struct ResolvedToolDescriptorDraft {
 pub struct ResolvedToolDescriptor {
     pub identity: ToolIdentity,
     pub native_tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_tool_alias: Option<StableToolAlias>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -294,6 +304,7 @@ impl ResolvedToolDescriptor {
         Self {
             identity: draft.identity,
             native_tool_name: draft.native_tool_name,
+            stable_tool_alias: draft.stable_tool_alias,
             title: draft.title,
             description: draft.description,
             input_schema: draft.input_schema,
@@ -312,6 +323,7 @@ impl ResolvedToolDescriptor {
         ResolvedToolDescriptorDraft {
             identity: self.identity.clone(),
             native_tool_name: self.native_tool_name.clone(),
+            stable_tool_alias: self.stable_tool_alias.clone(),
             title: self.title.clone(),
             description: self.description.clone(),
             input_schema: self.input_schema.clone(),
@@ -404,6 +416,8 @@ pub struct ProviderToolDeclaration {
     pub native_tool_id: NativeToolId,
     pub native_tool_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_tool_alias: Option<StableToolAlias>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -425,6 +439,17 @@ impl ProviderToolDeclaration {
         if self.native_tool_name.trim().is_empty() {
             return Err(ProviderContractError::EmptyIdentifier {
                 kind: "native_tool_name",
+            });
+        }
+        if let Some(alias) = &self.stable_tool_alias
+            && (alias.as_str() != alias.as_str().trim()
+                || !alias.as_str().chars().all(|character| {
+                    character.is_alphanumeric() || character == '_' || character == '-'
+                }))
+        {
+            return Err(ProviderContractError::InvalidStableToolAlias {
+                native_tool_id: self.native_tool_id.to_string(),
+                alias: alias.to_string(),
             });
         }
         if !self.input_schema.is_object() {
@@ -956,6 +981,11 @@ pub enum ProviderContractError {
         native_tool_id: String,
         field: &'static str,
     },
+    #[error("tool '{native_tool_id}' has invalid stable tool alias '{alias}'")]
+    InvalidStableToolAlias {
+        native_tool_id: String,
+        alias: String,
+    },
     #[error("tool '{native_tool_id}' extension field '{field}' must be namespace-qualified")]
     UnqualifiedExtensionField {
         native_tool_id: String,
@@ -1061,6 +1091,7 @@ mod tests {
         ProviderToolDeclaration {
             native_tool_id: NativeToolId::new(id).unwrap(),
             native_tool_name: id.to_string(),
+            stable_tool_alias: None,
             title: None,
             description: None,
             input_schema: schema,

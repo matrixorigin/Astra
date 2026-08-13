@@ -71,7 +71,8 @@ pub use provider_contract::{
     ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,
     ResolvedProviderToolClaims, ResolvedSemanticCacheBaseline, ResolvedToolDescriptor,
     ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
-    ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_SCHEMA_KEY, ToolIdentity,
+    ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_METADATA_KEY,
+    STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{

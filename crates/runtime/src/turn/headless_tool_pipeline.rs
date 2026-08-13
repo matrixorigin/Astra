@@ -3041,6 +3041,7 @@ mod tests {
             vec![astra_turn_types::ProviderToolDeclaration {
                 native_tool_id: astra_turn_types::NativeToolId::new("weather").unwrap(),
                 native_tool_name: "weather".to_string(),
+                stable_tool_alias: None,
                 title: None,
                 description: Some("Weather".to_string()),
                 input_schema: json!({"type": "object"}),

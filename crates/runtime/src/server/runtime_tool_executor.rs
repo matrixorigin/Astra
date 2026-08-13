@@ -4472,6 +4472,7 @@ mod tests {
             vec![astra_turn_types::ProviderToolDeclaration {
                 native_tool_id: astra_turn_types::NativeToolId::new("query").unwrap(),
                 native_tool_name: "query".to_string(),
+                stable_tool_alias: None,
                 title: None,
                 description: Some("Query".to_string()),
                 input_schema: json!({"type": "object"}),

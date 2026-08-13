@@ -5,7 +5,8 @@ use astra_turn_types::{
     ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
     ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionRequest,
     ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
-    ResolvedProviderSnapshot, STABLE_TOOL_ALIAS_SCHEMA_KEY,
+    ResolvedProviderSnapshot, STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY,
+    StableToolAlias,
 };
 use rmcp::model::{CallToolResult, TaskSupport, Tool};
 use serde_json::{Map, Value};
@@ -181,6 +182,7 @@ pub fn mcp_tool_to_provider_declaration(
     let declaration = ProviderToolDeclaration {
         native_tool_id: NativeToolId::new(tool.name.to_string())?,
         native_tool_name: tool.name.to_string(),
+        stable_tool_alias: stable_tool_alias_from_meta(tool)?,
         title: tool.title.clone(),
         description: tool.description.as_deref().map(str::to_string),
         input_schema: Value::Object(tool.input_schema.as_ref().clone()),
@@ -194,6 +196,25 @@ pub fn mcp_tool_to_provider_declaration(
     };
     declaration.validate()?;
     Ok(declaration)
+}
+
+fn stable_tool_alias_from_meta(
+    tool: &Tool,
+) -> Result<Option<StableToolAlias>, ProviderContractError> {
+    let Some(value) = tool
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.0.get(STABLE_TOOL_ALIAS_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let Some(alias) = value.as_str() else {
+        return Err(ProviderContractError::InvalidStableToolAlias {
+            native_tool_id: tool.name.to_string(),
+            alias: value.to_string(),
+        });
+    };
+    Ok(Some(StableToolAlias::new(alias.to_string())?))
 }
 
 /// Build the immutable discovery snapshot for one MCP binding.
@@ -235,19 +256,38 @@ pub fn mcp_tool_schema_from_parts(
     description: &str,
     parameters: Value,
 ) -> Value {
+    mcp_tool_schema_from_parts_with_stable_alias(
+        server_name,
+        tool_name,
+        description,
+        parameters,
+        None,
+    )
+}
+
+fn mcp_tool_schema_from_parts_with_stable_alias(
+    server_name: &str,
+    tool_name: &str,
+    description: &str,
+    parameters: Value,
+    stable_tool_alias: Option<&StableToolAlias>,
+) -> Value {
     let description = truncate_with_marker(description, MAX_DESCRIPTION_LENGTH);
-    let stable_tool_alias = sanitize_tool_name(tool_name);
     let tool_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool_name));
 
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "type": "function",
         "function": {
             "name": tool_name,
             "description": description,
             "parameters": parameters,
-            STABLE_TOOL_ALIAS_SCHEMA_KEY: stable_tool_alias,
         }
-    })
+    });
+    if let Some(stable_tool_alias) = stable_tool_alias {
+        schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY] =
+            Value::String(stable_tool_alias.to_string());
+    }
+    schema
 }
 
 /// Convert MCP tools to schemas and fail if sanitized public names collide.
@@ -293,39 +333,38 @@ pub fn mcp_resolved_provider_snapshot_to_schemas_checked(
         .iter()
         .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
         .collect::<std::collections::BTreeMap<_, _>>();
-    snapshot
-        .alias_index
-        .iter()
-        .map(|(alias, descriptor_ref)| {
-            let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
-                format!(
-                    "resolved MCP alias '{}' references missing descriptor '{}@{}'",
-                    alias,
-                    descriptor_ref.identity.native_tool_id,
-                    descriptor_ref.descriptor_version
-                )
-            })?;
-            let public_name = alias.as_str();
-            if sanitize_tool_name(public_name) != public_name {
-                return Err(format!(
-                    "resolved MCP public alias '{public_name}' is not model-safe"
-                ));
+    let mut schemas = Vec::with_capacity(snapshot.alias_index.len());
+    for (alias, descriptor_ref) in &snapshot.alias_index {
+        let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+            format!(
+                "resolved MCP alias '{}' references missing descriptor '{}@{}'",
+                alias, descriptor_ref.identity.native_tool_id, descriptor_ref.descriptor_version
+            )
+        })?;
+        let public_name = alias.as_str();
+        if sanitize_tool_name(public_name) != public_name {
+            return Err(format!(
+                "resolved MCP public alias '{public_name}' is not model-safe"
+            ));
+        }
+        let mut schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": public_name,
+                "description": truncate_with_marker(
+                    descriptor.description.as_deref().unwrap_or_default(),
+                    MAX_DESCRIPTION_LENGTH,
+                ),
+                "parameters": &descriptor.input_schema,
             }
-            let stable_tool_alias = sanitize_tool_name(&descriptor.native_tool_name);
-            Ok(serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": public_name,
-                    "description": truncate_with_marker(
-                        descriptor.description.as_deref().unwrap_or_default(),
-                        MAX_DESCRIPTION_LENGTH,
-                    ),
-                    "parameters": &descriptor.input_schema,
-                    STABLE_TOOL_ALIAS_SCHEMA_KEY: stable_tool_alias,
-                }
-            }))
-        })
-        .collect()
+        });
+        if let Some(stable_tool_alias) = &descriptor.stable_tool_alias {
+            schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY] =
+                Value::String(stable_tool_alias.to_string());
+        }
+        schemas.push(schema);
+    }
+    Ok(schemas)
 }
 
 fn provider_declarations_to_schemas_checked(
@@ -335,11 +374,12 @@ fn provider_declarations_to_schemas_checked(
     let mut seen = HashSet::new();
     let mut schemas = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        let schema = mcp_tool_schema_from_parts(
+        let schema = mcp_tool_schema_from_parts_with_stable_alias(
             server_name,
             &declaration.native_tool_name,
             declaration.description.as_deref().unwrap_or_default(),
             declaration.input_schema.clone(),
+            declaration.stable_tool_alias.as_ref(),
         );
         let name = schema["function"]["name"].as_str().unwrap_or_default();
         if !seen.insert(name.to_string()) {
@@ -491,11 +531,11 @@ mod tests {
         let func = schema["function"].as_object().unwrap();
         assert_eq!(func["name"], "mcp__filesystem__read_file");
         assert_eq!(func["description"], "Read a file");
-        assert_eq!(func[STABLE_TOOL_ALIAS_SCHEMA_KEY], "read_file");
+        assert!(!func.contains_key(STABLE_TOOL_ALIAS_SCHEMA_KEY));
     }
 
     #[test]
-    fn schema_conversion_publishes_sanitized_producer_owned_alias() {
+    fn schema_conversion_does_not_invent_stable_alias_from_native_name() {
         let schema = mcp_tool_schema_from_parts(
             "github",
             "ns::func",
@@ -504,7 +544,28 @@ mod tests {
         );
 
         assert_eq!(schema["function"]["name"], "mcp__github__ns__func");
-        assert_eq!(schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY], "ns__func");
+        assert!(
+            schema["function"]
+                .get(STABLE_TOOL_ALIAS_SCHEMA_KEY)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checked_projection_publishes_explicit_mcp_stable_alias() {
+        use rmcp::model::Meta;
+
+        let mut tool = Tool::new("runtime__ch_123", "Runtime tool", Arc::new(Map::new()));
+        tool.meta = Some(Meta(Map::from_iter([(
+            STABLE_TOOL_ALIAS_METADATA_KEY.to_string(),
+            Value::String("runtime".to_string()),
+        )])));
+
+        let schemas = tools_to_schemas_checked("provider", &[tool]).unwrap();
+        assert_eq!(
+            schemas[0]["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY],
+            "runtime"
+        );
     }
 
     #[test]
