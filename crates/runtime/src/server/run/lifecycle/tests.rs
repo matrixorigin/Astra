@@ -162,6 +162,33 @@ fn fresh_request_admission_accounts_for_large_non_message_payloads() {
     );
 }
 
+#[test]
+fn fresh_request_admission_accounts_for_both_runtime_prompt_lanes() {
+    let mut request = test_request("small");
+    let baseline = fresh_request_admission_bytes(&request).unwrap();
+    let none_prompt_bytes = astra_turn_types::json_serialized_len(&Option::<String>::None).unwrap();
+
+    request.stable_runtime_system_prompt = Some("s".repeat(4096));
+    let stable_prompt_bytes =
+        astra_turn_types::json_serialized_len(&request.stable_runtime_system_prompt).unwrap();
+    let with_stable = fresh_request_admission_bytes(&request).unwrap();
+    assert_eq!(
+        with_stable - baseline,
+        stable_prompt_bytes - none_prompt_bytes,
+        "stable runtime prompt bytes must be admitted"
+    );
+
+    request.runtime_system_prompt = Some("v".repeat(2048));
+    let volatile_prompt_bytes =
+        astra_turn_types::json_serialized_len(&request.runtime_system_prompt).unwrap();
+    let with_both = fresh_request_admission_bytes(&request).unwrap();
+    assert_eq!(
+        with_both - with_stable,
+        volatile_prompt_bytes - none_prompt_bytes,
+        "volatile runtime prompt bytes must be admitted"
+    );
+}
+
 struct EnvVarGuard {
     key: &'static str,
     previous: Option<OsString>,

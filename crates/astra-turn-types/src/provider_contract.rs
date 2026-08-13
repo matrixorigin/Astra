@@ -12,6 +12,12 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Internal function-schema extension carrying the producer-owned alias that
+/// capability contracts use to select a tool independently of its runtime
+/// public name. Model adapters strip all `x-astra-*` extensions before wire
+/// serialization.
+pub const STABLE_TOOL_ALIAS_SCHEMA_KEY: &str = "x-astra-stable-tool-alias";
+
 macro_rules! non_empty_id {
     ($name:ident, $kind:literal) => {
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

@@ -5,7 +5,7 @@ use astra_turn_types::{
     ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
     ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionRequest,
     ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
-    ResolvedProviderSnapshot,
+    ResolvedProviderSnapshot, STABLE_TOOL_ALIAS_SCHEMA_KEY,
 };
 use rmcp::model::{CallToolResult, TaskSupport, Tool};
 use serde_json::{Map, Value};
@@ -236,6 +236,7 @@ pub fn mcp_tool_schema_from_parts(
     parameters: Value,
 ) -> Value {
     let description = truncate_with_marker(description, MAX_DESCRIPTION_LENGTH);
+    let stable_tool_alias = sanitize_tool_name(tool_name);
     let tool_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool_name));
 
     serde_json::json!({
@@ -244,6 +245,7 @@ pub fn mcp_tool_schema_from_parts(
             "name": tool_name,
             "description": description,
             "parameters": parameters,
+            STABLE_TOOL_ALIAS_SCHEMA_KEY: stable_tool_alias,
         }
     })
 }
@@ -309,6 +311,7 @@ pub fn mcp_resolved_provider_snapshot_to_schemas_checked(
                     "resolved MCP public alias '{public_name}' is not model-safe"
                 ));
             }
+            let stable_tool_alias = sanitize_tool_name(&descriptor.native_tool_name);
             Ok(serde_json::json!({
                 "type": "function",
                 "function": {
@@ -318,6 +321,7 @@ pub fn mcp_resolved_provider_snapshot_to_schemas_checked(
                         MAX_DESCRIPTION_LENGTH,
                     ),
                     "parameters": &descriptor.input_schema,
+                    STABLE_TOOL_ALIAS_SCHEMA_KEY: stable_tool_alias,
                 }
             }))
         })
@@ -487,6 +491,20 @@ mod tests {
         let func = schema["function"].as_object().unwrap();
         assert_eq!(func["name"], "mcp__filesystem__read_file");
         assert_eq!(func["description"], "Read a file");
+        assert_eq!(func[STABLE_TOOL_ALIAS_SCHEMA_KEY], "read_file");
+    }
+
+    #[test]
+    fn schema_conversion_publishes_sanitized_producer_owned_alias() {
+        let schema = mcp_tool_schema_from_parts(
+            "github",
+            "ns::func",
+            "Namespaced function",
+            serde_json::json!({"type": "object"}),
+        );
+
+        assert_eq!(schema["function"]["name"], "mcp__github__ns__func");
+        assert_eq!(schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY], "ns__func");
     }
 
     #[test]

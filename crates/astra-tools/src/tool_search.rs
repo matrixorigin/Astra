@@ -3,6 +3,7 @@
 //! Takes a set of tool schemas and a query, returning ranked matches.
 //! Extracted from edge_tools as a standalone function.
 
+use astra_turn_types::STABLE_TOOL_ALIAS_SCHEMA_KEY;
 use serde_json::{Value, json};
 
 use crate::relevance_score::Scoreable;
@@ -260,6 +261,11 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         };
     }
 
+    let stable_alias_resolution = resolve_stable_alias_tool(schemas, requested);
+    if !matches!(stable_alias_resolution, SelectResolution::Missing) {
+        return stable_alias_resolution;
+    }
+
     let requested_lower = requested.to_ascii_lowercase();
     let mut prefix_matches: Vec<(&'a Value, &'a str)> = schemas
         .iter()
@@ -277,7 +283,7 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
             canonical_name: name,
             matched_by: Some("unique_prefix"),
         },
-        [] => resolve_qualified_segment_tool(schemas, requested),
+        [] => SelectResolution::Missing,
         matches => SelectResolution::Ambiguous {
             candidates: matches
                 .iter()
@@ -287,35 +293,24 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
     }
 }
 
-// MCP producers expose canonical names such as
-// `mcp__server__tool__instance`. Skills and capability contracts refer to the
-// producer-owned `tool` segment because server and instance qualifiers are
-// runtime details. Resolve that unqualified name only when it identifies one
-// canonical tool; multiple instances remain explicitly ambiguous.
-fn qualified_mcp_tool_component(name: &str) -> Option<&str> {
-    let segments = name.split("__").collect::<Vec<_>>();
-    match segments.as_slice() {
-        ["mcp", server, tool] if !server.is_empty() && !tool.is_empty() => Some(*tool),
-        ["mcp", server, tool, instance]
-            if !server.is_empty() && !tool.is_empty() && !instance.is_empty() =>
-        {
-            Some(*tool)
-        }
-        _ => None,
-    }
-}
-
-fn resolve_qualified_segment_tool<'a>(
+// Runtime public names may contain provider namespaces, sanitized native
+// separators, or instance qualifiers. Only producer-owned schema metadata can
+// identify the stable alias used by capability contracts; consumers never
+// infer that boundary from public-name text.
+fn resolve_stable_alias_tool<'a>(
     schemas: &'a [&'a Value],
     requested: &str,
 ) -> SelectResolution<'a> {
     let mut matches: Vec<(&'a Value, &'a str)> = schemas
         .iter()
         .copied()
-        .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
-        .filter(|(_, name)| {
-            qualified_mcp_tool_component(name)
-                .is_some_and(|tool| tool.eq_ignore_ascii_case(requested))
+        .filter_map(|schema| {
+            let function = schema.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            let stable_alias = function.get(STABLE_TOOL_ALIAS_SCHEMA_KEY)?.as_str()?;
+            stable_alias
+                .eq_ignore_ascii_case(requested)
+                .then_some((schema, name))
         })
         .collect();
     matches.sort_by_key(|(_, name)| *name);
@@ -323,7 +318,7 @@ fn resolve_qualified_segment_tool<'a>(
         [(schema, name)] => SelectResolution::Found {
             schema,
             canonical_name: name,
-            matched_by: Some("qualified_segment"),
+            matched_by: Some("stable_alias"),
         },
         [] => SelectResolution::Missing,
         matches => SelectResolution::Ambiguous {
@@ -722,7 +717,8 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "mcp__moi-tools__moi_github_authenticated_user__ch_23f40bed5331",
-                "description": "Return the authenticated GitHub user"
+                "description": "Return the authenticated GitHub user",
+                "x-astra-stable-tool-alias": "moi_github_authenticated_user"
             }
         })];
         let parsed = parse_result(&tool_search(
@@ -737,7 +733,7 @@ mod tests {
         );
         assert_eq!(
             parsed["matches"][0]["matched_by"].as_str(),
-            Some("qualified_segment")
+            Some("stable_alias")
         );
         assert_eq!(
             parsed["matches"][0]["requested"].as_str(),
@@ -753,14 +749,16 @@ mod tests {
                 "type": "function",
                 "function": {
                     "name": "mcp__moi-tools__moi_github_authenticated_user__ch_primary",
-                    "description": "Primary GitHub account"
+                    "description": "Primary GitHub account",
+                    "x-astra-stable-tool-alias": "moi_github_authenticated_user"
                 }
             }),
             json!({
                 "type": "function",
                 "function": {
                     "name": "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
-                    "description": "Secondary GitHub account"
+                    "description": "Secondary GitHub account",
+                    "x-astra-stable-tool-alias": "moi_github_authenticated_user"
                 }
             }),
         ];
@@ -791,16 +789,17 @@ mod tests {
     }
 
     #[test]
-    fn select_mode_matches_only_the_mcp_tool_component() {
+    fn select_mode_uses_producer_owned_alias_without_parsing_public_name_segments() {
         let schemas = vec![json!({
             "type": "function",
             "function": {
-                "name": "mcp__github__search__primary",
-                "description": "Search GitHub"
+                "name": "mcp__github__ns__func",
+                "description": "Namespaced GitHub function",
+                "x-astra-stable-tool-alias": "ns__func"
             }
         })];
 
-        for qualifier in ["mcp", "github", "primary"] {
+        for qualifier in ["mcp", "github", "ns", "func"] {
             let parsed = parse_result(&tool_search(
                 &schemas,
                 &json!({"query": format!("select:{qualifier}")}),
@@ -813,16 +812,17 @@ mod tests {
             assert!(match_names(&parsed).is_empty());
         }
 
-        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:search"})));
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:ns__func"})));
         assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
         assert_eq!(
             field_strings(&parsed, "resolved"),
-            strings(&["mcp__github__search__primary"])
+            strings(&["mcp__github__ns__func"])
         );
+        assert_eq!(parsed["matches"][0]["matched_by"], "stable_alias");
     }
 
     #[test]
-    fn select_mode_fails_closed_for_malformed_qualified_names() {
+    fn select_mode_does_not_infer_aliases_from_public_names_without_metadata() {
         let schemas = vec![
             json!({"type": "function", "function": {"name": "mcp__github__search__primary__extra"}}),
             json!({"type": "function", "function": {"name": "http__github__search"}}),

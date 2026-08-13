@@ -2881,6 +2881,7 @@ fn fresh_request_admission_bytes(request: &ChatRequestData) -> Result<u64, serde
     add_json_len!(&request.user_intent);
     add_json_len!(&request.parts);
     add_json_len!(&request.attachments);
+    add_json_len!(&request.stable_runtime_system_prompt);
     add_json_len!(&request.runtime_system_prompt);
     add_json_len!(&request.context);
     add_json_len!(&request.capabilities);
