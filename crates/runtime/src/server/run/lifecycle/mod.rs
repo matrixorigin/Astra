@@ -5236,7 +5236,7 @@ impl AgenticRunLifecycleService {
         if !request.provider_runtime_authorized {
             return Err("file_transfer requires provider-authorized runtime context".to_string());
         }
-        let edge_workspace = request.workspace_binding.as_ref().is_some_and(|binding| {
+        let edge_workspace = request.workspace_binding.as_ref().filter(|binding| {
             matches!(
                 binding.kind,
                 astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
@@ -5254,7 +5254,7 @@ impl AgenticRunLifecycleService {
                 )
             )
         });
-        if !edge_workspace || !edge_executor {
+        if edge_workspace.is_none() || !edge_executor {
             return Err(
                 "file_transfer requires an edge_workspace and Edge WebSocket executor".to_string(),
             );
@@ -5285,13 +5285,21 @@ impl AgenticRunLifecycleService {
         {
             return Err("file_transfer metadata contract is unsupported".to_string());
         }
+        let workspace_root = edge_workspace
+            .and_then(|binding| binding.root.as_deref())
+            .ok_or_else(|| "file_transfer requires an explicit edge workspace root".to_string())?;
+        let workspace_root = Path::new(workspace_root);
+        if workspace_root != Path::new("/sandbox") {
+            return Err("file_transfer workspace root is invalid".to_string());
+        }
         let root = Path::new(&metadata.root);
-        let expected_root = Path::new("/sandbox/.moi/runtime").join(&metadata.task_id);
+        let expected_root = workspace_root.join(".moi/runtime").join(&metadata.task_id);
+        let expected_sessions_root = workspace_root.join(".moi/sessions");
         let session = Path::new(&metadata.session_dir);
         if root != expected_root
             || Path::new(&metadata.catalog_dir) != root.join("catalog")
             || Path::new(&metadata.scratch_dir) != root.join("scratch")
-            || session.parent() != Some(Path::new("/sandbox/.moi/sessions"))
+            || session.parent() != Some(expected_sessions_root.as_path())
             || session.file_name().is_none()
         {
             return Err("file_transfer directory scope is invalid".to_string());
@@ -5320,6 +5328,7 @@ impl AgenticRunLifecycleService {
                 endpoint_url: descriptor.endpoint_url.clone(),
                 authorization: auth.authorization.clone(),
                 task_id: metadata.task_id,
+                workspace_root: workspace_root.display().to_string(),
                 root: metadata.root,
                 catalog_dir: metadata.catalog_dir,
                 session_dir: metadata.session_dir,

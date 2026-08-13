@@ -1328,6 +1328,7 @@ mod tests {
             runtime: None,
             runtime_file_transfer: None,
             runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: Some(
@@ -1425,6 +1426,7 @@ mod tests {
             runtime: Some(runtime),
             runtime_file_transfer: None,
             runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,

@@ -358,9 +358,6 @@ async fn try_edge_websocket(
                 "selected edge does not match the provider authorization scope".to_string(),
             );
         }
-        if let Err(error) = authorize_edge_dispatch(authorization, request).await {
-            return EdgeTransportAttempt::AdmissionRejected(error);
-        }
     }
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
@@ -381,7 +378,29 @@ async fn try_edge_websocket(
         .admit_and_claim_direct_dispatch(&dispatch_identity, &edge.edge_agent_id, &payload_json)
         .await
     {
-        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed) => {}
+        Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Claimed) => {
+            if let Some(authorization) = plan.runtime_edge_dispatch_authorization()
+                && let Err(error) = authorize_edge_dispatch(authorization, request).await
+            {
+                return match dispatch
+                    .fail_dispatch(
+                        &dispatch_identity,
+                        &edge.edge_agent_id,
+                        "provider authorization denied before delivery",
+                    )
+                    .await
+                {
+                    Ok(true) => EdgeTransportAttempt::AdmissionRejected(error),
+                    Ok(false) => EdgeTransportAttempt::AdmissionOutcomeUnknown(
+                        "provider authorization was denied but the durable claim was no longer fail-able"
+                            .to_string(),
+                    ),
+                    Err(fail_error) => EdgeTransportAttempt::AdmissionOutcomeUnknown(format!(
+                        "provider authorization was denied but the durable claim could not be closed: {fail_error}"
+                    )),
+                };
+            }
+        }
         Ok(astra_services::multi_agent::EdgeDirectDispatchAdmission::Observing) => {
             return match dispatch
                 .wait_result(&dispatch_identity, plan.wait_timeout())
@@ -420,6 +439,7 @@ async fn try_edge_websocket(
                 tool: &request.tool_name,
                 args: &request.args,
                 runtime_file_transfer: plan.runtime_file_transfer(),
+                runtime_filesystem_boundary: plan.runtime_filesystem_boundary(),
                 cancel_token,
             },
         )

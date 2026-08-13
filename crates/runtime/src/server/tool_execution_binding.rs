@@ -278,6 +278,11 @@ pub struct ToolExecutionRequest {
     /// to ordinary Edge dispatch.
     #[serde(default)]
     pub runtime_file_transfer_required: bool,
+    /// Non-secret, durable mount boundary for host-owned paths inside a
+    /// managed Edge workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_filesystem_boundary:
+        Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
     /// Request-scoped dispatch authorization callback. Like file transfer
     /// credentials, this is never serialized into durable tool snapshots.
     #[serde(skip)]
@@ -509,6 +514,7 @@ impl ExecutionBindingState {
             policy: ToolPolicySnapshot::default(),
             runtime_file_transfer: None,
             runtime_file_transfer_required: false,
+            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
         }

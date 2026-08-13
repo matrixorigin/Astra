@@ -1,9 +1,6 @@
-use std::io::{Read as _, Seek as _};
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
-
-#[cfg(test)]
-use std::io::Write as _;
 
 use astra_server_types::edge_ws_protocol::{
     RuntimeFileTransferAttachment, RuntimeFileTransferContext, runtime_attachment_destination_name,
@@ -34,6 +31,70 @@ pub(crate) async fn execute(
         "publish_artifact" => Some(publish(args, context, call_id).await),
         _ => None,
     }
+}
+
+pub(crate) async fn execute_default_tool(
+    executor: &astra_tools::executor::DefaultToolExecutor,
+    tool: &str,
+    args: &Value,
+    context: Option<&RuntimeFileTransferContext>,
+    boundary: Option<&astra_server_types::edge_ws_protocol::RuntimeFilesystemBoundaryContext>,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> ToolResult {
+    let Some(boundary) = boundary else {
+        return astra_tools::ToolExecutor::execute_with_cancel(executor, tool, args, Some(cancel))
+            .await;
+    };
+    if Path::new(&boundary.workspace_root) != executor.workspace_root() {
+        return ToolResult::error(
+            "Managed runtime workspace does not match the connected Edge workspace".to_string(),
+        );
+    }
+    if boundary.read_only_paths.is_empty()
+        || boundary.read_only_paths.iter().any(|path| {
+            let path = Path::new(path);
+            path == executor.workspace_root() || !path.starts_with(executor.workspace_root())
+        })
+    {
+        return ToolResult::error("Managed runtime filesystem boundary is invalid".to_string());
+    }
+    for path in &boundary.read_only_paths {
+        let trusted_root = PathBuf::from(&boundary.workspace_root);
+        let path = PathBuf::from(path);
+        let prepared =
+            tokio::task::spawn_blocking(move || create_dir_all_beneath(&trusted_root, &path)).await;
+        match prepared {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return ToolResult::error(error),
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Managed runtime filesystem boundary preparation failed: {error}"
+                ));
+            }
+        }
+    }
+    if let Some(context) = context {
+        if context.workspace_root != boundary.workspace_root
+            || !boundary.read_only_paths.contains(&context.root)
+            || !boundary.read_only_paths.contains(&context.session_dir)
+        {
+            return ToolResult::error(
+                "Managed transfer paths do not match the filesystem boundary".to_string(),
+            );
+        }
+        if let Err(error) = prepare_scope_dirs(context).await {
+            return ToolResult::error(error);
+        }
+    }
+    let guarded = astra_tools::executor::DefaultToolExecutor::for_workspace(
+        executor.workspace_root(),
+        executor.context().user_id.clone(),
+        executor.context().session_id.clone(),
+        "astra-edge/0.1",
+        Duration::from_secs(30),
+    )
+    .with_filesystem_write_boundary(boundary.read_only_paths.iter().map(PathBuf::from).collect());
+    astra_tools::ToolExecutor::execute_with_cancel(&guarded, tool, args, Some(cancel)).await
 }
 
 async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>) -> ToolResult {
@@ -244,21 +305,29 @@ async fn publish(
     let requested = if requested.is_absolute() {
         requested
     } else {
-        Path::new(&context.session_dir).join(requested)
+        Path::new(&context.workspace_root).join(requested)
     };
     let normalized_metadata = match validate_publish_args(&mut args, &requested) {
         Ok(metadata) => metadata,
         Err(error) => return ToolResult::error(error),
     };
     let allowed_roots = [
+        PathBuf::from(&context.workspace_root),
         PathBuf::from(&context.catalog_dir),
         PathBuf::from(&context.session_dir),
         PathBuf::from(&context.scratch_dir),
     ];
     let max_file_bytes = context.max_file_bytes;
     let trusted_root = trusted_sandbox_root(context);
+    let scratch_root = PathBuf::from(&context.scratch_dir);
     let opened = match tokio::task::spawn_blocking(move || {
-        read_scoped_artifact(&requested, &allowed_roots, &trusted_root, max_file_bytes)
+        snapshot_scoped_artifact(
+            &requested,
+            &allowed_roots,
+            &trusted_root,
+            &scratch_root,
+            max_file_bytes,
+        )
     })
     .await
     {
@@ -419,13 +488,14 @@ fn trusted_sandbox_root(_context: &RuntimeFileTransferContext) -> PathBuf {
 fn trusted_sandbox_root(context: &RuntimeFileTransferContext) -> PathBuf {
     let sandbox = Path::new("/sandbox");
     if Path::new(&context.root).starts_with(sandbox)
+        && Path::new(&context.workspace_root) == sandbox
         && Path::new(&context.catalog_dir).starts_with(sandbox)
         && Path::new(&context.session_dir).starts_with(sandbox)
         && Path::new(&context.scratch_dir).starts_with(sandbox)
     {
         sandbox.to_path_buf()
     } else {
-        PathBuf::from(&context.root)
+        PathBuf::from(&context.workspace_root)
     }
 }
 
@@ -755,12 +825,12 @@ struct ScopedArtifact {
     sha256: String,
 }
 
-fn read_scoped_artifact(
+fn scoped_artifact_source(
     requested: &Path,
     allowed_roots: &[PathBuf],
     trusted_root: &Path,
     max_file_bytes: u64,
-) -> Result<ScopedArtifact, String> {
+) -> Result<(String, std::fs::File, u64), String> {
     if max_file_bytes == 0 {
         return Err("runtime transfer limit is invalid".to_string());
     }
@@ -786,7 +856,7 @@ fn read_scoped_artifact(
     {
         return Err("artifact path escapes the current runtime scope".to_string());
     }
-    let mut file = open_beneath_without_symlinks(trusted_root, root, relative)?;
+    let file = open_beneath_without_symlinks(trusted_root, root, relative)?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("artifact metadata failed: {error}"))?;
@@ -798,6 +868,17 @@ fn read_scoped_artifact(
             "artifact must be between 1 and {max_file_bytes} bytes"
         ));
     }
+    Ok((filename, file, metadata.len()))
+}
+
+fn read_scoped_artifact(
+    requested: &Path,
+    allowed_roots: &[PathBuf],
+    trusted_root: &Path,
+    max_file_bytes: u64,
+) -> Result<ScopedArtifact, String> {
+    let (filename, mut file, expected_size) =
+        scoped_artifact_source(requested, allowed_roots, trusted_root, max_file_bytes)?;
     let mut md5 = Md5::new();
     let mut sha256 = Sha256::new();
     let mut size = 0_u64;
@@ -818,7 +899,7 @@ fn read_scoped_artifact(
         md5.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
     }
-    if size == 0 || size != metadata.len() {
+    if size == 0 || size != expected_size {
         return Err("artifact changed size while it was being read".to_string());
     }
     file.seek(std::io::SeekFrom::Start(0))
@@ -826,6 +907,91 @@ fn read_scoped_artifact(
     Ok(ScopedArtifact {
         filename,
         file,
+        size: size as i64,
+        md5: format!("{:x}", md5.finalize()),
+        sha256: format!("sha256:{:x}", sha256.finalize()),
+    })
+}
+
+#[cfg(unix)]
+fn create_unlinked_staging_file(
+    trusted_root: &Path,
+    scratch_root: &Path,
+) -> Result<std::fs::File, String> {
+    use nix::fcntl::{OFlag, openat};
+    use nix::sys::stat::Mode;
+    use nix::unistd::{UnlinkatFlags, unlinkat};
+
+    let relative_root = path_beneath_trusted_root(trusted_root, scratch_root)?;
+    let trusted_fd = open_trusted_root(trusted_root)?;
+    let scratch_fd = open_directory_beneath(&trusted_fd, &relative_root)
+        .map_err(|error| format!("runtime scratch is unavailable: {error}"))?;
+    let temporary = format!(".moi-publish-{:016x}", fastrand::u64(..));
+    let staged_fd = openat(
+        &scratch_fd,
+        temporary.as_str(),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| format!("artifact snapshot open failed: {error}"))?;
+    if let Err(error) = unlinkat(&scratch_fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir) {
+        drop(staged_fd);
+        let _ = unlinkat(&scratch_fd, temporary.as_str(), UnlinkatFlags::NoRemoveDir);
+        return Err(format!("artifact snapshot unlink failed: {error}"));
+    }
+    Ok(std::fs::File::from(staged_fd))
+}
+
+#[cfg(not(unix))]
+fn create_unlinked_staging_file(
+    _trusted_root: &Path,
+    _scratch_root: &Path,
+) -> Result<std::fs::File, String> {
+    Err("secure artifact snapshot is unsupported on this platform".to_string())
+}
+
+fn snapshot_scoped_artifact(
+    requested: &Path,
+    allowed_roots: &[PathBuf],
+    trusted_root: &Path,
+    scratch_root: &Path,
+    max_file_bytes: u64,
+) -> Result<ScopedArtifact, String> {
+    let (filename, mut source, expected_size) =
+        scoped_artifact_source(requested, allowed_roots, trusted_root, max_file_bytes)?;
+    let mut snapshot = create_unlinked_staging_file(trusted_root, scratch_root)?;
+    let mut md5 = Md5::new();
+    let mut sha256 = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = source
+            .read(&mut buffer)
+            .map_err(|error| format!("artifact read failed: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| "artifact changed size while it was being snapshotted".to_string())?;
+        if size > max_file_bytes {
+            return Err("artifact changed size while it was being snapshotted".to_string());
+        }
+        snapshot
+            .write_all(&buffer[..read])
+            .map_err(|error| format!("artifact snapshot write failed: {error}"))?;
+        md5.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
+    }
+    if size == 0 || size != expected_size {
+        return Err("artifact changed size while it was being snapshotted".to_string());
+    }
+    snapshot
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| format!("artifact snapshot rewind failed: {error}"))?;
+    Ok(ScopedArtifact {
+        filename,
+        file: snapshot,
         size: size as i64,
         md5: format!("{:x}", md5.finalize()),
         sha256: format!("sha256:{:x}", sha256.finalize()),
@@ -916,6 +1082,7 @@ mod tests {
             endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
             authorization: "Bearer secret-that-must-be-redacted".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: root.display().to_string(),
             root: root.display().to_string(),
             catalog_dir: root.join("catalog").display().to_string(),
             session_dir: root.join("session").display().to_string(),
@@ -993,7 +1160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_uploads_relative_session_artifact_with_inferred_metadata() {
+    async fn publish_uploads_relative_workspace_artifact_with_inferred_metadata() {
         let server = MockServer::start().await;
         let content = b"%PDF-report";
         let sha256 = format!("sha256:{:x}", Sha256::digest(content));
@@ -1022,7 +1189,7 @@ mod tests {
         let mut transfer = context(temp.path());
         transfer.endpoint_url = format!("{}/api/v1/runtime-files", server.uri());
         prepare_scope_dirs(&transfer).await.unwrap();
-        std::fs::write(temp.path().join("session/report.pdf"), content).unwrap();
+        std::fs::write(temp.path().join("report.pdf"), content).unwrap();
 
         let result = publish(&json!({"path": "report.pdf"}), Some(&transfer), "call-1").await;
 
@@ -1037,6 +1204,36 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.get("artifact_kind")),
             Some(&Value::String("pdf".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_snapshot_is_immutable_after_source_is_rewritten() {
+        let temp = tempfile::tempdir().unwrap();
+        let scratch = temp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let source = temp.path().join("report.txt");
+        std::fs::write(&source, b"first-version").unwrap();
+
+        let mut snapshot = snapshot_scoped_artifact(
+            &source,
+            &[temp.path().to_path_buf()],
+            temp.path(),
+            &scratch,
+            1024,
+        )
+        .unwrap();
+        std::fs::write(&source, b"other-version").unwrap();
+
+        let mut uploaded = Vec::new();
+        snapshot.file.read_to_end(&mut uploaded).unwrap();
+        assert_eq!(uploaded, b"first-version");
+        assert_eq!(snapshot.size, uploaded.len() as i64);
+        assert_eq!(snapshot.md5, md5_hex(&uploaded));
+        assert_eq!(
+            snapshot.sha256,
+            format!("sha256:{:x}", Sha256::digest(&uploaded))
         );
     }
 
@@ -1094,7 +1291,7 @@ mod tests {
         let mut transfer = context(temp.path());
         transfer.endpoint_url = format!("{}/api/v1/runtime-files", server.uri());
         prepare_scope_dirs(&transfer).await.unwrap();
-        std::fs::write(temp.path().join("session/report.txt"), b"report").unwrap();
+        std::fs::write(temp.path().join("report.txt"), b"report").unwrap();
 
         let result = publish(
             &json!({"path": "report.txt", "title": "x".repeat(161)}),
@@ -1119,7 +1316,7 @@ mod tests {
         let mut transfer = context(temp.path());
         transfer.endpoint_url = format!("{}/api/v1/runtime-files", server.uri());
         prepare_scope_dirs(&transfer).await.unwrap();
-        std::fs::write(temp.path().join("session/report.txt"), b"report").unwrap();
+        std::fs::write(temp.path().join("report.txt"), b"report").unwrap();
 
         let result = publish(&json!({"path": "report.txt"}), Some(&transfer), "call-1").await;
 

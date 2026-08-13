@@ -66,12 +66,32 @@ pub struct RuntimeFileTransferContext {
     pub endpoint_url: String,
     pub authorization: String,
     pub task_id: String,
+    pub workspace_root: String,
     pub root: String,
     pub catalog_dir: String,
     pub session_dir: String,
     pub scratch_dir: String,
     pub max_file_bytes: u64,
     pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFilesystemBoundaryContext {
+    pub workspace_root: String,
+    pub read_only_paths: Vec<String>,
+}
+
+#[cfg(feature = "server")]
+impl From<&astra_services::runs::RuntimeFilesystemBoundaryContext>
+    for RuntimeFilesystemBoundaryContext
+{
+    fn from(context: &astra_services::runs::RuntimeFilesystemBoundaryContext) -> Self {
+        Self {
+            workspace_root: context.workspace_root.clone(),
+            read_only_paths: context.read_only_paths.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for RuntimeFileTransferContext {
@@ -93,6 +113,7 @@ impl From<&astra_services::runs::RuntimeFileTransferContext> for RuntimeFileTran
             endpoint_url: context.endpoint_url.clone(),
             authorization: context.authorization.clone(),
             task_id: context.task_id.clone(),
+            workspace_root: context.workspace_root.clone(),
             root: context.root.clone(),
             catalog_dir: context.catalog_dir.clone(),
             session_dir: context.session_dir.clone(),
@@ -185,6 +206,10 @@ pub enum EdgeServerMessage {
         /// journal; its Debug implementation redacts authorization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_file_transfer: Option<Box<RuntimeFileTransferContext>>,
+        /// Non-secret mount boundary for host-owned lanes within the writable
+        /// workspace. Unlike transfer credentials this field is durable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_filesystem_boundary: Option<Box<RuntimeFilesystemBoundaryContext>>,
         /// Maximum execution time in seconds.
         #[serde(default = "default_tool_timeout_secs")]
         timeout_secs: u64,
@@ -307,6 +332,7 @@ mod tests {
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
             runtime_file_transfer: None,
+            runtime_filesystem_boundary: None,
             timeout_secs: 120,
         };
         let v = serde_json::to_value(&msg).unwrap();
@@ -327,6 +353,7 @@ mod tests {
                 endpoint_url: "https://moi.example/runtime-files".into(),
                 authorization: "Bearer runtime-grant".into(),
                 task_id: "task-1".into(),
+                workspace_root: "/sandbox".into(),
                 root: "/sandbox/.moi/runtime/task-1".into(),
                 catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
                 session_dir: "/sandbox/.moi/sessions/session-1".into(),
@@ -339,6 +366,13 @@ mod tests {
                     md5: "0123456789abcdef0123456789abcdef".into(),
                 }],
             })),
+            runtime_filesystem_boundary: Some(Box::new(RuntimeFilesystemBoundaryContext {
+                workspace_root: "/sandbox".into(),
+                read_only_paths: vec![
+                    "/sandbox/.moi/runtime/task-1".into(),
+                    "/sandbox/.moi/sessions/session-1".into(),
+                ],
+            })),
             timeout_secs: 120,
         };
 
@@ -348,11 +382,13 @@ mod tests {
         match decoded {
             EdgeServerMessage::ToolRequest {
                 runtime_file_transfer: Some(context),
+                runtime_filesystem_boundary: Some(boundary),
                 ..
             } => {
                 assert_eq!(context.task_id, "task-1");
                 assert_eq!(context.attachments[0].file_id, "file-1");
                 assert_eq!(context.authorization, "Bearer runtime-grant");
+                assert_eq!(boundary.workspace_root, "/sandbox");
             }
             other => panic!("expected tool request with transfer context, got {other:?}"),
         }

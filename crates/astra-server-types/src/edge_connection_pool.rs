@@ -48,6 +48,8 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub tool: &'a str,
     pub args: &'a serde_json::Value,
     pub runtime_file_transfer: Option<&'a astra_services::runs::RuntimeFileTransferContext>,
+    pub runtime_filesystem_boundary:
+        Option<&'a astra_services::runs::RuntimeFilesystemBoundaryContext>,
     pub cancel_token: Option<&'a CancellationToken>,
 }
 
@@ -594,6 +596,7 @@ impl EdgeConnectionPool {
                 tool,
                 args,
                 runtime_file_transfer: None,
+                runtime_filesystem_boundary: None,
                 cancel_token,
             },
         )
@@ -618,6 +621,7 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_file_transfer,
+            runtime_filesystem_boundary,
             cancel_token,
         } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
@@ -668,6 +672,8 @@ impl EdgeConnectionPool {
             tool: tool.to_string(),
             args: args.clone(),
             runtime_file_transfer: runtime_file_transfer.map(|context| Box::new(context.into())),
+            runtime_filesystem_boundary: runtime_filesystem_boundary
+                .map(|context| Box::new(context.into())),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
         };
 

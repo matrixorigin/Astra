@@ -494,12 +494,25 @@ pub struct RuntimeFileTransferContext {
     pub endpoint_url: String,
     pub authorization: String,
     pub task_id: String,
+    /// Canonical workspace root selected by the runtime binding. Relative
+    /// model-visible file paths are resolved from this directory.
+    pub workspace_root: String,
     pub root: String,
     pub catalog_dir: String,
     pub session_dir: String,
     pub scratch_dir: String,
     pub max_file_bytes: u64,
     pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+/// Non-secret filesystem boundary for a provider-managed Edge workspace.
+/// Unlike transfer credentials this contract is safe to persist in durable
+/// dispatch state and must accompany every tool that can mutate the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFilesystemBoundaryContext {
+    pub workspace_root: String,
+    pub read_only_paths: Vec<String>,
 }
 
 impl std::fmt::Debug for RuntimeFileTransferContext {

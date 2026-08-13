@@ -2015,6 +2015,7 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -2037,6 +2038,7 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -2051,6 +2053,17 @@ impl RuntimeToolExecutor {
         matches!(name, "materialize_attachment" | "publish_artifact")
             .then(|| self.runtime_file_transfer.clone())
             .flatten()
+    }
+
+    fn runtime_filesystem_boundary(
+        &self,
+    ) -> Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>> {
+        self.runtime_file_transfer.as_ref().map(|context| {
+            Arc::new(astra_services::runs::RuntimeFilesystemBoundaryContext {
+                workspace_root: context.workspace_root.clone(),
+                read_only_paths: vec![context.root.clone(), context.session_dir.clone()],
+            })
+        })
     }
 
     fn runtime_edge_dispatch_authorization_for_request(
@@ -4175,6 +4188,7 @@ mod tests {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: "/sandbox".to_string(),
             root: "/sandbox/.moi/runtime/task-1".to_string(),
             catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
             session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
@@ -4187,14 +4201,17 @@ mod tests {
         let materialize = exec.tool_execution_request("materialize_attachment", &Value::Null);
         assert!(materialize.runtime_file_transfer.is_some());
         assert!(materialize.runtime_file_transfer_required);
+        assert!(materialize.runtime_filesystem_boundary.is_some());
 
         let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
         assert!(publish.runtime_file_transfer.is_some());
         assert!(publish.runtime_file_transfer_required);
+        assert!(publish.runtime_filesystem_boundary.is_some());
 
         let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
         assert!(bash.runtime_file_transfer.is_none());
         assert!(!bash.runtime_file_transfer_required);
+        assert!(bash.runtime_filesystem_boundary.is_some());
     }
 
     #[test]

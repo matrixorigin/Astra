@@ -45,6 +45,9 @@ pub struct IsolationConfig {
     pub max_output_bytes: usize,
     /// Working directory for the subprocess.
     pub working_dir: PathBuf,
+    /// Host-owned paths inside the workspace that remain readable but must
+    /// not be writable by the child mount namespace.
+    pub read_only_paths: Vec<PathBuf>,
 }
 
 impl IsolationConfig {
@@ -59,6 +62,7 @@ impl IsolationConfig {
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
+            read_only_paths: Vec::new(),
         }
     }
 
@@ -73,6 +77,7 @@ impl IsolationConfig {
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
+            read_only_paths: Vec::new(),
         }
     }
 
@@ -89,6 +94,25 @@ impl IsolationConfig {
             timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
             working_dir,
+            read_only_paths: Vec::new(),
+        }
+    }
+
+    /// Mount-namespace write boundary for a managed workspace. The host
+    /// process keeps its ordinary filesystem view while the child sees the
+    /// host filesystem read-only, the selected workspace read-write, and the
+    /// supplied host-owned lanes read-only again.
+    pub fn filesystem_boundary(working_dir: PathBuf, read_only_paths: Vec<PathBuf>) -> Self {
+        Self {
+            pid_namespace: true,
+            mount_namespace: true,
+            net_namespace: false,
+            memory_limit_bytes: 0,
+            cpu_quota: 0.0,
+            timeout: Duration::from_secs(120),
+            max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
+            working_dir,
+            read_only_paths,
         }
     }
 }
@@ -425,6 +449,7 @@ pub fn apply_cgroup(memory_limit_bytes: u64, cpu_quota: f64) -> CgroupGuard {
         timeout: Duration::from_secs(0),
         max_output_bytes: DEFAULT_MAX_CAPTURED_OUTPUT_BYTES,
         working_dir: PathBuf::new(),
+        read_only_paths: Vec::new(),
     };
     let cg_path = match create_cgroup(&config) {
         Some(p) => p,
@@ -578,20 +603,19 @@ async fn drain_stream_pumps_after_exit(
 /// 4. Creates a `tmpfs` at `/workspace` and bind-mounts `working_dir` into it
 ///    so tools can read/write their workspace without seeing the host tree.
 ///
-/// Mount failures are non-fatal: the script continues with `|| true` so tools
-/// still execute even when the kernel denies a particular mount (e.g. inside
-/// an already-restricted container).
+/// Every mount that establishes the write boundary is fatal. A managed tool
+/// must not execute if the kernel cannot provide the requested isolation.
 fn build_mount_namespace_wrapper() -> String {
     let script = r#"
-set -e
+set -eu
 # Make / private to prevent mount propagation back to the host
-mount --make-rprivate / 2>/dev/null || true
+mount --make-rprivate /
 # Fresh procfs for the PID namespace
 mount -t proc proc /proc 2>/dev/null || true
 # Isolate temporary directories
-mount -t tmpfs -o size=128M,mode=1777 tmpfs /tmp 2>/dev/null || true
-mkdir -p /var/tmp 2>/dev/null || true
-mount -t tmpfs -o size=32M,mode=1777 tmpfs /var/tmp 2>/dev/null || true
+mount -t tmpfs -o size=128M,mode=1777 tmpfs /tmp
+mkdir -p /var/tmp
+mount -t tmpfs -o size=32M,mode=1777 tmpfs /var/tmp
 # Create workspace and bind-mount the working directory.
 # We use /tmp/_astra_ws instead of /workspace because / is often not
 # writable in unprivileged user namespaces (root-owned on the host).
@@ -601,12 +625,33 @@ if [ $# -lt 2 ]; then
   echo "Error: command and working directory arguments required" >&2
   exit 1
 fi
-mkdir -p /tmp/_astra_ws 2>/dev/null || true
-mount --bind -- "$2" /tmp/_astra_ws 2>/dev/null || true
+user_command=$1
+workspace_root=$2
+mkdir -p /tmp/_astra_ws
+mount --bind -- "$2" /tmp/_astra_ws
+# Each remaining argument is a host-owned lane below the selected workspace.
+# Bind-remount it read-only inside the child view before user code starts.
+shift 2
+for protected in "$@"; do
+  case "$protected" in
+    "$workspace_root"/*) relative=${protected#"$workspace_root"/} ;;
+    *) echo "Error: protected path escapes workspace" >&2; exit 1 ;;
+  esac
+  target="/tmp/_astra_ws/$relative"
+  test -e "$target"
+  mount --bind -- "$target" "$target"
+  mount -o remount,bind,ro -- "$target"
+done
+# The rest of the inherited filesystem is read-only. Separate /tmp and the
+# workspace bind remain writable mounts; protected workspace submounts do not.
+mount --bind / /
+mount -o remount,bind,ro /
 cd /tmp/_astra_ws
-# Execute the actual command with strict mode
-set -u
-exec bash -c "$1"
+# Root inside the private user namespace was needed only to construct mounts.
+# Drop every capability before executing untrusted code so it cannot remount a
+# protected lane read-write again.
+exec setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
+  bash -c "$user_command"
 "#;
     script.trim().to_string()
 }
@@ -640,6 +685,23 @@ pub async fn execute_isolated(
             stderr: "Error: namespace isolation unavailable — strict-mode requires \
                      PID/mount/network namespace isolation (unshare not found or not permitted)"
                 .to_string(),
+            exit_code: None,
+            timed_out: false,
+            stdout_capped: false,
+            stderr_capped: false,
+            namespace_active: false,
+            cgroup_active: false,
+        };
+    }
+    if config.mount_namespace
+        && config
+            .read_only_paths
+            .iter()
+            .any(|path| path == &config.working_dir || !path.starts_with(&config.working_dir))
+    {
+        return IsolatedOutput {
+            stdout: String::new(),
+            stderr: "Error: managed read-only path escapes the selected workspace".to_string(),
             exit_code: None,
             timed_out: false,
             stdout_capped: false,
@@ -691,6 +753,12 @@ pub async fn execute_isolated(
             args.push("astra-mount-wrapper".to_string());
             args.push(command.to_string());
             args.push(config.working_dir.display().to_string());
+            args.extend(
+                config
+                    .read_only_paths
+                    .iter()
+                    .map(|path| path.display().to_string()),
+            );
         } else {
             args.push(command.to_string());
         }
@@ -962,6 +1030,7 @@ mod tests {
         assert_eq!(cfg.memory_limit_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.cpu_quota, 1.0);
         assert_eq!(cfg.max_output_bytes, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(cfg.read_only_paths.is_empty());
     }
 
     #[test]
@@ -974,6 +1043,7 @@ mod tests {
         // and 600s timeout to prevent OOM and infinite execution.
         assert_eq!(cfg.memory_limit_bytes, 1024 * 1024 * 1024);
         assert_eq!(cfg.max_output_bytes, DEFAULT_MAX_CAPTURED_OUTPUT_BYTES);
+        assert!(cfg.read_only_paths.is_empty());
     }
 
     #[test]
@@ -1179,6 +1249,14 @@ mod tests {
             "must mount tmpfs for /tmp"
         );
         assert!(script.contains("mount --bind"), "must bind-mount workspace");
+        assert!(
+            script.contains("mount -o remount,bind,ro /"),
+            "the inherited filesystem must become read-only"
+        );
+        assert!(
+            script.contains("mount -o remount,bind,ro -- \"$target\""),
+            "host-owned workspace lanes must be read-only"
+        );
         // Should use argv, not a user-controlled environment variable.
         assert!(
             script.contains("mount --bind -- \"$2\""),
@@ -1193,7 +1271,7 @@ mod tests {
             "must change to workspace dir"
         );
         assert!(
-            script.contains("exec bash -c \"$1\""),
+            script.contains("setpriv --bounding-set=-all"),
             "must execute the original command from argv"
         );
     }
@@ -1232,7 +1310,7 @@ mod tests {
             !script.contains("echo 'injected"),
             "wrapper must not embed command text: {script}"
         );
-        assert!(script.contains("exec bash -c \"$1\""));
+        assert!(script.contains("bash -c \"$user_command\""));
     }
 
     /// Integration: when mount_namespace is active, the executed command
@@ -1279,6 +1357,63 @@ mod tests {
 
         let out = execute_isolated("printf 'quote_ok\\n'", &env, &config).await;
         assert!(out.stdout.contains("quote_ok"), "{out:?}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_boundary_blocks_arbitrary_writers_from_host_owned_lane() {
+        if !unshare_available() {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let protected = workspace.path().join(".moi/runtime/task-1");
+        std::fs::create_dir_all(&protected).unwrap();
+        std::fs::write(protected.join("owned.txt"), b"host-owned").unwrap();
+        let env =
+            std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        let config = IsolationConfig::filesystem_boundary(
+            workspace.path().to_path_buf(),
+            vec![protected.clone()],
+        );
+
+        let tar = execute_isolated(
+            "printf ok > ordinary.txt && tar -cf .moi/runtime/task-1/archive.tar ordinary.txt",
+            &env,
+            &config,
+        )
+        .await;
+        assert!(tar.namespace_active, "{tar:?}");
+        assert_ne!(tar.exit_code, Some(0), "{tar:?}");
+        assert_eq!(
+            std::fs::read(workspace.path().join("ordinary.txt")).unwrap(),
+            b"ok"
+        );
+        assert!(!protected.join("archive.tar").exists());
+
+        let python = execute_isolated(
+            "python3 -c \"open('.moi/runtime/task-1/owned.txt','w').write('changed')\"",
+            &env,
+            &config,
+        )
+        .await;
+        assert!(python.namespace_active, "{python:?}");
+        assert_ne!(python.exit_code, Some(0), "{python:?}");
+        assert_eq!(
+            std::fs::read(protected.join("owned.txt")).unwrap(),
+            b"host-owned"
+        );
+
+        let remount = execute_isolated(
+            "mount -o remount,rw .moi/runtime/task-1 || true; printf changed > .moi/runtime/task-1/owned.txt",
+            &env,
+            &config,
+        )
+        .await;
+        assert!(remount.namespace_active, "{remount:?}");
+        assert_ne!(remount.exit_code, Some(0), "{remount:?}");
+        assert_eq!(
+            std::fs::read(protected.join("owned.txt")).unwrap(),
+            b"host-owned"
+        );
     }
 
     /// Regression: when mount_namespace is disabled, the wrapper must NOT be

@@ -353,6 +353,7 @@ struct StaticEdgeDispatch {
     result_status: &'static str,
     terminal_admission_result: Option<String>,
     admission_error: Option<astra_services::multi_agent::EdgeDispatchAdmissionError>,
+    direct_claimed: AtomicBool,
 }
 
 impl Default for StaticEdgeDispatch {
@@ -365,6 +366,7 @@ impl Default for StaticEdgeDispatch {
             result_status: "completed",
             terminal_admission_result: None,
             admission_error: None,
+            direct_claimed: AtomicBool::new(false),
         }
     }
 }
@@ -379,6 +381,7 @@ impl StaticEdgeDispatch {
             result_status: "completed",
             terminal_admission_result: None,
             admission_error: None,
+            direct_claimed: AtomicBool::new(false),
         }
     }
 
@@ -391,6 +394,7 @@ impl StaticEdgeDispatch {
             result_status: "failed",
             terminal_admission_result: None,
             admission_error: None,
+            direct_claimed: AtomicBool::new(false),
         }
     }
 
@@ -405,6 +409,7 @@ impl StaticEdgeDispatch {
                 serde_json::json!({"status":"completed","output":output}).to_string(),
             ),
             admission_error: None,
+            direct_claimed: AtomicBool::new(false),
         }
     }
 
@@ -484,6 +489,17 @@ impl astra_services::multi_agent::EdgeDispatchService for StaticEdgeDispatch {
         _edge_agent_id: &str,
     ) -> Result<Vec<astra_services::multi_agent::EdgeDispatchRow>, String> {
         Ok(Vec::new())
+    }
+
+    async fn claim_direct_dispatch(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        Ok(self
+            .direct_claimed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok())
     }
 
     async fn deliver_result(
@@ -919,6 +935,7 @@ fn request(
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         selected_offer: None,
@@ -1554,6 +1571,7 @@ fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer durable-secret-must-not-appear".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: "/sandbox".to_string(),
             root: "/sandbox/.moi/runtime/task-1".to_string(),
             catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
             session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
@@ -1594,6 +1612,7 @@ fn validated_transfer_context_authorizes_edge_interceptor_support() {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: "/sandbox".to_string(),
             root: "/sandbox/.moi/runtime/task-1".to_string(),
             catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
             session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
@@ -1637,6 +1656,7 @@ fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: "/sandbox".to_string(),
             root: "/sandbox/.moi/runtime/task-1".to_string(),
             catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
             session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
@@ -3058,7 +3078,132 @@ async fn current_provider_executor_authorization_allows_one_durable_socket_dispa
 }
 
 #[tokio::test]
-async fn revoked_provider_executor_authorization_blocks_before_socket_or_durable_dispatch() {
+async fn concurrent_authorized_retries_only_reauthorize_the_durable_claimant() {
+    let authorization_calls = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::clone(&authorization_calls);
+    let app = axum::Router::new().route(
+        "/api/v1/runtime-executors/authorize",
+        axum::routing::post(move || {
+            let calls = Arc::clone(&calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::NO_CONTENT
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind authorization server");
+    let endpoint_url = format!(
+        "http://{}/api/v1/runtime-executors/authorize",
+        listener.local_addr().expect("authorization server address")
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve authorization response");
+    });
+
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(2);
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-selected",
+        Some("Runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_environment_advertisement("runner-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = Arc::new(
+        ToolExecutionService::builder()
+            .edge_connection_pool(pool.clone())
+            .edge_dispatch_service(dispatch.clone())
+            .build(),
+    );
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("Runner", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "runner-selected",
+            "Runner",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.runtime_edge_dispatch_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+            endpoint_url,
+            authorization: "Bearer runtime-grant".to_string(),
+            task_id: "task-1".to_string(),
+            executor_id: "runner-selected".to_string(),
+        },
+    ));
+    tool_request.runtime_edge_dispatch_authorization_required = true;
+
+    let start = Arc::new(tokio::sync::Barrier::new(3));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let service = Arc::clone(&service);
+        let request = tool_request.clone();
+        let start = Arc::clone(&start);
+        handles.push(tokio::spawn(async move {
+            start.wait().await;
+            service
+                .execute(request, &CountingLocalTransport::new())
+                .await
+        }));
+    }
+    start.wait().await;
+
+    let message = rx.recv().await.expect("claimed edge tool request");
+    let (request_id, delivery_generation) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            ..
+        } => (request_id, delivery_generation),
+        other => panic!("expected tool request, got {other:?}"),
+    };
+    assert!(pool.deliver_tool_result(
+        "user-1",
+        "runner-selected",
+        &request_id,
+        delivery_generation,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: "authorized-result".to_string(),
+            is_error: false,
+            duration_ms: Some(3),
+            tool_result_fields: None,
+        },
+    ));
+
+    let mut outputs = Vec::new();
+    for handle in handles {
+        let result = handle.await.expect("authorized retry join");
+        assert!(!result.is_error, "{result:?}");
+        outputs.push(result.output);
+    }
+    outputs.sort();
+    assert_eq!(
+        outputs,
+        ["authorized-result".to_string(), "ledger-result".to_string()]
+    );
+    assert_eq!(
+        authorization_calls.load(Ordering::SeqCst),
+        1,
+        "only the caller holding the durable dispatch claim may reauthorize"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the observing retry must not emit a second socket dispatch"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn revoked_provider_executor_authorization_closes_claim_before_socket_dispatch() {
     let authorization_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&authorization_calls);
     let app = axum::Router::new().route(
@@ -3130,15 +3275,75 @@ async fn revoked_provider_executor_authorization_blocks_before_socket_or_durable
         rx.try_recv().is_err(),
         "revoked use must not reach the Edge"
     );
-    assert!(
+    assert_eq!(
         dispatch
             .inserted_edge_agent_ids
             .lock()
             .expect("inserted edge agent ids lock")
-            .is_empty(),
-        "revoked use must not create a durable dispatch row"
+            .as_slice(),
+        ["runner-selected"],
+        "authorization must run only after one caller owns the durable claim"
+    );
+    assert_eq!(
+        dispatch
+            .failed_dispatches
+            .lock()
+            .expect("failed dispatches lock")
+            .len(),
+        1,
+        "a denied claim must become terminal before it can reach the Edge"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn completed_authorized_dispatch_replays_without_provider_reauthorization() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-selected",
+        Some("Runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_environment_advertisement("runner-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool)
+        .edge_dispatch_service(dispatch)
+        .build();
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("Runner", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "runner-selected",
+            "Runner",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.runtime_edge_dispatch_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+            endpoint_url: "http://127.0.0.1:9/must-not-be-called".to_string(),
+            authorization: "Bearer expired-runtime-grant".to_string(),
+            task_id: "task-1".to_string(),
+            executor_id: "runner-selected".to_string(),
+        },
+    ));
+    tool_request.runtime_edge_dispatch_authorization_required = true;
+
+    let result = service
+        .execute(tool_request, &CountingLocalTransport::new())
+        .await;
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "durable-result");
+    assert!(
+        rx.try_recv().is_err(),
+        "terminal replay must not use the socket"
+    );
 }
 
 #[tokio::test]
@@ -3289,6 +3494,7 @@ async fn replayed_managed_transfer_without_context_fails_before_dispatch() {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer transfer-secret-must-not-appear".to_string(),
             task_id: "task-1".to_string(),
+            workspace_root: "/workspace".to_string(),
             root: "/workspace/.moi/runtime/task-1".to_string(),
             catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
             session_dir: "/workspace/.moi/sessions/session-1".to_string(),
@@ -4970,6 +5176,7 @@ fn edge_executor_id_returns_none_for_empty_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),
@@ -5010,6 +5217,7 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),
@@ -5050,6 +5258,7 @@ fn edge_executor_id_returns_some_for_valid_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),

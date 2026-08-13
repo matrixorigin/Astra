@@ -121,6 +121,7 @@ pub struct DefaultToolExecutor {
     /// When `false`, GitHub tools and other HTTP-dependent tools will report
     /// a diagnostic error explaining why HTTP is unavailable.
     http_client_available: bool,
+    filesystem_write_boundary: Option<Vec<std::path::PathBuf>>,
 }
 
 /// Key for the per-session bash dedup cache. Bumping ANY of these
@@ -216,6 +217,7 @@ impl DefaultToolExecutor {
             workspace_generation: Arc::new(AtomicU64::new(0)),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
             http_client_available: true,
+            filesystem_write_boundary: None,
         }
     }
 
@@ -298,6 +300,13 @@ impl DefaultToolExecutor {
         self
     }
 
+    /// Require bash subprocesses to see host-owned runtime lanes as read-only.
+    /// Only managed Edge requests install this request-scoped boundary.
+    pub fn with_filesystem_write_boundary(mut self, paths: Vec<std::path::PathBuf>) -> Self {
+        self.filesystem_write_boundary = Some(paths);
+        self
+    }
+
     /// Install the host's detach slot so the bash runner can hand
     /// off live children to the BackgroundTaskRegistry on Ctrl+B.
     /// `None` is the default (no detach plumbing — bash runs through
@@ -373,6 +382,13 @@ impl ToolExecutor for DefaultToolExecutor {
             .is_some_and(|t| t.is_cancelled())
         {
             return ToolResult::error(format!("Tool '{name}' not executed: run was cancelled"));
+        }
+
+        if let Some(protected) = &self.filesystem_write_boundary
+            && let Err(error) =
+                validate_host_owned_write_boundary(name, args, &self.ctx.workspace_root, protected)
+        {
+            return ToolResult::error(error);
         }
 
         if name == "bash"
@@ -575,7 +591,13 @@ impl DefaultToolExecutor {
             "multi_edit" => crate::fs_ops::multi_edit(ws, args),
 
             // ── Shell operations ─────────────────────────────────────
-            "bash" => crate::shell_ops::execute_bash(&self.ctx, args).await,
+            "bash" => match &self.filesystem_write_boundary {
+                Some(paths) => {
+                    crate::shell_ops::execute_bash_with_filesystem_boundary(&self.ctx, args, paths)
+                        .await
+                }
+                None => crate::shell_ops::execute_bash(&self.ctx, args).await,
+            },
             "grep" => crate::shell_ops::grep(&self.ctx, args).await,
             "glob" => crate::shell_ops::glob(&self.ctx, args).await,
 
@@ -824,6 +846,39 @@ fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     }
 }
 
+fn validate_host_owned_write_boundary(
+    name: &str,
+    args: &Value,
+    workspace_root: &Path,
+    protected: &[std::path::PathBuf],
+) -> Result<(), String> {
+    let mut paths = Vec::new();
+    if matches!(
+        name,
+        "write_file" | "str_replace" | "multi_edit" | "delete_file"
+    ) {
+        paths.extend(args.get("path").and_then(Value::as_str));
+    }
+    if name == "str_replace"
+        && let Some(edits) = args.get("edits").and_then(Value::as_array)
+    {
+        paths.extend(
+            edits
+                .iter()
+                .filter_map(|edit| edit.get("path").and_then(Value::as_str)),
+        );
+    }
+    for path in paths {
+        let resolved = crate::fs_ops::resolve_path(workspace_root, path)?;
+        if protected.iter().any(|root| resolved.starts_with(root)) {
+            return Err(format!(
+                "Error: tool '{name}' cannot modify host-owned managed runtime paths"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn git_stash_sub_action_mutates_workspace(action: &str) -> bool {
     matches!(
         action,
@@ -845,6 +900,26 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    #[test]
+    fn managed_boundary_checks_every_str_replace_target() {
+        let workspace = Path::new("/sandbox");
+        let protected = vec![Path::new("/sandbox/.moi/runtime/task-1").to_path_buf()];
+        let args = serde_json::json!({
+            "edits": [
+                {"path": "ordinary.txt", "old_str": "a", "new_str": "b"},
+                {
+                    "path": ".moi/runtime/task-1/owned.txt",
+                    "old_str": "a",
+                    "new_str": "b"
+                }
+            ]
+        });
+
+        let error = validate_host_owned_write_boundary("str_replace", &args, workspace, &protected)
+            .expect_err("a nested edit path must not bypass the host-owned lane");
+        assert!(error.contains("host-owned managed runtime paths"));
     }
 
     #[test]

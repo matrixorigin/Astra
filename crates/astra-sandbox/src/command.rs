@@ -213,9 +213,10 @@ pub fn analyze_command_risks(command: &str) -> Vec<CommandRisk> {
 
 /// Analyze command risks with an explicit workspace boundary.
 ///
-/// Callers that enforce [`CommandRisk::WorkspaceOutWrite`] must use this
-/// variant. Whether an absolute path is inside the workspace cannot be
-/// determined from the command string alone.
+/// This variant improves diagnostics for known writers by resolving absolute
+/// paths against the real workspace. It is not a complete filesystem security
+/// boundary: arbitrary programs can write paths that shell syntax does not
+/// expose, so managed execution also enforces writable roots at the OS layer.
 pub fn analyze_command_risks_in_workspace(
     command: &str,
     workspace_root: &Path,
@@ -483,9 +484,8 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
 }
 
 /// Find a supported mutating command even when an unrecognized launcher
-/// precedes it. This is deliberately not a launcher allowlist: utilities such
-/// as `nice`, `timeout`, and project-specific wrappers must not make a known
-/// filesystem mutation invisible to the hard write-boundary check.
+/// precedes it. This improves diagnostics for known filesystem mutations; it
+/// does not replace the managed runtime's mount-namespace write boundary.
 fn effective_mutation_command(words: &[String]) -> Option<(&str, Vec<&str>)> {
     for index in 0..words.len() {
         let Some((executable, arguments)) = effective_write_command(&words[index..]) else {

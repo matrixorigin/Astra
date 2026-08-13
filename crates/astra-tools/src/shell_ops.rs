@@ -561,7 +561,9 @@ struct SearchIgnoreRule {
     negated: bool,
 }
 
-/// Hard validation for `execute_bash` (and server-side `bash` when routed through the same path).
+/// Policy validation for `execute_bash` (and server-side `bash` when routed through the same path).
+/// Managed Edge execution additionally applies a mount-namespace filesystem
+/// boundary because command parsing cannot enumerate arbitrary writers.
 ///
 /// Layering:
 /// 1. Local substring/heuristic rules (destructive `rm`, pipe-to-shell, netcat, etc.).
@@ -1135,6 +1137,78 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
             .with_result_class(result_class)
             .with_exit_code(output.exit_code)
     }
+}
+
+/// Execute bash behind a kernel mount-namespace write boundary. This is used
+/// by managed Edge workspaces whose host-owned runtime directories live below
+/// the otherwise writable workspace. Command parsing remains useful for
+/// diagnostics, but the mount namespace is the security boundary for writers
+/// such as interpreters, archivers, and newly installed binaries.
+pub async fn execute_bash_with_filesystem_boundary(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    read_only_paths: &[PathBuf],
+) -> ToolResult {
+    let workspace_root = ctx.workspace_root.as_path();
+    let command = match args.get("command").and_then(Value::as_str) {
+        Some(command) if !command.trim().is_empty() => command,
+        _ => {
+            return ToolResult::error(
+                "Error: missing required field `command` for bash. Origin: model_argument_error; no command was run."
+                    .to_string(),
+            );
+        }
+    };
+    if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
+        return ToolResult::error(reason);
+    }
+
+    let timeout_secs = parse_bash_timeout_secs_for(args, command);
+    let mut config = astra_sandbox::IsolationConfig::filesystem_boundary(
+        workspace_root.to_path_buf(),
+        read_only_paths.to_vec(),
+    );
+    config.timeout = Duration::from_secs_f64(timeout_secs);
+    config.max_output_bytes = per_tool_output_limit("bash");
+    let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
+    astra_sandbox::scrub_secrets_from_env(&mut environment);
+    let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
+    let rendered = output.combined_output();
+    if !output.namespace_active {
+        return ToolResult::error(if rendered.is_empty() {
+            "Error: managed filesystem write isolation is unavailable".to_string()
+        } else {
+            rendered
+        });
+    }
+    let exit_code = output.exit_code.unwrap_or(-1);
+    if output.timed_out {
+        return ToolResult::error(rendered)
+            .with_exit_semantics(ExitSemantics::TimedOut)
+            .with_exit_code(exit_code);
+    }
+    let exit_semantics = classify_exit(command, exit_code);
+    let result_class =
+        classify_command_result(command, &output.stdout, &output.stderr, output.exit_code);
+    if exit_code != 0 || result_class.is_tool_error() {
+        let result = if exit_semantics.is_tool_error() || result_class.is_tool_error() {
+            ToolResult::error(rendered)
+        } else {
+            ToolResult::text(rendered)
+        };
+        return result
+            .with_exit_semantics(exit_semantics)
+            .with_result_class(result_class)
+            .with_exit_code(exit_code);
+    }
+    ToolResult::text(if rendered.is_empty() {
+        "(command completed with no output)".to_string()
+    } else {
+        rendered
+    })
+    .with_exit_semantics(ExitSemantics::Success)
+    .with_result_class(result_class)
+    .with_exit_code(exit_code)
 }
 
 fn should_enable_pipefail(command: &str) -> bool {
