@@ -775,10 +775,7 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
         return false;
     }
     match command.to_ascii_lowercase().as_str() {
-        "cp" | "mv" => matches!(
-            option,
-            "-S" | "--suffix" | "-t" | "--target-directory"
-        ),
+        "cp" | "mv" => matches!(option, "-S" | "--suffix" | "-t" | "--target-directory"),
         "install" => matches!(
             option,
             "-g" | "--group"
@@ -1444,10 +1441,7 @@ mod tests {
                 "install input.txt '{}/output.txt' --mode 0644",
                 outside.display()
             ),
-            format!(
-                "cp input.txt '{}/output.txt' --suf .bak",
-                outside.display()
-            ),
+            format!("cp input.txt '{}/output.txt' --suf .bak", outside.display()),
             format!("mv -t '{}' input.txt", outside.display()),
             format!("mv input.txt -t'{}'", outside.display()),
         ] {
