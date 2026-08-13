@@ -3,8 +3,8 @@ use crate::server::run::lifecycle::run_state::{
 };
 use crate::server::*;
 use astra_server_types::{
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
-    SessionRunLifecycleStatus, SessionRunNode, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
+    SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 use astra_services::runs::{DurableRunRecord, validate_run_list_limit};
 use serde::Deserialize;
@@ -172,24 +172,6 @@ fn project_run_node_with_status(
         RunStatus::Failed => SessionRunLifecycleStatus::Failed,
         RunStatus::Cancelled => SessionRunLifecycleStatus::Cancelled,
     };
-    let capability_server_refs = run.capability_server_refs_json.as_deref().and_then(|raw| {
-        match serde_json::from_str::<astra_services::runs::CapabilityServerRefs>(raw) {
-            Ok(refs) => Some(SessionRunCapabilityServerRefs {
-                mcp: refs.mcp,
-                skills: refs.skills,
-            }),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::session_run_tree",
-                    run_id = %run.run_id,
-                    %error,
-                    "durable run capability refs are malformed; omitting inspector fact"
-                );
-                None
-            }
-        }
-    });
-
     let available_actions = if inherited_control {
         matches!(lifecycle_status, RunStatus::Paused)
             .then_some(SessionRunAction::Cancel)
@@ -237,7 +219,6 @@ fn project_run_node_with_status(
             agent_binding_id: run.agent_binding_id.clone(),
             agent_binding_name: run.agent_binding_name.clone(),
             agent_binding_schema_version: run.agent_binding_schema_version.clone(),
-            capability_server_refs,
             background: None,
             permission: None,
         },
@@ -295,8 +276,6 @@ mod tests {
             agent_binding_schema_version: (depth > 0).then(|| "2".into()),
             model_offering_id: (depth > 0).then(|| "offer-gpt-5".into()),
             resolved_model_name: (depth > 0).then(|| "gpt-5".into()),
-            capability_server_refs_json: (depth > 0)
-                .then(|| r#"{"mcp":"mcp-main","skills":"skills-main"}"#.into()),
             runtime_profile: Some("server".into()),
             provider_request_fingerprint: None,
             events: Vec::new(),
@@ -451,9 +430,6 @@ mod tests {
         assert_eq!(runtime.model_name.as_deref(), Some("gpt-5"));
         assert_eq!(runtime.agent_binding_id.as_deref(), Some("reviewer-v2"));
         assert_eq!(runtime.agent_binding_schema_version.as_deref(), Some("2"));
-        let capability_refs = runtime.capability_server_refs.as_ref().unwrap();
-        assert_eq!(capability_refs.mcp, "mcp-main");
-        assert_eq!(capability_refs.skills, "skills-main");
         assert!(runtime.permission.is_none());
     }
 

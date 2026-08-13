@@ -78,6 +78,15 @@ pub(super) fn sse_error_response_from_error(status: StatusCode, error: ErrorResp
     if let Some(metadata) = error.metadata
         && let Some(obj) = event.as_object_mut()
     {
+        if let Some(agent_binding_id) = metadata
+            .get("agent_binding_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            obj.insert(
+                "agent_binding_id".to_string(),
+                serde_json::Value::String(agent_binding_id.to_string()),
+            );
+        }
         obj.insert("metadata".to_string(), metadata);
     }
     sse_json_response(vec![event])
@@ -338,6 +347,25 @@ mod tests {
         assert_eq!(event["error_code"], "bridge_session_turn_stale");
         assert_eq!(event["request_id"], "req-1");
         assert_eq!(event["metadata"]["expected_session_turn"], 2);
+    }
+
+    #[tokio::test]
+    async fn sse_error_response_exposes_missing_agent_binding_id_at_top_level() {
+        let error = ErrorResponse::new("missing binding")
+            .with_error_code("agent_binding_not_found")
+            .with_metadata(serde_json::json!({"agent_binding_id": "binding-extension"}));
+        let response = sse_error_response_from_error(StatusCode::NOT_FOUND, error);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8");
+        let data = text
+            .strip_prefix("data: ")
+            .and_then(|value| value.strip_suffix("\n\n"))
+            .expect("single SSE data event");
+        let event: serde_json::Value = serde_json::from_str(data).expect("json");
+        assert_eq!(event["agent_binding_id"], "binding-extension");
+        assert_eq!(event["metadata"]["agent_binding_id"], "binding-extension");
     }
 
     #[tokio::test]

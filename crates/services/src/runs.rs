@@ -538,16 +538,8 @@ impl std::fmt::Debug for RuntimeEdgeDispatchAuthorizationContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CapabilityServerRefs {
-    pub mcp: String,
-    pub skills: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentBindingRuntimeRequest {
     pub id: String,
-    pub capability_server_refs: CapabilityServerRefs,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,12 +581,25 @@ pub enum RuntimeProfileRequest {
     AgentBindingRegistry,
 }
 
+/// Authenticated provider boundary that owns a provider-authorized run.
+///
+/// This value is injected from the authenticated request principal and is
+/// never accepted from an HTTP chat payload. Durable provider interactions
+/// copy it into their required event so callbacks can enforce the same
+/// provider and scope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRunOwner {
+    pub provider_id: String,
+    pub provider_scope_id: String,
+}
+
 #[derive(Clone, PartialEq)]
 pub struct ChatRequestData {
     pub message: String,
     pub user_intent: Option<String>,
     pub parts: Vec<serde_json::Value>,
     pub attachments: Vec<serde_json::Value>,
+    pub stable_runtime_system_prompt: Option<String>,
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     pub full_llm_capture: bool,
@@ -607,6 +612,7 @@ pub struct ChatRequestData {
     pub admitted_model_execution: Option<AdmittedModelExecution>,
     pub capability_descriptors: Option<RuntimeCapabilityDescriptorsRequest>,
     pub provider_runtime_authorized: bool,
+    pub agent_bindings: Vec<AgentBindingRuntimeRequest>,
     pub agent_binding: Option<AgentBindingRuntimeRequest>,
     pub runtime_auth: Option<RuntimeAuthRequest>,
     pub runtime_skill_binding: Option<RuntimeSkillBindingRequest>,
@@ -624,12 +630,9 @@ pub struct ChatRequestData {
     pub edge_executor_id: Option<String>,
     pub capabilities: Vec<String>,
     pub forward_headers: std::collections::HashMap<String, String>,
-    /// Owning workspace from the provider-authorized turn's edge-registration
-    /// token (`provider_scope_id`).  Injected at the request-injection layer
-    /// and propagated into `ToolExecutionRequest.workspace_record` by the run
-    /// lifecycle so that edge workspace isolation checks work correctly on the
-    /// MOI provider-authorized turn path.
-    pub provider_workspace_id: Option<String>,
+    /// Provider and scope authenticated at the request boundary. Injected by
+    /// the runtime and never accepted from the client payload.
+    pub provider_run_owner: Option<ProviderRunOwner>,
     pub execution_budget: Option<ExecutionBudget>,
     pub execution_policy: ExecutionPolicyRequest,
     pub explain: bool,
@@ -667,6 +670,10 @@ impl std::fmt::Debug for ChatRequestData {
             .field("user_intent", &self.user_intent)
             .field("parts", &self.parts)
             .field("attachments", &self.attachments)
+            .field(
+                "stable_runtime_system_prompt",
+                &self.stable_runtime_system_prompt,
+            )
             .field("runtime_system_prompt", &self.runtime_system_prompt)
             .field("session_id", &self.session_id)
             .field("agent_id", &self.agent_id)
@@ -682,6 +689,7 @@ impl std::fmt::Debug for ChatRequestData {
                 "provider_runtime_authorized",
                 &self.provider_runtime_authorized,
             )
+            .field("agent_bindings", &self.agent_bindings)
             .field("agent_binding", &self.agent_binding)
             .field("runtime_auth", &self.runtime_auth)
             .field("runtime_skill_binding", &self.runtime_skill_binding)
@@ -719,6 +727,13 @@ impl std::fmt::Debug for ChatRequestData {
             .field("interaction_mode", &self.interaction_mode)
             .field("interactive_client", &self.interactive_client)
             .finish()
+    }
+}
+
+impl ChatRequestData {
+    #[must_use]
+    pub fn has_agent_binding_runtime(&self) -> bool {
+        self.agent_binding.is_some() || !self.agent_bindings.is_empty()
     }
 }
 
@@ -1032,7 +1047,6 @@ pub struct DurableRunRecord {
     pub model_offering_id: Option<String>,
     /// Concrete model identity resolved when the run was admitted.
     pub resolved_model_name: Option<String>,
-    pub capability_server_refs_json: Option<String>,
     pub runtime_profile: Option<String>,
     /// Canonical provider request fingerprint bound atomically to a
     /// provider-selected idempotency identity. Ordinary runs leave this unset.
@@ -1086,6 +1100,7 @@ fn existing_durable_run_start_claim(
 pub enum DurableRunInteractionKind {
     Approval,
     AskUser,
+    Provider,
 }
 
 impl DurableRunInteractionKind {
@@ -1093,6 +1108,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval_required",
             Self::AskUser => "ask_user_prompted",
+            Self::Provider => "provider_interaction_required",
         }
     }
 
@@ -1100,6 +1116,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval_resolved",
             Self::AskUser => "ask_user_resolved",
+            Self::Provider => "provider_interaction_resolved",
         }
     }
 
@@ -1107,6 +1124,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "tool_approval",
             Self::AskUser => "user_input",
+            Self::Provider => "provider_interaction",
         }
     }
 
@@ -1114,6 +1132,7 @@ impl DurableRunInteractionKind {
         match self {
             Self::Approval => "approval",
             Self::AskUser => "ask_user",
+            Self::Provider => "provider_interaction",
         }
     }
 }
@@ -1251,8 +1270,8 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      owner_pod_id, owner_lease_expires_at, run_generation, last_event_idx, checkpoint_version, \
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
-     agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     capability_server_refs_json, runtime_profile, provider_request_fingerprint, created_at, updated_at";
+     agent_binding_schema_version, model_offering_id, resolved_model_name, runtime_profile, \
+     provider_request_fingerprint, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
 const MAX_RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 256;
 const RUN_RECOVERY_CLAIM_COLLISION_RETRIES: usize = 4;
@@ -4187,10 +4206,9 @@ impl DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  model_offering_id, resolved_model_name, runtime_profile, provider_request_fingerprint,
                   created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
             )
             .bind(&record.run_id)
             .bind(&record.user_id)
@@ -4222,7 +4240,6 @@ impl DatabaseRunStateStore {
             .bind(&record.agent_binding_schema_version)
             .bind(&record.model_offering_id)
             .bind(&record.resolved_model_name)
-            .bind(&record.capability_server_refs_json)
             .bind(&record.runtime_profile)
             .bind(&record.provider_request_fingerprint)
             .execute(&mut *tx)
@@ -4282,10 +4299,9 @@ impl DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  model_offering_id, resolved_model_name, runtime_profile, provider_request_fingerprint,
                   created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))"
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))"
             } else {
                 "INSERT INTO agent_runs
                  (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
@@ -4294,10 +4310,9 @@ impl DatabaseRunStateStore {
                   checkpoint_version, checkpoint_json, error_code, error_message, retry_count,
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
-                  model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, provider_request_fingerprint,
+                  model_offering_id, resolved_model_name, runtime_profile, provider_request_fingerprint,
                   created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
                  ON DUPLICATE KEY UPDATE updated_at = NOW(6)"
             };
             let result = sqlx::query(insert_sql)
@@ -4331,7 +4346,6 @@ impl DatabaseRunStateStore {
                 .bind(&record.agent_binding_schema_version)
                 .bind(&record.model_offering_id)
                 .bind(&record.resolved_model_name)
-                .bind(&record.capability_server_refs_json)
                 .bind(&record.runtime_profile)
                 .bind(&record.provider_request_fingerprint)
                 .execute(self.pool.get())
@@ -6806,12 +6820,6 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
         )?,
         model_offering_id: run_row_optional_string(row, operation, table, "model_offering_id")?,
         resolved_model_name: run_row_optional_string(row, operation, table, "resolved_model_name")?,
-        capability_server_refs_json: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "capability_server_refs_json",
-        )?,
         runtime_profile: run_row_optional_string(row, operation, table, "runtime_profile")?,
         provider_request_fingerprint: run_row_optional_string(
             row,
@@ -7092,6 +7100,8 @@ const EXTERNAL_CLIENT_ALLOWLIST: &[&str] = &[
     "approval_required",
     "approval_batch_required",
     "user_prompt_required",
+    "provider_interaction_required",
+    "provider_interaction_resolved",
     // Run lifecycle + framing.
     "run_started",
     "run_error",
@@ -7503,6 +7513,24 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
             }
             out
         }
+        "provider_interaction_required" => {
+            let mut out = serde_json::json!({ "type": "provider_interaction_required" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
+        "provider_interaction_resolved" => {
+            let mut out = serde_json::json!({ "type": "provider_interaction_resolved" });
+            if let Some(obj) = out.as_object_mut() {
+                for (k, v) in &data {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            out
+        }
         "user_input" => {
             let mut out = serde_json::json!({ "type": "user_input" });
             if let Some(obj) = out.as_object_mut() {
@@ -7901,7 +7929,6 @@ mod tests {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
-            capability_server_refs_json: None,
             runtime_profile: None,
             provider_request_fingerprint: None,
             events: vec![],
@@ -8030,7 +8057,6 @@ mod tests {
                 "agent_binding_schema_version" => Some("v1".to_string()),
                 "model_offering_id" => Some("offer-model".to_string()),
                 "resolved_model_name" => Some("model".to_string()),
-                "capability_server_refs_json" => Some("[]".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "provider_request_fingerprint" => Some("fingerprint-1".to_string()),
                 "latest_event_type" => Some("text_delta".to_string()),
@@ -8424,7 +8450,6 @@ mod tests {
             "agent_binding_schema_version",
             "model_offering_id",
             "resolved_model_name",
-            "capability_server_refs_json",
             "runtime_profile",
             "provider_request_fingerprint",
             "created_at",
@@ -11233,6 +11258,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
@@ -11258,6 +11284,7 @@ mod tests {
             }),
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: None,
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -11284,7 +11311,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
             conversation_authority: None,
         };
 
@@ -11318,6 +11345,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: Some("sess-1".to_string()),
             agent_id: None,
@@ -11332,6 +11360,7 @@ mod tests {
             admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: None,
             runtime_auth: Some(RuntimeAuthRequest {
                 authorization: "Bearer secret-runtime-token".to_string(),
@@ -11357,7 +11386,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
             conversation_authority: None,
         };
 
@@ -11411,6 +11440,7 @@ mod tests {
                     user_intent: None,
                     parts: Vec::new(),
                     attachments: Vec::new(),
+                    stable_runtime_system_prompt: None,
                     runtime_system_prompt: None,
                     session_id: None,
                     agent_id: None,
@@ -11420,6 +11450,7 @@ mod tests {
                     admitted_model_execution: None,
                     capability_descriptors: None,
                     provider_runtime_authorized: false,
+                    agent_bindings: Vec::new(),
                     agent_binding: None,
                     runtime_auth: None,
                     runtime_skill_binding: None,
@@ -11446,7 +11477,7 @@ mod tests {
                     explain: false,
                     interaction_mode: None,
                     interactive_client: false,
-                    provider_workspace_id: None,
+                    provider_run_owner: None,
                     conversation_authority: None,
                 },
             )
@@ -11502,7 +11533,6 @@ mod tests {
                     agent_binding_schema_version: None,
                     model_offering_id: None,
                     resolved_model_name: None,
-                    capability_server_refs_json: None,
                     runtime_profile: None,
                     provider_request_fingerprint: None,
                     events: vec![],

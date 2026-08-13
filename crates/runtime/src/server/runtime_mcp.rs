@@ -1247,13 +1247,22 @@ fn extract_agent_binding_mcp_tool_result(
 impl AgentBindingMcpRuntime {
     #[cfg(test)]
     pub(crate) fn for_tests(server_name: &str, public_tool_names: &[&str]) -> Self {
+        Self::for_tests_at_endpoint(server_name, public_tool_names, "http://127.0.0.1:1/mcp")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests_at_endpoint(
+        server_name: &str,
+        public_tool_names: &[&str],
+        endpoint_url: &str,
+    ) -> Self {
         let tool_names_by_public_name = public_tool_names
             .iter()
             .map(|name| ((*name).to_string(), (*name).to_string()))
             .collect();
         Self {
             server_name: server_name.to_string(),
-            endpoint_url: "http://127.0.0.1:1/mcp".to_string(),
+            endpoint_url: endpoint_url.to_string(),
             authorization: "Bearer test".to_string(),
             tool_names_by_public_name: Arc::new(tool_names_by_public_name),
             semantic_read_tools: Arc::new(HashSet::new()),
@@ -1270,6 +1279,7 @@ impl AgentBindingMcpRuntime {
         args: &Value,
         tool_call_id: &str,
         semantic_read_condition: Option<&astra_turn_types::SemanticReadCondition>,
+        provider_interaction_response: Option<&astra_turn_types::ProviderInteractionResponse>,
     ) -> Result<McpToolCallResult, AgentBindingMcpRpcError> {
         if tool_call_id.trim().is_empty() {
             return Err(agent_binding_mcp_rpc_error(
@@ -1285,10 +1295,22 @@ impl AgentBindingMcpRuntime {
             "arguments": agent_binding_tool_call_arguments(args),
             "call_id": tool_call_id,
         });
+        let mut protocol_metadata = serde_json::Map::new();
         if let Some(condition) = semantic_read_condition {
-            params["_meta"] = json!({
-                (AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY): condition,
-            });
+            protocol_metadata.insert(
+                AGENT_BINDING_SEMANTIC_READ_CONDITION_METADATA_KEY.to_string(),
+                serde_json::to_value(condition).expect("semantic read condition must serialize"),
+            );
+        }
+        if let Some(response) = provider_interaction_response {
+            protocol_metadata.insert(
+                astra_turn_types::PROVIDER_INTERACTION_RESPONSE_METADATA_KEY.to_string(),
+                serde_json::to_value(response)
+                    .expect("provider interaction response must serialize"),
+            );
+        }
+        if !protocol_metadata.is_empty() {
+            params["_meta"] = Value::Object(protocol_metadata);
         }
         let payload = json!({
             "jsonrpc": "2.0",
@@ -1822,6 +1844,99 @@ mod tests {
     }
 
     #[test]
+    fn explicit_mcp_stable_alias_survives_discovery_resolution_and_tool_search() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [{
+                "name": "moi_qq_mail__ch_23f40bed5331",
+                "description": "Send QQ mail",
+                "inputSchema": {"type": "object"},
+                "_meta": {
+                    "astra/stableToolAlias": "moi_qq_mail"
+                }
+            }]
+        }))
+        .expect("valid discovery response");
+        let native_tools = tools
+            .iter()
+            .map(|tool| tool.tool.clone())
+            .collect::<Vec<_>>();
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("moi-tools").unwrap(),
+            ProviderBindingRef::new("moi-tools").unwrap(),
+            &native_tools,
+        )
+        .unwrap();
+        assert_eq!(
+            discovery.tool_declarations[0]
+                .stable_tool_alias
+                .as_ref()
+                .map(|alias| alias.as_str()),
+            Some("moi_qq_mail")
+        );
+
+        let resolved = resolve_mcp_snapshot("moi-tools", &discovery).unwrap();
+        let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+        let result: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+            &schemas,
+            &json!({"query": "select:moi_qq_mail"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["selection_status"], "ok");
+        assert_eq!(result["matches"][0]["matched_by"], "stable_alias");
+        assert_eq!(
+            result["resolved"][0],
+            "mcp__moi-tools__moi_qq_mail__ch_23f40bed5331"
+        );
+    }
+
+    #[test]
+    fn duplicate_explicit_mcp_stable_aliases_fail_closed_as_ambiguous_selection() {
+        let tools = parse_agent_binding_mcp_tools(json!({
+            "tools": [
+                {
+                    "name": "moi_qq_mail__ch_primary",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"astra/stableToolAlias": "moi_qq_mail"}
+                },
+                {
+                    "name": "moi_qq_mail__ch_secondary",
+                    "inputSchema": {"type": "object"},
+                    "_meta": {"astra/stableToolAlias": "moi_qq_mail"}
+                }
+            ]
+        }))
+        .expect("valid discovery response");
+        let native_tools = tools
+            .iter()
+            .map(|tool| tool.tool.clone())
+            .collect::<Vec<_>>();
+        let discovery = mcp_tools_to_provider_snapshot(
+            ProviderIdentity::new("moi-tools").unwrap(),
+            ProviderBindingRef::new("moi-tools").unwrap(),
+            &native_tools,
+        )
+        .unwrap();
+        let resolved = resolve_mcp_snapshot("moi-tools", &discovery).unwrap();
+        let schemas = mcp_resolved_provider_snapshot_to_schemas_checked(&resolved).unwrap();
+        let result: Value = serde_json::from_str(&astra_tools::tool_search::tool_search(
+            &schemas,
+            &json!({"query": "select:moi_qq_mail"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["selection_status"], "not_found");
+        assert_eq!(result["ambiguous"][0]["requested"], "moi_qq_mail");
+        assert_eq!(
+            result["ambiguous"][0]["candidates"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
     fn agent_binding_discovery_preserves_terminal_control_metadata_by_public_name() {
         let tools = parse_agent_binding_mcp_tools(json!({
             "tools": [{
@@ -2193,6 +2308,7 @@ mod tests {
                     &json!({"q": "hello"}),
                     invalid_tool_call_id,
                     None,
+                    None,
                 )
                 .await
                 .expect_err("a blank tool call identity must fail before transport");
@@ -2220,6 +2336,7 @@ mod tests {
                 &json!({"q": "hello"}),
                 "model-tool-call-42",
                 None,
+                None,
             )
             .await
             .expect("tool call should succeed");
@@ -2234,10 +2351,28 @@ mod tests {
             Some(1)
         );
 
+        bundle
+            .agent_binding_mcp
+            .as_ref()
+            .unwrap()
+            .call_tool_by_mcp_name(
+                "mcp__tools__query",
+                &json!({"q": "hello"}),
+                "model-tool-call-42",
+                None,
+                Some(&astra_turn_types::ProviderInteractionResponse {
+                    request_id: "model-tool-call-42:select".to_string(),
+                    outcome: astra_turn_types::ProviderInteractionOutcome::Submitted,
+                    payload: Some(json!({"selected": "opaque-1"})),
+                }),
+            )
+            .await
+            .expect("resumed tool call should preserve its identity and protocol metadata");
+
         let calls = calls
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, "Bearer runtime-grant");
         assert_eq!(calls[0].1["method"], "tools/list");
         assert_eq!(calls[1].0, "Bearer runtime-grant");
@@ -2251,6 +2386,23 @@ mod tests {
         assert_ne!(
             calls[1].1["id"], calls[1].1["params"]["call_id"],
             "JSON-RPC correlation and the business tool call identity are independent"
+        );
+        assert_eq!(
+            calls[2].1.pointer("/params/call_id"),
+            Some(&json!("model-tool-call-42")),
+            "resuming a provider interaction must retry the same business tool call"
+        );
+        assert_eq!(
+            calls[2]
+                .1
+                .pointer("/params/_meta/astra~1providerInteractionResponse/request_id"),
+            Some(&json!("model-tool-call-42:select"))
+        );
+        assert_eq!(
+            calls[2]
+                .1
+                .pointer("/params/_meta/astra~1providerInteractionResponse/payload/selected"),
+            Some(&json!("opaque-1"))
         );
         server.abort();
     }
@@ -2374,6 +2526,7 @@ mod tests {
                 &json!({"a": 2, "z": 1}),
                 "semantic-read-call",
                 Some(&condition),
+                None,
             )
             .await
             .expect("conditioned tool call should succeed");

@@ -20,8 +20,8 @@ pub mod sse;
 pub use astra_server_types::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
-    SessionRunCapabilityServerRefs, SessionRunLifecycleStatus, SessionRunNode,
-    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
+    SessionRunTreeSnapshot,
 };
 pub use client::ThinClient;
 pub use device_proof::{
@@ -37,11 +37,12 @@ pub use error::ThinClientError;
 pub use protocol::{
     ApprovalDecision, ApprovalKind, ApprovalRespondRequest, ChatStreamRequest,
     EdgeHeartbeatReplayPolicy, EdgeHeartbeatRequest, EdgeHeartbeatResponse, EdgeRegisterRequest,
-    LegacyEdgePendingRequest, ModelSelection, RunUserIntentRequest, RunUserIntentResponse,
-    SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
-    SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
-    SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
-    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    LegacyEdgePendingRequest, ModelSelection, ProviderInteractionRespondRequest,
+    RunUserIntentRequest, RunUserIntentResponse, SessionCreateRequest, SessionTranscriptItem,
+    SessionTranscriptPage, SessionTranscriptPageRef, SessionTranscriptReadScope,
+    SessionTranscriptToolCall, SessionTranscriptToolResult, SessionUpdateRequest, StreamEvent,
+    TaskLeaseMutationRequest, ToolResultRequest, ToolResultRequestParts, UserPromptRespondRequest,
+    classify_stream_event,
 };
 /// SSE / buffered HTTP response from [`ThinClient::post_chat_turn`] (transport type for consumers like CLI stream rendering).
 pub use reqwest::Response as HttpResponse;

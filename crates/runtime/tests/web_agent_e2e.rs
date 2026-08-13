@@ -15,26 +15,29 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use astra_runtime::{
-    AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
-    AuthTokenRecord, AuthUserRecord, ErrorResponse, HealthChecker, ServiceInfo,
-    SessionActivityRecord, SessionCreateRequestData, SessionListFilter, SessionListRecord,
-    SessionRecord, SessionService, SessionUpdateRequestData, TurnAuxiliaryEventRecord,
-    TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter, TurnObserverRequest,
-    TurnObserverWorker, build_app,
+    AppState, AuthLoginRequestData, AuthPrincipal, AuthPrincipalOrigin, AuthRefreshRequestData,
+    AuthRegisterRequestData, AuthService, AuthTokenRecord, AuthUserRecord, ErrorResponse,
+    HealthChecker, ServiceInfo, SessionActivityRecord, SessionCreateRequestData, SessionListFilter,
+    SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    TurnAuxiliaryEventRecord, TurnAuxiliaryEventWriter, TurnHookDbPersistPlan, TurnHookDbWriter,
+    TurnObserverRequest, TurnObserverWorker, build_app,
 };
 use astra_services::skills::{
     SkillInfoRecord, SkillListCursor, SkillListItem, SkillListRecord, SkillPublishRequestData,
     SkillRecord, SkillService, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_services::{
-    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    AgentBindingCreateRequestData, AgentBindingPayload, AgentBindingService,
+    AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService, ModelCreateRequestData,
+    ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData, ProviderRequestDescriptor,
     ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::{self, Body},
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
+    routing::post,
 };
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
@@ -48,6 +51,7 @@ use crate::test_support::{
 
 const SECRET: &str = "web-agent-e2e-secret";
 const TOKEN: &str = "Bearer web-agent-e2e-token";
+const PROVIDER_TOKEN: &str = "Bearer web-agent-e2e-provider-token";
 const USER_ID: &str = "web-agent-e2e-user";
 const DEFAULT_MODEL_OFFERING_ID: &str = "model-test-model";
 const DEFAULT_TEST_EDGE_AGENT_ID: &str = "web-agent-e2e-edge";
@@ -183,6 +187,37 @@ impl AuthService for StubAuth {
             email: "web-e2e@test.com".into(),
             display_name: None,
         })
+    }
+
+    async fn current_principal_for_request(
+        &self,
+        headers: &HeaderMap,
+        _request: ProviderRequestDescriptor,
+    ) -> Result<AuthPrincipal, (StatusCode, axum::Json<ErrorResponse>)> {
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        if authorization == Some(PROVIDER_TOKEN) {
+            return Ok(AuthPrincipal {
+                user: AuthUserRecord {
+                    user_id: "provider_authorized:moi:web-agent-e2e-user".to_string(),
+                    username: "web-agent-e2e-user".to_string(),
+                    email: String::new(),
+                    display_name: None,
+                },
+                session_id: None,
+                origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                    AuthProviderAuthorizedRequestContext {
+                        provider_id: "moi".to_string(),
+                        external_subject: "web-agent-e2e-user".to_string(),
+                        provider_scope_id: "web-agent-e2e-workspace".to_string(),
+                        request_authorization_id: "web-agent-e2e-authorization".to_string(),
+                        edge_agent_id: None,
+                    },
+                ),
+            });
+        }
+        self.current_principal(headers).await
     }
     async fn register(
         &self,
@@ -615,6 +650,29 @@ fn build_test_app_with_hooks_and_skills() -> (
     (build_app(state), hook_writer, observer_worker)
 }
 
+fn build_test_app_with_agent_bindings(
+    binding_service: Arc<InMemoryAgentBindingService>,
+) -> (Router, Arc<RecordingObserverWorker>) {
+    init_env();
+    let base = AppState::new(ServiceInfo::default(), Arc::new(StubHealth))
+        .with_auth_service(Arc::new(StubAuth))
+        .with_session_service(Arc::new(StubSession));
+
+    let ledger = base.edge_callback_ledger();
+    let observer_worker = Arc::new(RecordingObserverWorker::default());
+    let lifecycle = test_run_lifecycle(
+        test_fernet_encryptor("web-e2e-fernet-key-32-chars!!!"),
+        ledger,
+    )
+    .with_model_service(Arc::new(TestModelService))
+    .with_agent_binding_service(binding_service)
+    .with_observer_worker(observer_worker.clone())
+    .with_auxiliary_event_writer(Arc::new(NoopAuxiliaryEventWriter));
+
+    let state = base.with_run_lifecycle_service(Arc::new(lifecycle));
+    (build_app(state), observer_worker)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn normalize_chat_stream_payload(mut payload: Value) -> Value {
@@ -730,6 +788,367 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
         .unwrap();
     let body_str = String::from_utf8_lossy(&body_bytes);
     parse_sse_events(&body_str)
+}
+
+async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
+    let payload = normalize_chat_stream_payload(payload);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/chat/stream")
+        .header("authorization", PROVIDER_TOKEN)
+        .header("content-type", "application/json")
+        .header("x-mo-bridge-test-secret", SECRET)
+        .body(Body::from(payload.to_string()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body_bytes = body::to_bytes(resp.into_body(), 16 * 1024 * 1024)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    parse_sse_events(&body_str)
+}
+
+async fn create_e2e_agent_binding(
+    service: &InMemoryAgentBindingService,
+    binding_name: &str,
+    agent_md: &str,
+) -> String {
+    AgentBindingService::create_binding(
+        service,
+        AgentBindingCreateRequestData {
+            idempotency_key: format!("web-agent-e2e-{binding_name}"),
+            binding: AgentBindingPayload {
+                binding_name: binding_name.to_string(),
+                agent_md: agent_md.to_string(),
+                metadata: None,
+                binding_schema_version: "v1".to_string(),
+            },
+        },
+    )
+    .await
+    .expect("create E2E Agent Binding")
+    .id
+}
+
+#[derive(Clone, Debug)]
+struct AgentBindingGatewayCall {
+    authorization: String,
+    method: String,
+    agent_binding_id: Option<String>,
+    skill_id: Option<String>,
+}
+
+async fn start_agent_binding_gateway(
+    foundation_binding_id: String,
+    extension_binding_id: String,
+) -> (
+    String,
+    Arc<tokio::sync::Mutex<Vec<AgentBindingGatewayCall>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let handler_calls = calls.clone();
+    let handler = move |headers: HeaderMap, Json(body): Json<Value>| {
+        let calls = handler_calls.clone();
+        let foundation_binding_id = foundation_binding_id.clone();
+        let extension_binding_id = extension_binding_id.clone();
+        async move {
+            let authorization = headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let method = body
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let agent_binding_id = body
+                .pointer("/params/agent_binding_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let skill_id = body
+                .pointer("/params/id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            calls.lock().await.push(AgentBindingGatewayCall {
+                authorization,
+                method: method.clone(),
+                agent_binding_id: agent_binding_id.clone(),
+                skill_id: skill_id.clone(),
+            });
+
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let response = match method.as_str() {
+                "tools/list" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {"tools": []}
+                }),
+                "skills/list" if agent_binding_id.as_deref() == Some(&foundation_binding_id) => {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"skills": [{
+                            "name": "moi.agent.momo.skill.pdf",
+                            "description": "Work with PDF documents"
+                        }]}
+                    })
+                }
+                "skills/list" if agent_binding_id.as_deref() == Some(&extension_binding_id) => {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"skills": [{
+                            "name": "financial-analysis",
+                            "description": "Analyze financial statements"
+                        }]}
+                    })
+                }
+                "skills/read"
+                    if agent_binding_id.as_deref() == Some(&extension_binding_id)
+                        && skill_id.as_deref() == Some("financial-analysis") =>
+                {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"skill": {
+                            "id": "financial-analysis",
+                            "instruction": {
+                                "body": "Use the user-provided financial analysis workflow."
+                            }
+                        }}
+                    })
+                }
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32602, "message": "unexpected binding capability call"}
+                }),
+            };
+            Json(response)
+        }
+    };
+    let app = Router::new().route("/capabilities", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind Agent Binding gateway");
+    let address = listener
+        .local_addr()
+        .expect("Agent Binding gateway address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve Agent Binding gateway");
+    });
+    (format!("http://{address}/capabilities"), calls, server)
+}
+
+fn agent_binding_chat_payload(
+    foundation_binding_id: &str,
+    extension_binding_id: &str,
+    capability_endpoint: &str,
+    test_llm_rounds: Value,
+) -> Value {
+    json!({
+        "message": "Analyze the attached financial statement.",
+        "stable_runtime_system_prompt": "User-added capabilities take precedence when they are semantically applicable.",
+        "model_selection": {"offering_id": DEFAULT_MODEL_OFFERING_ID},
+        "resolved_model_selection": {
+            "offering_id": DEFAULT_MODEL_OFFERING_ID,
+            "model_name": "test-model"
+        },
+        "agent_bindings": [
+            {"id": foundation_binding_id},
+            {"id": extension_binding_id}
+        ],
+        "runtime_auth": {"authorization": "Bearer runtime-grant"},
+        "capability_descriptors": {
+            "model_gateway": {
+                "id": "moi-model-gateway",
+                "type": "model_gateway",
+                "transport": "http",
+                "endpoint_url": capability_endpoint,
+                "protocol": "openai_chat_completions"
+            },
+            "mcp": {
+                "id": "moi-tools",
+                "type": "mcp",
+                "transport": "streamable_http",
+                "endpoint_url": capability_endpoint,
+                "protocol": "mcp"
+            },
+            "skills": {
+                "id": "moi-skills",
+                "type": "skills",
+                "transport": "streamable_http",
+                "endpoint_url": capability_endpoint,
+                "protocol": "astra_skills"
+            }
+        },
+        "execution_policy": {"turn_intent": "fixed_default"},
+        "context": {"test_llm_rounds": test_llm_rounds}
+    })
+}
+
+#[tokio::test]
+async fn multi_agent_binding_http_e2e_discovers_and_reads_skill_from_owning_binding() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let binding_service = Arc::new(InMemoryAgentBindingService::new());
+        let foundation_binding_id = create_e2e_agent_binding(
+            binding_service.as_ref(),
+            "momo-foundation-e2e",
+            "Follow the platform contract and sandbox safety rules.",
+        )
+        .await;
+        let extension_binding_id = create_e2e_agent_binding(
+            binding_service.as_ref(),
+            "financial-extension-e2e",
+            "Act as the user's financial analyst.",
+        )
+        .await;
+        let (capability_endpoint, calls, gateway_server) = start_agent_binding_gateway(
+            foundation_binding_id.clone(),
+            extension_binding_id.clone(),
+        )
+        .await;
+        let (app, observer_worker) = build_test_app_with_agent_bindings(binding_service);
+
+        let events = provider_chat_stream_collect(
+            &app,
+            agent_binding_chat_payload(
+                &foundation_binding_id,
+                &extension_binding_id,
+                &capability_endpoint,
+                json!([
+                    {
+                        "tool_calls": [tool_call(
+                            "tc-financial-analysis",
+                            "skill",
+                            json!({"skill_name": "financial-analysis"})
+                        )]
+                    },
+                    {"full_text": "Financial analysis completed with the user workflow."}
+                ]),
+            ),
+        )
+        .await;
+
+        assert!(
+            find_events(&events, "error").is_empty(),
+            "unexpected SSE error events: {events:?}"
+        );
+        assert_eq!(find_events(&events, "turn_complete").len(), 1);
+        assert!(find_events(&events, "text_delta").iter().any(|event| {
+            event["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Financial analysis completed"))
+        }));
+
+        let ow = observer_worker.clone();
+        poll_until(
+            || {
+                let ow = ow.clone();
+                async move { !ow.requests.lock().await.is_empty() }
+            },
+            5,
+        )
+        .await;
+        let requests = observer_worker.requests.lock().await;
+        let skill_result = requests
+            .first()
+            .expect("observer receives the skill follow-up round")
+            .messages
+            .iter()
+            .find(|message| {
+                message.get("tool_call_id").and_then(Value::as_str) == Some("tc-financial-analysis")
+            })
+            .and_then(|message| message.get("content").and_then(Value::as_str))
+            .expect("skill instructions reach the follow-up model round");
+        assert!(skill_result.contains("Use the user-provided financial analysis workflow."));
+        assert!(skill_result.contains("<skill-loaded name=\"financial-analysis\"/>"));
+        drop(requests);
+
+        let calls = calls.lock().await;
+        assert!(
+            calls
+                .iter()
+                .all(|call| call.authorization == "Bearer runtime-grant")
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.method == "tools/list")
+                .count(),
+            1
+        );
+        let listed_binding_ids = calls
+            .iter()
+            .filter(|call| call.method == "skills/list")
+            .filter_map(|call| call.agent_binding_id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            listed_binding_ids,
+            std::collections::HashSet::from([
+                foundation_binding_id.as_str(),
+                extension_binding_id.as_str(),
+            ])
+        );
+        let read_calls = calls
+            .iter()
+            .filter(|call| call.method == "skills/read")
+            .collect::<Vec<_>>();
+        assert_eq!(read_calls.len(), 1);
+        assert_eq!(
+            read_calls[0].agent_binding_id.as_deref(),
+            Some(extension_binding_id.as_str())
+        );
+        assert_eq!(
+            read_calls[0].skill_id.as_deref(),
+            Some("financial-analysis")
+        );
+        drop(calls);
+        gateway_server.abort();
+    })
+    .await
+    .expect("multi-Agent-Binding HTTP E2E timed out");
+}
+
+#[tokio::test]
+async fn multi_agent_binding_http_e2e_reports_exact_missing_binding_id() {
+    let binding_service = Arc::new(InMemoryAgentBindingService::new());
+    let foundation_binding_id = create_e2e_agent_binding(
+        binding_service.as_ref(),
+        "momo-foundation-missing-binding-e2e",
+        "Follow the platform contract and sandbox safety rules.",
+    )
+    .await;
+    let missing_binding_id = "ab_missing_financial_extension";
+    let (app, _observer_worker) = build_test_app_with_agent_bindings(binding_service);
+
+    let events = provider_chat_stream_collect(
+        &app,
+        agent_binding_chat_payload(
+            &foundation_binding_id,
+            missing_binding_id,
+            "http://127.0.0.1:9/capabilities",
+            json!([{"full_text": "must not run"}]),
+        ),
+    )
+    .await;
+
+    let error = find_events(&events, "error")
+        .into_iter()
+        .next()
+        .expect("missing binding produces an SSE error");
+    assert_eq!(
+        error["error_code"].as_str(),
+        Some("agent_binding_not_found")
+    );
+    assert_eq!(error["agent_binding_id"].as_str(), Some(missing_binding_id));
+    assert!(find_events(&events, "session_info").is_empty());
 }
 
 /// Send a POST /chat/stream and return the streaming body as a stream of bytes.

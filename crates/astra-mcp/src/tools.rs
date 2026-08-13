@@ -1,10 +1,12 @@
 use std::collections::HashSet;
 
 use astra_turn_types::{
-    NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload, ProviderClaim,
-    ProviderClaimSource, ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity,
+    NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY, ProviderBindingRef,
+    ProviderCallOutcome, ProviderCallPayload, ProviderClaim, ProviderClaimSource,
+    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionRequest,
     ProviderProtocolId, ProviderTaskSupport, ProviderToolClaims, ProviderToolDeclaration,
-    ResolvedProviderSnapshot,
+    ResolvedProviderSnapshot, STABLE_TOOL_ALIAS_METADATA_KEY, STABLE_TOOL_ALIAS_SCHEMA_KEY,
+    StableToolAlias,
 };
 use rmcp::model::{CallToolResult, TaskSupport, Tool};
 use serde_json::{Map, Value};
@@ -30,6 +32,26 @@ impl McpToolCallResult {
     /// Convert the wire-specific MCP result into the provider-neutral outcome.
     /// The typed MCP flag is authoritative; result prose is never classified.
     pub fn into_provider_outcome(self) -> ProviderCallOutcome {
+        if !self.is_error
+            && let Some(raw) = self
+                .protocol_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get(PROVIDER_INTERACTION_REQUEST_METADATA_KEY))
+        {
+            return match serde_json::from_value::<ProviderInteractionRequest>(raw.clone())
+                .map_err(|error| error.to_string())
+                .and_then(|request| {
+                    request.validate().map_err(|error| error.to_string())?;
+                    Ok(request)
+                }) {
+                Ok(request) => ProviderCallOutcome::InteractionRequired(request),
+                Err(error) => ProviderCallOutcome::ToolFailure(ProviderCallPayload {
+                    text: format!("Provider interaction contract is invalid: {error}"),
+                    structured_content: None,
+                    protocol_metadata: None,
+                }),
+            };
+        }
         let payload = ProviderCallPayload {
             text: self.output,
             structured_content: self.structured_content,
@@ -160,6 +182,7 @@ pub fn mcp_tool_to_provider_declaration(
     let declaration = ProviderToolDeclaration {
         native_tool_id: NativeToolId::new(tool.name.to_string())?,
         native_tool_name: tool.name.to_string(),
+        stable_tool_alias: stable_tool_alias_from_meta(tool)?,
         title: tool.title.clone(),
         description: tool.description.as_deref().map(str::to_string),
         input_schema: Value::Object(tool.input_schema.as_ref().clone()),
@@ -173,6 +196,25 @@ pub fn mcp_tool_to_provider_declaration(
     };
     declaration.validate()?;
     Ok(declaration)
+}
+
+fn stable_tool_alias_from_meta(
+    tool: &Tool,
+) -> Result<Option<StableToolAlias>, ProviderContractError> {
+    let Some(value) = tool
+        .meta
+        .as_ref()
+        .and_then(|metadata| metadata.0.get(STABLE_TOOL_ALIAS_METADATA_KEY))
+    else {
+        return Ok(None);
+    };
+    let Some(alias) = value.as_str() else {
+        return Err(ProviderContractError::InvalidStableToolAlias {
+            native_tool_id: tool.name.to_string(),
+            alias: value.to_string(),
+        });
+    };
+    Ok(Some(StableToolAlias::new(alias.to_string())?))
 }
 
 /// Build the immutable discovery snapshot for one MCP binding.
@@ -214,17 +256,38 @@ pub fn mcp_tool_schema_from_parts(
     description: &str,
     parameters: Value,
 ) -> Value {
+    mcp_tool_schema_from_parts_with_stable_alias(
+        server_name,
+        tool_name,
+        description,
+        parameters,
+        None,
+    )
+}
+
+fn mcp_tool_schema_from_parts_with_stable_alias(
+    server_name: &str,
+    tool_name: &str,
+    description: &str,
+    parameters: Value,
+    stable_tool_alias: Option<&StableToolAlias>,
+) -> Value {
     let description = truncate_with_marker(description, MAX_DESCRIPTION_LENGTH);
     let tool_name = sanitize_tool_name(&format!("mcp__{}__{}", server_name, tool_name));
 
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "type": "function",
         "function": {
             "name": tool_name,
             "description": description,
             "parameters": parameters,
         }
-    })
+    });
+    if let Some(stable_tool_alias) = stable_tool_alias {
+        schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY] =
+            Value::String(stable_tool_alias.to_string());
+    }
+    schema
 }
 
 /// Convert MCP tools to schemas and fail if sanitized public names collide.
@@ -270,37 +333,38 @@ pub fn mcp_resolved_provider_snapshot_to_schemas_checked(
         .iter()
         .map(|descriptor| (descriptor.descriptor_ref(), descriptor))
         .collect::<std::collections::BTreeMap<_, _>>();
-    snapshot
-        .alias_index
-        .iter()
-        .map(|(alias, descriptor_ref)| {
-            let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
-                format!(
-                    "resolved MCP alias '{}' references missing descriptor '{}@{}'",
-                    alias,
-                    descriptor_ref.identity.native_tool_id,
-                    descriptor_ref.descriptor_version
-                )
-            })?;
-            let public_name = alias.as_str();
-            if sanitize_tool_name(public_name) != public_name {
-                return Err(format!(
-                    "resolved MCP public alias '{public_name}' is not model-safe"
-                ));
+    let mut schemas = Vec::with_capacity(snapshot.alias_index.len());
+    for (alias, descriptor_ref) in &snapshot.alias_index {
+        let descriptor = descriptors.get(descriptor_ref).ok_or_else(|| {
+            format!(
+                "resolved MCP alias '{}' references missing descriptor '{}@{}'",
+                alias, descriptor_ref.identity.native_tool_id, descriptor_ref.descriptor_version
+            )
+        })?;
+        let public_name = alias.as_str();
+        if sanitize_tool_name(public_name) != public_name {
+            return Err(format!(
+                "resolved MCP public alias '{public_name}' is not model-safe"
+            ));
+        }
+        let mut schema = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": public_name,
+                "description": truncate_with_marker(
+                    descriptor.description.as_deref().unwrap_or_default(),
+                    MAX_DESCRIPTION_LENGTH,
+                ),
+                "parameters": &descriptor.input_schema,
             }
-            Ok(serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": public_name,
-                    "description": truncate_with_marker(
-                        descriptor.description.as_deref().unwrap_or_default(),
-                        MAX_DESCRIPTION_LENGTH,
-                    ),
-                    "parameters": &descriptor.input_schema,
-                }
-            }))
-        })
-        .collect()
+        });
+        if let Some(stable_tool_alias) = &descriptor.stable_tool_alias {
+            schema["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY] =
+                Value::String(stable_tool_alias.to_string());
+        }
+        schemas.push(schema);
+    }
+    Ok(schemas)
 }
 
 fn provider_declarations_to_schemas_checked(
@@ -310,11 +374,12 @@ fn provider_declarations_to_schemas_checked(
     let mut seen = HashSet::new();
     let mut schemas = Vec::with_capacity(declarations.len());
     for declaration in declarations {
-        let schema = mcp_tool_schema_from_parts(
+        let schema = mcp_tool_schema_from_parts_with_stable_alias(
             server_name,
             &declaration.native_tool_name,
             declaration.description.as_deref().unwrap_or_default(),
             declaration.input_schema.clone(),
+            declaration.stable_tool_alias.as_ref(),
         );
         let name = schema["function"]["name"].as_str().unwrap_or_default();
         if !seen.insert(name.to_string()) {
@@ -466,6 +531,41 @@ mod tests {
         let func = schema["function"].as_object().unwrap();
         assert_eq!(func["name"], "mcp__filesystem__read_file");
         assert_eq!(func["description"], "Read a file");
+        assert!(!func.contains_key(STABLE_TOOL_ALIAS_SCHEMA_KEY));
+    }
+
+    #[test]
+    fn schema_conversion_does_not_invent_stable_alias_from_native_name() {
+        let schema = mcp_tool_schema_from_parts(
+            "github",
+            "ns::func",
+            "Namespaced function",
+            serde_json::json!({"type": "object"}),
+        );
+
+        assert_eq!(schema["function"]["name"], "mcp__github__ns__func");
+        assert!(
+            schema["function"]
+                .get(STABLE_TOOL_ALIAS_SCHEMA_KEY)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn checked_projection_publishes_explicit_mcp_stable_alias() {
+        use rmcp::model::Meta;
+
+        let mut tool = Tool::new("runtime__ch_123", "Runtime tool", Arc::new(Map::new()));
+        tool.meta = Some(Meta(Map::from_iter([(
+            STABLE_TOOL_ALIAS_METADATA_KEY.to_string(),
+            Value::String("runtime".to_string()),
+        )])));
+
+        let schemas = tools_to_schemas_checked("provider", &[tool]).unwrap();
+        assert_eq!(
+            schemas[0]["function"][STABLE_TOOL_ALIAS_SCHEMA_KEY],
+            "runtime"
+        );
     }
 
     #[test]
@@ -551,6 +651,56 @@ mod tests {
             success.into_provider_outcome(),
             ProviderCallOutcome::Success(_)
         ));
+    }
+
+    #[test]
+    fn provider_interaction_metadata_becomes_a_typed_provider_outcome() {
+        let result = McpToolCallResult {
+            output: String::new(),
+            structured_content: None,
+            protocol_metadata: Some(serde_json::json!({
+                PROVIDER_INTERACTION_REQUEST_METADATA_KEY: {
+                    "request_id": "call-1:select",
+                    "payload": {"provider_owned": true},
+                    "timeout_ms": 1000,
+                }
+            })),
+            is_error: false,
+        };
+
+        assert!(matches!(
+            result.into_provider_outcome(),
+            ProviderCallOutcome::InteractionRequired(ProviderInteractionRequest {
+                request_id,
+                payload,
+                timeout_ms: Some(1000),
+            }) if request_id == "call-1:select" && payload == serde_json::json!({"provider_owned": true})
+        ));
+    }
+
+    #[test]
+    fn malformed_provider_interaction_metadata_is_a_tool_failure() {
+        let result = McpToolCallResult {
+            output: String::new(),
+            structured_content: None,
+            protocol_metadata: Some(serde_json::json!({
+                PROVIDER_INTERACTION_REQUEST_METADATA_KEY: {
+                    "request_id": " ",
+                    "payload": [],
+                }
+            })),
+            is_error: false,
+        };
+
+        let ProviderCallOutcome::ToolFailure(payload) = result.into_provider_outcome() else {
+            panic!("malformed interaction must fail the provider tool call");
+        };
+        assert!(
+            payload
+                .text
+                .contains("Provider interaction contract is invalid")
+        );
+        assert!(payload.protocol_metadata.is_none());
     }
 
     #[test]

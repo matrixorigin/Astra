@@ -3,6 +3,7 @@
 //! Takes a set of tool schemas and a query, returning ranked matches.
 //! Extracted from edge_tools as a standalone function.
 
+use astra_turn_types::STABLE_TOOL_ALIAS_SCHEMA_KEY;
 use serde_json::{Value, json};
 
 use crate::relevance_score::Scoreable;
@@ -88,7 +89,7 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                 SelectResolution::Found {
                     schema: tool,
                     canonical_name,
-                    matched_by_prefix,
+                    matched_by,
                 } => {
                     let Some(func) = tool.get("function") else {
                         missing.push(name.clone());
@@ -112,9 +113,11 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
                     {
                         obj.insert("parameters".to_string(), compact_select_parameters(params));
                     }
-                    if matched_by_prefix && let Some(obj) = entry.as_object_mut() {
+                    if let Some(matched_by) = matched_by
+                        && let Some(obj) = entry.as_object_mut()
+                    {
                         obj.insert("requested".to_string(), json!(name));
-                        obj.insert("matched_by".to_string(), json!("unique_prefix"));
+                        obj.insert("matched_by".to_string(), json!(matched_by));
                     }
                     resolved.push(canonical_name.to_string());
                     found.push(entry);
@@ -239,7 +242,7 @@ enum SelectResolution<'a> {
     Found {
         schema: &'a Value,
         canonical_name: &'a str,
-        matched_by_prefix: bool,
+        matched_by: Option<&'static str>,
     },
     Ambiguous {
         candidates: Vec<String>,
@@ -254,8 +257,13 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         return SelectResolution::Found {
             schema,
             canonical_name: tool_schema_name(schema).expect("valid schema has name"),
-            matched_by_prefix: false,
+            matched_by: None,
         };
+    }
+
+    let stable_alias_resolution = resolve_stable_alias_tool(schemas, requested);
+    if !matches!(stable_alias_resolution, SelectResolution::Missing) {
+        return stable_alias_resolution;
     }
 
     let requested_lower = requested.to_ascii_lowercase();
@@ -263,14 +271,54 @@ fn resolve_select_tool<'a>(schemas: &'a [&'a Value], requested: &str) -> SelectR
         .iter()
         .copied()
         .filter_map(|schema| tool_schema_name(schema).map(|name| (schema, name)))
-        .filter(|(_, name)| name.to_ascii_lowercase().starts_with(&requested_lower))
+        .filter(|(_, name)| {
+            (!name.contains("__") || requested.contains("__"))
+                && name.to_ascii_lowercase().starts_with(&requested_lower)
+        })
         .collect();
     prefix_matches.sort_by_key(|(_, name)| *name);
     match prefix_matches.as_slice() {
         [(schema, name)] => SelectResolution::Found {
             schema,
             canonical_name: name,
-            matched_by_prefix: true,
+            matched_by: Some("unique_prefix"),
+        },
+        [] => SelectResolution::Missing,
+        matches => SelectResolution::Ambiguous {
+            candidates: matches
+                .iter()
+                .map(|(_, name)| (*name).to_string())
+                .collect(),
+        },
+    }
+}
+
+// Runtime public names may contain provider namespaces, sanitized native
+// separators, or instance qualifiers. Only producer-owned schema metadata can
+// identify the stable alias used by capability contracts; consumers never
+// infer that boundary from public-name text.
+fn resolve_stable_alias_tool<'a>(
+    schemas: &'a [&'a Value],
+    requested: &str,
+) -> SelectResolution<'a> {
+    let mut matches: Vec<(&'a Value, &'a str)> = schemas
+        .iter()
+        .copied()
+        .filter_map(|schema| {
+            let function = schema.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            let stable_alias = function.get(STABLE_TOOL_ALIAS_SCHEMA_KEY)?.as_str()?;
+            stable_alias
+                .eq_ignore_ascii_case(requested)
+                .then_some((schema, name))
+        })
+        .collect();
+    matches.sort_by_key(|(_, name)| *name);
+    match matches.as_slice() {
+        [(schema, name)] => SelectResolution::Found {
+            schema,
+            canonical_name: name,
+            matched_by: Some("stable_alias"),
         },
         [] => SelectResolution::Missing,
         matches => SelectResolution::Ambiguous {
@@ -661,6 +709,130 @@ mod tests {
         );
         assert_eq!(parsed["matches"][0]["requested"].as_str(), Some("gitH"));
         assert!(field_strings(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn select_mode_resolves_unique_unqualified_mcp_tool_name() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__moi-tools__moi_github_authenticated_user__ch_23f40bed5331",
+                "description": "Return the authenticated GitHub user",
+                "x-astra-stable-tool-alias": "moi_github_authenticated_user"
+            }
+        })];
+        let parsed = parse_result(&tool_search(
+            &schemas,
+            &json!({"query": "select:moi_github_authenticated_user"}),
+        ));
+
+        assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
+        assert_eq!(
+            field_strings(&parsed, "resolved"),
+            strings(&["mcp__moi-tools__moi_github_authenticated_user__ch_23f40bed5331"])
+        );
+        assert_eq!(
+            parsed["matches"][0]["matched_by"].as_str(),
+            Some("stable_alias")
+        );
+        assert_eq!(
+            parsed["matches"][0]["requested"].as_str(),
+            Some("moi_github_authenticated_user")
+        );
+        assert!(field_strings(&parsed, "missing").is_empty());
+    }
+
+    #[test]
+    fn select_mode_rejects_ambiguous_unqualified_mcp_tool_name() {
+        let schemas = vec![
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__moi-tools__moi_github_authenticated_user__ch_primary",
+                    "description": "Primary GitHub account",
+                    "x-astra-stable-tool-alias": "moi_github_authenticated_user"
+                }
+            }),
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
+                    "description": "Secondary GitHub account",
+                    "x-astra-stable-tool-alias": "moi_github_authenticated_user"
+                }
+            }),
+        ];
+        let parsed = parse_result(&tool_search(
+            &schemas,
+            &json!({"query": "select:moi_github_authenticated_user"}),
+        ));
+
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
+        assert!(match_names(&parsed).is_empty());
+        assert_eq!(
+            field_strings(&parsed, "missing"),
+            strings(&["moi_github_authenticated_user"])
+        );
+        let candidates = parsed["ambiguous"][0]["candidates"]
+            .as_array()
+            .expect("ambiguous candidates must be present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            candidates,
+            vec![
+                "mcp__moi-tools__moi_github_authenticated_user__ch_primary",
+                "mcp__moi-tools__moi_github_authenticated_user__ch_secondary",
+            ]
+        );
+    }
+
+    #[test]
+    fn select_mode_uses_producer_owned_alias_without_parsing_public_name_segments() {
+        let schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "mcp__github__ns__func",
+                "description": "Namespaced GitHub function",
+                "x-astra-stable-tool-alias": "ns__func"
+            }
+        })];
+
+        for qualifier in ["mcp", "github", "ns", "func"] {
+            let parsed = parse_result(&tool_search(
+                &schemas,
+                &json!({"query": format!("select:{qualifier}")}),
+            ));
+            assert_eq!(
+                parsed["selection_status"].as_str(),
+                Some("not_found"),
+                "{qualifier} must not resolve a qualified tool"
+            );
+            assert!(match_names(&parsed).is_empty());
+        }
+
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:ns__func"})));
+        assert_eq!(parsed["selection_status"].as_str(), Some("ok"));
+        assert_eq!(
+            field_strings(&parsed, "resolved"),
+            strings(&["mcp__github__ns__func"])
+        );
+        assert_eq!(parsed["matches"][0]["matched_by"], "stable_alias");
+    }
+
+    #[test]
+    fn select_mode_does_not_infer_aliases_from_public_names_without_metadata() {
+        let schemas = vec![
+            json!({"type": "function", "function": {"name": "mcp__github__search__primary__extra"}}),
+            json!({"type": "function", "function": {"name": "http__github__search"}}),
+            json!({"type": "function", "function": {"name": "mcp____search"}}),
+            json!({"type": "function", "function": {"name": "mcp__github__search__"}}),
+        ];
+
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "select:search"})));
+        assert_eq!(parsed["selection_status"].as_str(), Some("not_found"));
+        assert!(match_names(&parsed).is_empty());
     }
 
     #[test]

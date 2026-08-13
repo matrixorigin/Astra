@@ -201,6 +201,7 @@ pub fn resolve_provider_snapshot(
         drafts.push(ResolvedToolDescriptorDraft {
             identity,
             native_tool_name: declaration.native_tool_name.clone(),
+            stable_tool_alias: declaration.stable_tool_alias.clone(),
             title: declaration.title.clone(),
             description: declaration.description.clone(),
             input_schema: declaration.input_schema.clone(),
@@ -426,6 +427,7 @@ mod tests {
         ProviderToolDeclaration {
             native_tool_id: NativeToolId::new(id).unwrap(),
             native_tool_name: id.to_string(),
+            stable_tool_alias: None,
             title: None,
             description: None,
             input_schema: json!({"type": "object", "properties": {}}),

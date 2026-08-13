@@ -60,16 +60,19 @@ pub use memory_structure::{
     should_store_persistent_memory, validate_persistent_memory_content,
 };
 pub use provider_contract::{
-    DescriptorVersion, NativeToolId, ProviderBindingRef, ProviderCallOutcome, ProviderCallPayload,
-    ProviderClaim, ProviderClaimSource, ProviderClaimTrust, ProviderContractError,
-    ProviderDiscoverySnapshot, ProviderIdentity, ProviderProtocolId, ProviderRejection,
+    DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
+    PROVIDER_INTERACTION_RESPONSE_METADATA_KEY, ProviderBindingRef, ProviderCallOutcome,
+    ProviderCallPayload, ProviderClaim, ProviderClaimSource, ProviderClaimTrust,
+    ProviderContractError, ProviderDiscoverySnapshot, ProviderIdentity, ProviderInteractionOutcome,
+    ProviderInteractionRequest, ProviderInteractionResponse, ProviderProtocolId, ProviderRejection,
     ProviderRejectionCode, ProviderResolverVersion, ProviderSemanticCacheContract,
     ProviderSemanticDiagnostic, ProviderSemanticDiagnosticCode, ProviderTaskSupport,
     ProviderToolClaims, ProviderToolDeclaration, PublicToolAlias, ResolvedConcurrencyBaseline,
     ResolvedProviderClaim, ResolvedProviderSnapshot, ResolvedProviderSnapshotRef,
     ResolvedProviderToolClaims, ResolvedSemanticCacheBaseline, ResolvedToolDescriptor,
     ResolvedToolDescriptorDraft, ResolvedToolDescriptorRef, ResolvedToolEffect,
-    ResolvedToolIdempotency, ResolvedToolSemantics, ToolIdentity,
+    ResolvedToolIdempotency, ResolvedToolSemantics, STABLE_TOOL_ALIAS_METADATA_KEY,
+    STABLE_TOOL_ALIAS_SCHEMA_KEY, StableToolAlias, ToolIdentity,
 };
 pub use result_quality::{ResultQuality, classify_result, quality_feedback};
 pub use resume::{

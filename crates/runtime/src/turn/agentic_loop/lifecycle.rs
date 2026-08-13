@@ -1866,24 +1866,28 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
         // value for downstream adapters (introspect tooling, tests) so
         // they don't need to know about the cache-scope plumbing.
         let full = resolver.available_skills();
-        state.skills.listing_message = if full.is_empty() {
-            None
-        } else {
-            let agent_spawn_available = host
-                .capabilities()
-                .has(astra_turn_core::capability::Capability::AgentSpawner);
-            crate::prompts::build_skill_listing_section_with_context_window_and_caps(
-                &full,
-                approximate_context_window_from_effective_input_budget(state.max_turn_input_tokens),
-                agent_spawn_available,
-            )
-            .map(|section| {
-                serde_json::json!({
-                    "role": "system",
-                    "content": section.text,
+        if state.skills.listing_message.is_none() {
+            state.skills.listing_message = if full.is_empty() {
+                None
+            } else {
+                let agent_spawn_available = host
+                    .capabilities()
+                    .has(astra_turn_core::capability::Capability::AgentSpawner);
+                crate::prompts::build_skill_listing_section_with_context_window_and_caps(
+                    &full,
+                    approximate_context_window_from_effective_input_budget(
+                        state.max_turn_input_tokens,
+                    ),
+                    agent_spawn_available,
+                )
+                .map(|section| {
+                    serde_json::json!({
+                        "role": "system",
+                        "content": section.text,
+                    })
                 })
-            })
-        };
+            };
+        }
     }
     maybe_pre_route_skill(host, state).await;
 

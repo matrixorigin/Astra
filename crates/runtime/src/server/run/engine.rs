@@ -36,13 +36,12 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use astra_services::{
     DatabaseStateProjectionStore,
     runs::{
-        CapabilityServerRefs, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunEventDelta, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
-        DurableRunListPage, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
-        GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
-        RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
-        RunListCursor, RunStateStore, RuntimeProfileRequest, TurnIntentExecutionPolicy,
-        durable_run_status_kind,
+        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
+        DurableRunInteractionKind, DurableRunInteractionResolveOutcome, DurableRunListPage,
+        DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, GuardedRunStatusTransition,
+        GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
+        RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
+        RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -150,14 +149,15 @@ pub struct RunStartContext {
     pub interactive_client: Option<bool>,
     pub turn_intent_policy: TurnIntentExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
+    pub agent_binding_ids: Vec<String>,
     pub agent_binding_id: Option<String>,
     pub agent_binding_name: Option<String>,
     pub agent_binding_schema_version: Option<String>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
-    pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
+    pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
 }
 
 fn durable_model_identity(
@@ -185,7 +185,7 @@ fn durable_model_identity(
     }
 }
 
-fn inherit_parent_model_identity(
+fn inherit_parent_run_identity(
     context: &mut RunStartContext,
     parent: &DurableRunRecord,
 ) -> Result<(), String> {
@@ -223,6 +223,29 @@ fn inherit_parent_model_identity(
             }
         }
         _ => Err("durable parent run contains an incomplete model identity".to_string()),
+    }?;
+
+    let parent_provider_run_owner = parent
+        .events
+        .iter()
+        .find(|event| event["event_type"] == "run_started")
+        .and_then(|event| event.pointer("/data/provider_run_owner"))
+        .cloned()
+        .map(serde_json::from_value::<astra_services::runs::ProviderRunOwner>)
+        .transpose()
+        .map_err(|error| format!("durable parent run has an invalid provider owner: {error}"))?;
+    match (
+        context.provider_run_owner.as_ref(),
+        parent_provider_run_owner,
+    ) {
+        (None, Some(parent_owner)) => {
+            context.provider_run_owner = Some(parent_owner);
+            Ok(())
+        }
+        (Some(child_owner), Some(parent_owner)) if child_owner != &parent_owner => {
+            Err("child run provider owner must match its durable parent".to_string())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -419,6 +442,18 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
             serde_json::Value::String(fingerprint.clone()),
         );
     }
+    if let Some(owner) = context.provider_run_owner.as_ref() {
+        data.insert(
+            "provider_run_owner".to_string(),
+            serde_json::to_value(owner).expect("provider run owner must serialize"),
+        );
+    }
+    if !context.agent_binding_ids.is_empty() {
+        data.insert(
+            "agent_binding_ids".to_string(),
+            serde_json::json!(context.agent_binding_ids),
+        );
+    }
     if let Some(agent_binding_id) = context.agent_binding_id.as_ref() {
         data.insert(
             "agent_binding_id".to_string(),
@@ -446,11 +481,6 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         && let Ok(value) = serde_json::to_value(resolved_model_selection)
     {
         data.insert("resolved_model_selection".to_string(), value);
-    }
-    if let Some(capability_server_refs) = context.capability_server_refs.as_ref()
-        && let Ok(value) = serde_json::to_value(capability_server_refs)
-    {
-        data.insert("capability_server_refs".to_string(), value);
     }
     if let Some(runtime_profile) = context.runtime_profile {
         data.insert(
@@ -704,7 +734,7 @@ impl RunEngine {
             let parent = self
                 .require_delegation_parent(user_id, session_id, parent_run_id)
                 .await?;
-            inherit_parent_model_identity(&mut context, &parent)?;
+            inherit_parent_run_identity(&mut context, &parent)?;
             let parent_root = parent.root_run_id.unwrap_or(parent.run_id.clone());
             let parent_path = parent.ancestor_path.unwrap_or(parent.run_id);
             (
@@ -716,19 +746,6 @@ impl RunEngine {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
         let (model_offering_id, resolved_model_name) = durable_model_identity(&context)?;
-        let capability_server_refs_json =
-            context.capability_server_refs.as_ref().and_then(|refs| {
-                serde_json::to_string(refs)
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            target: "astra_runtime::engine",
-                            run_id = %run_id,
-                            error = %e,
-                            "failed to serialize capability_server_refs for durable run record"
-                        );
-                    })
-                    .ok()
-            });
         let runtime_profile = context
             .runtime_profile
             .map(runtime_profile_label)
@@ -765,7 +782,6 @@ impl RunEngine {
             agent_binding_schema_version: context.agent_binding_schema_version,
             model_offering_id,
             resolved_model_name,
-            capability_server_refs_json,
             runtime_profile,
             provider_request_fingerprint: context.provider_request_fingerprint,
             events: vec![serde_json::json!({
@@ -3165,6 +3181,24 @@ mod tests {
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
     }
 
+    #[test]
+    fn run_started_event_records_complete_ordered_binding_set() {
+        let event = run_started_event_data(&RunStartContext {
+            agent_binding_ids: vec![
+                "binding-foundation".to_string(),
+                "binding-extension".to_string(),
+            ],
+            agent_binding_id: Some("binding-extension".to_string()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            event["agent_binding_ids"],
+            serde_json::json!(["binding-foundation", "binding-extension"])
+        );
+        assert_eq!(event["agent_binding_id"], "binding-extension");
+    }
+
     #[tokio::test]
     async fn start_run_with_context_persists_admitted_offering_identity_without_route_fields() {
         let engine = test_engine();
@@ -3231,7 +3265,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_run_inherits_parent_offering_identity() {
+    async fn delegated_run_inherits_parent_run_identity() {
         let engine = test_engine();
         engine
             .start_run_with_context(
@@ -3245,6 +3279,10 @@ mod tests {
                     resolved_model_selection: Some(ResolvedModelSelection {
                         offering_id: "offer-primary".to_string(),
                         model_name: "provider-model-v2".to_string(),
+                    }),
+                    provider_run_owner: Some(astra_services::runs::ProviderRunOwner {
+                        provider_id: "moi".to_string(),
+                        provider_scope_id: "workspace-a".to_string(),
                     }),
                     ..Default::default()
                 },
@@ -3274,6 +3312,13 @@ mod tests {
         assert_eq!(
             child.resolved_model_name.as_deref(),
             Some("provider-model-v2")
+        );
+        assert_eq!(
+            child.events[0]["data"]["provider_run_owner"],
+            serde_json::json!({
+                "provider_id": "moi",
+                "provider_scope_id": "workspace-a"
+            })
         );
     }
 
@@ -3396,6 +3441,7 @@ mod tests {
             user_intent: None,
             parts: Vec::new(),
             attachments: Vec::new(),
+            stable_runtime_system_prompt: None,
             runtime_system_prompt: None,
             session_id: None,
             full_llm_capture: false,
@@ -3406,12 +3452,9 @@ mod tests {
             admitted_model_execution: None,
             capability_descriptors: None,
             provider_runtime_authorized: false,
+            agent_bindings: Vec::new(),
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
                 id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
-                capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                    mcp: "tools".to_string(),
-                    skills: "skills".to_string(),
-                },
             }),
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -3434,7 +3477,7 @@ mod tests {
             explain: false,
             interaction_mode: None,
             interactive_client: false,
-            provider_workspace_id: None,
+            provider_run_owner: None,
         };
         let context = crate::server::run::binding_resolution::run_start_context_from_request(
             &request, None, None,
@@ -5095,7 +5138,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 provider_request_fingerprint: None,
                 events: vec![serde_json::json!({"event_type":"run_started","data":{}})],

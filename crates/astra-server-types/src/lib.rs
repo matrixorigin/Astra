@@ -46,9 +46,8 @@ pub use edge_ws_protocol::{
     EdgeClientMessage, EdgeServerMessage,
 };
 pub use session_run_tree::{
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
-    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
-    SessionRunTreeSnapshot,
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
+    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 
 #[cfg(feature = "server")]
@@ -101,6 +100,8 @@ pub struct ChatRequest {
     #[serde(default)]
     pub attachments: Vec<serde_json::Value>,
     #[serde(default)]
+    pub stable_runtime_system_prompt: Option<String>,
+    #[serde(default)]
     pub runtime_system_prompt: Option<String>,
     pub session_id: Option<String>,
     pub agent_id: Option<String>,
@@ -110,6 +111,8 @@ pub struct ChatRequest {
     pub resolved_model_selection: Option<astra_services::runs::ResolvedModelSelection>,
     #[serde(default)]
     pub capability_descriptors: Option<astra_services::runs::RuntimeCapabilityDescriptorsRequest>,
+    #[serde(default)]
+    pub agent_bindings: Vec<astra_services::runs::AgentBindingRuntimeRequest>,
     #[serde(default)]
     pub agent_binding: Option<astra_services::runs::AgentBindingRuntimeRequest>,
     #[serde(default)]
@@ -1263,6 +1266,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         user_intent: request.user_intent,
         parts: request.parts,
         attachments: request.attachments,
+        stable_runtime_system_prompt: request.stable_runtime_system_prompt,
         runtime_system_prompt: request.runtime_system_prompt,
         session_id: request.session_id,
         full_llm_capture: false,
@@ -1273,6 +1277,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         admitted_model_execution: None,
         capability_descriptors: request.capability_descriptors,
         provider_runtime_authorized: false,
+        agent_bindings: request.agent_bindings,
         agent_binding: request.agent_binding,
         runtime_auth: request.runtime_auth,
         runtime_skill_binding: None,
@@ -1290,7 +1295,7 @@ pub fn chat_request_into_data(mut request: ChatRequest) -> ChatRequestData {
         edge_executor_id,
         capabilities: request.capabilities,
         forward_headers: std::collections::HashMap::new(),
-        provider_workspace_id: None,
+        provider_run_owner: None,
         execution_budget: request.execution_budget,
         execution_policy: request.execution_policy,
         explain: request.explain,

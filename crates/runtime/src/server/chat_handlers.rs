@@ -1393,11 +1393,25 @@ mod chat_stream_lifecycle_tests {
                 .runtime_auth
                 .as_ref()
                 .expect("agent binding stream request should carry runtime auth");
+            let agent_binding_ids = if request.agent_bindings.is_empty() {
+                request
+                    .agent_binding
+                    .iter()
+                    .map(|binding| binding.id.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                request
+                    .agent_bindings
+                    .iter()
+                    .map(|binding| binding.id.clone())
+                    .collect::<Vec<_>>()
+            };
             let _ =
                 crate::server::agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
                     "skills",
                     &self.endpoint_url,
                     &runtime_auth.authorization,
+                    &agent_binding_ids,
                 )
                 .await?;
             unreachable!("fake skill endpoint must return non-2xx")
@@ -1777,11 +1791,7 @@ mod chat_stream_lifecycle_tests {
                             "message": "hi",
                             "model_selection": {"offering_id": "offer-gpt-4o-mini"},
                             "agent_binding": {
-                                "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
-                                "capability_server_refs": {
-                                    "mcp": "tools",
-                                    "skills": "skills"
-                                }
+                                "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391"
                             },
                             "runtime_auth": {
                                 "authorization": "Bearer abc"

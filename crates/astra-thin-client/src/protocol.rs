@@ -365,6 +365,22 @@ pub struct UserPromptRespondRequest {
     pub answers: Option<Value>,
 }
 
+/// `POST /provider-interactions/respond`.
+///
+/// Astra treats `payload` as opaque provider-owned data. The provider that
+/// requested the interaction validates it when the suspended tool call is
+/// resumed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProviderInteractionRespondRequest {
+    pub request_id: String,
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+}
+
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EdgeRegisterRequest {

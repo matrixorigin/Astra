@@ -275,6 +275,16 @@ impl McpClientManager {
         mcp_name: &str,
         arguments: Value,
     ) -> Result<McpToolCallResult, McpError> {
+        self.call_tool_by_mcp_name_with_metadata(mcp_name, arguments, None)
+            .await
+    }
+
+    pub async fn call_tool_by_mcp_name_with_metadata(
+        &self,
+        mcp_name: &str,
+        arguments: Value,
+        protocol_metadata: Option<serde_json::Map<String, Value>>,
+    ) -> Result<McpToolCallResult, McpError> {
         let (server_name, original_name) = self
             .find_tool_by_mcp_name(mcp_name)
             .ok_or_else(|| McpError::ToolNotFound(mcp_name.to_string()))?;
@@ -285,7 +295,7 @@ impl McpClientManager {
             .ok_or_else(|| McpError::ServerNotConnected(server_name.to_string()))?;
 
         let result = conn
-            .call_tool(original_name, arguments)
+            .call_tool_with_metadata(original_name, arguments, protocol_metadata)
             .await
             .map_err(McpError::Service)?;
 

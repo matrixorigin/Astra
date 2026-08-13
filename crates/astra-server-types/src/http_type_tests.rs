@@ -157,6 +157,11 @@ fn chat_request_all_fields() {
             }
         ],
         "context": {"key": "value"},
+        "stable_runtime_system_prompt": "Extension instructions take precedence on semantic overlap.",
+        "agent_bindings": [
+            {"id": "binding-foundation"},
+            {"id": "binding-extension"}
+        ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "execution_policy": {"turn_intent": "fixed_default"},
         "explain": true
@@ -187,6 +192,13 @@ fn chat_request_all_fields() {
             .map(String::as_str),
         Some("Bearer runtime-token")
     );
+    assert_eq!(
+        req.stable_runtime_system_prompt.as_deref(),
+        Some("Extension instructions take precedence on semantic overlap.")
+    );
+    assert_eq!(req.agent_bindings.len(), 2);
+    assert_eq!(req.agent_bindings[0].id, "binding-foundation");
+    assert_eq!(req.agent_bindings[1].id, "binding-extension");
     assert_eq!(
         req.execution_budget,
         Some(ExecutionBudget {
@@ -265,17 +277,18 @@ fn chat_request_rejects_runtime_auth_credentials_map() {
 }
 
 #[test]
-fn chat_request_rejects_agent_binding_model_capability_ref() {
+fn chat_request_rejects_removed_agent_binding_capability_refs() {
     let result = serde_json::from_str::<ChatRequest>(
         r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
     );
     assert!(
         result.is_err(),
-        "agent_binding.capability_server_refs.models must be rejected"
+        "agent_binding.capability_server_refs must be rejected"
     );
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("unknown field `models`"),
+        err.to_string()
+            .contains("unknown field `capability_server_refs`"),
         "unexpected error: {err}"
     );
 }
@@ -1227,6 +1240,7 @@ fn chat_request_into_data_maps_all_fields() {
         user_intent: Some("pure hello".into()),
         parts: vec![json!({"type": "text", "text": "hello"})],
         attachments: vec![json!({"id": "att-1", "kind": "file"})],
+        stable_runtime_system_prompt: Some("Prefer extension skills on semantic overlap.".into()),
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
         agent_id: Some("a1".into()),
@@ -1238,6 +1252,7 @@ fn chat_request_into_data_maps_all_fields() {
             model_name: "gpt-4".into(),
         }),
         capability_descriptors: None,
+        agent_bindings: Vec::new(),
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,
@@ -1282,6 +1297,10 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(
         data.attachments,
         vec![json!({"id": "att-1", "kind": "file"})]
+    );
+    assert_eq!(
+        data.stable_runtime_system_prompt.as_deref(),
+        Some("Prefer extension skills on semantic overlap.")
     );
     assert_eq!(
         data.runtime_system_prompt.as_deref(),
@@ -1370,12 +1389,14 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         user_intent: None,
         parts: Vec::new(),
         attachments: Vec::new(),
+        stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
         agent_id: None,
         model_selection: None,
         resolved_model_selection: None,
         capability_descriptors: None,
+        agent_bindings: Vec::new(),
         agent_binding: None,
         runtime_auth: None,
         runtime_profile: None,

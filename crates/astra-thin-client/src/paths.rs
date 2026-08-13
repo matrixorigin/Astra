@@ -15,6 +15,9 @@ pub const APPROVAL_RESPOND: &str = "/approval/respond";
 /// `POST` — answer or cancel a durable `ask_user` interaction.
 pub const USER_PROMPT_RESPOND: &str = "/user-prompts/respond";
 
+/// `POST` — submit or cancel an opaque provider interaction.
+pub const PROVIDER_INTERACTION_RESPOND: &str = "/provider-interactions/respond";
+
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
 

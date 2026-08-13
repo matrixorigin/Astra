@@ -7,12 +7,11 @@ pub(crate) async fn inject_effective_runtime_context(
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if principal.is_provider_authorized_request() {
         request.provider_runtime_authorized = true;
-        // Thread provider_scope_id into the request so the run lifecycle can
-        // propagate it into ToolExecutionRequest.workspace_record, enabling
-        // workspace isolation checks on the edge transport path even when the
-        // turn carries no full WorkspaceRecord (MOI provider-authorized turns).
         if let AuthPrincipalOrigin::ProviderAuthorizedRequest(ctx) = &principal.origin {
-            request.provider_workspace_id = Some(ctx.provider_scope_id.clone());
+            request.provider_run_owner = Some(astra_services::runs::ProviderRunOwner {
+                provider_id: ctx.provider_id.clone(),
+                provider_scope_id: ctx.provider_scope_id.clone(),
+            });
         }
         if principal.is_edge_registration() {
             hydrate_edge_registration_runtime_context(state, principal, request).await?;
@@ -119,6 +118,7 @@ async fn inject_edge_registration_runtime_context_body(
     object.remove("runtime_profile");
     object.remove("runtime_mcp_bindings");
     object.remove("runtime_skill_binding");
+    object.remove("stable_runtime_system_prompt");
     object.remove("runtime_system_prompt");
 
     let requested_model_id = match object
@@ -296,7 +296,7 @@ fn apply_provider_supplied_runtime_context(
                 "agent_binding_runtime_auth_missing",
             )
         })?;
-    let agent_binding_mode = request.agent_binding.is_some();
+    let agent_binding_mode = request.has_agent_binding_runtime();
     if let Some(mcp) = descriptors.mcp.as_ref() {
         astra_services::auth::provider_request::validate_runtime_capability_descriptor(mcp, "mcp")?;
         if !agent_binding_mode {
@@ -345,7 +345,13 @@ fn apply_provider_supplied_runtime_context(
 fn reject_unauthorized_capability_descriptors(
     request: &astra_services::runs::ChatRequestData,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    if request.capability_descriptors.is_some() {
+    // The legacy singular agent_binding field remains on its existing auth
+    // path during the protocol migration. The new Binding Set and stable
+    // runtime policy are provider-owned inputs and require provider auth.
+    if request.capability_descriptors.is_some()
+        || request.stable_runtime_system_prompt.is_some()
+        || !request.agent_bindings.is_empty()
+    {
         return Err(provider_runtime_authorization_required());
     }
     Ok(())
@@ -650,7 +656,13 @@ mod tests {
             .expect("provider authorization should accept the supplied runtime context");
 
         assert!(request.provider_runtime_authorized);
-        assert_eq!(request.provider_workspace_id.as_deref(), Some("ws-1"));
+        assert_eq!(
+            request.provider_run_owner,
+            Some(astra_services::runs::ProviderRunOwner {
+                provider_id: "p1".to_string(),
+                provider_scope_id: "ws-1".to_string(),
+            })
+        );
         let resolved = request
             .resolved_model_selection
             .as_ref()

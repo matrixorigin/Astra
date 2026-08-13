@@ -225,6 +225,19 @@ pub(crate) fn build_external_sources(
         }
     }
 
+    // Provider policy comes after the ordered Binding Instructions so it can
+    // describe how the visible binding layers compose without duplicating the
+    // binding-owned agent.md or skill summaries.
+    let runtime_stable_texts = astra_turn_core::chat_turn_edge_profile::edge_profile_texts(
+        edge_profile,
+        astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS,
+    );
+    if !runtime_stable_texts.is_empty() {
+        providers.push(Box::new(RuntimeStableTextsProvider {
+            texts: runtime_stable_texts,
+        }));
+    }
+
     // Cache strategy (prompt caching hint for capable models)
     if let Some(cc) = cache_capability {
         if cc.prefers_intra_turn_batching() {
@@ -386,6 +399,33 @@ impl astra_turn_core::context_sources::ContextChannelProvider for EnvVolatilePro
 /// None scope by definition: these bytes can change every turn.
 struct RuntimeVolatileTextsProvider {
     texts: Vec<String>,
+}
+
+/// Provider-owned policy stable for the exact Binding Set used by this run.
+struct RuntimeStableTextsProvider {
+    texts: Vec<String>,
+}
+
+impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeStableTextsProvider {
+    fn channel_id(&self) -> &'static str {
+        "runtime_stable_texts"
+    }
+    fn cache_scope(&self) -> CacheScope {
+        CacheScope::Session
+    }
+    fn token_bucket(&self) -> PromptTokenBucket {
+        PromptTokenBucket::Environment
+    }
+    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
+        let text = self
+            .texts
+            .iter()
+            .filter(|text| !text.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then(|| PromptSection::stable(text, CacheScope::Session))
+    }
 }
 
 /// Runtime-owned advisory evidence received through the typed edge lane.
@@ -2258,6 +2298,43 @@ mod tests {
                 .iter()
                 .any(|section| section.text.contains("Runtime Turn Context")),
             "turn context must be routed to RuntimeVolatile / CacheScope::None"
+        );
+    }
+
+    #[test]
+    fn external_sources_runtime_stable_texts_use_session_lane() {
+        let mut ep = serde_json::Map::new();
+        ep.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS.into(),
+            serde_json::json!(["Foundation capabilities are inherited by this agent."]),
+        );
+        let mut state = make_state();
+        state.skills.listing_message = Some(serde_json::json!({
+            "role": "system",
+            "content": "## Agent Binding Instructions\n<agent_binding id=\"binding-foundation\" />"
+        }));
+        let sources = build_external_sources(&ep, &state, &[], None, None);
+
+        let stable_index = sources
+            .extra_stable_sections
+            .iter()
+            .position(|section| section.text.contains("Foundation capabilities"))
+            .expect("runtime stable section");
+        let binding_index = sources
+            .extra_stable_sections
+            .iter()
+            .position(|section| section.text.contains("Agent Binding Instructions"))
+            .expect("binding instructions");
+        assert!(binding_index < stable_index);
+        assert_eq!(
+            sources.extra_stable_sections[stable_index].scope,
+            CacheScope::Session
+        );
+        assert!(
+            sources
+                .extra_dynamic_sections
+                .iter()
+                .all(|section| !section.text.contains("Foundation capabilities"))
         );
     }
 

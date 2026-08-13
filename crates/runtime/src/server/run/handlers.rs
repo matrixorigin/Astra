@@ -150,6 +150,8 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "runtime.control.handoff.rejected"
             | "ask_user_prompted"
             | "user_prompt_required"
+            | "provider_interaction_required"
+            | "provider_interaction_resolved"
             | "user_intent"
             | "user_intent_applied"
             | "run_finished"

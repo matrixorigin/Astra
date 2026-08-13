@@ -15,6 +15,10 @@ pub const EDGE_PROFILE_KEY_SKILL_LISTING_TEXT: &str = "skill_listing_text";
 /// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS`] instead.
 pub const EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS: &str = "runtime_volatile_texts";
 
+/// Protocol key for provider-owned runtime policy that is stable for the
+/// resolved Binding Set and belongs in the session-cached system prefix.
+pub const EDGE_PROFILE_KEY_RUNTIME_STABLE_TEXTS: &str = "runtime_stable_texts";
+
 /// Protocol key for runtime-owned volatile injections that cross the CLI/server
 /// boundary without losing their producer kind. This is distinct from
 /// [`EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS`], which remains the generic

@@ -143,6 +143,10 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/user-prompts/respond",
             post(edge::edge_callback_handlers::post_user_prompt_respond_handler),
         )
+        .route(
+            "/provider-interactions/respond",
+            post(edge::edge_callback_handlers::post_provider_interaction_respond_handler),
+        )
         .route("/chat/ws", get(ws_handler::ws_chat_handler))
         .route("/edge/ws", get(edge::edge_ws_handler::edge_ws_handler))
         .route(

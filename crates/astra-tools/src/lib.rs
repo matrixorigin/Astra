@@ -491,6 +491,24 @@ pub trait AskUserGate: Send + Sync {
     ) -> AskUserDecision;
 }
 
+// ─── Provider interaction gate ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProviderInteractionDecision {
+    Submitted(Value),
+    Cancelled,
+    Timeout,
+    Error(String),
+}
+
+#[async_trait]
+pub trait ProviderInteractionGate: Send + Sync {
+    async fn request_interaction(
+        &self,
+        request: &astra_turn_types::ProviderInteractionRequest,
+    ) -> ProviderInteractionDecision;
+}
+
 // ─── Tool progress callback ─────────────────────────────────────────────────
 
 /// Callback for streaming tool execution progress to the frontend.

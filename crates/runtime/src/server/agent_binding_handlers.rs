@@ -13,8 +13,6 @@ pub(super) struct AgentBindingResponse {
     pub binding_name: String,
     pub status: astra_services::AgentBindingStatus,
     pub agent_md: String,
-    pub capability_servers: Vec<astra_services::CapabilityServerEndpoint>,
-    pub runtime_policy: astra_services::RuntimePolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
     pub binding_schema_version: String,
@@ -40,8 +38,6 @@ impl From<astra_services::AgentBindingRecord> for AgentBindingResponse {
             binding_name: record.binding_name,
             status: record.status,
             agent_md: record.agent_md,
-            capability_servers: record.capability_servers,
-            runtime_policy: record.runtime_policy,
             metadata: record.metadata,
             binding_schema_version: record.binding_schema_version,
             created_at: record.created_at,

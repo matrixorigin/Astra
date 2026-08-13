@@ -183,7 +183,6 @@ const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     agent_binding_schema_version VARCHAR(32) NULL,
     model_offering_id VARCHAR(64) NULL,
     resolved_model_name VARCHAR(255) NULL,
-    capability_server_refs_json LONGTEXT NULL,
     runtime_profile VARCHAR(64) NULL,
     provider_request_fingerprint VARCHAR(64) NULL,
     created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -243,7 +242,6 @@ const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "agent_binding_id",
     "agent_binding_name",
     "agent_binding_schema_version",
-    "capability_server_refs_json",
     "runtime_profile",
     "created_at",
     "updated_at",
@@ -1524,6 +1522,16 @@ async fn drop_column_if_present(
     Ok(())
 }
 
+async fn migrate_legacy_agent_binding_runtime_columns(
+    pool: &sqlx::Pool<MySql>,
+    database: &str,
+) -> Result<(), sqlx::Error> {
+    for column in ["capability_servers_json", "runtime_policy_json"] {
+        drop_column_if_present(pool, database, "agent_bindings", column).await?;
+    }
+    Ok(())
+}
+
 async fn add_index_if_missing(
     pool: &sqlx::Pool<MySql>,
     database: &str,
@@ -2623,6 +2631,11 @@ async fn ensure_core_schema_while_leased(
     pool: sqlx::Pool<MySql>,
     holder_id: &str,
 ) -> Result<(), sqlx::Error> {
+    // These runtime-owned columns were removed without changing the core
+    // schema contract version. Reconcile that exact legacy shape before the
+    // contract fast path so existing v24 databases receive the migration.
+    migrate_legacy_agent_binding_runtime_columns(&pool, &settings.database).await?;
+
     if core_schema_contract_is_current(&pool).await? {
         verify_core_schema_catalog(&pool, &settings.database).await?;
         verify_inference_invocation_schema_contract(&pool, &settings.database).await?;
@@ -3098,10 +3111,6 @@ async fn ensure_core_schema_while_leased(
             "ALTER TABLE agent_runs ADD COLUMN resolved_model_name VARCHAR(255) NULL",
         ),
         (
-            "capability_server_refs_json",
-            "ALTER TABLE agent_runs ADD COLUMN capability_server_refs_json LONGTEXT NULL",
-        ),
-        (
             "runtime_profile",
             "ALTER TABLE agent_runs ADD COLUMN runtime_profile VARCHAR(64) NULL",
         ),
@@ -3137,6 +3146,7 @@ async fn ensure_core_schema_while_leased(
         "selected_model_json",
         "selected_model_name",
         "selected_model_gateway",
+        "capability_server_refs_json",
     ] {
         drop_column_if_present(&pool, &settings.database, "agent_runs", obsolete_column).await?;
     }
@@ -6545,8 +6555,6 @@ async fn ensure_core_schema_while_leased(
             idempotency_key VARCHAR(255) NOT NULL,
             status VARCHAR(32) NOT NULL DEFAULT 'active',
             agent_md LONGTEXT NOT NULL,
-            capability_servers_json LONGTEXT NOT NULL,
-            runtime_policy_json LONGTEXT NOT NULL,
             metadata_json LONGTEXT NULL,
             binding_schema_version VARCHAR(32) NOT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
@@ -6559,7 +6567,6 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
-
     core_schema_create!(
         pool,
         "mcp_servers",
