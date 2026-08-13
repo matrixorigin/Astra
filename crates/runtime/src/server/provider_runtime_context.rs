@@ -432,8 +432,8 @@ mod tests {
         > {
             use astra_services::auth::external::{
                 ExternalCatalogTool, ExternalRuntimeAuthResponse,
-                ExternalRuntimeCapabilityDescriptors, ExternalRuntimeScopeResponse,
-                ExternalSelectedModelResponse,
+                ExternalRuntimeCapabilityDescriptor, ExternalRuntimeCapabilityDescriptors,
+                ExternalRuntimeScopeResponse, ExternalSelectedModelResponse,
             };
 
             assert_eq!(request.requested_model_id, "model-requested");
@@ -448,7 +448,23 @@ mod tests {
                     authorization: "Bearer runtime-grant".to_string(),
                     expires_at: "2026-07-21T00:00:00Z".to_string(),
                 },
-                capability_descriptors: ExternalRuntimeCapabilityDescriptors::default(),
+                capability_descriptors: ExternalRuntimeCapabilityDescriptors {
+                    edge_agent: Some(ExternalRuntimeCapabilityDescriptor {
+                        id: "edge-test".to_string(),
+                        descriptor_type: "edge_agent".to_string(),
+                        transport: "edge_ws".to_string(),
+                        endpoint_url: "https://moi.example/agent-executors/authorize-dispatch"
+                            .to_string(),
+                        protocol: "moi_edge_dispatch_authorization_v1".to_string(),
+                        semantic_read: None,
+                        metadata: serde_json::Map::from_iter([
+                            ("contract_version".to_string(), serde_json::json!(1)),
+                            ("task_id".to_string(), serde_json::json!("task-1")),
+                            ("executor_id".to_string(), serde_json::json!("edge-test")),
+                        ]),
+                    }),
+                    ..Default::default()
+                },
                 runtime_scope: ExternalRuntimeScopeResponse {
                     allowed_model_id: "model-requested".to_string(),
                     allowed_tools: vec![ExternalCatalogTool {
@@ -586,6 +602,21 @@ mod tests {
         assert_eq!(
             value["runtime_auth"]["authorization"],
             "Bearer runtime-grant"
+        );
+        assert_eq!(
+            value["capability_descriptors"]["edge_agent"],
+            serde_json::json!({
+                "id": "edge-test",
+                "type": "edge_agent",
+                "transport": "edge_ws",
+                "endpoint_url": "https://moi.example/agent-executors/authorize-dispatch",
+                "protocol": "moi_edge_dispatch_authorization_v1",
+                "metadata": {
+                    "contract_version": 1,
+                    "task_id": "task-1",
+                    "executor_id": "edge-test"
+                }
+            })
         );
     }
 
