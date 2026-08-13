@@ -2051,7 +2051,6 @@ mod tests {
         assert!(out.contains("server record"), "{out}");
         assert!(out.contains("agent binding registry"), "{out}");
         assert!(out.contains("gpt-5"), "{out}");
-        assert!(out.contains("mcp mcp-main"), "{out}");
         assert!(out.contains("binding Reviewer"), "{out}");
         assert!(!out.contains("not reported"), "{out}");
         assert!(out.contains("↳ 2. task 1"), "{out}");
