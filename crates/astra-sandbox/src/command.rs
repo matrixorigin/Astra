@@ -962,7 +962,11 @@ fn write_option_takes_separate_value(command: &str, option: &str) -> bool {
         return false;
     }
     match command.to_ascii_lowercase().as_str() {
-        "cp" | "mv" => matches!(option, "-S" | "--suffix" | "-t" | "--target-directory"),
+        "cp" => matches!(
+            option,
+            "-S" | "--suffix" | "-t" | "--target-directory" | "--no-preserve" | "--sparse"
+        ),
+        "mv" => matches!(option, "-S" | "--suffix" | "-t" | "--target-directory"),
         "install" => matches!(
             option,
             "-g" | "--group"
@@ -1526,6 +1530,8 @@ mod tests {
             format!("cp --target-directory='{}' input.pdf", outside.display()),
             format!("cp --target-d '{}' input.pdf", outside.display()),
             format!("cp --target-d='{}' input.pdf", outside.display()),
+            format!("cp input.pdf '{}' --sparse always", outside.display()),
+            format!("cp input.pdf '{}' --no-preserve mode", outside.display()),
             format!("install --dir '{}' reports", outside.display()),
         ] {
             let risks = analyze_command_risks_in_workspace(&command, &workspace);

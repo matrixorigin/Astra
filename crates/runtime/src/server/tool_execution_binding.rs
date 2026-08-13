@@ -273,6 +273,11 @@ pub struct ToolExecutionRequest {
     /// serialization so credentials cannot enter durable tool snapshots.
     #[serde(skip)]
     pub runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    /// Non-secret durable marker. If a snapshot is replayed without the
+    /// skipped transfer context, routing must fail closed rather than degrade
+    /// to ordinary Edge dispatch.
+    #[serde(default)]
+    pub runtime_file_transfer_required: bool,
     /// Request-scoped dispatch authorization callback. Like file transfer
     /// credentials, this is never serialized into durable tool snapshots.
     #[serde(skip)]
@@ -503,6 +508,7 @@ impl ExecutionBindingState {
             selected_offer: None,
             policy: ToolPolicySnapshot::default(),
             runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
         }

@@ -274,6 +274,7 @@ mod tests {
             workspace_record: None,
             runtime: None,
             runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,

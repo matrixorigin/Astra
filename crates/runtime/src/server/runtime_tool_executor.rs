@@ -1933,6 +1933,7 @@ impl RuntimeToolExecutor {
             request = request.with_selected_offer(offer);
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization.clone();
         request.runtime_edge_dispatch_authorization_required =
@@ -1954,6 +1955,7 @@ impl RuntimeToolExecutor {
             request = request.with_selected_offer(offer);
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
+        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization.clone();
         request.runtime_edge_dispatch_authorization_required =
@@ -4079,21 +4081,17 @@ mod tests {
         });
         let exec = exec.with_runtime_file_transfer(Some(context));
 
-        assert!(
-            exec.tool_execution_request("materialize_attachment", &Value::Null)
-                .runtime_file_transfer
-                .is_some()
-        );
-        assert!(
-            exec.tool_execution_request("publish_artifact", &Value::Null)
-                .runtime_file_transfer
-                .is_some()
-        );
-        assert!(
-            exec.tool_execution_request("bash", &json!({"command": "pwd"}))
-                .runtime_file_transfer
-                .is_none()
-        );
+        let materialize = exec.tool_execution_request("materialize_attachment", &Value::Null);
+        assert!(materialize.runtime_file_transfer.is_some());
+        assert!(materialize.runtime_file_transfer_required);
+
+        let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
+        assert!(publish.runtime_file_transfer.is_some());
+        assert!(publish.runtime_file_transfer_required);
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
+        assert!(bash.runtime_file_transfer.is_none());
+        assert!(!bash.runtime_file_transfer_required);
     }
 
     #[test]

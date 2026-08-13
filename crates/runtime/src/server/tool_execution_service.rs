@@ -592,6 +592,23 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
+        if transport_request.runtime_file_transfer_required
+            && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
+                || transport_request.runtime_file_transfer.is_none())
+        {
+            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
+            let reason = if transport_request.runtime_file_transfer.is_none() {
+                "managed runtime file-transfer context is unavailable"
+            } else {
+                "managed runtime file transfer requires an edge-bound execution route"
+            };
+            return edge_admission_rejected_result(
+                &transport_request,
+                &binding,
+                "file-transfer",
+                reason,
+            );
+        }
         if transport_request.runtime_edge_dispatch_authorization_required
             && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
                 || transport_request
@@ -1310,6 +1327,7 @@ mod tests {
             executor: ExecutorBinding::server_local(),
             runtime: None,
             runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: Some(
@@ -1406,6 +1424,7 @@ mod tests {
             executor: ExecutorBinding::server_local(),
             runtime: Some(runtime),
             runtime_file_transfer: None,
+            runtime_file_transfer_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,

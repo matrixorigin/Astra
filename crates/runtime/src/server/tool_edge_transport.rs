@@ -42,6 +42,14 @@ pub(crate) async fn execute_edge_bound(
             ));
         }
     };
+    if plan.runtime_file_transfer_required() && plan.runtime_file_transfer().is_none() {
+        return edge_admission_rejected_result(
+            &request,
+            binding,
+            "file-transfer",
+            "managed runtime file-transfer context is unavailable",
+        );
+    }
     if plan.runtime_edge_dispatch_authorization_required()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {

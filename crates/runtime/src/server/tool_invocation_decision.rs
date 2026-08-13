@@ -20,7 +20,7 @@ use super::tool_execution_binding::{
 };
 use super::tool_route_selection::ToolExecutionRouteKind;
 
-const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v3";
+const DECISION_CONTRACT_VERSION: &str = "tool-dispatch-decision-v4";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub(crate) struct ToolInvocationDecisionSnapshot {
@@ -36,6 +36,7 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub semantic_cache: InvocationSemanticReadCacheDecision,
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
+    pub runtime_file_transfer_required: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,6 +210,7 @@ impl ToolInvocationDecisionSnapshot {
                 }
             }),
             admission,
+            runtime_file_transfer_required: request.runtime_file_transfer_required,
         })
     }
 
@@ -341,6 +343,7 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.admission_snapshot = Some(self.admission.clone());
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
+        request.runtime_file_transfer_required = self.runtime_file_transfer_required;
     }
 }
 
@@ -678,9 +681,9 @@ mod tests {
     }
 
     #[test]
-    fn pre_current_freshness_decision_contract_is_rejected_as_an_explicit_upgrade_boundary() {
+    fn pre_file_transfer_requirement_contract_is_rejected_as_an_explicit_upgrade_boundary() {
         let legacy = ToolInvocationDecision::from_snapshot(json!({
-            "contract_version": "tool-dispatch-decision-v2",
+            "contract_version": "tool-dispatch-decision-v3",
             "legacy": true,
         }))
         .unwrap();
@@ -688,7 +691,7 @@ mod tests {
         assert!(matches!(
             ToolInvocationDecisionSnapshot::from_durable(&legacy),
             Err(ToolInvocationDecisionError::UnsupportedContractVersion(version))
-                if version == "tool-dispatch-decision-v2"
+                if version == "tool-dispatch-decision-v3"
         ));
     }
 
@@ -781,6 +784,7 @@ mod tests {
         let mut request = request();
         request.workspace.cwd = Some("/original".to_string());
         request.policy.max_output_bytes = Some(4096);
+        request.runtime_file_transfer_required = true;
         let original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
@@ -793,6 +797,7 @@ mod tests {
         request.workspace.authority = WorkspaceAuthority::None;
         request.executor.status = astra_runtime_env::ExecutorStatus::Offline;
         request.policy.max_output_bytes = Some(1);
+        request.runtime_file_transfer_required = false;
         request.policy.admission_snapshot = Some(Default::default());
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
         restored.apply_to_request(&mut request);
@@ -804,6 +809,7 @@ mod tests {
             astra_runtime_env::ExecutorStatus::Online
         );
         assert_eq!(request.policy.max_output_bytes, Some(4096));
+        assert!(request.runtime_file_transfer_required);
         assert_eq!(restored.route, ToolExecutionRouteKind::ServerLocal);
         assert_eq!(restored, original);
     }
