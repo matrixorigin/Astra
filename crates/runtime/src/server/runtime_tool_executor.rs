@@ -1935,9 +1935,9 @@ impl RuntimeToolExecutor {
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_edge_dispatch_authorization =
-            self.runtime_edge_dispatch_authorization.clone();
+            self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
-            self.runtime_edge_dispatch_authorization.is_some();
+            request.runtime_edge_dispatch_authorization.is_some();
         request
     }
 
@@ -1957,9 +1957,9 @@ impl RuntimeToolExecutor {
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_edge_dispatch_authorization =
-            self.runtime_edge_dispatch_authorization.clone();
+            self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
-            self.runtime_edge_dispatch_authorization.is_some();
+            request.runtime_edge_dispatch_authorization.is_some();
         request
     }
 
@@ -1970,6 +1970,18 @@ impl RuntimeToolExecutor {
         matches!(name, "materialize_attachment" | "publish_artifact")
             .then(|| self.runtime_file_transfer.clone())
             .flatten()
+    }
+
+    fn runtime_edge_dispatch_authorization_for_request(
+        &self,
+        request: &ToolExecutionRequest,
+    ) -> Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>> {
+        matches!(
+            self.tool_execution_service.routing_decision(request),
+            crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound
+        )
+        .then(|| self.runtime_edge_dispatch_authorization.clone())
+        .flatten()
     }
 
     fn selected_offer_for_request(
@@ -4092,6 +4104,61 @@ mod tests {
         let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
         assert!(bash.runtime_file_transfer.is_none());
         assert!(!bash.runtime_file_transfer_required);
+    }
+
+    #[test]
+    fn edge_authorization_is_attached_only_to_edge_bound_tools() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "Managed runner",
+                "/sandbox",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "runner-1",
+                "Managed runner",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        let exec = exec.with_runtime_edge_dispatch_authorization(Some(Arc::new(
+            astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+                endpoint_url: "https://moi.example/runtime-executors/authorize".to_string(),
+                authorization: "Bearer request-scoped".to_string(),
+                task_id: "task-1".to_string(),
+                executor_id: "runner-1".to_string(),
+            },
+        )));
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
+        assert!(bash.runtime_edge_dispatch_authorization.is_some());
+        assert!(bash.runtime_edge_dispatch_authorization_required);
+
+        for tool_name in ["ask_user", "tool_search", "memory"] {
+            let local = exec.tool_execution_request(tool_name, &Value::Null);
+            assert!(
+                local.runtime_edge_dispatch_authorization.is_none(),
+                "{tool_name} must keep its server-owned route"
+            );
+            assert!(!local.runtime_edge_dispatch_authorization_required);
+        }
+
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let invocation = exec.tool_execution_request_for_invocation(
+            &identity,
+            "bash",
+            &json!({"command": "pwd"}),
+        );
+        assert!(invocation.runtime_edge_dispatch_authorization.is_some());
+        assert!(invocation.runtime_edge_dispatch_authorization_required);
     }
 
     #[test]

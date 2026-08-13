@@ -435,17 +435,21 @@ pub(crate) fn active_provider_declarations_for_binding(
                 .tool_schema_digests
                 .retain(|name, _| runtime_declared_tool_names.contains(name));
         }
-        providers.push(runtime_provider);
-
-        if context.request_scoped_file_transfer_provider_ready {
-            providers.push(CapacityProviderDeclaration::new(
-                capacity_provider_type_for_workspace_executor(workspace.kind, executor.kind),
-                runtime_execution_provider_id_for_executor(executor),
-                astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES
-                    .iter()
-                    .map(|name| (*name).to_string()),
-            ));
+        if context.request_scoped_file_transfer_provider_ready
+            && matches!(executor.kind, ExecutorBindingKind::EdgeAgent)
+        {
+            for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
+                let Some(spec) = registry.get(tool_name) else {
+                    continue;
+                };
+                runtime_provider.tool_names.insert((*tool_name).to_string());
+                runtime_provider.tool_schema_digests.insert(
+                    (*tool_name).to_string(),
+                    astra_runtime_env::canonical_tool_spec_digest(spec),
+                );
+            }
         }
+        providers.push(runtime_provider);
     }
 
     if context.request_scoped_mcp_provider_ready
@@ -1019,7 +1023,10 @@ mod tests {
                 &registry(),
                 ToolAdmissionContext {
                     request_scoped_file_transfer_provider_ready: true,
-                    runtime_declared_tool_names: Some(HashSet::from(["bash".to_string()])),
+                    runtime_declared_tool_names: Some(HashSet::from([
+                        "bash".to_string(),
+                        "publish_artifact".to_string(),
+                    ])),
                     ..ToolAdmissionContext::default()
                 },
             );
@@ -1029,6 +1036,41 @@ mod tests {
             assert_eq!(
                 available.selected_offer_id(),
                 Some(expected_offer_id.as_str())
+            );
+        }
+
+        let providers = active_provider_declarations_for_binding(
+            &[],
+            &workspace,
+            &executor,
+            None,
+            &registry(),
+            &ToolAdmissionContext {
+                request_scoped_file_transfer_provider_ready: true,
+                runtime_declared_tool_names: Some(HashSet::from([
+                    "bash".to_string(),
+                    "publish_artifact".to_string(),
+                ])),
+                ..ToolAdmissionContext::default()
+            },
+        );
+        let edge_providers = providers
+            .iter()
+            .filter(|provider| provider.provider_id == "edge-managed")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            edge_providers.len(),
+            1,
+            "runtime provider ID must be unique"
+        );
+        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
+            assert!(edge_providers[0].declares_tool(tool_name));
+            assert_eq!(
+                edge_providers[0].schema_digest_for_tool(tool_name),
+                registry()
+                    .get(tool_name)
+                    .map(astra_runtime_env::canonical_tool_spec_digest)
+                    .as_deref()
             );
         }
     }

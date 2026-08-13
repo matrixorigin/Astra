@@ -62,6 +62,10 @@ pub struct ServerSkillSubRunExecutor {
     edge_profile: Map<String, Value>,
     /// Workspace/executor/runtime binding inherited from the parent run.
     execution_binding_snapshot: Option<ExecutionBindingSnapshot>,
+    /// Provider-authorized workspace scope used for cross-user managed Edge
+    /// lookup.  The edge agent may connect as a service account rather than
+    /// the workspace user running this skill.
+    workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
@@ -78,6 +82,11 @@ pub struct ServerSkillSubRunExecutor {
     session_id: String,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    /// Durable dispatch authority required before any direct Edge socket send.
+    edge_dispatch_service: Option<Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    /// Durable Edge registry used when the selected executor is connected to
+    /// another Astra replica.
+    edge_registry_service: Option<Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
     /// host will observe the same emitted_tool_call_ids HashSet as the parent,
     /// preventing duplicate `tool_call` events across host instances within the
@@ -120,6 +129,7 @@ impl ServerSkillSubRunExecutor {
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
+            workspace_record: None,
             runtime_file_transfer: None,
             runtime_edge_dispatch_authorization: None,
             skill_resolver: None,
@@ -128,6 +138,8 @@ impl ServerSkillSubRunExecutor {
             request_constraints: Default::default(),
             session_id,
             edge_connection_pool: None,
+            edge_dispatch_service: None,
+            edge_registry_service: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             dedup_state: None,
             #[cfg(feature = "harness")]
@@ -197,6 +209,14 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub fn with_workspace_record(
+        mut self,
+        workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
+    ) -> Self {
+        self.workspace_record = workspace_record;
+        self
+    }
+
     pub fn with_runtime_file_transfer(
         mut self,
         context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
@@ -263,6 +283,22 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub fn with_edge_dispatch_service(
+        mut self,
+        service: Arc<dyn astra_services::multi_agent::EdgeDispatchService>,
+    ) -> Self {
+        self.edge_dispatch_service = Some(service);
+        self
+    }
+
+    pub fn with_edge_registry_service(
+        mut self,
+        service: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    ) -> Self {
+        self.edge_registry_service = Some(service);
+        self
+    }
+
     /// Set the parent session's harness sink for observe-only sub-run monitoring.
     #[cfg(feature = "harness")]
     pub fn with_harness_sink(
@@ -275,6 +311,16 @@ impl ServerSkillSubRunExecutor {
 }
 
 impl ServerSkillSubRunExecutor {
+    fn apply_execution_binding_snapshot(
+        &self,
+        executor: &mut super::runtime_tool_executor::RuntimeToolExecutor,
+    ) {
+        if let Some(snapshot) = &self.execution_binding_snapshot {
+            executor.set_execution_binding_snapshot(snapshot.clone());
+        }
+        executor.set_workspace_record(self.workspace_record.clone());
+    }
+
     /// Provision a workspace directory for a skill sub-run.
     fn provision_skill_workspace(
         &self,
@@ -379,6 +425,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         }
 
         let mut host = builder.build();
+        if self.runtime_file_transfer.is_some() {
+            host.install_managed_file_transfer_tool_schemas();
+        }
         if let Some(sink) = &self.interaction_sink {
             host.set_interaction_sink(Arc::clone(sink));
         }
@@ -604,6 +653,12 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             if let Some(pool) = &self.edge_connection_pool {
                 builder = builder.edge_connection_pool(pool.clone());
             }
+            if let Some(service) = &self.edge_dispatch_service {
+                builder = builder.edge_dispatch_service(Arc::clone(service));
+            }
+            if let Some(service) = &self.edge_registry_service {
+                builder = builder.edge_registry_service(Arc::clone(service));
+            }
 
             let mut executor = super::runtime_tool_executor::RuntimeToolExecutor::new(
                 workspace,
@@ -623,6 +678,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 self.runtime_edge_dispatch_authorization.clone(),
             )
             .with_tool_execution_service(builder.build());
+            self.apply_execution_binding_snapshot(&mut executor);
             if let Some(pool) = &self.shared_pool {
                 executor.set_context_manifest_pool(pool.clone());
             }
@@ -738,11 +794,19 @@ mod tests {
         .with_edge_tools(vec![
             json!({"type": "function", "function": {"name": "bash"}}),
         ])
+        .with_edge_dispatch_service(Arc::new(
+            astra_services::multi_agent::UnconfiguredEdgeDispatchService,
+        ))
+        .with_edge_registry_service(Arc::new(
+            astra_services::multi_agent::UnconfiguredEdgeRegistryService,
+        ))
         .with_cancel_token(Some(Arc::new(tokio_util::sync::CancellationToken::new())));
 
         assert!(executor.default_model.is_some());
         assert!(executor.admitted_model_execution.is_some());
         assert_eq!(executor.edge_tools.len(), 1);
+        assert!(executor.edge_dispatch_service.is_some());
+        assert!(executor.edge_registry_service.is_some());
         assert!(executor.cancel_token.is_some());
     }
 
@@ -781,18 +845,48 @@ mod tests {
     #[test]
     fn server_skill_subrun_executor_keeps_execution_binding_snapshot() {
         let snapshot = edge_runtime_snapshot();
+        let workspace_record = astra_runtime_env::WorkspaceRecord {
+            workspace_id: "workspace-1".to_string(),
+            owner_scope: astra_runtime_env::WorkspaceOwnerScope::None,
+            kind: astra_runtime_env::WorkspaceBindingKind::None,
+            authority: astra_runtime_env::WorkspaceAuthority::None,
+            root_or_volume_ref: String::new(),
+            source: astra_runtime_env::WorkspaceSource::None,
+            persistence: astra_runtime_env::WorkspacePersistence::None,
+            revision: String::new(),
+            display_name: String::new(),
+        };
         let executor = ServerSkillSubRunExecutor::new(
             mock_matrixone(),
             mock_encryptor(),
             "test-user".to_string(),
             "test-session".to_string(),
         )
-        .with_execution_binding_snapshot(snapshot.clone());
+        .with_execution_binding_snapshot(snapshot.clone())
+        .with_workspace_record(Some(workspace_record.clone()));
 
         assert_eq!(
             executor.execution_binding_snapshot.as_ref(),
             Some(&snapshot)
         );
+
+        let workspace = tempfile::tempdir().expect("temporary skill workspace");
+        let mut runtime_executor = crate::server::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace.path().to_path_buf(),
+            "test-user".to_string(),
+            "test-session".to_string(),
+            None,
+            None,
+        );
+        executor.apply_execution_binding_snapshot(&mut runtime_executor);
+        let binding = runtime_executor.binding_metadata();
+        assert_eq!(binding["workspace"]["kind"], "edge_workspace");
+        assert_eq!(binding["executor"]["executor_id"], "edge-1");
+        let request = runtime_executor.tool_execution_request(
+            "bash",
+            &json!({"command": "pwd", "_run_id": "run-1", "_tool_call_id": "call-1"}),
+        );
+        assert_eq!(request.workspace_record, Some(workspace_record));
     }
 
     #[test]

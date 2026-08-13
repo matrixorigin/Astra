@@ -2935,6 +2935,129 @@ async fn edge_websocket_without_durable_dispatch_authority_does_not_send() {
 }
 
 #[tokio::test]
+async fn current_provider_executor_authorization_allows_one_durable_socket_dispatch() {
+    let authorization_calls = Arc::new(AtomicUsize::new(0));
+    let observed_request = Arc::new(Mutex::new(None));
+    let calls = Arc::clone(&authorization_calls);
+    let observed = Arc::clone(&observed_request);
+    let app = axum::Router::new().route(
+        "/api/v1/runtime-executors/authorize",
+        axum::routing::post(
+            move |headers: axum::http::HeaderMap, axum::Json(body): axum::Json<Value>| {
+                let calls = Arc::clone(&calls);
+                let observed = Arc::clone(&observed);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    *observed.lock().expect("authorization request lock") = Some((headers, body));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind authorization server");
+    let endpoint_url = format!(
+        "http://{}/api/v1/runtime-executors/authorize",
+        listener.local_addr().expect("authorization server address")
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve authorization response");
+    });
+
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-selected",
+        Some("Runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_environment_advertisement("runner-selected")),
+        None,
+        tx,
+    );
+    let dispatch = Arc::new(StaticEdgeDispatch::default());
+    let service = ToolExecutionService::builder()
+        .edge_connection_pool(pool.clone())
+        .edge_dispatch_service(dispatch.clone())
+        .build();
+    let mut tool_request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace("Runner", "/workspace", WorkspaceAuthority::ReadWrite),
+        ExecutorBinding::edge_agent(
+            "runner-selected",
+            "Runner",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    tool_request.runtime_edge_dispatch_authorization = Some(Arc::new(
+        astra_services::runs::RuntimeEdgeDispatchAuthorizationContext {
+            endpoint_url,
+            authorization: "Bearer runtime-grant".to_string(),
+            task_id: "task-1".to_string(),
+            executor_id: "runner-selected".to_string(),
+        },
+    ));
+    tool_request.runtime_edge_dispatch_authorization_required = true;
+
+    let handle = tokio::spawn(async move {
+        service
+            .execute(tool_request, &CountingLocalTransport::new())
+            .await
+    });
+    let message = rx.recv().await.expect("authorized edge tool request");
+    let (request_id, delivery_generation) = match message {
+        astra_server_types::EdgeServerMessage::ToolRequest {
+            request_id,
+            delivery_generation,
+            ..
+        } => (request_id, delivery_generation),
+        other => panic!("expected tool request, got {other:?}"),
+    };
+    assert!(pool.deliver_tool_result(
+        "user-1",
+        "runner-selected",
+        &request_id,
+        delivery_generation,
+        astra_server_types::edge_connection_pool::EdgeToolResult {
+            output: "authorized-result".to_string(),
+            is_error: false,
+            duration_ms: Some(3),
+            tool_result_fields: None,
+        },
+    ));
+    let result = handle.await.expect("authorized edge execution join");
+
+    assert!(!result.is_error, "{result:?}");
+    assert_eq!(result.output, "authorized-result");
+    assert_eq!(authorization_calls.load(Ordering::SeqCst), 1);
+    let observed = observed_request
+        .lock()
+        .expect("authorization request lock")
+        .take()
+        .expect("authorization request");
+    assert_eq!(
+        observed.0.get(axum::http::header::AUTHORIZATION),
+        Some(&axum::http::HeaderValue::from_static(
+            "Bearer runtime-grant"
+        ))
+    );
+    assert_eq!(observed.1["task_id"], "task-1");
+    assert_eq!(observed.1["executor_id"], "runner-selected");
+    assert_eq!(
+        *dispatch
+            .inserted_edge_agent_ids
+            .lock()
+            .expect("inserted edge agent ids lock"),
+        vec!["runner-selected".to_string()]
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn revoked_provider_executor_authorization_blocks_before_socket_or_durable_dispatch() {
     let authorization_calls = Arc::new(AtomicUsize::new(0));
     let calls = Arc::clone(&authorization_calls);

@@ -1916,6 +1916,41 @@ mod tests {
             .expect("direct admission");
 
         assert_eq!(admission, EdgeDirectDispatchAdmission::Claimed);
+        let persisted = sqlx::query(
+            "SELECT edge_agent_id, CAST(payload_json AS CHAR) AS payload_json, status \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? \
+               AND turn_chain_id = ? AND request_id = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("direct admission must persist its claimed row");
+        assert_eq!(
+            persisted
+                .try_get::<String, _>("edge_agent_id")
+                .expect("persisted edge owner"),
+            edge_agent_id
+        );
+        assert_eq!(
+            persisted
+                .try_get::<String, _>("status")
+                .expect("persisted dispatch status"),
+            "dispatched"
+        );
+        assert!(
+            json_payloads_match(
+                &persisted
+                    .try_get::<String, _>("payload_json")
+                    .expect("persisted dispatch payload"),
+                &payload,
+            )
+            .expect("persisted direct payload is valid JSON")
+        );
         assert!(
             relay
                 .poll_pending(&user_id, &edge_agent_id)

@@ -112,6 +112,16 @@ fn valid_lowercase_md5(md5: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
+    reqwest::Url::parse(endpoint).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
 use crate::observability::ObservabilityHub;
@@ -2143,6 +2153,7 @@ fn build_server_skill_executor(
     edge_tools: &[Value],
     edge_profile: &Map<String, Value>,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
+    workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     runtime_edge_dispatch_authorization: Option<
         Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>,
@@ -2155,6 +2166,8 @@ fn build_server_skill_executor(
     user_id: &str,
     session_id: &str,
     edge_connection_pool: Option<&astra_server_types::edge_connection_pool::EdgeConnectionPool>,
+    edge_dispatch_service: Option<&Arc<dyn astra_services::multi_agent::EdgeDispatchService>>,
+    edge_registry_service: Option<&Arc<dyn astra_services::multi_agent::EdgeRegistryService>>,
     cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     memory_extraction_service: Option<&Arc<crate::session_memory::MemoryExtractionService>>,
     interaction_sink: Option<Arc<dyn server_loop_host::HostInteractionSink>>,
@@ -2176,6 +2189,7 @@ fn build_server_skill_executor(
     .with_admitted_model_execution(admitted_model_execution.cloned())
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
+    .with_workspace_record(workspace_record)
     .with_runtime_file_transfer(runtime_file_transfer)
     .with_runtime_edge_dispatch_authorization(runtime_edge_dispatch_authorization)
     .with_forward_headers(forward_headers.clone())
@@ -2195,6 +2209,12 @@ fn build_server_skill_executor(
     }
     if let Some(pool) = edge_connection_pool {
         subrun_executor = subrun_executor.with_edge_connection_pool(pool.clone());
+    }
+    if let Some(service) = edge_dispatch_service {
+        subrun_executor = subrun_executor.with_edge_dispatch_service(Arc::clone(service));
+    }
+    if let Some(service) = edge_registry_service {
+        subrun_executor = subrun_executor.with_edge_registry_service(Arc::clone(service));
     }
     #[cfg(feature = "harness")]
     if let Some(sink) = harness_sink {
@@ -5029,12 +5049,34 @@ impl AgenticRunLifecycleService {
         if !request.provider_runtime_authorized {
             return Err("file_transfer requires provider-authorized runtime context".to_string());
         }
+        let edge_workspace = request.workspace_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.kind,
+                astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+            )
+        });
+        let edge_executor = request.executor_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.kind,
+                astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            ) && matches!(
+                binding.transport,
+                Some(
+                    astra_services::runs::ToolTransportKindRequest::EdgeWs
+                        | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
+                )
+            )
+        });
+        if !edge_workspace || !edge_executor {
+            return Err(
+                "file_transfer requires an edge_workspace and Edge WebSocket executor".to_string(),
+            );
+        }
         if descriptor.id != "moi-runtime-files"
             || descriptor.descriptor_type != "file_transfer"
             || descriptor.transport != "http"
             || descriptor.protocol != "moi_runtime_files_v1"
-            || !(descriptor.endpoint_url.starts_with("http://")
-                || descriptor.endpoint_url.starts_with("https://"))
+            || !valid_runtime_http_endpoint(&descriptor.endpoint_url)
         {
             return Err("file_transfer descriptor contract is invalid".to_string());
         }
@@ -5155,8 +5197,7 @@ impl AgenticRunLifecycleService {
         if descriptor.id != executor_id
             || descriptor.descriptor_type != "edge_agent"
             || descriptor.transport != "edge_ws"
-            || !(descriptor.endpoint_url.starts_with("http://")
-                || descriptor.endpoint_url.starts_with("https://"))
+            || !valid_runtime_http_endpoint(&descriptor.endpoint_url)
         {
             return Err(
                 "runtime executor authorization descriptor contract is invalid".to_string(),
@@ -7184,6 +7225,7 @@ impl AgenticRunLifecycleService {
             &edge_tools,
             &edge_profile,
             execution_bindings,
+            provider_effective_workspace_record(None, request.provider_workspace_id.as_deref()),
             Self::runtime_file_transfer_context(request)
                 .expect("runtime file transfer was validated before state construction"),
             Self::runtime_edge_dispatch_authorization_context(request)
@@ -7196,6 +7238,8 @@ impl AgenticRunLifecycleService {
             user_id,
             session_id,
             self.edge_connection_pool.as_ref(),
+            self.edge_dispatch_service.as_ref(),
+            self.edge_registry_service.as_ref(),
             cancel_token,
             memory_extraction_service.as_ref(),
             interaction_sink,

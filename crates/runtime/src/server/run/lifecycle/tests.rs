@@ -5807,6 +5807,22 @@ fn file_transfer_request_with_attachments(
     request.runtime_auth = Some(RuntimeAuthRequest {
         authorization: "Bearer runtime-grant".to_string(),
     });
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Managed sandbox".to_string()),
+        root: Some("/sandbox".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/sandbox".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("sbx-test".to_string()),
+        display_name: Some("Managed sandbox".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
     let mut descriptor = test_runtime_descriptor(
         "moi-runtime-files",
         "file_transfer",
@@ -5893,6 +5909,55 @@ fn runtime_file_transfer_rejects_edge_invalid_attachment_inventory_at_request_bo
         )
         .expect_err("invalid inventory must be rejected before edge dispatch");
         assert_eq!(error, "file_transfer attachment inventory is invalid");
+    }
+}
+
+#[test]
+fn runtime_file_transfer_rejects_non_edge_execution_boundary() {
+    let mut request = file_transfer_request_with_attachment(json!({
+        "file_id": "file-1",
+        "name": "paper.pdf",
+        "size": 512,
+        "md5": "0123456789abcdef0123456789abcdef"
+    }));
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+        display_name: Some("Server sandbox".to_string()),
+        root: Some("/sandbox".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
+        executor_id: Some("server".to_string()),
+        display_name: Some("Server".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+
+    assert_eq!(
+        AgenticRunLifecycleService::runtime_file_transfer_context(&request).unwrap_err(),
+        "file_transfer requires an edge_workspace and Edge WebSocket executor"
+    );
+}
+
+#[test]
+fn runtime_provider_endpoints_require_plain_http_authority() {
+    for endpoint in [
+        "http://127.0.0.1:18001/runtime-files",
+        "https://moi.example/runtime-executors/authorize?version=1",
+    ] {
+        assert!(valid_runtime_http_endpoint(endpoint), "{endpoint}");
+    }
+
+    for endpoint in [
+        "ftp://moi.example/runtime-files",
+        "http://",
+        "https://user@moi.example/runtime-files",
+        "https://moi.example/runtime-files#fragment",
+        "not-a-url",
+    ] {
+        assert!(!valid_runtime_http_endpoint(endpoint), "{endpoint}");
     }
 }
 

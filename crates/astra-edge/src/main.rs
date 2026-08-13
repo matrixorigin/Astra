@@ -454,6 +454,8 @@ fn edge_invocation_journal_path_in_root(
 /// enforces this via [`canonical_workspace_dir`] before calling here.
 fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Value {
     let registry = ToolRegistry::builtins();
+    #[cfg(unix)]
+    let managed_file_transfer_supported = workspace.starts_with(Path::new("/sandbox"));
     let workspace = workspace.to_string_lossy().to_string();
     let binding = RunBinding::resolve(
         WorkspaceBinding::edge_workspace(workspace, WorkspaceAuthority::ReadWrite),
@@ -465,9 +467,13 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
 
     let mut advertisement = serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
         .expect("runtime environment advertisement serializes");
-    advertisement["protocol_capabilities"] = serde_json::json!({
-        "managed_file_transfer_v1": true,
-    });
+    advertisement["protocol_capabilities"] = serde_json::json!({});
+    #[cfg(unix)]
+    if managed_file_transfer_supported {
+        advertisement["protocol_capabilities"]
+            [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY] =
+            Value::Bool(true);
+    }
     advertisement
 }
 
@@ -1718,10 +1724,10 @@ mod tests {
             value["binding"]["capabilities"]["runtime"]["runtime_has_git"],
             true
         );
-        assert_eq!(
+        assert!(
             value["protocol_capabilities"]
-                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
-            true
+                .get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
+                .is_none()
         );
         assert!(
             value["binding"]["tool_surface"]["tool_names"]
@@ -1729,6 +1735,18 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|name| name.as_str() == Some("bash"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_sandbox_edge_advertises_file_transfer_capability() {
+        let value = edge_runtime_environment_capabilities("edge-managed", Path::new("/sandbox"));
+
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
+            true
         );
     }
 
