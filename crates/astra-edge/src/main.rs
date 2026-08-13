@@ -1495,7 +1495,7 @@ mod tests {
             .await
             .expect("bind websocket test server");
         let address = listener.local_addr().expect("websocket server address");
-        let expected_catalog_file = transfer_root.join("catalog/input.txt");
+        let expected_catalog_file = transfer_root.join("catalog/000000-input.txt");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept edge connection");
             let mut websocket = tokio_tungstenite::accept_async(stream)

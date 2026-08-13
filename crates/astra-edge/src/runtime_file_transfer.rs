@@ -965,7 +965,7 @@ mod tests {
 
         assert!(!result.is_error, "{result:?}");
         assert_eq!(
-            std::fs::read(temp.path().join("catalog/input.txt")).unwrap(),
+            std::fs::read(temp.path().join("catalog/000000-input.txt")).unwrap(),
             b"hello"
         );
     }
