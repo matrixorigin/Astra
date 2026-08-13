@@ -895,7 +895,7 @@ fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> Value {
     )
     .expect("serialize edge runtime environment advertisement");
     advertisement["protocol_capabilities"] = serde_json::json!({
-        astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+        "managed_file_transfer_v1": true,
     });
     advertisement
 }

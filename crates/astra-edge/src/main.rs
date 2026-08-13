@@ -465,8 +465,8 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
 
     let mut advertisement = serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
         .expect("runtime environment advertisement serializes");
-    advertisement["protocol_capabilities"] = json!({
-        astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+    advertisement["protocol_capabilities"] = serde_json::json!({
+        "managed_file_transfer_v1": true,
     });
     advertisement
 }

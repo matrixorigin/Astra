@@ -1460,7 +1460,7 @@ fn validate_edge_capabilities(
     let mut sanitized = serde_json::to_value(&advert).ok()?;
     if managed_file_transfer_v1 {
         sanitized["protocol_capabilities"] = serde_json::json!({
-            astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+            "managed_file_transfer_v1": true,
         });
     }
     Some(sanitized)
@@ -1714,7 +1714,7 @@ mod tests {
     fn validate_edge_capabilities_preserves_known_protocol_versions_only() {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["protocol_capabilities"] = serde_json::json!({
-            astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY: true,
+            "managed_file_transfer_v1": true,
             "unrecognized_future_protocol": true,
         });
 
