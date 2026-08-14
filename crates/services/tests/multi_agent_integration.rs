@@ -373,6 +373,41 @@ async fn edge_registry_reads_json_typed_capabilities_across_all_record_paths() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn edge_registry_rejects_scalar_capabilities_before_persisting() {
+    let db = IsolatedEdgeRegistryDatabase::new().await;
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let edge_agent = format!("it-edge-{}", Uuid::new_v4());
+    let registry = DatabaseEdgeRegistryService::new(db.pool.clone());
+
+    let error = registry
+        .register_or_update(
+            &user,
+            &edge_agent,
+            "transport-a",
+            None,
+            None,
+            Some(serde_json::json!("bash")),
+            None,
+        )
+        .await
+        .expect_err("top-level scalar capabilities must be rejected");
+    assert_eq!(error, "capabilities must be a JSON object");
+
+    let persisted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?",
+    )
+    .bind(&user)
+    .bind(&edge_agent)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count rejected edge registry rows");
+    assert_eq!(persisted, 0);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
 async fn task_lease_second_holder_gets_contested() {
     let shared = setup_pool().await;
     let pool = shared.get().clone();

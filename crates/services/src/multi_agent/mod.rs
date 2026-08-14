@@ -21,7 +21,7 @@ pub use edge_dispatch::{
 };
 pub use edge_registry::{
     DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistrationLease, EdgeRegistryService,
-    HeartbeatError, UnconfiguredEdgeRegistryService,
+    HeartbeatError, UnconfiguredEdgeRegistryService, validate_edge_capabilities_shape,
 };
 pub use hold_cache::TaskLeaseHoldCache;
 pub use lease_renewal::{LeaseRenewalConfig, LeaseRenewalTask};

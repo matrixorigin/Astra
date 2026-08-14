@@ -20,6 +20,29 @@ const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, ed
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
 
+pub const EDGE_CAPABILITIES_OBJECT_REQUIRED: &str = "capabilities must be a JSON object";
+
+/// Capability advertisements are structured objects. Enforce that contract at
+/// the service boundary so every caller, not only the HTTP handler, is covered.
+pub fn validate_edge_capabilities_shape(
+    capabilities: Option<&serde_json::Value>,
+) -> Result<(), &'static str> {
+    match capabilities {
+        None | Some(serde_json::Value::Object(_)) => Ok(()),
+        Some(_) => Err(EDGE_CAPABILITIES_OBJECT_REQUIRED),
+    }
+}
+
+fn serialize_edge_capabilities(
+    capabilities: Option<&serde_json::Value>,
+) -> Result<Option<String>, String> {
+    validate_edge_capabilities_shape(capabilities).map_err(str::to_string)?;
+    capabilities
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("capabilities json: {error}"))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EdgeAgentRecord {
     pub registry_id: String,
@@ -264,11 +287,7 @@ impl DatabaseEdgeRegistryService {
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
     ) -> Result<EdgeRegistrationLease, String> {
-        let cap_json = capabilities
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| format!("capabilities json: {e}"))?;
+        let cap_json = serialize_edge_capabilities(capabilities.as_ref())?;
         const MAX_RETRIES: u32 = 5;
         let claim_id = uuid::Uuid::new_v4().to_string();
 
@@ -502,10 +521,7 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
         let capabilities_for_record = capabilities.clone();
-        let cap_json = capabilities
-            .map(|v| serde_json::to_string(&v))
-            .transpose()
-            .map_err(|e| format!("capabilities json: {e}"))?;
+        let cap_json = serialize_edge_capabilities(capabilities.as_ref())?;
 
         // MatrixOne does not reliably fire ON DUPLICATE KEY UPDATE for UNIQUE KEY
         // violations (only PRIMARY KEY). Use SELECT-then-UPDATE-or-INSERT instead.
@@ -987,6 +1003,7 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
+        validate_edge_capabilities_shape(capabilities.as_ref()).map_err(str::to_string)?;
         let now = chrono::Utc::now()
             .format("%Y-%m-%d %H:%M:%S%.6f")
             .to_string();
@@ -1048,6 +1065,25 @@ mod tests {
                 .contains("JSON_UNQUOTE(capabilities_json) AS capabilities_json")
         );
         assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
+    }
+
+    #[test]
+    fn edge_capabilities_contract_accepts_only_objects_or_absence() {
+        assert!(validate_edge_capabilities_shape(None).is_ok());
+        assert!(validate_edge_capabilities_shape(Some(&serde_json::json!({}))).is_ok());
+
+        for invalid in [
+            serde_json::json!("bash"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(["bash"]),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(
+                validate_edge_capabilities_shape(Some(&invalid)),
+                Err(EDGE_CAPABILITIES_OBJECT_REQUIRED)
+            );
+        }
     }
 
     struct FakeEdgeRegistryRow {
