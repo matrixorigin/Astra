@@ -7,7 +7,7 @@
 //! Uses `MATRIXONE_*` env vars (after `dotenvy`) with the same defaults as local dev (`127.0.0.1:6001`, …).
 //! Effective database name includes optional `ASTRA_DATABASE_PREFIX` (same as `AppSettings`).
 
-use astra_core::SharedPool;
+use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::multi_agent::{
     DatabaseEdgeRegistryService, DatabaseTaskLeaseService, EdgeRegistryService, LeaseClaimResult,
     NextClaimableLeaseClaimResult, TaskLeaseHoldCache, TaskLeaseService,
@@ -16,7 +16,7 @@ use astra_services::multi_agent::{
 use astra_services::task_orchestrator::{
     MatrixOneTaskService, TaskRecord, TaskService, TaskStatus,
 };
-use sqlx::Row;
+use sqlx::{MySql, Pool, Row, mysql::MySqlPoolOptions, query};
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -24,6 +24,83 @@ use uuid::Uuid;
 mod common;
 
 const EXPIRED_TASK_LEASE_AT: &str = "2000-01-01 00:00:00.000000";
+
+struct IsolatedEdgeRegistryDatabase {
+    settings: MatrixOneSettings,
+    pool: Pool<MySql>,
+    admin_pool: Pool<MySql>,
+}
+
+impl IsolatedEdgeRegistryDatabase {
+    async fn new() -> Self {
+        let mut settings = common::require_db_it_env();
+        settings.database = format!("astra_edge_registry_json_it_{}", Uuid::new_v4().simple());
+        settings.db_pool_max_connections = 4;
+        settings.db_pool_min_connections = 1;
+
+        let bootstrap_catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
+            .unwrap_or_else(|_| "mysql".to_string());
+        let mut admin_settings = settings.clone();
+        admin_settings.database = bootstrap_catalog;
+        let admin_pool = MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_settings.database_url_with_password())
+            .await
+            .expect("connect MatrixOne bootstrap catalog");
+        query(&format!("CREATE DATABASE `{}`", settings.database))
+            .execute(&admin_pool)
+            .await
+            .expect("create isolated edge registry database");
+        let pool = MySqlPoolOptions::new()
+            .max_connections(4)
+            .connect(&settings.database_url_with_password())
+            .await
+            .expect("connect isolated edge registry database");
+        query(
+            "CREATE TABLE edge_agent_registry (
+                user_id VARCHAR(128) NOT NULL,
+                registry_id VARCHAR(64) NOT NULL,
+                edge_agent_id VARCHAR(255) NOT NULL,
+                edge_id VARCHAR(128) NOT NULL,
+                hostname VARCHAR(255) NULL,
+                worktree_path VARCHAR(512) NULL,
+                capabilities_json JSON NULL,
+                workspace_id VARCHAR(512) NULL,
+                registration_claim_id VARCHAR(64) NULL,
+                registration_claim_expires_at DATETIME(6) NULL,
+                registration_state TINYINT NOT NULL DEFAULT 1,
+                registration_previous_edge_id VARCHAR(128) NULL,
+                registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                PRIMARY KEY (user_id, registry_id),
+                UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
+                INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
+                INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create JSON-typed edge registry table");
+
+        Self {
+            settings,
+            pool,
+            admin_pool,
+        }
+    }
+
+    async fn cleanup(self) {
+        self.pool.close().await;
+        query(&format!(
+            "DROP DATABASE IF EXISTS `{}`",
+            self.settings.database
+        ))
+        .execute(&self.admin_pool)
+        .await
+        .expect("drop isolated edge registry database");
+        self.admin_pool.close().await;
+    }
+}
 
 async fn setup_pool() -> SharedPool {
     common::setup_pool().await
@@ -190,6 +267,85 @@ async fn edge_registry_register_twice_keeps_registry_id() {
         .expect("heartbeat");
 
     cleanup_edge(&pool, &user, &edge_agent).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
+async fn edge_registry_reads_json_typed_capabilities_across_all_record_paths() {
+    let db = IsolatedEdgeRegistryDatabase::new().await;
+    let user = format!("it-u-{}", Uuid::new_v4());
+    let edge_agent = format!("it-edge-{}", Uuid::new_v4());
+    let workspace = format!("it-ws-{}", Uuid::new_v4());
+    let original_capabilities = serde_json::json!({
+        "protocol_capabilities": {"managed_file_transfer_v1": true},
+        "tools": ["bash"]
+    });
+    let updated_capabilities = serde_json::json!({
+        "protocol_capabilities": {"managed_file_transfer_v1": true},
+        "tools": ["bash", "read_file"]
+    });
+    let registry = DatabaseEdgeRegistryService::new(db.pool.clone());
+
+    registry
+        .register_or_update(
+            &user,
+            &edge_agent,
+            "transport-a",
+            Some("runner-host"),
+            Some("/workspace"),
+            Some(original_capabilities.clone()),
+            Some(&workspace),
+        )
+        .await
+        .expect("insert JSON-typed edge registry capabilities");
+
+    let lease = registry
+        .register_or_update_with_lease(
+            &user,
+            &edge_agent,
+            "transport-b",
+            Some("runner-host"),
+            Some("/workspace"),
+            Some(updated_capabilities.clone()),
+            Some(&workspace),
+        )
+        .await
+        .expect("lease lookup decodes JSON-typed capabilities");
+    assert_eq!(
+        lease
+            .previous
+            .as_ref()
+            .and_then(|record| record.capabilities.as_ref()),
+        Some(&original_capabilities)
+    );
+    assert!(
+        registry
+            .finalize_registration(&lease)
+            .await
+            .expect("finalize registration")
+    );
+    assert!(
+        registry
+            .release_registration(&lease)
+            .await
+            .expect("release registration claim")
+    );
+
+    let resolved = registry
+        .find_by_agent_id_and_workspace(&edge_agent, Some(&workspace))
+        .await
+        .expect("workspace lookup decodes JSON-typed capabilities")
+        .expect("workspace-scoped edge record");
+    assert_eq!(resolved.capabilities.as_ref(), Some(&updated_capabilities));
+
+    let listed = registry
+        .list_by_user(&user)
+        .await
+        .expect("user listing decodes JSON-typed capabilities");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].capabilities.as_ref(), Some(&updated_capabilities));
+
+    db.cleanup().await;
 }
 
 #[tokio::test]
