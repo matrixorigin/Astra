@@ -7,9 +7,19 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version to publish, e.g. 0.1.0 or v0.1.0'
-        required: true
+        description: 'Docker tag to publish (defaults to <YYYYMMDD>-<short-commit>)'
+        required: false
+        default: ''
         type: string
+      architecture:
+        description: 'Architecture to build (single-architecture tags get an architecture suffix)'
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
 
 env:
   IMAGE_NAME: matrixorigin/astra
@@ -18,43 +28,98 @@ env:
 
 jobs:
   version:
-    name: Resolve Version
+    name: Resolve Image Settings
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.release.outputs.version }}
       image_version: ${{ steps.release.outputs.image_version }}
+      rolling_version: ${{ steps.release.outputs.rolling_version }}
       latest: ${{ steps.release.outputs.latest }}
+      matrix: ${{ steps.release.outputs.matrix }}
 
     steps:
-      - name: Resolve release version
+      - name: Resolve image tag and build matrix
         id: release
         shell: bash
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           set -euo pipefail
 
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            version="${INPUT_VERSION}"
+            if [ -n "${INPUT_VERSION}" ]; then
+              image_version="${INPUT_VERSION}"
+            else
+              image_version="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
+            fi
+            architecture="${INPUT_ARCHITECTURE:-all}"
           else
-            version="${GITHUB_REF_NAME}"
+            image_version="${GITHUB_REF_NAME#v}"
+            architecture=all
           fi
 
-          if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release version: ${version}" >&2
-            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
+          # Keep the previous behavior for semantic versions while preserving
+          # a leading "v" on non-semver custom tags.
+          if [[ "${image_version}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
+            image_version="${BASH_REMATCH[1]}"
+          fi
+
+          validate_tag() {
+            local tag="$1"
+            if [[ ! "${tag}" =~ ^[0-9A-Za-z_][0-9A-Za-z_.-]{0,127}$ ]]; then
+              echo "Invalid Docker tag: ${tag}" >&2
+              echo "A tag must start with a letter, digit, or underscore; contain only letters, digits, underscores, periods, and dashes; and be at most 128 characters." >&2
+              exit 1
+            fi
+          }
+          validate_tag "${image_version}"
+
+          case "${image_version}" in
+            latest|buildcache|buildcache-*)
+              echo "Reserved Docker tag: ${image_version}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${image_version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+            echo "Reserved rolling-version tag: ${image_version}" >&2
             exit 1
           fi
 
-          image_version="${version#v}"
-          latest=true
-          if [[ "${image_version}" == *-* ]]; then
-            latest=false
-          fi
+          rolling_version=""
+          latest=false
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          case "${architecture}" in
+            all)
+              matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
+              if [[ "${image_version}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
+                rolling_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+                latest=true
+              fi
+              ;;
+            amd64)
+              if [[ "${image_version}" != *-amd64 ]]; then
+                image_version="${image_version}-amd64"
+              fi
+              validate_tag "${image_version}"
+              matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"}]}'
+              ;;
+            arm64)
+              if [[ "${image_version}" != *-arm64 ]]; then
+                image_version="${image_version}-arm64"
+              fi
+              validate_tag "${image_version}"
+              matrix='{"include":[{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
+              ;;
+            *)
+              echo "Unsupported architecture: ${architecture}" >&2
+              exit 1
+              ;;
+          esac
+
           echo "image_version=${image_version}" >> "${GITHUB_OUTPUT}"
+          echo "rolling_version=${rolling_version}" >> "${GITHUB_OUTPUT}"
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -63,14 +128,7 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - platform: linux/amd64
-            runner: ubuntu-latest
-            slug: linux-amd64
-          - platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            slug: linux-arm64
+      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@v4
@@ -89,8 +147,8 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
+            type=raw,value=${{ needs.version.outputs.image_version }}
+            type=raw,value=${{ needs.version.outputs.rolling_version }},enable=${{ needs.version.outputs.latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
       - uses: docker/build-push-action@v6
@@ -156,8 +214,8 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=semver,pattern={{version}},value=${{ needs.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.version }},enable=${{ needs.version.outputs.latest == 'true' }}
+            type=raw,value=${{ needs.version.outputs.image_version }}
+            type=raw,value=${{ needs.version.outputs.rolling_version }},enable=${{ needs.version.outputs.latest == 'true' }}
             type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
 
       - name: Create DockerHub manifest list
@@ -215,6 +273,7 @@ jobs:
         shell: bash
         env:
           IMAGE_VERSION: ${{ needs.version.outputs.image_version }}
+          ROLLING_VERSION: ${{ needs.version.outputs.rolling_version }}
           PUBLISH_LATEST: ${{ needs.version.outputs.latest }}
           SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
           TARGET_IMAGE: ${{ env.IDC_IMAGE_NAME }}
@@ -229,7 +288,7 @@ jobs:
 
           tags=("${IMAGE_VERSION}")
           if [ "${PUBLISH_LATEST}" = "true" ]; then
-            tags+=("${IMAGE_VERSION%.*}" "latest")
+            tags+=("${ROLLING_VERSION}" "latest")
           fi
           for tag in "${tags[@]}"; do
             crane copy --platform=all --jobs 2 \
