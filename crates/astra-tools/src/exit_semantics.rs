@@ -146,6 +146,13 @@ pub fn classify_command_result(
     // "test failed". Treating those phrases as control signals turns inspected
     // text into a false runtime failure.
     if let Some(code) = exit_code {
+        // POSIX shells reserve 126 for "found but not executable" and 127 for
+        // "command not found". Both are authoritative environment failures;
+        // do not depend on localized or concurrently truncated stderr text to
+        // preserve that classification.
+        if matches!(code, 126 | 127) {
+            return CommandResultClass::EnvFailure;
+        }
         match classify_exit(command, code) {
             ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
                 return CommandResultClass::Success;
@@ -787,6 +794,17 @@ mod tests {
             ),
             CommandResultClass::EnvFailure
         );
+    }
+
+    #[test]
+    fn reserved_shell_status_is_env_failure_without_output() {
+        for code in [126, 127] {
+            assert_eq!(
+                classify_command_result("missing-command", "", "", Some(code)),
+                CommandResultClass::EnvFailure,
+                "{code}"
+            );
+        }
     }
 
     #[test]

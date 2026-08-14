@@ -1012,6 +1012,10 @@ impl PreparedWriteFile {
     }
 
     pub fn apply(&self) -> ToolResult {
+        self.apply_with_formatting(true)
+    }
+
+    fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if let Some(parent) = self.path.parent()
             && let Err(e) = std::fs::create_dir_all(parent)
         {
@@ -1023,6 +1027,7 @@ impl PreparedWriteFile {
             self.content.as_bytes(),
             false,
             self.original_content_hash.as_deref(),
+            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = format!(
@@ -1092,6 +1097,13 @@ pub fn write_file(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
+pub(crate) fn write_file_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
+    match prepare_write_file(workspace_root, args) {
+        Ok(prepared) => prepared.apply_with_formatting(false),
+        Err(error) => error,
+    }
+}
+
 #[derive(Debug)]
 pub struct PreparedStrReplace {
     path: PathBuf,
@@ -1118,6 +1130,10 @@ impl PreparedStrReplace {
     }
 
     pub fn apply(self) -> ToolResult {
+        self.apply_with_formatting(true)
+    }
+
+    fn apply_with_formatting(self, format_staging: bool) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(self.success_message);
         }
@@ -1126,6 +1142,7 @@ impl PreparedStrReplace {
             self.new_content.as_bytes(),
             self.allow_structural_change,
             self.original_content_hash.as_deref(),
+            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = self.success_message;
@@ -1312,15 +1329,27 @@ pub fn prepare_str_replace(
 }
 
 pub fn str_replace(workspace_root: &Path, args: &Value) -> ToolResult {
+    str_replace_with_formatting(workspace_root, args, true)
+}
+
+pub(crate) fn str_replace_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
+    str_replace_with_formatting(workspace_root, args, false)
+}
+
+fn str_replace_with_formatting(
+    workspace_root: &Path,
+    args: &Value,
+    format_staging: bool,
+) -> ToolResult {
     let args = match normalize_str_replace_args(args) {
         Ok(args) => args,
         Err(error) => return ToolResult::error(error),
     };
     if args.get("edits").and_then(Value::as_array).is_some() {
-        return multi_path_edit(workspace_root, &args);
+        return multi_path_edit(workspace_root, &args, format_staging);
     }
     match prepare_str_replace(workspace_root, &args) {
-        Ok(prepared) => prepared.apply(),
+        Ok(prepared) => prepared.apply_with_formatting(format_staging),
         Err(error) => error,
     }
 }
@@ -1351,6 +1380,10 @@ impl PreparedMultiEdit {
     }
 
     pub fn apply(&self) -> ToolResult {
+        self.apply_with_formatting(true)
+    }
+
+    fn apply_with_formatting(&self, format_staging: bool) -> ToolResult {
         if self.dry_run {
             return ToolResult::text(format!(
                 "Dry run: {} edit(s) would be applied to {}",
@@ -1363,6 +1396,7 @@ impl PreparedMultiEdit {
             self.new_content.as_bytes(),
             self.allow_structural_change,
             self.original_content_hash.as_deref(),
+            format_staging,
         ) {
             Ok(warning) => {
                 let mut message = format!(
@@ -1618,13 +1652,20 @@ pub fn multi_edit(workspace_root: &Path, args: &Value) -> ToolResult {
     }
 }
 
+pub(crate) fn multi_edit_without_formatter(workspace_root: &Path, args: &Value) -> ToolResult {
+    match prepare_multi_edit(workspace_root, args) {
+        Ok(prepared) => prepared.apply_with_formatting(false),
+        Err(error) => error,
+    }
+}
+
 #[derive(Debug)]
 struct PreparedMultiPathEdit {
     prepared: Vec<PreparedMultiEdit>,
 }
 
 impl PreparedMultiPathEdit {
-    fn apply(&self) -> ToolResult {
+    fn apply(&self, format_staging: bool) -> ToolResult {
         if self.prepared.iter().all(|prepared| prepared.dry_run) {
             let messages: Vec<String> = self
                 .prepared
@@ -1693,7 +1734,12 @@ impl PreparedMultiPathEdit {
             }
 
             // Format the staging file (best-effort, same as single-file path).
-            let warning = match format_file_in_place_best_effort(&staging_path) {
+            let formatter_outcome = if format_staging {
+                format_file_in_place_best_effort(&staging_path)
+            } else {
+                FormatterOutcome::NotFound
+            };
+            let warning = match formatter_outcome {
                 FormatterOutcome::Success | FormatterOutcome::NotFound => None,
                 FormatterOutcome::Warning(w) => Some(w),
                 FormatterOutcome::SyntaxError(error) => {
@@ -1776,9 +1822,9 @@ impl PreparedMultiPathEdit {
     }
 }
 
-fn multi_path_edit(workspace_root: &Path, args: &Value) -> ToolResult {
+fn multi_path_edit(workspace_root: &Path, args: &Value, format_staging: bool) -> ToolResult {
     match prepare_multi_path_edit(workspace_root, args) {
-        Ok(prepared) => prepared.apply(),
+        Ok(prepared) => prepared.apply(format_staging),
         Err(error) => error,
     }
 }
@@ -2145,6 +2191,7 @@ fn write_file_atomic_with_format(
     content: &[u8],
     allow_formatter_syntax_error: bool,
     expected_original_hash: Option<&str>,
+    format_staging: bool,
 ) -> Result<Option<String>, String> {
     // Verify the file hasn't been modified since we read it.
     verify_expected_original_hash(path, expected_original_hash)?;
@@ -2162,7 +2209,12 @@ fn write_file_atomic_with_format(
         return Err(format!("Error: Cannot stage write: {e}"));
     }
 
-    let warning = match format_file_in_place_best_effort(&tmp) {
+    let formatter_outcome = if format_staging {
+        format_file_in_place_best_effort(&tmp)
+    } else {
+        FormatterOutcome::NotFound
+    };
+    let warning = match formatter_outcome {
         FormatterOutcome::Success | FormatterOutcome::NotFound => None,
         FormatterOutcome::Warning(warning) => Some(warning),
         FormatterOutcome::SyntaxError(error) => {
@@ -3520,7 +3572,7 @@ mod tests {
         let prepared = prepare_multi_path_edit(tmp.path(), &args).expect("prepared");
         std::fs::write(&b, "external change").unwrap();
 
-        let result = prepared.apply();
+        let result = prepared.apply(true);
 
         assert!(result.is_error, "stale target must fail: {}", result.output);
         assert!(
@@ -4815,7 +4867,8 @@ mod tests {
         std::fs::write(&target, "original\n").unwrap();
 
         let _warning =
-            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None).unwrap();
+            write_file_atomic_with_format(&target, b"pub fn new_body() {}\n", false, None, true)
+                .unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "pub fn new_body() {}\n",
@@ -4840,7 +4893,7 @@ mod tests {
         // End-to-end: write, check content lands.
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("hello.txt");
-        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None);
+        let result = write_file_atomic_with_format(&target, b"hello world\n", false, None, true);
         assert!(result.is_ok(), "atomic write must succeed: {result:?}");
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello world\n");
     }
@@ -4865,7 +4918,7 @@ mod tests {
             ro.set_mode(0o500); // r-x only, no write for owner
             std::fs::set_permissions(tmp.path(), ro).unwrap();
 
-            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None);
+            let result = write_file_atomic_with_format(&target, b"NEW\n", false, None, true);
 
             // Restore perms before asserting so tempdir drop works.
             std::fs::set_permissions(tmp.path(), orig_perm).unwrap();

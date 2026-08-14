@@ -579,16 +579,30 @@ impl DefaultToolExecutor {
                     .unwrap_or(false)
                 {
                     crate::fs_ops::delete_file(ws, args)
+                } else if self.filesystem_write_boundary.is_some() {
+                    crate::fs_ops::write_file_without_formatter(ws, args)
                 } else {
                     crate::fs_ops::write_file(ws, args)
                 }
             }
-            "str_replace" => crate::fs_ops::str_replace(ws, args),
+            "str_replace" => {
+                if self.filesystem_write_boundary.is_some() {
+                    crate::fs_ops::str_replace_without_formatter(ws, args)
+                } else {
+                    crate::fs_ops::str_replace(ws, args)
+                }
+            }
             "delete_file" => crate::fs_ops::delete_file(ws, args),
             "list_dir" => crate::fs_ops::list_dir(ws, args),
 
             // ── Multi-edit (atomic) ──────────────────────────────────
-            "multi_edit" => crate::fs_ops::multi_edit(ws, args),
+            "multi_edit" => {
+                if self.filesystem_write_boundary.is_some() {
+                    crate::fs_ops::multi_edit_without_formatter(ws, args)
+                } else {
+                    crate::fs_ops::multi_edit(ws, args)
+                }
+            }
 
             // ── Shell operations ─────────────────────────────────────
             "bash" => match &self.filesystem_write_boundary {
@@ -852,6 +866,12 @@ fn validate_host_owned_write_boundary(
     workspace_root: &Path,
     protected: &[std::path::PathBuf],
 ) -> Result<(), String> {
+    if matches!(name, "run_script" | "git") {
+        return Err(format!(
+            "Error: tool '{name}' cannot run outside the managed filesystem boundary; use bash so the command executes inside the protected mount namespace"
+        ));
+    }
+
     let mut paths = Vec::new();
     if matches!(
         name,
@@ -920,6 +940,76 @@ mod tests {
         let error = validate_host_owned_write_boundary("str_replace", &args, workspace, &protected)
             .expect_err("a nested edit path must not bypass the host-owned lane");
         assert!(error.contains("host-owned managed runtime paths"));
+    }
+
+    #[tokio::test]
+    async fn managed_boundary_rejects_run_script_before_python_can_write() {
+        let tmp = TempDir::new().unwrap();
+        let protected = tmp.path().join(".moi/runtime/task-1");
+        std::fs::create_dir_all(&protected).unwrap();
+        let sentinel = protected.join("owned.txt");
+        let exec = DefaultToolExecutor::new(ToolContext::test(tmp.path()))
+            .with_filesystem_write_boundary(vec![protected]);
+
+        let result = exec
+            .execute(
+                "run_script",
+                &serde_json::json!({
+                    "script": format!(
+                        "from pathlib import Path\nPath({:?}).write_text('owned')",
+                        sentinel
+                    )
+                }),
+            )
+            .await;
+
+        assert!(result.is_error, "run_script must fail closed");
+        assert!(
+            result.output.contains("managed filesystem boundary"),
+            "unexpected error: {}",
+            result.output
+        );
+        assert!(
+            !sentinel.exists(),
+            "Python must not run outside the boundary"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_boundary_rejects_git_hook_before_it_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = TempDir::new().unwrap();
+        init_git_repo(tmp.path());
+        let protected = tmp.path().join(".moi/runtime/task-1");
+        std::fs::create_dir_all(&protected).unwrap();
+        let sentinel = protected.join("owned.txt");
+        let hook = tmp.path().join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf owned > '{}'\n", sentinel.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(tmp.path().join("tracked.txt"), "content").unwrap();
+        let exec = DefaultToolExecutor::new(ToolContext::test(tmp.path()))
+            .with_filesystem_write_boundary(vec![protected]);
+
+        let result = exec
+            .execute(
+                "git",
+                &serde_json::json!({"action": "commit", "message": "must not run"}),
+            )
+            .await;
+
+        assert!(result.is_error, "structured git must fail closed");
+        assert!(
+            result.output.contains("managed filesystem boundary"),
+            "unexpected error: {}",
+            result.output
+        );
+        assert!(!sentinel.exists(), "the pre-commit hook must not execute");
     }
 
     #[test]
