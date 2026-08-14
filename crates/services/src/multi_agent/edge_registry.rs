@@ -12,10 +12,11 @@ use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 // MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
 // decodes this optional payload as text before serde_json validation. Keep all
-// EdgeAgentRecord reads on one projection so no query accidentally asks sqlx
-// to decode JSON directly into Option<String>.
+// EdgeAgentRecord reads on one unbounded projection so no query accidentally
+// asks sqlx to decode JSON directly into Option<String> or truncates large JSON
+// through MatrixOne's VARCHAR(65535)-bounded CAST(... AS CHAR).
 const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-     CAST(capabilities_json AS CHAR) AS capabilities_json, workspace_id, \
+     JSON_UNQUOTE(capabilities_json) AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
 
@@ -1041,11 +1042,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn edge_agent_record_projection_casts_matrixone_json_to_text() {
+    fn edge_agent_record_projection_extracts_matrixone_json_as_unbounded_text() {
         assert!(
             EDGE_AGENT_RECORD_COLUMNS
-                .contains("CAST(capabilities_json AS CHAR) AS capabilities_json")
+                .contains("JSON_UNQUOTE(capabilities_json) AS capabilities_json")
         );
+        assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
     }
 
     struct FakeEdgeRegistryRow {
