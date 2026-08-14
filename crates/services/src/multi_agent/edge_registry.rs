@@ -14,8 +14,7 @@ use crate::db_row::RowExt as EdgeRegistryDbRow;
 // decodes this optional payload as text before serde_json validation. Keep all
 // EdgeAgentRecord reads on one projection so no query accidentally asks sqlx
 // to decode JSON directly into Option<String>.
-const EDGE_AGENT_RECORD_COLUMNS: &str =
-    "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
+const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
      CAST(capabilities_json AS CHAR) AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
@@ -1043,8 +1042,10 @@ mod tests {
 
     #[test]
     fn edge_agent_record_projection_casts_matrixone_json_to_text() {
-        assert!(EDGE_AGENT_RECORD_COLUMNS
-            .contains("CAST(capabilities_json AS CHAR) AS capabilities_json"));
+        assert!(
+            EDGE_AGENT_RECORD_COLUMNS
+                .contains("CAST(capabilities_json AS CHAR) AS capabilities_json")
+        );
     }
 
     struct FakeEdgeRegistryRow {
