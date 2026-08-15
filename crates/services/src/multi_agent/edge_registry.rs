@@ -12,15 +12,16 @@ use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 // MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
 // decodes this optional payload as text before serde_json validation. Wrapping
-// the value in a one-element JSON array lets JSON_UNQUOTE produce unbounded
-// text without stripping quotes from a top-level JSON string; SUBSTRING removes
-// only the wrapper brackets. Keep every EdgeAgentRecord read on this projection
-// so no query asks sqlx to decode JSON directly or uses VARCHAR(65535)-bounded
-// CAST(... AS CHAR).
+// the parsed value in a one-element JSON array lets JSON_UNQUOTE produce
+// unbounded text without stripping quotes from a top-level JSON string;
+// SUBSTRING removes only the wrapper brackets. JSON_EXTRACT first normalizes
+// both the canonical TEXT schema and legacy JSON-typed columns to the same JSON
+// value. Keep every EdgeAgentRecord read on this projection so no query asks
+// sqlx to decode JSON directly or uses VARCHAR(65535)-bounded CAST(... AS CHAR).
 const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
      CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
-       SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(capabilities_json)), 2, \
-         LENGTH(JSON_UNQUOTE(JSON_ARRAY(capabilities_json))) - 2) \
+       SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$'))), 2, \
+         LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
      END AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
@@ -1050,7 +1051,10 @@ mod tests {
 
     #[test]
     fn edge_agent_record_projection_extracts_matrixone_json_as_unbounded_text() {
-        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("JSON_UNQUOTE(JSON_ARRAY(capabilities_json))"));
+        assert!(
+            EDGE_AGENT_RECORD_COLUMNS
+                .contains("JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))"),
+        );
         assert!(EDGE_AGENT_RECORD_COLUMNS.contains("END AS capabilities_json"));
         assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
     }

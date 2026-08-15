@@ -33,6 +33,11 @@ struct IsolatedEdgeRegistryDatabase {
 
 impl IsolatedEdgeRegistryDatabase {
     async fn new() -> Self {
+        Self::new_with_capabilities_column_type("JSON").await
+    }
+
+    async fn new_with_capabilities_column_type(capabilities_column_type: &str) -> Self {
+        assert!(matches!(capabilities_column_type, "JSON" | "TEXT"));
         let mut settings = common::require_db_it_env();
         settings.database = format!("astra_edge_registry_json_it_{}", Uuid::new_v4().simple());
         settings.db_pool_max_connections = 4;
@@ -56,7 +61,7 @@ impl IsolatedEdgeRegistryDatabase {
             .connect(&settings.database_url_with_password())
             .await
             .expect("connect isolated edge registry database");
-        query(
+        query(&format!(
             "CREATE TABLE edge_agent_registry (
                 user_id VARCHAR(128) NOT NULL,
                 registry_id VARCHAR(64) NOT NULL,
@@ -64,7 +69,7 @@ impl IsolatedEdgeRegistryDatabase {
                 edge_id VARCHAR(128) NOT NULL,
                 hostname VARCHAR(255) NULL,
                 worktree_path VARCHAR(512) NULL,
-                capabilities_json JSON NULL,
+                capabilities_json {capabilities_column_type} NULL,
                 workspace_id VARCHAR(512) NULL,
                 registration_claim_id VARCHAR(64) NULL,
                 registration_claim_expires_at DATETIME(6) NULL,
@@ -76,11 +81,11 @@ impl IsolatedEdgeRegistryDatabase {
                 UNIQUE KEY uq_edge_registry_user_agent (user_id, edge_agent_id),
                 INDEX idx_edge_registry_user_heartbeat (user_id, last_heartbeat_at),
                 INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)
-            )",
-        )
+            )"
+        ))
         .execute(&pool)
         .await
-        .expect("create JSON-typed edge registry table");
+        .expect("create isolated edge registry table");
 
         Self {
             settings,
@@ -373,83 +378,88 @@ async fn edge_registry_reads_json_typed_capabilities_across_all_record_paths() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne; see module doc"]
-async fn edge_registry_preserves_legacy_scalar_capabilities_across_all_record_paths() {
-    let db = IsolatedEdgeRegistryDatabase::new().await;
-    let user = format!("it-u-{}", Uuid::new_v4());
-    let edge_agent = format!("it-edge-{}", Uuid::new_v4());
-    let workspace = format!("it-ws-{}", Uuid::new_v4());
-    let registry_id = Uuid::new_v4().to_string();
-    let registry = DatabaseEdgeRegistryService::new(db.pool.clone());
-
-    query(
-        "INSERT INTO edge_agent_registry \
-         (user_id, registry_id, edge_agent_id, edge_id, capabilities_json, workspace_id) \
-         VALUES (?, ?, ?, 'transport-a', ?, ?)",
-    )
-    .bind(&user)
-    .bind(&registry_id)
-    .bind(&edge_agent)
-    .bind(serde_json::to_string(&serde_json::json!("bash")).expect("serialize legacy scalar"))
-    .bind(&workspace)
-    .execute(&db.pool)
-    .await
-    .expect("seed legacy scalar JSON capabilities");
-
-    let resolved = registry
-        .find_by_agent_id_and_workspace(&edge_agent, Some(&workspace))
-        .await
-        .expect("workspace lookup decodes legacy scalar capabilities")
-        .expect("workspace-scoped legacy edge record");
-    assert_eq!(resolved.capabilities, Some(serde_json::json!("bash")));
-
-    let listed = registry
-        .list_by_user(&user)
-        .await
-        .expect("user listing decodes legacy scalar capabilities");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].capabilities, Some(serde_json::json!("bash")));
-
-    let updated_capabilities = serde_json::json!(["bash", "read_file"]);
-    let lease = registry
-        .register_or_update_with_lease(
-            &user,
-            &edge_agent,
-            "transport-b",
-            None,
-            None,
-            Some(updated_capabilities.clone()),
-            Some(&workspace),
+async fn edge_registry_preserves_legacy_scalar_capabilities_in_json_and_text_schemas() {
+    for capabilities_column_type in ["JSON", "TEXT"] {
+        let db = IsolatedEdgeRegistryDatabase::new_with_capabilities_column_type(
+            capabilities_column_type,
         )
-        .await
-        .expect("lease lookup decodes legacy scalar capabilities");
-    assert_eq!(
-        lease
-            .previous
-            .as_ref()
-            .and_then(|record| record.capabilities.as_ref()),
-        Some(&serde_json::json!("bash"))
-    );
-    assert!(
-        registry
-            .finalize_registration(&lease)
-            .await
-            .expect("finalize array capabilities registration")
-    );
-    assert!(
-        registry
-            .release_registration(&lease)
-            .await
-            .expect("release array capabilities registration claim")
-    );
+        .await;
+        let user = format!("it-u-{}", Uuid::new_v4());
+        let edge_agent = format!("it-edge-{}", Uuid::new_v4());
+        let workspace = format!("it-ws-{}", Uuid::new_v4());
+        let registry_id = Uuid::new_v4().to_string();
+        let registry = DatabaseEdgeRegistryService::new(db.pool.clone());
 
-    let updated = registry
-        .find_by_agent_id_and_workspace(&edge_agent, Some(&workspace))
+        query(
+            "INSERT INTO edge_agent_registry \
+             (user_id, registry_id, edge_agent_id, edge_id, capabilities_json, workspace_id) \
+             VALUES (?, ?, ?, 'transport-a', ?, ?)",
+        )
+        .bind(&user)
+        .bind(&registry_id)
+        .bind(&edge_agent)
+        .bind(serde_json::to_string(&serde_json::json!("bash")).expect("serialize legacy scalar"))
+        .bind(&workspace)
+        .execute(&db.pool)
         .await
-        .expect("workspace lookup decodes array capabilities")
-        .expect("updated workspace-scoped edge record");
-    assert_eq!(updated.capabilities.as_ref(), Some(&updated_capabilities));
+        .expect("seed legacy scalar JSON capabilities");
 
-    db.cleanup().await;
+        let resolved = registry
+            .find_by_agent_id_and_workspace(&edge_agent, Some(&workspace))
+            .await
+            .expect("workspace lookup decodes legacy scalar capabilities")
+            .expect("workspace-scoped legacy edge record");
+        assert_eq!(resolved.capabilities, Some(serde_json::json!("bash")));
+
+        let listed = registry
+            .list_by_user(&user)
+            .await
+            .expect("user listing decodes legacy scalar capabilities");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].capabilities, Some(serde_json::json!("bash")));
+
+        let updated_capabilities = serde_json::json!(["bash", "read_file"]);
+        let lease = registry
+            .register_or_update_with_lease(
+                &user,
+                &edge_agent,
+                "transport-b",
+                None,
+                None,
+                Some(updated_capabilities.clone()),
+                Some(&workspace),
+            )
+            .await
+            .expect("lease lookup decodes legacy scalar capabilities");
+        assert_eq!(
+            lease
+                .previous
+                .as_ref()
+                .and_then(|record| record.capabilities.as_ref()),
+            Some(&serde_json::json!("bash"))
+        );
+        assert!(
+            registry
+                .finalize_registration(&lease)
+                .await
+                .expect("finalize array capabilities registration")
+        );
+        assert!(
+            registry
+                .release_registration(&lease)
+                .await
+                .expect("release array capabilities registration claim")
+        );
+
+        let updated = registry
+            .find_by_agent_id_and_workspace(&edge_agent, Some(&workspace))
+            .await
+            .expect("workspace lookup decodes array capabilities")
+            .expect("updated workspace-scoped edge record");
+        assert_eq!(updated.capabilities.as_ref(), Some(&updated_capabilities));
+
+        db.cleanup().await;
+    }
 }
 
 #[tokio::test]
