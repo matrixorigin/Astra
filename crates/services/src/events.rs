@@ -12,7 +12,8 @@ use astra_core::{
 use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{
-    add_agent_session_event_count_or_create, agent_session_exists_for_user,
+    add_agent_session_event_count_or_create, agent_session_accepts_events_for_user,
+    agent_session_deletion_fence_exists_for_user, agent_session_exists_for_user,
     bump_agent_session_event_count,
 };
 use crate::sync_outbox::{sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id};
@@ -1040,10 +1041,10 @@ async fn ensure_event_session_requirement(
     if sync_outbox_ingestion {
         return ensure_sync_event_session_header(tx, session_id, user_id).await;
     }
-    let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)
+    let writable = agent_session_accepts_events_for_user(&mut **tx, session_id, user_id)
         .await
         .map_err(internal_error)?;
-    if exists {
+    if writable {
         Ok(())
     } else {
         Err(error_response(
@@ -1061,11 +1062,28 @@ async fn ensure_sync_event_session_header(
     match add_agent_session_event_count_or_create(&mut **tx, session_id, user_id, 0, None).await {
         Ok(()) => Ok(()),
         Err(sqlx::Error::RowNotFound) => {
+            let writable = agent_session_accepts_events_for_user(&mut **tx, session_id, user_id)
+                .await
+                .map_err(internal_error)?;
+            if writable {
+                return Ok(());
+            }
             let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)
                 .await
                 .map_err(internal_error)?;
             if exists {
-                Ok(())
+                Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("Session {session_id} is being deleted"),
+                ))
+            } else if agent_session_deletion_fence_exists_for_user(&mut **tx, session_id, user_id)
+                .await
+                .map_err(internal_error)?
+            {
+                Err(error_response(
+                    StatusCode::CONFLICT,
+                    format!("Session {session_id} was deleted"),
+                ))
             } else {
                 Err(error_response(
                     StatusCode::CONFLICT,

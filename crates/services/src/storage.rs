@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v24";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-08-15-v25";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1036,6 +1036,44 @@ where
     Ok(row.is_some())
 }
 
+pub(crate) async fn agent_session_accepts_events_for_user<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let row = query(
+        "SELECT 1 AS writable FROM agent_sessions \
+         WHERE session_id = ? AND user_id = ? AND status <> 'deleting' LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.is_some())
+}
+
+pub(crate) async fn agent_session_deletion_fence_exists_for_user<'e, E>(
+    executor: E,
+    session_id: &str,
+    user_id: &str,
+) -> Result<bool, sqlx::Error>
+where
+    E: Executor<'e, Database = MySql>,
+{
+    let row = query(
+        "SELECT 1 AS fenced FROM agent_session_deletion_fences \
+         WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(executor)
+    .await?;
+    Ok(row.is_some())
+}
+
 pub async fn agent_event_exists_for_user_session<'e, E>(
     executor: E,
     event_id: &str,
@@ -1074,7 +1112,7 @@ where
                  updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
                  last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
                  last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ? AND user_id = ?",
+             WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
         )
         .bind(delta)
         .bind(last_event_id)
@@ -1093,7 +1131,7 @@ where
                  updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
                  last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
                  last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ? AND user_id = ?",
+             WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
         )
         .bind(decrement)
         .bind(decrement)
@@ -1118,11 +1156,16 @@ const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_ses
              WHERE session_id = ? AND user_id <> ? \
              LIMIT 1 \
          ) \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM agent_session_deletion_fences \
+             WHERE session_id = ? AND user_id = ? \
+             LIMIT 1 \
+         ) \
          ON DUPLICATE KEY UPDATE \
-         event_count = IF(user_id = VALUES(user_id), event_count + VALUES(event_count), event_count), \
-         last_event_id = IF(user_id = VALUES(user_id), COALESCE(VALUES(last_event_id), last_event_id), last_event_id), \
-         updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
-         last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)";
+         event_count = IF(user_id = VALUES(user_id) AND status <> 'deleting', event_count + VALUES(event_count), event_count), \
+         last_event_id = IF(user_id = VALUES(user_id) AND status <> 'deleting', COALESCE(VALUES(last_event_id), last_event_id), last_event_id), \
+         updated_at = IF(user_id = VALUES(user_id) AND status <> 'deleting' AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+         last_active_at = IF(user_id = VALUES(user_id) AND status <> 'deleting' AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)";
 
 pub async fn add_agent_session_event_count_or_create<'e, E>(
     executor: E,
@@ -1147,6 +1190,8 @@ where
         .bind(last_event_id)
         .bind(session_id)
         .bind(user_id)
+        .bind(session_id)
+        .bind(user_id)
         .execute(executor)
         .await?;
     if result.rows_affected() == 0 {
@@ -1169,7 +1214,7 @@ where
          SET updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
              last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
              last_event_id = COALESCE(?, last_event_id) \
-         WHERE session_id = ? AND user_id = ?",
+         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
     )
     .bind(last_event_id)
     .bind(session_id)
@@ -1177,8 +1222,8 @@ where
     .execute(executor)
     .await?;
     if result.rows_affected() == 0 {
-        let exists = agent_session_exists_for_user(executor, session_id, user_id).await?;
-        if !exists {
+        let writable = agent_session_accepts_events_for_user(executor, session_id, user_id).await?;
+        if !writable {
             return Err(sqlx::Error::RowNotFound);
         }
     }
@@ -2884,6 +2929,21 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_agent_sessions_active_plan_id (active_plan_id),
             INDEX idx_agent_sessions_config_version (config_version_id),
             INDEX idx_sessions_project (user_id, project_id, updated_at)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    core_schema_create!(
+        pool,
+        "agent_session_deletion_fences",
+        // Session identifiers are immutable. Keep this minimal tombstone after
+        // hard deletion so delayed durable writers cannot recreate a session.
+        "CREATE TABLE IF NOT EXISTS agent_session_deletion_fences (
+            user_id VARCHAR(128) NOT NULL,
+            session_id VARCHAR(64) NOT NULL,
+            deleted_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, session_id),
+            INDEX idx_agent_session_deletion_fences_deleted_at (deleted_at)
         )",
     )
     .execute(&pool)

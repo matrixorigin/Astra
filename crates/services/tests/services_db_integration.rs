@@ -1241,6 +1241,7 @@ async fn cleanup_session_delete_fixture_for_owner(
         "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
+        "agent_session_deletion_fences",
     ] {
         let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
         let _ = sqlx::query(&sql)
@@ -1258,6 +1259,124 @@ async fn cleanup_session_delete_fixture_for_owner(
             .execute(pool)
             .await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_fences_late_event_writer_and_prevents_session_resurrection() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'delete-fence-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    // Hold an event insert open without touching the session summary. The
+    // delete can persist its fence, but its destructive transaction must wait
+    // for this writer to either commit or roll back.
+    let mut writer = pool.begin().await.expect("begin late event writer");
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, `metadata`) \
+         VALUES (?, ?, ?, 'astra-cli', 'test', 'test.event', 'late event', '{}')",
+    )
+    .bind(&event_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&mut *writer)
+    .await
+    .expect("insert uncommitted late event");
+
+    let delete_session_id = session_id.clone();
+    let delete_user_id = user_id.clone();
+    let delete_task = tokio::spawn(async move {
+        DatabaseSessionService::new(settings)
+            .with_pool(shared)
+            .delete_session(delete_session_id, delete_user_id)
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let fenced: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_session_deletion_fences \
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("poll deletion fence");
+            if fenced == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delete intent must become visible");
+
+    let late_summary = astra_services::storage::bump_agent_session_event_count(
+        &mut *writer,
+        &session_id,
+        &user_id,
+        1,
+        Some(&event_id),
+    )
+    .await;
+    assert!(
+        matches!(late_summary, Err(sqlx::Error::RowNotFound)),
+        "late event writer must be rejected once deletion is fenced: {late_summary:?}"
+    );
+    writer
+        .rollback()
+        .await
+        .expect("roll back late event writer");
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), delete_task)
+        .await
+        .expect("session delete must finish after writer rollback")
+        .expect("session delete task")
+        .expect("session delete result");
+
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_sessions", &user_id, &session_id).await,
+        0
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_events", &user_id, &session_id).await,
+        0
+    );
+
+    let resurrect = astra_services::storage::add_agent_session_event_count_or_create(
+        &pool,
+        &session_id,
+        &user_id,
+        1,
+        Some("post-delete-event"),
+    )
+    .await;
+    assert!(
+        matches!(resurrect, Err(sqlx::Error::RowNotFound)),
+        "a delayed writer must not recreate a deleted session: {resurrect:?}"
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_sessions", &user_id, &session_id).await,
+        0
+    );
+
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
 }
 
 async fn insert_harness_run_fixture(

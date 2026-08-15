@@ -1079,6 +1079,10 @@ async fn mark_session_deleting(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.begin: {source}"))?;
     let result = query(
         "UPDATE agent_sessions \
          SET status = 'deleting', \
@@ -1088,7 +1092,7 @@ async fn mark_session_deleting(
     )
     .bind(session_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .map_err(|source| format!("delete_session.mark_deleting: {source}"))?;
 
@@ -1097,17 +1101,45 @@ async fn mark_session_deleting(
             query("SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1")
                 .bind(session_id)
                 .bind(user_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|source| format!("delete_session.mark_deleting.confirm: {source}"))?
                 .is_some();
         if still_exists {
+            query(
+                "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
+                 VALUES (?, ?, CURRENT_TIMESTAMP(6)) \
+                 ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| format!("delete_session.mark_deleting.fence: {source}"))?;
+            tx.commit()
+                .await
+                .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
             return Ok(());
         }
         return Err(
             "delete_session.mark_deleting: session not found or not owned by user".to_string(),
         );
     }
+
+    query(
+        "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
+         VALUES (?, ?, CURRENT_TIMESTAMP(6)) \
+         ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|source| format!("delete_session.mark_deleting.fence: {source}"))?;
+
+    tx.commit()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
 
     Ok(())
 }
