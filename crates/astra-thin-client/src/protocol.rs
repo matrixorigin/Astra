@@ -389,9 +389,6 @@ pub struct EdgeRegisterRequest {
     pub hostname: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,
-    /// Structured runtime capability advertisement. When present this must be
-    /// a JSON object; the server rejects top-level scalar, array, and null
-    /// values with `400 Bad Request`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<Value>,
 }

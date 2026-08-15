@@ -1207,8 +1207,6 @@ pub(crate) async fn post_agents_edge_register_handler(
             "edge_agent_id required",
         ));
     }
-    astra_services::multi_agent::validate_edge_capabilities_shape(body.capabilities.as_ref())
-        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
     let edge_id = edge_id_from_headers(&headers);
     let rec = state
         .execution

@@ -11,32 +11,23 @@ use super::metrics::SharedMultiAgentMetrics;
 use crate::db_row::RowExt as EdgeRegistryDbRow;
 
 // MatrixOne exposes JSON columns with SQL type JSON, while RowExt intentionally
-// decodes this optional payload as text before serde_json validation. Keep all
-// EdgeAgentRecord reads on one unbounded projection so no query accidentally
-// asks sqlx to decode JSON directly into Option<String> or truncates large JSON
-// through MatrixOne's VARCHAR(65535)-bounded CAST(... AS CHAR).
+// decodes this optional payload as text before serde_json validation. Wrapping
+// the value in a one-element JSON array lets JSON_UNQUOTE produce unbounded
+// text without stripping quotes from a top-level JSON string; SUBSTRING removes
+// only the wrapper brackets. Keep every EdgeAgentRecord read on this projection
+// so no query asks sqlx to decode JSON directly or uses VARCHAR(65535)-bounded
+// CAST(... AS CHAR).
 const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
-     JSON_UNQUOTE(capabilities_json) AS capabilities_json, workspace_id, \
+     CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
+       SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(capabilities_json)), 2, \
+         LENGTH(JSON_UNQUOTE(JSON_ARRAY(capabilities_json))) - 2) \
+     END AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
-
-pub const EDGE_CAPABILITIES_OBJECT_REQUIRED: &str = "capabilities must be a JSON object";
-
-/// Capability advertisements are structured objects. Enforce that contract at
-/// the service boundary so every caller, not only the HTTP handler, is covered.
-pub fn validate_edge_capabilities_shape(
-    capabilities: Option<&serde_json::Value>,
-) -> Result<(), &'static str> {
-    match capabilities {
-        None | Some(serde_json::Value::Object(_)) => Ok(()),
-        Some(_) => Err(EDGE_CAPABILITIES_OBJECT_REQUIRED),
-    }
-}
 
 fn serialize_edge_capabilities(
     capabilities: Option<&serde_json::Value>,
 ) -> Result<Option<String>, String> {
-    validate_edge_capabilities_shape(capabilities).map_err(str::to_string)?;
     capabilities
         .map(serde_json::to_string)
         .transpose()
@@ -1003,7 +994,6 @@ impl EdgeRegistryService for UnconfiguredEdgeRegistryService {
         capabilities: Option<serde_json::Value>,
         workspace_id: Option<&str>,
     ) -> Result<EdgeAgentRecord, String> {
-        validate_edge_capabilities_shape(capabilities.as_ref()).map_err(str::to_string)?;
         let now = chrono::Utc::now()
             .format("%Y-%m-%d %H:%M:%S%.6f")
             .to_string();
@@ -1060,30 +1050,9 @@ mod tests {
 
     #[test]
     fn edge_agent_record_projection_extracts_matrixone_json_as_unbounded_text() {
-        assert!(
-            EDGE_AGENT_RECORD_COLUMNS
-                .contains("JSON_UNQUOTE(capabilities_json) AS capabilities_json")
-        );
+        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("JSON_UNQUOTE(JSON_ARRAY(capabilities_json))"));
+        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("END AS capabilities_json"));
         assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
-    }
-
-    #[test]
-    fn edge_capabilities_contract_accepts_only_objects_or_absence() {
-        assert!(validate_edge_capabilities_shape(None).is_ok());
-        assert!(validate_edge_capabilities_shape(Some(&serde_json::json!({}))).is_ok());
-
-        for invalid in [
-            serde_json::json!("bash"),
-            serde_json::json!(42),
-            serde_json::json!(true),
-            serde_json::json!(["bash"]),
-            serde_json::Value::Null,
-        ] {
-            assert_eq!(
-                validate_edge_capabilities_shape(Some(&invalid)),
-                Err(EDGE_CAPABILITIES_OBJECT_REQUIRED)
-            );
-        }
     }
 
     struct FakeEdgeRegistryRow {
