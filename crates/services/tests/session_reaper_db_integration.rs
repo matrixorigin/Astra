@@ -186,6 +186,7 @@ async fn reaper_marks_stale_active_session_idle_then_ended() {
         idle_after_secs: 60,
         end_after_idle_secs: 86_400,
         delete_after_ended_days: 365,
+        deletion_fence_retention_days: 365,
         batch_limit: 500,
     };
     reap_until(&pool, &idle_only, &user_id, &session_id, "idle", 50).await;
@@ -195,6 +196,7 @@ async fn reaper_marks_stale_active_session_idle_then_ended() {
         idle_after_secs: 86_400,
         end_after_idle_secs: 60,
         delete_after_ended_days: 365,
+        deletion_fence_retention_days: 365,
         batch_limit: 500,
     };
     reap_until(&pool, &end_policy, &user_id, &session_id, "ended", 50).await;
@@ -432,6 +434,7 @@ async fn reaper_deletes_full_session_lifecycle_tables() {
         idle_after_secs: 86_400,
         end_after_idle_secs: 86_400,
         delete_after_ended_days: 1,
+        deletion_fence_retention_days: 365,
         batch_limit: 500,
     };
     let (database_rows_deleted, local_bytes_freed) =
@@ -620,6 +623,7 @@ async fn reaper_delete_preserves_foreign_owner_child_rows_with_same_session_id()
         idle_after_secs: 86_400,
         end_after_idle_secs: 86_400,
         delete_after_ended_days: 1,
+        deletion_fence_retention_days: 365,
         batch_limit: 500,
     };
     let (database_rows_deleted, _) =

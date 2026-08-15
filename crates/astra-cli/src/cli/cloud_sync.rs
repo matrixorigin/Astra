@@ -16,7 +16,8 @@ use astra_services::session_journal;
 use astra_services::state_sync::pref_keys;
 use astra_services::{
     SyncOutboxDeliverySettlement, SyncOutboxJournalDelta, SyncOutboxJournalDeltaOutcome,
-    SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
+    SyncOutboxPoisonKind, SyncOutboxRecord, SyncOutboxSettlementReport, SyncOutboxStatus,
+    SyncOutboxStore,
 };
 use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use serde_json::{Value, json};
@@ -1210,15 +1211,38 @@ async fn try_drain_sync_outbox_for_snapshot(
             client.post_sync_outbox_event_json(Some(token.as_str()), &body),
         )
         .await;
+        let mut terminal_rejection = None;
         let delivery_error = match delivery {
             Ok(Ok(ack)) if ack.confirms(&record.record_id, &record.payload_hash) => None,
             Ok(Ok(ack)) => Some(format!("cloud returned an uncorrelated sync ack: {ack:?}")),
-            Ok(Err(error)) => Some(error.to_string()),
+            Ok(Err(error)) => {
+                terminal_rejection = terminal_sync_outbox_rejection(&error);
+                Some(error.to_string())
+            }
             Err(_) => Some(format!(
                 "cloud event delivery timed out after {}ms",
                 SYNC_OUTBOX_RECORD_DELIVERY_TIMEOUT.as_millis()
             )),
         };
+        // A cloud session that was deleted can never accept this record, so it
+        // is parked with its reason instead of burning the retry budget and
+        // landing in retry-exhausted poison that repair would re-queue forever.
+        if let Some((kind, reason)) = terminal_rejection {
+            tracing::warn!(
+                target: "astra_cli::cloud_sync",
+                record_id = %record.record_id,
+                session_id = %record.session_id,
+                ?kind,
+                %reason,
+                "sync outbox record rejected terminally by cloud"
+            );
+            settlements.push(SyncOutboxDeliverySettlement::Rejected {
+                record_id: record.record_id,
+                kind,
+                reason,
+            });
+            continue;
+        }
         let delivery_confirmed = delivery_error.is_none()
             || reconcile_sync_outbox_delivery(&client, &token, &record).await;
         if delivery_confirmed {
@@ -1302,6 +1326,29 @@ fn unix_ms() -> Option<u64> {
             );
             None
         }
+    }
+}
+
+/// Classify a delivery failure that no retry can resolve.
+///
+/// The decision reads the machine-owned `error_code` from the JSON error body,
+/// never the human-facing prose, so wording changes on the server cannot flip
+/// an outbox record between retryable and terminal.
+fn terminal_sync_outbox_rejection(
+    error: &astra_thin_client::ThinClientError,
+) -> Option<(SyncOutboxPoisonKind, String)> {
+    let astra_thin_client::ThinClientError::Api { status, body } = error else {
+        return None;
+    };
+    if status.as_u16() != 409 {
+        return None;
+    }
+    let parsed: astra_core::ErrorResponse = serde_json::from_str(body).ok()?;
+    let error_code = parsed.error_code.as_deref()?;
+    if error_code == astra_core::ERROR_CODE_SESSION_DELETED {
+        Some((SyncOutboxPoisonKind::SessionDeletedUpstream, parsed.detail))
+    } else {
+        None
     }
 }
 
@@ -1524,11 +1571,60 @@ mod tests {
         reconcile_sync_outbox_journal, record_settlement_result,
         release_sync_outbox_drain_schedule, release_sync_outbox_retry_wake_schedule,
         run_sync_outbox_io, schedule_sync_outbox_journal_ingestion,
-        should_append_cloud_pull_journal, try_claim_sync_outbox_drain_schedule,
+        should_append_cloud_pull_journal, terminal_sync_outbox_rejection,
+        try_claim_sync_outbox_drain_schedule,
     };
     use astra_services::session_journal::{JournalEvent, JournalWriter, ProcessJournalDirGuard};
-    use astra_services::{SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore};
+    use astra_services::{
+        SyncOutboxPoisonKind, SyncOutboxSettlementReport, SyncOutboxStatus, SyncOutboxStore,
+    };
     use fs2::FileExt;
+
+    fn api_error(status: u16, body: &str) -> astra_thin_client::ThinClientError {
+        astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::from_u16(status).expect("status"),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn only_the_deleted_session_error_code_parks_a_record_terminally() {
+        let deleted = api_error(
+            409,
+            r#"{"detail":"Session s-1 was deleted","error_code":"SESSION_DELETED"}"#,
+        );
+        let (kind, reason) =
+            terminal_sync_outbox_rejection(&deleted).expect("deleted session must be terminal");
+        assert_eq!(kind, SyncOutboxPoisonKind::SessionDeletedUpstream);
+        assert_eq!(reason, "Session s-1 was deleted");
+
+        // Still deleting, owned elsewhere, or a transient fault: all retryable.
+        for retryable in [
+            api_error(
+                409,
+                r#"{"detail":"Session s-1 is being deleted","error_code":"SESSION_DELETING"}"#,
+            ),
+            api_error(
+                409,
+                r#"{"detail":"lost a race","error_code":"SESSION_WRITE_CONFLICT"}"#,
+            ),
+            api_error(503, r#"{"detail":"Session s-1 was deleted"}"#),
+            // Prose alone must never decide: only the typed code does.
+            api_error(409, r#"{"detail":"Session s-1 was deleted"}"#),
+            api_error(409, "not json"),
+        ] {
+            assert!(
+                terminal_sync_outbox_rejection(&retryable).is_none(),
+                "must stay retryable: {retryable:?}"
+            );
+        }
+
+        assert!(
+            terminal_sync_outbox_rejection(&astra_thin_client::ThinClientError::InvalidAuthHeader)
+                .is_none(),
+            "transport-shaped errors carry no cloud verdict"
+        );
+    }
 
     #[test]
     fn journal_ingest_retry_budget_quarantines_and_success_resets() {

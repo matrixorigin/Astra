@@ -9,7 +9,9 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use crate::session_lifecycle::{SessionTableDeleteOutcome, hard_delete_session};
+use crate::session_lifecycle::{
+    SessionTableDeleteOutcome, hard_delete_session, prune_expired_session_deletion_fences,
+};
 use sqlx::Pool;
 use sqlx::mysql::MySql;
 
@@ -22,6 +24,12 @@ pub struct SessionReaperPolicy {
     pub end_after_idle_secs: u64,
     /// Days after `ended_at` before deleting the row (default: 1 day).
     pub delete_after_ended_days: u32,
+    /// Days a session deletion fence is kept after the session row is gone
+    /// (default: 30 days). The fence must outlive every delayed writer that
+    /// could still arrive for a deleted session — in practice the local sync
+    /// outbox retention — but not longer, or the tombstone table grows to one
+    /// row per session ever created. Set to 0 to disable the prune.
+    pub deletion_fence_retention_days: u32,
     /// Maximum rows to mutate per sweep (prevents lock contention).
     pub batch_limit: u32,
 }
@@ -29,9 +37,10 @@ pub struct SessionReaperPolicy {
 impl Default for SessionReaperPolicy {
     fn default() -> Self {
         Self {
-            idle_after_secs: 30 * 60,      // 30 minutes
-            end_after_idle_secs: 2 * 3600, // 2 hours
-            delete_after_ended_days: 1,    // 1 day
+            idle_after_secs: 30 * 60,          // 30 minutes
+            end_after_idle_secs: 2 * 3600,     // 2 hours
+            delete_after_ended_days: 1,        // 1 day
+            deletion_fence_retention_days: 30, // 30 days
             batch_limit: 500,
         }
     }
@@ -46,6 +55,8 @@ pub struct ReaperSweepResult {
     pub marked_ended: u64,
     /// Ended session rows deleted.
     pub deleted: u64,
+    /// Expired session deletion fences retired past their retention window.
+    pub deletion_fences_pruned: u64,
     /// Expired fork-retention pins released.
     pub expired_fork_pins_released: u64,
     /// Fork records whose child session no longer exists.
@@ -200,6 +211,15 @@ pub async fn reap_sessions(
             }
         }
     }
+
+    // 4. Retire deletion fences left by the deletes above once no delayed
+    //    writer can still arrive for those sessions.
+    result.deletion_fences_pruned = prune_expired_session_deletion_fences(
+        pool,
+        policy.deletion_fence_retention_days,
+        policy.batch_limit,
+    )
+    .await?;
 
     const MODEL_REQUEST_CONTEXT_RETENTION_DAYS: u32 = 30;
     result.model_request_context_events_expired = sqlx::query(

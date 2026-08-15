@@ -829,6 +829,17 @@ impl ErrorResponse {
     }
 }
 
+/// Session-scoped write was refused because deletion intent is already
+/// persisted for a session row that still exists.
+pub const ERROR_CODE_SESSION_DELETING: &str = "SESSION_DELETING";
+/// Session-scoped write was refused because the session was hard-deleted and a
+/// deletion fence forbids recreating it. Terminal: retrying can never succeed.
+pub const ERROR_CODE_SESSION_DELETED: &str = "SESSION_DELETED";
+/// `session_id` exists under a different owner.
+pub const ERROR_CODE_SESSION_FOREIGN_OWNER: &str = "SESSION_FOREIGN_OWNER";
+/// Session-scoped write lost a race against a concurrent writer; retryable.
+pub const ERROR_CODE_SESSION_WRITE_CONFLICT: &str = "SESSION_WRITE_CONFLICT";
+
 pub fn error_response(
     status: StatusCode,
     detail: impl Into<String>,

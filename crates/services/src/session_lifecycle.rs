@@ -1074,6 +1074,30 @@ pub(crate) struct SessionHardDeleteOutcome {
     pub cleanup_errors: Vec<String>,
 }
 
+/// Persist the owner-scoped deletion fence.
+///
+/// The fence outlives the session row: it is what stops a delayed create-or-
+/// update writer from resurrecting a session after the row is gone. It is
+/// therefore written in the same transaction that records deletion intent, and
+/// only a completed deletion (or the reaper's retention prune) retires it.
+async fn persist_session_deletion_fence(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    query(
+        "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
+         VALUES (?, ?, CURRENT_TIMESTAMP(6)) \
+         ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|source| format!("delete_session.mark_deleting.fence: {source}"))?;
+    Ok(())
+}
+
 async fn mark_session_deleting(
     pool: &Pool<MySql>,
     session_id: &str,
@@ -1106,19 +1130,11 @@ async fn mark_session_deleting(
                 .map_err(|source| format!("delete_session.mark_deleting.confirm: {source}"))?
                 .is_some();
         if still_exists {
-            query(
-                "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
-                 VALUES (?, ?, CURRENT_TIMESTAMP(6)) \
-                 ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
-            )
-            .bind(user_id)
-            .bind(session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|source| format!("delete_session.mark_deleting.fence: {source}"))?;
+            persist_session_deletion_fence(&mut tx, session_id, user_id).await?;
             tx.commit()
                 .await
                 .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
+            log_session_deletion_fence_persisted(session_id, user_id);
             return Ok(());
         }
         return Err(
@@ -1126,22 +1142,66 @@ async fn mark_session_deleting(
         );
     }
 
-    query(
-        "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
-         VALUES (?, ?, CURRENT_TIMESTAMP(6)) \
-         ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(|source| format!("delete_session.mark_deleting.fence: {source}"))?;
+    persist_session_deletion_fence(&mut tx, session_id, user_id).await?;
 
     tx.commit()
         .await
         .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
+    log_session_deletion_fence_persisted(session_id, user_id);
 
     Ok(())
+}
+
+const SESSION_DELETION_FENCE_PRUNE_SQL: &str = "DELETE FROM agent_session_deletion_fences \
+     WHERE deleted_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
+       AND NOT EXISTS ( \
+           SELECT 1 FROM agent_sessions \
+           WHERE agent_sessions.user_id = agent_session_deletion_fences.user_id \
+             AND agent_sessions.session_id = agent_session_deletion_fences.session_id \
+       ) \
+     LIMIT ?";
+
+/// Retire deletion fences that have outlived the delayed writers they fence.
+///
+/// Every hard delete — including the reaper's own retention sweeps — leaves a
+/// fence behind, so without this prune the tombstone table grows to one row per
+/// session ever created while sitting on the session write path. A fence only
+/// has to outlive the writers that could still arrive for a deleted session, so
+/// it is retired once `retention_days` have passed and no session row exists
+/// for that owner/session; a session still stuck in `deleting` keeps its fence
+/// (and a later delete retry re-persists it either way).
+pub(crate) async fn prune_expired_session_deletion_fences(
+    pool: &Pool<MySql>,
+    retention_days: u32,
+    batch_limit: u32,
+) -> Result<u64, String> {
+    if retention_days == 0 || batch_limit == 0 {
+        return Ok(0);
+    }
+    // One bounded batch per sweep, like the reaper's other steps: a backlog
+    // drains across sweeps instead of holding this one open.
+    query(SESSION_DELETION_FENCE_PRUNE_SQL)
+        .bind(i64::from(retention_days))
+        .bind(batch_limit)
+        .execute(pool)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|source| format!("session_reaper.prune_session_deletion_fences: {source}"))
+}
+
+/// Record that the fence is now authoritative.
+///
+/// After this point every session write is refused, including when the
+/// destructive pass below fails and leaves the row in `deleting`: the reaper
+/// retries such sessions, and until it succeeds this log line is what explains
+/// why writers are being turned away.
+fn log_session_deletion_fence_persisted(session_id: &str, user_id: &str) {
+    tracing::info!(
+        target: "astra_services::session_lifecycle",
+        %session_id,
+        %user_id,
+        "session deletion fence persisted; session writes are now refused"
+    );
 }
 
 pub(crate) async fn hard_delete_session(
@@ -1317,6 +1377,46 @@ mod tests {
                 "unsafe workspace id must not be sanitized into another deletable path: {unsafe_id:?}"
             );
         }
+    }
+
+    #[test]
+    fn deletion_fence_prune_keeps_fences_that_still_guard_a_session() {
+        let normalized = SESSION_DELETION_FENCE_PRUNE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            normalized.contains("deleted_at < DATE_SUB(NOW(6), INTERVAL ? DAY)"),
+            "fence prune must be bounded by an explicit retention window: {normalized}"
+        );
+        assert!(
+            normalized.contains("NOT EXISTS ( SELECT 1 FROM agent_sessions"),
+            "fence prune must keep fences whose session row still exists: {normalized}"
+        );
+        assert!(
+            normalized.ends_with("LIMIT ?"),
+            "fence prune must stay bounded per sweep: {normalized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_fence_prune_is_disabled_by_a_zero_retention_window() {
+        // A zero window would otherwise retire fences the instant they are
+        // written, which is exactly when delayed writers still show up.
+        let pool =
+            sqlx::Pool::<MySql>::connect_lazy("mysql://unreachable-host/astra").expect("lazy pool");
+
+        assert_eq!(
+            prune_expired_session_deletion_fences(&pool, 0, 500).await,
+            Ok(0),
+            "zero retention must skip the prune without touching the database"
+        );
+        assert_eq!(
+            prune_expired_session_deletion_fences(&pool, 30, 0).await,
+            Ok(0),
+            "zero batch limit must skip the prune without touching the database"
+        );
     }
 
     #[test]

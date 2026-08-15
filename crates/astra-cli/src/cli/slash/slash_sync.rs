@@ -60,6 +60,9 @@ pub(crate) async fn handle_sync_command(arg: &str, _state: &SessionState) {
                 cli_dim!(
                     "Payload hash mismatch records remain poisoned until the conflicting source is inspected."
                 );
+                cli_dim!(
+                    "Records for sessions deleted in the cloud stay poisoned by design; no retry can deliver them."
+                );
                 if !report.cloud_configured {
                     cli_dim!("ASTRA_API_URL is not configured; records remain durable locally.");
                 }

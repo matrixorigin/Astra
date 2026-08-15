@@ -78,11 +78,16 @@ pub enum SyncOutboxRecordState {
     Poisoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncOutboxPoisonKind {
     PayloadHashMismatch,
     RetryExhausted,
+    /// The cloud session this record belongs to was deleted, and its deletion
+    /// fence refuses any recreation. Unlike `RetryExhausted` this is terminal
+    /// by fact, not by budget: re-queueing can never make it deliverable, so
+    /// `repair_retry_exhausted_poison` deliberately leaves it alone.
+    SessionDeletedUpstream,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,6 +251,12 @@ pub enum SyncOutboxDeliverySettlement {
     Failed {
         record_id: String,
         error: String,
+    },
+    /// The cloud refused this record for a reason no retry can change.
+    Rejected {
+        record_id: String,
+        kind: SyncOutboxPoisonKind,
+        reason: String,
     },
 }
 
@@ -587,6 +598,25 @@ impl SyncOutboxStore {
                             SyncOutboxAckOutcome::NotFound => {
                                 report.missing = report.missing.saturating_add(1);
                             }
+                        }
+                    }
+                    SyncOutboxDeliverySettlement::Rejected {
+                        record_id,
+                        kind,
+                        reason,
+                    } => {
+                        let Some(record) = state
+                            .records
+                            .iter_mut()
+                            .find(|record| record.record_id.as_str() == record_id.as_str())
+                        else {
+                            report.missing = report.missing.saturating_add(1);
+                            continue;
+                        };
+                        if apply_terminal_rejection(record, *kind, reason, now)
+                            || record.state == SyncOutboxRecordState::Poisoned
+                        {
+                            report.poisoned = report.poisoned.saturating_add(1);
                         }
                     }
                     SyncOutboxDeliverySettlement::Failed { record_id, error } => {
@@ -1377,6 +1407,33 @@ fn acknowledge_record(
     }
 }
 
+/// Park a record that the cloud refused for a reason no retry can change.
+///
+/// Unlike [`apply_delivery_failure`] this does not consume the retry budget:
+/// the record is poisoned immediately with the typed reason, so operators see
+/// why it will never be delivered instead of watching it burn attempts.
+fn apply_terminal_rejection(
+    record: &mut SyncOutboxRecord,
+    kind: SyncOutboxPoisonKind,
+    reason: &str,
+    now: u64,
+) -> bool {
+    if matches!(
+        record.state,
+        SyncOutboxRecordState::Acked | SyncOutboxRecordState::Poisoned
+    ) {
+        return false;
+    }
+    record.attempts = record.attempts.saturating_add(1);
+    record.last_error = Some(reason.to_string());
+    record.state = SyncOutboxRecordState::Poisoned;
+    record.poison_kind = Some(kind);
+    record.poison_reason = Some(reason.to_string());
+    record.next_retry_after_unix_ms = None;
+    record.updated_at_unix_ms = now;
+    true
+}
+
 fn apply_delivery_failure(record: &mut SyncOutboxRecord, error: &str, now: u64) -> bool {
     if matches!(
         record.state,
@@ -1859,6 +1916,112 @@ mod tests {
             "repair reopens the record, so the terminal-prefix watermark must move back"
         );
         assert!(!repaired.degraded);
+    }
+
+    #[test]
+    fn deleted_session_rejection_parks_the_record_without_burning_retries() {
+        let (_temp, _guard, store) = test_store();
+        let SyncOutboxEnqueueOutcome::Inserted { record_id, .. } = store
+            .enqueue_journal_event(&event("gpt-5"))
+            .expect("enqueue")
+        else {
+            panic!("insert");
+        };
+
+        let report = store
+            .settle_delivery_batch(&[SyncOutboxDeliverySettlement::Rejected {
+                record_id: record_id.clone(),
+                kind: SyncOutboxPoisonKind::SessionDeletedUpstream,
+                reason: "Session s-1 was deleted".to_string(),
+            }])
+            .expect("settle terminal rejection");
+        assert_eq!(report.poisoned, 1);
+        assert_eq!(report.failed, 0);
+
+        let status = store.status().expect("status");
+        assert_eq!(status.poisoned, 1);
+        assert_eq!(
+            status.pending, 0,
+            "a session that no longer exists must not stay queued for retry"
+        );
+
+        // Repair exists to reopen records that merely ran out of attempts.
+        // Reopening this one would only replay the same refusal forever.
+        assert_eq!(
+            store.repair_retry_exhausted_poison().expect("repair"),
+            0,
+            "terminal session rejections must survive repair"
+        );
+        let after_repair = store.status().expect("status after repair");
+        assert_eq!(after_repair.poisoned, 1);
+        assert_eq!(after_repair.pending, 0);
+
+        let record = store
+            .ready_records(10)
+            .expect("ready records")
+            .into_iter()
+            .find(|candidate| candidate.record_id == record_id);
+        assert!(
+            record.is_none(),
+            "terminally rejected records must never be claimed again"
+        );
+    }
+
+    #[test]
+    fn terminal_rejection_records_its_reason_for_operators() {
+        let mut record = SyncOutboxRecord {
+            schema_version: SYNC_OUTBOX_SCHEMA_VERSION,
+            sequence: 1,
+            record_id: "rec-1".to_string(),
+            domain: SyncDomain::Events,
+            session_id: "sess-1".to_string(),
+            event_type: "config_change".to_string(),
+            event_ts: "2026-07-08T00:00:00Z".to_string(),
+            payload_hash: "sha256:abc".to_string(),
+            payload: serde_json::json!({}),
+            state: SyncOutboxRecordState::InFlight,
+            attempts: 1,
+            next_retry_after_unix_ms: Some(42),
+            last_error: None,
+            poison_kind: None,
+            poison_reason: None,
+            created_at_unix_ms: 1,
+            updated_at_unix_ms: 1,
+            acked_at_unix_ms: None,
+        };
+
+        assert!(apply_terminal_rejection(
+            &mut record,
+            SyncOutboxPoisonKind::SessionDeletedUpstream,
+            "Session sess-1 was deleted",
+            99,
+        ));
+        assert_eq!(record.state, SyncOutboxRecordState::Poisoned);
+        assert_eq!(
+            record.poison_kind,
+            Some(SyncOutboxPoisonKind::SessionDeletedUpstream)
+        );
+        assert_eq!(
+            record.poison_reason.as_deref(),
+            Some("Session sess-1 was deleted")
+        );
+        assert_eq!(
+            record.next_retry_after_unix_ms, None,
+            "a terminal record must not be scheduled for another attempt"
+        );
+
+        // An already settled record keeps its original disposition.
+        let mut acked = record.clone();
+        acked.state = SyncOutboxRecordState::Acked;
+        acked.poison_kind = None;
+        assert!(!apply_terminal_rejection(
+            &mut acked,
+            SyncOutboxPoisonKind::SessionDeletedUpstream,
+            "late rejection",
+            100,
+        ));
+        assert_eq!(acked.state, SyncOutboxRecordState::Acked);
+        assert_eq!(acked.poison_kind, None);
     }
 
     #[test]

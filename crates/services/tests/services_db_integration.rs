@@ -1379,6 +1379,365 @@ async fn session_delete_fences_late_event_writer_and_prevents_session_resurrecti
     cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
 }
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_delete_cleans_up_events_committed_before_deletion_starts() {
+    // The other side of the fence: a writer that wins the race commits
+    // normally, and deletion is still responsible for removing what it wrote.
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'delete-fence-writer-first-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    let mut writer = pool.begin().await.expect("begin early event writer");
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, `metadata`) \
+         VALUES (?, ?, ?, 'astra-cli', 'test', 'test.event', 'early event', '{}')",
+    )
+    .bind(&event_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&mut *writer)
+    .await
+    .expect("insert early event");
+    astra_services::storage::bump_agent_session_event_count(
+        &mut *writer,
+        &session_id,
+        &user_id,
+        1,
+        Some(&event_id),
+    )
+    .await
+    .expect("event writer must be admitted before deletion starts");
+    writer.commit().await.expect("commit early event writer");
+
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_events", &user_id, &session_id).await,
+        1
+    );
+
+    DatabaseSessionService::new(settings)
+        .with_pool(shared)
+        .delete_session(session_id.clone(), user_id.clone())
+        .await
+        .expect("session delete must clean up committed events");
+
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_events", &user_id, &session_id).await,
+        0,
+        "deletion must remove events that committed before it started"
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_sessions", &user_id, &session_id).await,
+        0
+    );
+    let fenced: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_deletion_fences WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deletion fence");
+    assert_eq!(fenced, 1, "a completed delete must leave its fence behind");
+
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_event_for_deleted_session_reports_terminal_error_code() {
+    // The sync client parks records on this code instead of retrying until the
+    // retry budget is exhausted, so it must survive the whole delete path.
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'delete-fence-sync-it', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+
+    DatabaseSessionService::new(settings.clone())
+        .with_pool(shared.clone())
+        .delete_session(session_id.clone(), user_id.clone())
+        .await
+        .expect("session delete result");
+
+    let mut journal_event = astra_services::session_journal::JournalEvent::config_change(
+        Some(session_id.as_str()),
+        "model",
+        "post-delete-sync",
+    );
+    journal_event.ts = "2026-08-15T00:00:00Z".to_string();
+    let content = serde_json::to_value(&journal_event).expect("journal content");
+    let payload_hash = astra_services::sync_outbox_canonical_payload_hash(&content);
+    let event_id = astra_services::sync_outbox_stable_event_id(&journal_event, &payload_hash)
+        .expect("stable sync outbox event id");
+
+    let error = DatabaseEventService::new(settings)
+        .with_pool(shared)
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                event_id: Some(event_id.clone()),
+                session_id: session_id.clone(),
+                event_type: "config_change".into(),
+                content: content.to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({
+                    "sync_outbox": { "payload_hash": payload_hash }
+                })),
+            },
+        )
+        .await
+        .expect_err("a deleted session must not accept delayed sync events");
+
+    assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some(astra_core::ERROR_CODE_SESSION_DELETED),
+        "the sync client keys its terminal disposition off this code, not the message"
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_sessions", &user_id, &session_id).await,
+        0,
+        "the refused write must not resurrect the session row"
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_events", &user_id, &session_id).await,
+        0
+    );
+
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_writes_during_deletion_report_conflict_not_internal_error() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = Uuid::new_v4().to_string();
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'delete-fence-conflict-it', 'active', 1)",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert session");
+    sqlx::query(
+        "INSERT INTO agent_events \
+         (event_id, session_id, user_id, agent_id, agent_version, event_type, content, `metadata`) \
+         VALUES (?, ?, ?, 'astra-cli', 'test', 'test.event', 'existing event', '{}')",
+    )
+    .bind(&event_id)
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert existing event");
+
+    // Persisted deletion intent, exactly as `mark_session_deleting` leaves it
+    // before the destructive pass runs.
+    sqlx::query(
+        "UPDATE agent_sessions SET status = 'deleting' WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("mark session deleting");
+    sqlx::query(
+        "INSERT INTO agent_session_deletion_fences (user_id, session_id) VALUES (?, ?) \
+         ON DUPLICATE KEY UPDATE deleted_at = deleted_at",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("persist deletion fence");
+
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+    let create_error = event_service
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::Client,
+                event_id: None,
+                session_id: session_id.clone(),
+                event_type: "it_create".into(),
+                content: "late".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("a deleting session must not accept new events");
+    assert_eq!(create_error.0, axum::http::StatusCode::CONFLICT);
+    assert_eq!(
+        create_error.1.0.error_code.as_deref(),
+        Some(astra_core::ERROR_CODE_SESSION_DELETING)
+    );
+
+    let delete_error = event_service
+        .delete_event(event_id.clone(), user_id.clone())
+        .await
+        .expect_err("event deletion cannot rewrite a deleting session summary");
+    assert_eq!(
+        delete_error.0,
+        axum::http::StatusCode::CONFLICT,
+        "a deletion race is a conflict, not an internal server error"
+    );
+    assert_eq!(
+        delete_error.1.0.error_code.as_deref(),
+        Some(astra_core::ERROR_CODE_SESSION_DELETING)
+    );
+    assert_eq!(
+        count_user_session_rows(&pool, "agent_events", &user_id, &session_id).await,
+        1,
+        "the refused event delete must roll back instead of half-applying"
+    );
+
+    cleanup_session_delete_fixture_for_owner(&pool, &user_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn session_reaper_retires_only_expired_unguarded_deletion_fences() {
+    let (shared, _settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let user_id = Uuid::new_v4().to_string();
+    let expired_session = Uuid::new_v4().to_string();
+    let recent_session = Uuid::new_v4().to_string();
+    let guarded_session = Uuid::new_v4().to_string();
+    for session_id in [&expired_session, &recent_session, &guarded_session] {
+        cleanup_session_delete_fixture_for_owner(&pool, &user_id, session_id).await;
+    }
+
+    for (session_id, age_days) in [(&expired_session, 90), (&recent_session, 0)] {
+        sqlx::query(
+            "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
+             VALUES (?, ?, DATE_SUB(NOW(6), INTERVAL ? DAY))",
+        )
+        .bind(&user_id)
+        .bind(session_id)
+        .bind(age_days)
+        .execute(&pool)
+        .await
+        .expect("insert deletion fence");
+    }
+    // An old fence whose session is still being deleted must stay: the delete
+    // has not finished, so delayed writers can still arrive for it.
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'fence-prune-guarded-it', 'deleting', 0)",
+    )
+    .bind(&guarded_session)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("insert guarded session");
+    sqlx::query(
+        "INSERT INTO agent_session_deletion_fences (user_id, session_id, deleted_at) \
+         VALUES (?, ?, DATE_SUB(NOW(6), INTERVAL 90 DAY))",
+    )
+    .bind(&user_id)
+    .bind(&guarded_session)
+    .execute(&pool)
+    .await
+    .expect("insert guarded deletion fence");
+
+    let policy = astra_services::session_reaper::SessionReaperPolicy {
+        // Only the fence prune may act in this sweep.
+        idle_after_secs: 365 * 86_400,
+        end_after_idle_secs: 365 * 86_400,
+        delete_after_ended_days: 365,
+        deletion_fence_retention_days: 1,
+        batch_limit: 500,
+    };
+    let sweep = astra_services::session_reaper::reap_sessions(&pool, &policy)
+        .await
+        .expect("reaper sweep");
+    assert!(
+        sweep.deletion_fences_pruned >= 1,
+        "the sweep must report the fences it retired: {sweep:?}"
+    );
+
+    let fence_count = |session_id: String| {
+        let pool = pool.clone();
+        let user_id = user_id.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM agent_session_deletion_fences \
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(&user_id)
+            .bind(&session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count deletion fence")
+        }
+    };
+    assert_eq!(
+        fence_count(expired_session.clone()).await,
+        0,
+        "an expired fence with no session row must be retired"
+    );
+    assert_eq!(
+        fence_count(recent_session.clone()).await,
+        1,
+        "a fence inside the retention window must survive"
+    );
+    assert_eq!(
+        fence_count(guarded_session.clone()).await,
+        1,
+        "a fence whose session is still deleting must survive"
+    );
+
+    for session_id in [&expired_session, &recent_session, &guarded_session] {
+        cleanup_session_delete_fixture_for_owner(&pool, &user_id, session_id).await;
+    }
+}
+
 async fn insert_harness_run_fixture(
     pool: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,

@@ -1074,6 +1074,78 @@ where
     Ok(row.is_some())
 }
 
+/// Why a session-scoped write is or is not admitted.
+///
+/// Session write helpers signal refusal with [`sqlx::Error::RowNotFound`],
+/// which cannot distinguish "never existed" from "deletion already won". Every
+/// boundary that has to answer a client (HTTP status, sync settlement) resolves
+/// the reason through this enum instead of guessing from the row count, so the
+/// refusal stays a typed fact rather than a 500.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionWriteAdmission {
+    /// Owner-visible session row exists and has not started deleting.
+    Writable,
+    /// Owner-visible session row exists and deletion intent is persisted.
+    Deleting,
+    /// Session row is gone and a deletion fence forbids recreating it.
+    /// Terminal: no retry can make this write succeed.
+    Fenced,
+    /// `session_id` exists under a different owner.
+    ForeignOwner,
+    /// No session row, no fence, no foreign owner.
+    Missing,
+}
+
+impl SessionWriteAdmission {
+    pub fn is_writable(self) -> bool {
+        matches!(self, Self::Writable)
+    }
+}
+
+/// Session status that persists deletion intent. Must match the `'deleting'`
+/// literal used by the session write guards in this module.
+pub const SESSION_STATUS_DELETING: &str = "deleting";
+
+/// Resolve why a session write was refused.
+///
+/// Short-circuits on the common answers: one query settles `Writable`/
+/// `Deleting`, and the fence/foreign-owner lookups only run once the session
+/// row is already known to be gone.
+pub async fn classify_session_write_admission(
+    conn: &mut sqlx::MySqlConnection,
+    session_id: &str,
+    user_id: &str,
+) -> Result<SessionWriteAdmission, sqlx::Error> {
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(status) = status {
+        return Ok(if status == SESSION_STATUS_DELETING {
+            SessionWriteAdmission::Deleting
+        } else {
+            SessionWriteAdmission::Writable
+        });
+    }
+    if agent_session_deletion_fence_exists_for_user(&mut *conn, session_id, user_id).await? {
+        return Ok(SessionWriteAdmission::Fenced);
+    }
+    let foreign_owner = query("SELECT 1 AS foreign_owner FROM agent_sessions WHERE session_id = ? AND user_id <> ? LIMIT 1")
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .is_some();
+    Ok(if foreign_owner {
+        SessionWriteAdmission::ForeignOwner
+    } else {
+        SessionWriteAdmission::Missing
+    })
+}
+
 pub async fn agent_event_exists_for_user_session<'e, E>(
     executor: E,
     event_id: &str,

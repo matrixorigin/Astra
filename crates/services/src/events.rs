@@ -5,16 +5,16 @@ use sqlx::{Acquire, MySql, QueryBuilder, Row, query};
 use uuid::Uuid;
 
 use astra_core::{
-    ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
-    is_duplicate_key_error,
+    ERROR_CODE_SESSION_DELETED, ERROR_CODE_SESSION_DELETING, ERROR_CODE_SESSION_FOREIGN_OWNER,
+    ERROR_CODE_SESSION_WRITE_CONFLICT, ErrorResponse, MatrixOneSettings, SharedPool,
+    error_response, error_response_coded, internal_error, is_duplicate_key_error,
 };
 
 use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
 use crate::storage::{
-    add_agent_session_event_count_or_create, agent_session_accepts_events_for_user,
-    agent_session_deletion_fence_exists_for_user, agent_session_exists_for_user,
-    bump_agent_session_event_count,
+    SessionWriteAdmission, add_agent_session_event_count_or_create, bump_agent_session_event_count,
+    classify_session_write_admission,
 };
 use crate::sync_outbox::{sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id};
 use astra_core::canonical_names::{
@@ -758,15 +758,18 @@ impl EventService for DatabaseEventService {
         let event_count_delta =
             crate::storage::rows_affected_to_i64(insert_result.rows_affected(), "create_event")
                 .map_err(internal_error)?;
-        bump_agent_session_event_count(
+        // Deletion can win between the admission check above and this write.
+        // That is a refused write, not an internal fault, so the caller learns
+        // the session is going away instead of seeing a 500.
+        let summary_write = bump_agent_session_event_count(
             &mut *tx,
             &session_id,
             &user_id,
             event_count_delta,
             Some(&event_id),
         )
-        .await
-        .map_err(internal_error)?;
+        .await;
+        map_session_summary_write(&mut tx, &session_id, &user_id, summary_write).await?;
 
         let select_sql = format!(
             "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",
@@ -1022,13 +1025,82 @@ impl EventService for DatabaseEventService {
             .await
             .map_err(internal_error)?;
         if delete_result.rows_affected() > 0 {
-            bump_agent_session_event_count(&mut *tx, &record.session_id, &user_id, -1, None)
-                .await
-                .map_err(internal_error)?;
+            let summary_write =
+                bump_agent_session_event_count(&mut *tx, &record.session_id, &user_id, -1, None)
+                    .await;
+            map_session_summary_write(&mut tx, &record.session_id, &user_id, summary_write).await?;
         }
         tx.commit().await.map_err(internal_error)?;
 
         Ok(())
+    }
+}
+
+/// Map a refused session write onto the owner-visible boundary error.
+///
+/// `Writable` means the refusal did not come from session state (a concurrent
+/// writer took the row): retryable conflict, not an internal fault.
+fn session_write_rejection(
+    admission: SessionWriteAdmission,
+    session_id: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match admission {
+        SessionWriteAdmission::Deleting => error_response_coded(
+            StatusCode::CONFLICT,
+            format!("Session {session_id} is being deleted"),
+            ERROR_CODE_SESSION_DELETING,
+        ),
+        SessionWriteAdmission::Fenced => error_response_coded(
+            StatusCode::CONFLICT,
+            format!("Session {session_id} was deleted"),
+            ERROR_CODE_SESSION_DELETED,
+        ),
+        SessionWriteAdmission::ForeignOwner => error_response_coded(
+            StatusCode::CONFLICT,
+            format!("session_id {session_id} is owned by another user"),
+            ERROR_CODE_SESSION_FOREIGN_OWNER,
+        ),
+        SessionWriteAdmission::Missing => error_response(
+            StatusCode::NOT_FOUND,
+            format!("Session {session_id} not found"),
+        ),
+        SessionWriteAdmission::Writable => error_response_coded(
+            StatusCode::CONFLICT,
+            format!("Session {session_id} write lost a concurrent race; retry"),
+            ERROR_CODE_SESSION_WRITE_CONFLICT,
+        ),
+    }
+}
+
+/// Resolve why a session summary write was refused and turn it into a boundary
+/// error. Only call this after a helper signalled [`sqlx::Error::RowNotFound`].
+async fn reject_refused_session_write(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> (StatusCode, Json<ErrorResponse>) {
+    match classify_session_write_admission(tx, session_id, user_id).await {
+        Ok(admission) => session_write_rejection(admission, session_id),
+        Err(error) => internal_error(format!(
+            "session {session_id} write refusal could not be classified: {error}"
+        )),
+    }
+}
+
+/// Map a session summary write result, classifying refusals instead of
+/// surfacing them as internal faults.
+async fn map_session_summary_write(
+    tx: &mut sqlx::Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+    result: Result<(), sqlx::Error>,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(sqlx::Error::RowNotFound) => {
+            Err(reject_refused_session_write(tx, session_id, user_id).await)
+        }
+        Err(error) => Err(internal_error(error)),
     }
 }
 
@@ -1041,16 +1113,18 @@ async fn ensure_event_session_requirement(
     if sync_outbox_ingestion {
         return ensure_sync_event_session_header(tx, session_id, user_id).await;
     }
-    let writable = agent_session_accepts_events_for_user(&mut **tx, session_id, user_id)
+    let admission = classify_session_write_admission(tx, session_id, user_id)
         .await
         .map_err(internal_error)?;
-    if writable {
-        Ok(())
-    } else {
-        Err(error_response(
+    match admission {
+        SessionWriteAdmission::Writable => Ok(()),
+        // A session id owned by somebody else must stay indistinguishable from
+        // one that never existed on this non-sync path.
+        SessionWriteAdmission::ForeignOwner => Err(error_response(
             StatusCode::NOT_FOUND,
-            format!("Session {} not found", session_id),
-        ))
+            format!("Session {session_id} not found"),
+        )),
+        rejected => Err(session_write_rejection(rejected, session_id)),
     }
 }
 
@@ -1062,34 +1136,24 @@ async fn ensure_sync_event_session_header(
     match add_agent_session_event_count_or_create(&mut **tx, session_id, user_id, 0, None).await {
         Ok(()) => Ok(()),
         Err(sqlx::Error::RowNotFound) => {
-            let writable = agent_session_accepts_events_for_user(&mut **tx, session_id, user_id)
+            // A no-op upsert also reports zero rows for a live session whose
+            // summary already holds these values, so writability decides.
+            let admission = classify_session_write_admission(tx, session_id, user_id)
                 .await
                 .map_err(internal_error)?;
-            if writable {
+            if admission.is_writable() {
                 return Ok(());
             }
-            let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)
-                .await
-                .map_err(internal_error)?;
-            if exists {
-                Err(error_response(
+            // This path creates the header on demand, so "no row anywhere" is a
+            // lost race rather than a missing session: keep it retryable.
+            if admission == SessionWriteAdmission::Missing {
+                return Err(error_response_coded(
                     StatusCode::CONFLICT,
-                    format!("Session {session_id} is being deleted"),
-                ))
-            } else if agent_session_deletion_fence_exists_for_user(&mut **tx, session_id, user_id)
-                .await
-                .map_err(internal_error)?
-            {
-                Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("Session {session_id} was deleted"),
-                ))
-            } else {
-                Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("session_id {session_id} is owned by another user"),
-                ))
+                    format!("Session {session_id} header could not be created; retry"),
+                    ERROR_CODE_SESSION_WRITE_CONFLICT,
+                ));
             }
+            Err(session_write_rejection(admission, session_id))
         }
         Err(error) => Err(internal_error(error)),
     }
@@ -1125,10 +1189,12 @@ async fn repair_sync_event_session_summary(
         .as_ref()
         .map(|row| event_row_string(row, "event_id"))
         .transpose()?;
-    query(
+    // Same deletion fence as every other session summary writer: a replayed
+    // sync event must not rewrite the summary of a session that is going away.
+    let result = query(
         "UPDATE agent_sessions \
          SET event_count = ?, last_event_id = ?, updated_at = NOW(6), last_active_at = NOW(6) \
-         WHERE session_id = ? AND user_id = ?",
+         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
     )
     .bind(event_count)
     .bind(last_event_id)
@@ -1137,6 +1203,14 @@ async fn repair_sync_event_session_summary(
     .execute(&mut **tx)
     .await
     .map_err(internal_error)?;
+    if result.rows_affected() == 0 {
+        let admission = classify_session_write_admission(tx, session_id, user_id)
+            .await
+            .map_err(internal_error)?;
+        if !admission.is_writable() {
+            return Err(session_write_rejection(admission, session_id));
+        }
+    }
     Ok(())
 }
 
@@ -1348,6 +1422,64 @@ impl From<EventListRecord> for EventListResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- session write rejection ---
+
+    #[test]
+    fn refused_session_writes_are_reported_as_typed_client_errors() {
+        // A refused write is a fact about session state, never an internal
+        // fault: deletion races must stay 4xx with a machine-readable code so
+        // clients can tell "retry later" from "never again".
+        for (admission, expected_status, expected_code) in [
+            (
+                SessionWriteAdmission::Deleting,
+                StatusCode::CONFLICT,
+                Some(ERROR_CODE_SESSION_DELETING),
+            ),
+            (
+                SessionWriteAdmission::Fenced,
+                StatusCode::CONFLICT,
+                Some(ERROR_CODE_SESSION_DELETED),
+            ),
+            (
+                SessionWriteAdmission::ForeignOwner,
+                StatusCode::CONFLICT,
+                Some(ERROR_CODE_SESSION_FOREIGN_OWNER),
+            ),
+            (
+                SessionWriteAdmission::Writable,
+                StatusCode::CONFLICT,
+                Some(ERROR_CODE_SESSION_WRITE_CONFLICT),
+            ),
+            (SessionWriteAdmission::Missing, StatusCode::NOT_FOUND, None),
+        ] {
+            let (status, body) = session_write_rejection(admission, "session-1");
+            assert_eq!(status, expected_status, "{admission:?} status");
+            assert_eq!(
+                body.0.error_code.as_deref(),
+                expected_code,
+                "{admission:?} error code"
+            );
+            assert!(
+                body.0.detail.contains("session-1"),
+                "{admission:?} detail must name the session: {}",
+                body.0.detail
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_live_owner_session_admits_writes() {
+        assert!(SessionWriteAdmission::Writable.is_writable());
+        for refused in [
+            SessionWriteAdmission::Deleting,
+            SessionWriteAdmission::Fenced,
+            SessionWriteAdmission::ForeignOwner,
+            SessionWriteAdmission::Missing,
+        ] {
+            assert!(!refused.is_writable(), "{refused:?} must not admit writes");
+        }
+    }
 
     // --- metadata_tool_name ---
 
