@@ -1409,9 +1409,10 @@ fn acknowledge_record(
 
 /// Park a record that the cloud refused for a reason no retry can change.
 ///
-/// Unlike [`apply_delivery_failure`] this does not consume the retry budget:
-/// the record is poisoned immediately with the typed reason, so operators see
-/// why it will never be delivered instead of watching it burn attempts.
+/// `attempts` still counts this delivery — it happened, and the count is the
+/// record's delivery history — but unlike [`apply_delivery_failure`] the record
+/// does not wait for that budget to run out: it is poisoned on this attempt
+/// with the typed reason, and never scheduled again.
 fn apply_terminal_rejection(
     record: &mut SyncOutboxRecord,
     kind: SyncOutboxPoisonKind,
@@ -1997,6 +1998,14 @@ mod tests {
             99,
         ));
         assert_eq!(record.state, SyncOutboxRecordState::Poisoned);
+        assert_eq!(
+            record.attempts, 2,
+            "the refused delivery still counts in the record's history"
+        );
+        assert!(
+            record.attempts < SYNC_OUTBOX_MAX_ATTEMPTS,
+            "poisoning must not wait for the retry budget to run out"
+        );
         assert_eq!(
             record.poison_kind,
             Some(SyncOutboxPoisonKind::SessionDeletedUpstream)

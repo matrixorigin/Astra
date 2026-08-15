@@ -1307,7 +1307,10 @@ async fn session_delete_fences_late_event_writer_and_prevents_session_resurrecti
             .await
     });
 
+    // Back off between polls: the delete task shares this runtime and the
+    // database, so spinning would compete with the very work being awaited.
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut delay = std::time::Duration::from_millis(5);
         loop {
             let fenced: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM agent_session_deletion_fences \
@@ -1321,7 +1324,8 @@ async fn session_delete_fences_late_event_writer_and_prevents_session_resurrecti
             if fenced == 1 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(std::time::Duration::from_millis(100));
         }
     })
     .await

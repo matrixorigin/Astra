@@ -1036,6 +1036,9 @@ where
     Ok(row.is_some())
 }
 
+const AGENT_SESSION_ACCEPTS_EVENTS_SQL: &str = "SELECT 1 AS writable FROM agent_sessions \
+     WHERE session_id = ? AND user_id = ? AND status <> 'deleting' LIMIT 1";
+
 pub(crate) async fn agent_session_accepts_events_for_user<'e, E>(
     executor: E,
     session_id: &str,
@@ -1044,14 +1047,11 @@ pub(crate) async fn agent_session_accepts_events_for_user<'e, E>(
 where
     E: Executor<'e, Database = MySql>,
 {
-    let row = query(
-        "SELECT 1 AS writable FROM agent_sessions \
-         WHERE session_id = ? AND user_id = ? AND status <> 'deleting' LIMIT 1",
-    )
-    .bind(session_id)
-    .bind(user_id)
-    .fetch_optional(executor)
-    .await?;
+    let row = query(AGENT_SESSION_ACCEPTS_EVENTS_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(executor)
+        .await?;
     Ok(row.is_some())
 }
 
@@ -1102,9 +1102,48 @@ impl SessionWriteAdmission {
     }
 }
 
-/// Session status that persists deletion intent. Must match the `'deleting'`
-/// literal used by the session write guards in this module.
+/// Session status that persists deletion intent.
+///
+/// The SQL guards below spell this status inline rather than binding it: the
+/// value is a fixed part of each statement, and threading four more parameters
+/// through `ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL`'s duplicate-key branch
+/// would make a mis-ordered bind — comparing `status` against a session id —
+/// silently disable the fence. `session_write_guards_all_fence_on_the_deleting_status`
+/// keeps every guarded statement tied back to this constant instead.
 pub const SESSION_STATUS_DELETING: &str = "deleting";
+
+/// Every statement that may write session summary state, paired with its label.
+///
+/// A session write path that is missing from this list is a path that can write
+/// to a session whose deletion is already persisted, so new writers belong here
+/// with their guard.
+#[cfg(test)]
+const SESSION_WRITE_FENCE_GUARDED_SQL: &[(&str, &str)] = &[
+    (
+        "bump_agent_session_event_count.increment",
+        BUMP_AGENT_SESSION_EVENT_COUNT_INCREMENT_SQL,
+    ),
+    (
+        "bump_agent_session_event_count.decrement",
+        BUMP_AGENT_SESSION_EVENT_COUNT_DECREMENT_SQL,
+    ),
+    (
+        "add_agent_session_event_count_or_create",
+        ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL,
+    ),
+    (
+        "touch_agent_session_activity",
+        TOUCH_AGENT_SESSION_ACTIVITY_SQL,
+    ),
+    (
+        "agent_session_accepts_events_for_user",
+        AGENT_SESSION_ACCEPTS_EVENTS_SQL,
+    ),
+    (
+        "repair_sync_event_session_summary",
+        crate::events::REPAIR_SYNC_EVENT_SESSION_SUMMARY_SQL,
+    ),
+];
 
 /// Resolve why a session write was refused.
 ///
@@ -1167,6 +1206,23 @@ where
     Ok(row.is_some())
 }
 
+const BUMP_AGENT_SESSION_EVENT_COUNT_INCREMENT_SQL: &str = "UPDATE agent_sessions \
+     SET event_count = event_count + ?, \
+         updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+         last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
+         last_event_id = COALESCE(?, last_event_id) \
+     WHERE session_id = ? AND user_id = ? AND status <> 'deleting'";
+
+const BUMP_AGENT_SESSION_EVENT_COUNT_DECREMENT_SQL: &str = "UPDATE agent_sessions \
+     SET event_count = CASE \
+             WHEN event_count >= ? THEN event_count - ? \
+             ELSE 0 \
+         END, \
+         updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+         last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
+         last_event_id = COALESCE(?, last_event_id) \
+     WHERE session_id = ? AND user_id = ? AND status <> 'deleting'";
+
 pub async fn bump_agent_session_event_count<'e, E>(
     executor: E,
     session_id: &str,
@@ -1178,40 +1234,23 @@ where
     E: Executor<'e, Database = MySql>,
 {
     let result = if delta >= 0 {
-        query(
-            "UPDATE agent_sessions \
-             SET event_count = event_count + ?, \
-                 updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
-                 last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
-                 last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-        )
-        .bind(delta)
-        .bind(last_event_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(executor)
-        .await?
+        query(BUMP_AGENT_SESSION_EVENT_COUNT_INCREMENT_SQL)
+            .bind(delta)
+            .bind(last_event_id)
+            .bind(session_id)
+            .bind(user_id)
+            .execute(executor)
+            .await?
     } else {
         let decrement = delta.saturating_abs();
-        query(
-            "UPDATE agent_sessions \
-             SET event_count = CASE \
-                     WHEN event_count >= ? THEN event_count - ? \
-                     ELSE 0 \
-                 END, \
-                 updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
-                 last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
-                 last_event_id = COALESCE(?, last_event_id) \
-             WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-        )
-        .bind(decrement)
-        .bind(decrement)
-        .bind(last_event_id)
-        .bind(session_id)
-        .bind(user_id)
-        .execute(executor)
-        .await?
+        query(BUMP_AGENT_SESSION_EVENT_COUNT_DECREMENT_SQL)
+            .bind(decrement)
+            .bind(decrement)
+            .bind(last_event_id)
+            .bind(session_id)
+            .bind(user_id)
+            .execute(executor)
+            .await?
     };
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
@@ -1272,6 +1311,12 @@ where
     Ok(())
 }
 
+const TOUCH_AGENT_SESSION_ACTIVITY_SQL: &str = "UPDATE agent_sessions \
+     SET updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
+         last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
+         last_event_id = COALESCE(?, last_event_id) \
+     WHERE session_id = ? AND user_id = ? AND status <> 'deleting'";
+
 pub async fn touch_agent_session_activity<'e, E>(
     executor: E,
     session_id: &str,
@@ -1281,18 +1326,12 @@ pub async fn touch_agent_session_activity<'e, E>(
 where
     E: Executor<'e, Database = MySql> + Copy,
 {
-    let result = query(
-        "UPDATE agent_sessions \
-         SET updated_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
-             last_active_at = IF(last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at), \
-             last_event_id = COALESCE(?, last_event_id) \
-         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-    )
-    .bind(last_event_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(executor)
-    .await?;
+    let result = query(TOUCH_AGENT_SESSION_ACTIVITY_SQL)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(executor)
+        .await?;
     if result.rows_affected() == 0 {
         let writable = agent_session_accepts_events_for_user(executor, session_id, user_id).await?;
         if !writable {
@@ -8664,6 +8703,56 @@ pub async fn cleanup_expired_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_write_guards_all_fence_on_the_deleting_status() {
+        // The guard fragment is derived from the constant the Rust-side
+        // classification compares against, so a status rename that misses a
+        // statement fails here instead of silently unfencing that writer.
+        let guard = format!("status <> '{SESSION_STATUS_DELETING}'");
+        for (label, sql) in SESSION_WRITE_FENCE_GUARDED_SQL {
+            assert!(
+                sql.contains(&guard),
+                "{label} must refuse writes to a session whose deletion is persisted: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_or_update_session_summary_fences_every_duplicate_key_assignment() {
+        // The upsert's duplicate-key branch is the resurrection path: each
+        // assignment carries its own guard, so one unguarded assignment would
+        // let a delayed writer keep a deleting session alive.
+        let guard = format!("status <> '{SESSION_STATUS_DELETING}'");
+        let assignments = ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL
+            .split("ON DUPLICATE KEY UPDATE")
+            .nth(1)
+            .expect("upsert must have a duplicate-key branch");
+        for assignment in [
+            "event_count =",
+            "last_event_id =",
+            "updated_at =",
+            "last_active_at =",
+        ] {
+            let clause = assignments
+                .split(assignment)
+                .nth(1)
+                .unwrap_or_else(|| panic!("duplicate-key branch must assign {assignment}"));
+            assert!(
+                clause
+                    .split_once(", ")
+                    .map(|(head, _)| head)
+                    .unwrap_or(clause)
+                    .contains(&guard),
+                "duplicate-key assignment {assignment} must be fenced: {assignments}"
+            );
+        }
+        assert!(
+            ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL
+                .contains("NOT EXISTS ( SELECT 1 FROM agent_session_deletion_fences"),
+            "the insert branch must refuse to recreate a fenced session"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires ASTRA_TEST_DB_IT=1 and a real MySQL/MatrixOne instance"]

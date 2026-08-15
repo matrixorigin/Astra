@@ -1159,6 +1159,10 @@ async fn ensure_sync_event_session_header(
     }
 }
 
+pub(crate) const REPAIR_SYNC_EVENT_SESSION_SUMMARY_SQL: &str = "UPDATE agent_sessions \
+     SET event_count = ?, last_event_id = ?, updated_at = NOW(6), last_active_at = NOW(6) \
+     WHERE session_id = ? AND user_id = ? AND status <> 'deleting'";
+
 async fn repair_sync_event_session_summary(
     tx: &mut sqlx::Transaction<'_, MySql>,
     session_id: &str,
@@ -1191,18 +1195,14 @@ async fn repair_sync_event_session_summary(
         .transpose()?;
     // Same deletion fence as every other session summary writer: a replayed
     // sync event must not rewrite the summary of a session that is going away.
-    let result = query(
-        "UPDATE agent_sessions \
-         SET event_count = ?, last_event_id = ?, updated_at = NOW(6), last_active_at = NOW(6) \
-         WHERE session_id = ? AND user_id = ? AND status <> 'deleting'",
-    )
-    .bind(event_count)
-    .bind(last_event_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(internal_error)?;
+    let result = query(REPAIR_SYNC_EVENT_SESSION_SUMMARY_SQL)
+        .bind(event_count)
+        .bind(last_event_id)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal_error)?;
     if result.rows_affected() == 0 {
         let admission = classify_session_write_admission(tx, session_id, user_id)
             .await
