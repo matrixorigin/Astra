@@ -389,6 +389,7 @@ async fn edge_registry_preserves_legacy_scalar_capabilities_in_json_and_text_sch
         let workspace = format!("it-ws-{}", Uuid::new_v4());
         let registry_id = Uuid::new_v4().to_string();
         let registry = DatabaseEdgeRegistryService::new(db.pool.clone());
+        let scalar_capabilities = serde_json::json!("中文/bash");
 
         query(
             "INSERT INTO edge_agent_registry \
@@ -398,7 +399,7 @@ async fn edge_registry_preserves_legacy_scalar_capabilities_in_json_and_text_sch
         .bind(&user)
         .bind(&registry_id)
         .bind(&edge_agent)
-        .bind(serde_json::to_string(&serde_json::json!("bash")).expect("serialize legacy scalar"))
+        .bind(serde_json::to_string(&scalar_capabilities).expect("serialize legacy scalar"))
         .bind(&workspace)
         .execute(&db.pool)
         .await
@@ -409,14 +410,14 @@ async fn edge_registry_preserves_legacy_scalar_capabilities_in_json_and_text_sch
             .await
             .expect("workspace lookup decodes legacy scalar capabilities")
             .expect("workspace-scoped legacy edge record");
-        assert_eq!(resolved.capabilities, Some(serde_json::json!("bash")));
+        assert_eq!(resolved.capabilities.as_ref(), Some(&scalar_capabilities));
 
         let listed = registry
             .list_by_user(&user)
             .await
             .expect("user listing decodes legacy scalar capabilities");
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].capabilities, Some(serde_json::json!("bash")));
+        assert_eq!(listed[0].capabilities.as_ref(), Some(&scalar_capabilities));
 
         let updated_capabilities = serde_json::json!(["bash", "read_file"]);
         let lease = registry
@@ -436,7 +437,7 @@ async fn edge_registry_preserves_legacy_scalar_capabilities_in_json_and_text_sch
                 .previous
                 .as_ref()
                 .and_then(|record| record.capabilities.as_ref()),
-            Some(&serde_json::json!("bash"))
+            Some(&scalar_capabilities)
         );
         assert!(
             registry

@@ -21,7 +21,7 @@ use crate::db_row::RowExt as EdgeRegistryDbRow;
 const EDGE_AGENT_RECORD_COLUMNS: &str = "registry_id, user_id, edge_agent_id, edge_id, hostname, worktree_path, \
      CASE WHEN capabilities_json IS NULL THEN NULL ELSE \
        SUBSTRING(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$'))), 2, \
-         LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
+         CHAR_LENGTH(JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))) - 2) \
      END AS capabilities_json, workspace_id, \
      CAST(registered_at AS CHAR) AS registered_at, \
      CAST(last_heartbeat_at AS CHAR) AS last_heartbeat_at";
@@ -1055,8 +1055,10 @@ mod tests {
             EDGE_AGENT_RECORD_COLUMNS
                 .contains("JSON_UNQUOTE(JSON_ARRAY(JSON_EXTRACT(capabilities_json, '$')))"),
         );
+        assert!(EDGE_AGENT_RECORD_COLUMNS.contains("CHAR_LENGTH(JSON_UNQUOTE"));
         assert!(EDGE_AGENT_RECORD_COLUMNS.contains("END AS capabilities_json"));
         assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("CAST(capabilities_json AS CHAR)"));
+        assert!(!EDGE_AGENT_RECORD_COLUMNS.contains("\n         LENGTH(JSON_UNQUOTE"));
     }
 
     struct FakeEdgeRegistryRow {
