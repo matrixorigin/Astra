@@ -78,7 +78,9 @@ Retention policy is per layer:
 - C4 short TTL by default and explicit opt-in.
 - C5 governed by consent, lineage, and deletion propagation.
 
-`agent_events` must not be an infinite append-only table without TTL/archive semantics.
+Session-owned `agent_events` must not be silently deleted by a background TTL.
+They may be compacted or archived while the session remains user-visible, and
+are physically removed only with the user's explicit session deletion.
 
 ## User-visible sync state
 

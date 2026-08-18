@@ -176,12 +176,7 @@ pub(super) async fn resolve_or_create_chat_session(
 ) -> Result<ResolvedChatSession, (StatusCode, Json<ErrorResponse>)> {
     match requested_session_id {
         Some(session_id) => {
-            if session_id.trim().is_empty() {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "session_id must not be empty",
-                ));
-            }
+            validate_requested_chat_session_id(&session_id)?;
 
             match state
                 .session_service
@@ -201,7 +196,7 @@ pub(super) async fn resolve_or_create_chat_session(
                         full_llm_capture: false,
                     })
                 }
-                Err(error) => Err(normalize_chat_turn_session_error(error)),
+                Err(error) => Err(normalize_chat_turn_session_error(error, &session_id)),
             }
         }
         None => {
@@ -240,6 +235,24 @@ pub(super) async fn resolve_or_create_chat_session(
             }
         }
     }
+}
+
+fn validate_requested_chat_session_id(
+    session_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    astra_services::validate_persisted_session_id(session_id).map_err(|error| {
+        tracing::warn!(
+            target: "astra_runtime::chat",
+            session_id_bytes = session_id.len(),
+            validation_error = %error,
+            "rejected invalid requested session id"
+        );
+        error_response_coded(
+            StatusCode::BAD_REQUEST,
+            "session_id is invalid",
+            "session_id_invalid",
+        )
+    })
 }
 
 pub(super) fn is_session_service_unconfigured_error(
@@ -300,6 +313,9 @@ pub(super) async fn chat_stream_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let request_id = trace
+        .as_ref()
+        .map(|Extension(trace)| trace.request_id.clone());
     let principal = match state
         .auth_service
         .current_principal_for_request(
@@ -309,12 +325,22 @@ pub(super) async fn chat_stream_handler(
         .await
     {
         Ok(principal) => principal,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_request_id(
+                status,
+                error.0,
+                request_id.as_deref(),
+            );
+        }
     };
     let request = match parse_chat_request_body(&body) {
         Ok(request) => request,
         Err((status, error)) => {
-            return sse_error_response_from_error(status, error.0);
+            return sse_error_response_from_error_with_request_id(
+                status,
+                error.0,
+                request_id.as_deref(),
+            );
         }
     };
     let user = principal.user.clone();
@@ -327,6 +353,10 @@ pub(super) async fn chat_stream_handler(
             .entry("x-request-id".to_string())
             .or_insert(trace.request_id);
     }
+    let requested_session_id = chat_data.session_id.clone();
+    let requested_session_id_for_diagnostics = requested_session_id
+        .as_deref()
+        .filter(|session_id| astra_services::validate_persisted_session_id(session_id).is_ok());
     let resolved = match resolve_or_create_chat_session(
         &state,
         &user,
@@ -337,7 +367,17 @@ pub(super) async fn chat_stream_handler(
     .await
     {
         Ok(resolved) => resolved,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_context(
+                status,
+                error.0,
+                SseErrorContext {
+                    request_id: request_id.as_deref(),
+                    session_id: requested_session_id_for_diagnostics,
+                    ..SseErrorContext::default()
+                },
+            );
+        }
     };
     chat_data.session_id = resolved.session_id;
     chat_data.full_llm_capture = resolved.full_llm_capture;
@@ -349,12 +389,28 @@ pub(super) async fn chat_stream_handler(
     )
     .await
     {
-        return sse_error_response_from_error(status, error.0);
+        return sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            SseErrorContext {
+                request_id: request_id.as_deref(),
+                session_id: chat_data.session_id.as_deref(),
+                ..SseErrorContext::default()
+            },
+        );
     }
     if let Err((status, error)) =
         inject_effective_runtime_context(&state, &principal, &mut chat_data).await
     {
-        return sse_error_response_from_error(status, error.0);
+        return sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            SseErrorContext {
+                request_id: request_id.as_deref(),
+                session_id: chat_data.session_id.as_deref(),
+                ..SseErrorContext::default()
+            },
+        );
     }
 
     match state
@@ -368,7 +424,7 @@ pub(super) async fn chat_stream_handler(
                 // Incremental SSE streaming: convert channel into SSE body.
                 let session_id = stream.session_id.clone();
                 let run_id = stream.run_id.clone();
-                sse_streaming_response(session_id, run_id, event_rx)
+                sse_streaming_response(session_id, run_id, request_id.clone(), event_rx)
             } else {
                 // Batch fallback (test stubs, etc.)
                 let mut events = vec![serde_json::json!({
@@ -383,17 +439,29 @@ pub(super) async fn chat_stream_handler(
                 sse_json_response(events)
             }
         }
-        Err((status, error)) => sse_error_response_from_error(status, error.0),
+        Err((status, error)) => sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            SseErrorContext {
+                request_id: request_id.as_deref(),
+                session_id: chat_data.session_id.as_deref(),
+                ..SseErrorContext::default()
+            },
+        ),
     }
 }
 
 pub(super) async fn chat_turn_handler(
     State(state): State<AppState>,
+    trace: Option<Extension<RequestTrace>>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let request_id = trace
+        .as_ref()
+        .map(|Extension(trace)| trace.request_id.clone());
     let principal = match state
         .auth_service
         .current_principal_for_request(
@@ -403,11 +471,23 @@ pub(super) async fn chat_turn_handler(
         .await
     {
         Ok(principal) => principal,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_request_id(
+                status,
+                error.0,
+                request_id.as_deref(),
+            );
+        }
     };
     let body = match inject_effective_runtime_context_body(&state, &principal, body).await {
         Ok(body) => body,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_request_id(
+                status,
+                error.0,
+                request_id.as_deref(),
+            );
+        }
     };
     let model_execution_authority = if principal.is_provider_authorized_request() {
         ModelExecutionAdmissionAuthority::ProviderRuntime
@@ -420,6 +500,7 @@ pub(super) async fn chat_turn_handler(
         &headers,
         body,
         model_execution_authority,
+        request_id.as_deref(),
     )
     .await
 }
@@ -430,6 +511,7 @@ pub(super) async fn dispatch_chat_turn_bridge(
     source_headers: &HeaderMap,
     body: Bytes,
     model_execution_authority: ModelExecutionAdmissionAuthority,
+    request_id: Option<&str>,
 ) -> Response {
     let admitted_model_execution = match admit_model_execution_from_body(
         &state.model_service,
@@ -439,7 +521,9 @@ pub(super) async fn dispatch_chat_turn_bridge(
     .await
     {
         Ok(execution) => execution,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_request_id(status, error.0, request_id);
+        }
     };
     let mut bridge_headers = HeaderMap::new();
     bridge_headers.insert(
@@ -474,7 +558,9 @@ pub(super) async fn dispatch_chat_turn_bridge(
 
     let prepared = match prepare_chat_turn_bridge_body(state, user, body, None).await {
         Ok(result) => result,
-        Err((status, error)) => return sse_error_response_from_error(status, error.0),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_request_id(status, error.0, request_id);
+        }
     };
     if let Some(trusted_session_id) = prepared.trusted_session_id.as_deref() {
         bridge_headers.insert(
@@ -562,9 +648,15 @@ pub(super) async fn dispatch_chat_turn_bridge(
     let bridge = match state.chat_turn_bridge.as_ref() {
         Some(b) => b,
         None => {
-            return sse_error_response(
+            return sse_error_response_with_retryable_and_context(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "chat turn bridge disabled. Configure the runtime with an in-process bridge.",
+                true,
+                SseErrorContext {
+                    request_id,
+                    session_id: prepared.trusted_session_id.as_deref(),
+                    ..SseErrorContext::default()
+                },
             );
         }
     };
@@ -592,10 +684,15 @@ pub(super) async fn dispatch_chat_turn_bridge(
             } else {
                 "Chat turn bridge rejected request"
             };
-            sse_error_response_with_retryable(
+            sse_error_response_with_retryable_and_context(
                 status,
                 format!("{context}: {error}"),
                 status == StatusCode::CONFLICT || status_to_sse_retryable(status),
+                SseErrorContext {
+                    request_id,
+                    session_id: prepared.trusted_session_id.as_deref(),
+                    ..SseErrorContext::default()
+                },
             )
         }
     }
@@ -714,6 +811,7 @@ mod session_resolution_tests {
     struct RecordingSessionService {
         created: Arc<Mutex<Vec<(String, SessionCreateRequestData)>>>,
         missing_sessions: Arc<Mutex<Vec<String>>>,
+        looked_up_session_ids: Arc<Mutex<Vec<String>>>,
     }
 
     impl RecordingSessionService {
@@ -726,6 +824,10 @@ mod session_resolution_tests {
 
         async fn created_requests(&self) -> Vec<(String, SessionCreateRequestData)> {
             self.created.lock().await.clone()
+        }
+
+        async fn looked_up_session_ids(&self) -> Vec<String> {
+            self.looked_up_session_ids.lock().await.clone()
         }
     }
 
@@ -771,6 +873,10 @@ mod session_resolution_tests {
             session_id: String,
             user_id: String,
         ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
+            self.looked_up_session_ids
+                .lock()
+                .await
+                .push(session_id.clone());
             if self
                 .missing_sessions
                 .lock()
@@ -894,6 +1000,28 @@ mod session_resolution_tests {
 
         assert_eq!(error.0, StatusCode::NOT_FOUND);
         assert_eq!(error.1.0.detail, "Session not found");
+    }
+
+    #[tokio::test]
+    async fn resolve_or_create_chat_session_id_rejects_invalid_id_before_lookup() {
+        let session_service = RecordingSessionService::default();
+        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
+            .with_session_service(Arc::new(session_service.clone()));
+        let invalid_session_id = "x".repeat(4 * 1024 * 1024);
+
+        let error = resolve_or_create_chat_session_id(
+            &state,
+            &test_user(),
+            Some(invalid_session_id),
+            None,
+            false,
+        )
+        .await
+        .expect_err("oversized session id must be rejected");
+
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(error.1.0.error_code.as_deref(), Some("session_id_invalid"));
+        assert!(session_service.looked_up_session_ids().await.is_empty());
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 │  Cloud（astra-server）— SaaS 核心价值所在                         │
 │  认证/RBAC · /chat/turn · 上下文组装 · LLM（Key 不出云）          │
 │  记忆代理 · 模型路由 · 预算/限流 · 审计 · 持久化（MatrixOne）      │
-│  资源治理 · Admin · Session Reaper · 多 Agent Run / Lease       │
+│  资源治理 · Admin · 运行时存储维护 · 多 Agent Run / Lease       │
 └────────────────────────────┬────────────────────────────────────┘
                              │
               MatrixOne · Redis · Memoria ·（可选 Skill Worker）
@@ -57,7 +57,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 | **弹性与可用性** | 多副本无状态；HPA 扩缩；依赖故障可恢复 | K8s 压测 + 混沌 |
 | **可观测性** | 健康检查、指标、审计导出、SLO 可查询 | 监控 + introspection API |
 | **安全合规** | 生产密钥策略、Key 加密、Edge 信任边界 | 安全专项 + 渗透 |
-| **数据生命周期** | Session Reaper、过期清理、保留策略 | Reaper 测试 + Admin cleanup |
+| **数据生命周期** | 用户会话保留、诊断数据过期、运行时存储维护 | 生命周期测试 + Admin cleanup |
 
 ---
 
@@ -69,7 +69,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 ├──────────────────────────────────────────────────────────────┤
 │  第三层：SaaS 端到端场景（多客户端 × 典型用户旅程）              │
 ├──────────────────────────────────────────────────────────────┤
-│  第二层：SaaS 平台能力（认证、治理、Admin、隔离、Reaper）          │
+│  第二层：SaaS 平台能力（认证、治理、Admin、隔离、存储维护）        │
 ├──────────────────────────────────────────────────────────────┤
 │  第一层：Cloud 运行时协议（/chat/turn、回调、Run、Sync）        │
 └──────────────────────────────────────────────────────────────┘
@@ -247,21 +247,16 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 | 同版本 API 连不同 Account | 行为一致，数据隔离 |
 | Skill 配置 tenant scope（P2） | tenant 级 settings 不泄漏到其他 tenant |
 
-### 5.5 Session Reaper 与数据生命周期
+### 5.5 用户会话保留与运行时存储维护
 
-SaaS 需自动清理 idle/ended Session，防止存储无限增长。
+用户可见的 C1 会话历史（`agent_sessions`、对话事件及其关联状态）不会因空闲或年龄被后台任务改变或删除。显式删除会先持久化不可逆的 `delete_requested_at`；若前台删除中断，后台在短暂 grace 后按该时间戳重试完成删除。其他会话更新不得取消或推迟这一删除意图。
 
-| 阶段 | 策略（默认） | 验证 |
-|------|--------------|------|
-| active → idle | 30 min 无活动 | `last_active_at` 超时后 status=idle |
-| idle → ended | 再 idle 2h | `ended_at` 写入 |
-| ended → deleted | 1 天后 | 行删除 + workspace 目录清除 |
-| batch_limit | 500/次 | 大批量不锁表 |
+C3 模型请求诊断（`model_request_context_events`）与 C1 历史分离：不包含消息或工具输出，完整 attempt 对保留 30 天；每个 owner/session 或 owner/harness scope 最多保留 2,048 条。scope 压缩只删除完整的 accepted/terminal attempt 对，未完成 attempt 可暂时超过上限；30 天过期清理则以 attempt 为原子单位，在该 attempt 的最新诊断事实超过保留期后删除其全部记录，因此进程崩溃留下的未完成 attempt 也会最终回收。后台维护还会清理过期 fork grace pin、孤儿 fork/manifest/reference，以及无引用 conversation segment。每次维护操作最多处理 500 个数据库对象或一个有界 attempt 批次，避免长期锁表。
 
 **测试方式：**
-- 单元：`session_reaper.rs` 中 `reap_sessions` 纯函数测试
-- 集成：缩短 policy 时间窗口，插入测试 Session，触发 sweep，断言 DB + 文件系统
-- Admin：`POST /admin/cleanup` 与 scheduled reaper 结果一致
+- 单元：验证删除重试只按 `delete_requested_at` 选取；运行时维护不会因 idle/ended/closed 删除 C1 会话；诊断压缩不会拆分 attempt 对
+- 集成：中断一次显式删除后触发维护，断言该 intent 收敛；创建孤儿运行时存储并触发维护，断言只有无引用对象被回收
+- Admin：`POST /admin/cleanup` 处理其授权范围内的 TTL 数据；不得删除未显式请求删除的 C1 会话历史
 
 ### 5.6 模型与 LLM 托管
 
@@ -477,7 +472,7 @@ cargo test -p astra-services --test services_db_integration -- --ignored  # 服�
 | `e2e_matrix_saas_auth_refresh_cycle` | Token 刷新 |
 | `e2e_matrix_saas_session_cross_user_isolation` | Session IDOR（GET/PUT/cancel/DELETE） |
 | `e2e_matrix_saas_events_and_audit_cross_user_isolation` | Events/Audit/Activity 隔离 |
-| `reaper_marks_stale_active_session_idle_then_ended` | Session Reaper（services DB IT） |
+| `runtime_maintenance_*` | 显式删除重试、C3 诊断过期与孤儿运行时存储回收 |
 | `packages/sdk` `saas-remote.test.ts` | SDK 注册/Session/资源/隔离/Refresh（需 astra-server） |
 
 ---
@@ -496,7 +491,7 @@ SaaS 平台（第二层）
 [ ] Admin RBAC（403 → grant → 200 → revoke → 403）
 [ ] ResourceGovernor 配额拒绝 + Admin override
 [ ] 用户隔离矩阵全通过
-[ ] Session Reaper / cleanup 验证
+[ ] 运行时存储维护 / cleanup 验证
 [ ] Memoria 代理 + 降级
 
 端到端（第三层）
@@ -525,7 +520,7 @@ SaaS 平台（第二层）
 |------|------|------|
 | Cloud 协议 + Edge-Cloud E2E | 后端 + QA | ~1.5 周 |
 | Auth / Admin / 资源治理 | 后端 + QA | ~1.5 周 |
-| 隔离 + Reaper + Memoria 代理 | 后端 + QA | ~1 周 |
+| 隔离 + 存储维护 + Memoria 代理 | 后端 + QA | ~1 周 |
 | SDK / 多客户端场景 | 前端 + QA | ~1 周 |
 | K8s 规模化 + 混沌 | SRE + QA | ~2 周 |
 | 安全 + 渗透 | 安全 + QA | ~1 周 |
@@ -545,7 +540,7 @@ Edge-Cloud 与 Engine 能力重叠部分只测一次。
 | Admin 运维 | router_builder `/admin/*` | admin_smoke, models_admin_crud | §6.3 |
 | 资源治理 | resource_governor.rs | `e2e_matrix_saas_resource_*` | §5.3, §6.6 |
 | 多租户 | trust-and-safety §10 | — | §5.4 Multi-Account |
-| Session Reaper | session_reaper.rs | 单元 + 集成 | §5.5 |
+| 运行时存储维护 | runtime_maintenance.rs | 单元 + 集成 | §5.5 |
 | Headless Run | multi-agent-cloud-runtime §5.3 | chat_run_pause_resume | §4.3 |
 | Task Lease | sync_protocol / §9 | tasks_lease E2E | §6.4 |
 | Memoria 代理 | edge-cloud-execution | memory_full_lifecycle | §5.7 |
@@ -561,7 +556,7 @@ Edge-Cloud 与 Engine 能力重叠部分只测一次。
 |------|------|------|
 | ResourceGovernor HTTP E2E | 配额行为仅靠单元测试 | ✅ `e2e_matrix_saas_resource_*` |
 | `/admin/config` 深度 E2E | Admin 配置回归风险 | ✅ `e2e_matrix_saas_admin_config_crud_rbac` |
-| Session Reaper 集成 | 数据生命周期 | ✅ `session_reaper_db_integration` |
+| 无引用运行时存储集成 | 可达性回收 | 待补：显式删除会话后的 orphan 回收 E2E |
 | `/chat/ws` 无 system E2E | Web 实时通道 | 待补：SDK WS 测试 |
 | Skill tenant-scope admin（P2） | 企业多租户配置 | GA 若不含则 Out of Scope |
 | Multi-Account 无自动化 | 租户隔离 | 专项手工 + 脚本化 smoke |

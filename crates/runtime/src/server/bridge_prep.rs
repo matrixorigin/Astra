@@ -5,6 +5,8 @@ use crate::turn::bridge::{
 };
 use astra_turn_types::ModelSelection;
 
+const CHAT_SESSION_NOT_FOUND_ERROR_CODE: &str = "session_not_found";
+
 // ─── Typed request body ──────────────────────────────────────────────────────
 
 /// Typed representation of the incoming chat turn request payload.
@@ -196,13 +198,19 @@ fn validate_session_id_shape(
             "session_id must be a string",
         ));
     }
-    if request
-        .session_id_str()
-        .is_some_and(|session_id| session_id.trim().is_empty())
+    if let Some(session_id) = request.session_id_str()
+        && let Err(error) = astra_services::validate_persisted_session_id(session_id)
     {
-        return Err(error_response(
+        tracing::warn!(
+            target: "astra_runtime::chat",
+            session_id_bytes = session_id.len(),
+            validation_error = %error,
+            "rejected invalid chat turn session id"
+        );
+        return Err(error_response_coded(
             StatusCode::BAD_REQUEST,
-            "session_id must not be empty",
+            "session_id is invalid",
+            "session_id_invalid",
         ));
     }
     Ok(())
@@ -433,7 +441,7 @@ pub(super) async fn prepare_chat_turn_bridge_body(
                 .session_service
                 .get_session(session_id.clone(), user.user_id.clone())
                 .await
-                .map_err(normalize_chat_turn_session_error)?;
+                .map_err(|error| normalize_chat_turn_session_error(error, &session_id))?;
             (
                 Some(session_id),
                 normalize_session_created_at_for_bridge(&session.created_at),
@@ -617,10 +625,16 @@ fn normalize_session_created_at_for_bridge(created_at: &str) -> Option<String> {
 
 pub(super) fn normalize_chat_turn_session_error(
     error: (StatusCode, Json<ErrorResponse>),
+    session_id: &str,
 ) -> (StatusCode, Json<ErrorResponse>) {
     let (status, detail) = error;
     if status == StatusCode::NOT_FOUND {
-        error_response(StatusCode::NOT_FOUND, "Session not found")
+        error_response_coded_with_metadata(
+            StatusCode::NOT_FOUND,
+            "Session not found",
+            CHAT_SESSION_NOT_FOUND_ERROR_CODE,
+            serde_json::json!({ "session_id": session_id }),
+        )
     } else {
         (status, detail)
     }
@@ -1236,16 +1250,24 @@ mod tests {
     #[test]
     fn session_error_not_found_is_normalized() {
         let input = error_response(StatusCode::NOT_FOUND, "some db error details");
-        let (status, body) = normalize_chat_turn_session_error(input);
+        let (status, body) = normalize_chat_turn_session_error(input, "session-1");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.0.detail, "Session not found");
+        assert_eq!(
+            body.0.error_code.as_deref(),
+            Some(CHAT_SESSION_NOT_FOUND_ERROR_CODE)
+        );
+        assert_eq!(
+            body.0.metadata,
+            Some(serde_json::json!({ "session_id": "session-1" }))
+        );
     }
 
     #[test]
     fn session_error_internal_passes_through() {
         let msg = "unexpected failure";
         let input = error_response(StatusCode::INTERNAL_SERVER_ERROR, msg);
-        let (status, body) = normalize_chat_turn_session_error(input);
+        let (status, body) = normalize_chat_turn_session_error(input, "session-1");
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(body.0.detail, msg);
     }
@@ -1254,7 +1276,7 @@ mod tests {
     fn session_error_bad_request_passes_through() {
         let msg = "invalid request body";
         let input = error_response(StatusCode::BAD_REQUEST, msg);
-        let (status, body) = normalize_chat_turn_session_error(input);
+        let (status, body) = normalize_chat_turn_session_error(input, "session-1");
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.0.detail, msg);
     }
@@ -2023,11 +2045,8 @@ mod tests {
             (r#"{"session_id":null}"#, None),
             (r#"{"session_id":"sess-1"}"#, None),
             (r#"{"session_id":42}"#, Some("session_id must be a string")),
-            (r#"{"session_id":""}"#, Some("session_id must not be empty")),
-            (
-                r#"{"session_id":"   "}"#,
-                Some("session_id must not be empty"),
-            ),
+            (r#"{"session_id":""}"#, Some("session_id is invalid")),
+            (r#"{"session_id":"   "}"#, Some("session_id is invalid")),
         ] {
             let request: ChatTurnRequestBody = serde_json::from_str(raw).unwrap();
             match expected {

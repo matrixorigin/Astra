@@ -1672,7 +1672,8 @@ impl EventIngestionWorker {
         for (user_id, session_id) in inserted_session_end_sessions {
             sqlx::query(
                 "UPDATE agent_sessions SET status = 'ended', ended_at = NOW() \
-                 WHERE session_id = ? AND user_id = ? AND status != 'ended'",
+                 WHERE session_id = ? AND user_id = ? \
+                   AND status NOT IN ('ended', 'deleting')",
             )
             .bind(&session_id)
             .bind(&user_id)

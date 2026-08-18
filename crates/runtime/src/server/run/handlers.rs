@@ -390,12 +390,16 @@ async fn load_run_prompt_observability(
 
 pub(crate) async fn stream_run_handler(
     State(state): State<AppState>,
+    trace: Option<axum::Extension<crate::server::RequestTrace>>,
     Path(run_id): Path<String>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     Query(query): Query<RunStreamQuery>,
 ) -> Response {
+    let request_id = trace
+        .as_ref()
+        .map(|axum::Extension(trace)| trace.request_id.clone());
     let principal = match state
         .auth_service
         .current_principal_for_request(
@@ -411,7 +415,17 @@ pub(crate) async fn stream_run_handler(
         .await
     {
         Ok(principal) => principal,
-        Err((status, error)) => return sse_error_response(status, error.0.detail),
+        Err((status, error)) => {
+            return sse_error_response_from_error_with_context(
+                status,
+                error.0,
+                SseErrorContext {
+                    request_id: request_id.as_deref(),
+                    run_id: Some(&run_id),
+                    ..SseErrorContext::default()
+                },
+            );
+        }
     };
 
     match state
@@ -422,7 +436,12 @@ pub(crate) async fn stream_run_handler(
     {
         Ok(mut stream) => {
             if let Some(event_rx) = stream.event_rx.take() {
-                sse_streaming_response(stream.session_id, stream.run_id, event_rx)
+                sse_streaming_response(
+                    stream.session_id,
+                    stream.run_id,
+                    request_id.clone(),
+                    event_rx,
+                )
             } else {
                 sse_json_response(transform_stream_run_events_for_client(
                     &run_id,
@@ -430,7 +449,15 @@ pub(crate) async fn stream_run_handler(
                 ))
             }
         }
-        Err((status, error)) => sse_error_response(status, error.0.detail),
+        Err((status, error)) => sse_error_response_from_error_with_context(
+            status,
+            error.0,
+            SseErrorContext {
+                request_id: request_id.as_deref(),
+                run_id: Some(&run_id),
+                ..SseErrorContext::default()
+            },
+        ),
     }
 }
 

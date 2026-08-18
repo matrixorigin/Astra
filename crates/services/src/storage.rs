@@ -2874,11 +2874,14 @@ async fn ensure_core_schema_while_leased(
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             ended_at DATETIME(6) NULL,
+            delete_requested_at DATETIME(6) NULL,
             last_active_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             active_plan_id VARCHAR(64) NULL,
             config_version_id VARCHAR(24) NULL,
             PRIMARY KEY (user_id, session_id),
             INDEX idx_agent_sessions_user_status_updated (user_id, status, updated_at),
+            INDEX idx_agent_sessions_delete_requested_owner
+                (delete_requested_at, user_id, session_id),
             INDEX idx_agent_sessions_user_last_active (user_id, last_active_at),
             INDEX idx_agent_sessions_agent_status (agent_id, status),
             INDEX idx_agent_sessions_active_plan_id (active_plan_id),
@@ -2887,6 +2890,44 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "agent_sessions",
+        "delete_requested_at",
+        "ALTER TABLE agent_sessions ADD COLUMN delete_requested_at DATETIME(6) NULL",
+    )
+    .await?;
+    let legacy_delete_intents_backfilled = query(
+        "UPDATE agent_sessions
+         SET delete_requested_at = COALESCE(ended_at, updated_at, created_at)
+         WHERE status = 'deleting' AND delete_requested_at IS NULL",
+    )
+    .execute(&pool)
+    .await?
+    .rows_affected();
+    if legacy_delete_intents_backfilled > 0 {
+        tracing::info!(
+            legacy_delete_intents_backfilled,
+            "backfilled immutable timestamps for legacy session delete intents"
+        );
+    }
+    drop_index_if_present(
+        &pool,
+        &settings.database,
+        "agent_sessions",
+        "idx_agent_sessions_status_updated_owner",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_sessions",
+        "idx_agent_sessions_delete_requested_owner",
+        &["delete_requested_at", "user_id", "session_id"],
+        "ALTER TABLE agent_sessions ADD INDEX idx_agent_sessions_delete_requested_owner (delete_requested_at, user_id, session_id)",
+    )
     .await?;
     ensure_primary_key_shape(
         &pool,
@@ -6022,6 +6063,8 @@ async fn ensure_core_schema_while_leased(
                 (user_id, session_id, created_at, event_id),
             INDEX idx_model_request_context_owner_harness_created
                 (user_id, harness_run_id, created_at, event_id),
+            INDEX idx_model_request_context_created_event
+                (created_at, event_id),
             INDEX idx_model_request_context_metrics
                 (topology, provider, model_family, purpose, created_at),
             INDEX idx_model_request_context_terminal_status
@@ -6029,6 +6072,15 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "model_request_context_events",
+        "idx_model_request_context_created_event",
+        &["created_at", "event_id"],
+        "ALTER TABLE model_request_context_events ADD INDEX idx_model_request_context_created_event (created_at, event_id)",
+    )
     .await?;
     ensure_index_shape(
         &pool,
@@ -8127,7 +8179,7 @@ pub struct CleanupResult {
     pub rows_deleted: u64,
 }
 
-/// Configuration for data retention policies.
+/// Configuration for expiry policies of authentication and operational data.
 pub struct RetentionPolicy {
     /// Max age in days for expired/revoked refresh tokens (default: 7)
     pub refresh_token_days: u32,
@@ -8137,10 +8189,6 @@ pub struct RetentionPolicy {
     pub task_lease_days: u32,
     /// Max age in days for audit logs (default: 90)
     pub audit_log_days: u32,
-    /// Max age in days for prompt observability rows after their session/run is inactive (default: 90)
-    pub prompt_request_days: u32,
-    /// Max age in days for agent events (default: 90)
-    pub event_days: u32,
 }
 
 impl Default for RetentionPolicy {
@@ -8150,60 +8198,11 @@ impl Default for RetentionPolicy {
             auth_token_days: 30,
             task_lease_days: 7,
             audit_log_days: 90,
-            prompt_request_days: 90,
-            event_days: 90,
         }
     }
 }
 
-trait ExpiredAgentEventRow {
-    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
-}
-
-impl ExpiredAgentEventRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn decode_expired_agent_event_ref(
-    row: &impl ExpiredAgentEventRow,
-) -> Result<(String, String), String> {
-    let user_id = row
-        .string_column("user_id")
-        .map_err(|e| format!("cleanup agent_events decode user_id: {e}"))?;
-    let event_id = row
-        .string_column("event_id")
-        .map_err(|e| format!("cleanup agent_events decode event_id: {e}"))?;
-    Ok((user_id, event_id))
-}
-
-trait ExpiredPromptRequestRow {
-    fn string_column(&self, column: &str) -> Result<String, sqlx::Error>;
-}
-
-impl ExpiredPromptRequestRow for sqlx::mysql::MySqlRow {
-    fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-        self.try_get(column)
-    }
-}
-
-fn decode_expired_prompt_request_ref(
-    row: &impl ExpiredPromptRequestRow,
-) -> Result<(String, String, String), String> {
-    let user_id = row
-        .string_column("user_id")
-        .map_err(|e| format!("cleanup prompt_request_records decode user_id: {e}"))?;
-    let session_id = row
-        .string_column("session_id")
-        .map_err(|e| format!("cleanup prompt_request_records decode session_id: {e}"))?;
-    let request_id = row
-        .string_column("request_id")
-        .map_err(|e| format!("cleanup prompt_request_records decode request_id: {e}"))?;
-    Ok((user_id, session_id, request_id))
-}
-
-/// Purge expired data across all tables with TTL/expiry semantics.
+/// Purge expired authentication and operational records with TTL/expiry semantics.
 ///
 /// Returns a list of per-table cleanup results showing how many rows were deleted.
 /// Each DELETE uses a LIMIT to avoid long-running locks; callers should invoke
@@ -8219,11 +8218,6 @@ pub async fn cleanup_expired_data(
     const AUTH_PROVIDER_REQUEST_REPLAY_BATCH_LIMIT: u32 = 1000;
     const TASK_LEASE_BATCH_LIMIT: u32 = 1000;
     const AUTH_AUDIT_LOG_BATCH_LIMIT: u32 = 1000;
-    const PROMPT_REQUEST_BATCH_LIMIT: u32 = 1000;
-    const PROMPT_REQUEST_MAX_BATCHES_PER_RUN: u32 = 10;
-    const PROMPT_REQUEST_DELETE_CHUNK_SIZE: usize = 250;
-    const AGENT_EVENT_BATCH_LIMIT: u32 = 1000;
-    const AGENT_EVENT_DELETE_CHUNK_SIZE: usize = 250;
     let mut results = Vec::new();
 
     // 1. Expired + revoked refresh tokens
@@ -8348,181 +8342,6 @@ pub async fn cleanup_expired_data(
     .map_err(|e| format!("cleanup auth_audit_logs: {e}"))?;
     results.push(CleanupResult {
         table: "auth_audit_logs",
-        rows_deleted: deleted,
-    });
-
-    // 6. Old prompt observability rows. Select parent request records first so
-    // child prompt_deltas and parent prompt_request_records are pruned together.
-    let prompt_request_retention_select_sql = format!(
-        "SELECT p.user_id, p.session_id, p.request_id
-             FROM prompt_request_records p
-             LEFT JOIN agent_sessions s
-               ON s.user_id = p.user_id AND s.session_id = p.session_id
-             LEFT JOIN agent_runs r
-               ON r.user_id = p.user_id AND r.run_id = p.run_id
-             WHERE p.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {} DAY)) * 1000
-               AND (s.session_id IS NULL OR s.status IN ('ended', 'closed', 'cancelled', 'deleting'))
-               AND (p.run_id IS NULL OR r.run_id IS NULL OR r.status IN ('completed', 'delegated', 'failed', 'cancelled'))
-             ORDER BY p.created_at_unix_ms ASC, p.user_id ASC, p.request_id ASC
-             LIMIT ?",
-        policy.prompt_request_days
-    );
-    let mut prompt_delta_deleted = 0_u64;
-    let mut prompt_request_deleted = 0_u64;
-    for _ in 0..PROMPT_REQUEST_MAX_BATCHES_PER_RUN {
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| format!("cleanup prompt_request_records begin transaction: {e}"))?;
-        let expired_prompt_rows = sqlx::query(&prompt_request_retention_select_sql)
-            .bind(PROMPT_REQUEST_BATCH_LIMIT)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| format!("cleanup prompt_request_records select expired ids: {e}"))?;
-        let expired_prompt_request_ids: Vec<(String, String, String)> = expired_prompt_rows
-            .iter()
-            .map(decode_expired_prompt_request_ref)
-            .collect::<Result<Vec<_>, _>>()?;
-        if expired_prompt_request_ids.is_empty() {
-            tx.commit()
-                .await
-                .map_err(|e| format!("cleanup prompt_request_records commit empty batch: {e}"))?;
-            break;
-        }
-        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
-            let mut builder = QueryBuilder::<MySql>::new(
-                "DELETE FROM prompt_deltas WHERE (user_id, session_id, request_id) IN (",
-            );
-            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
-                if index > 0 {
-                    builder.push(", ");
-                }
-                builder
-                    .push("(")
-                    .push_bind(user_id)
-                    .push(", ")
-                    .push_bind(session_id)
-                    .push(", ")
-                    .push_bind(request_id)
-                    .push(")");
-            }
-            builder.push(")");
-            let deleted = builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("cleanup prompt_deltas: {e}"))?;
-            prompt_delta_deleted = prompt_delta_deleted.saturating_add(deleted);
-        }
-        for chunk in expired_prompt_request_ids.chunks(PROMPT_REQUEST_DELETE_CHUNK_SIZE) {
-            let mut builder = QueryBuilder::<MySql>::new(
-                "DELETE FROM prompt_request_records WHERE (user_id, session_id, request_id) IN (",
-            );
-            for (index, (user_id, session_id, request_id)) in chunk.iter().enumerate() {
-                if index > 0 {
-                    builder.push(", ");
-                }
-                builder
-                    .push("(")
-                    .push_bind(user_id)
-                    .push(", ")
-                    .push_bind(session_id)
-                    .push(", ")
-                    .push_bind(request_id)
-                    .push(")");
-            }
-            builder.push(")");
-            let deleted = builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("cleanup prompt_request_records delete expired ids: {e}"))?;
-            prompt_request_deleted = prompt_request_deleted.saturating_add(deleted);
-        }
-        tx.commit()
-            .await
-            .map_err(|e| format!("cleanup prompt_request_records commit transaction: {e}"))?;
-        if expired_prompt_request_ids.len() < PROMPT_REQUEST_BATCH_LIMIT as usize {
-            break;
-        }
-    }
-    results.push(CleanupResult {
-        table: "prompt_deltas",
-        rows_deleted: prompt_delta_deleted,
-    });
-    results.push(CleanupResult {
-        table: "prompt_request_records",
-        rows_deleted: prompt_request_deleted,
-    });
-
-    // 7. Old agent events
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| format!("cleanup agent_events begin transaction: {e}"))?;
-    let expired_event_rows = sqlx::query(
-        "SELECT user_id, event_id FROM agent_events \
-         WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY) \
-         ORDER BY created_at ASC, user_id ASC, event_id ASC \
-         LIMIT ?",
-    )
-    .bind(policy.event_days)
-    .bind(AGENT_EVENT_BATCH_LIMIT)
-    .fetch_all(&mut *tx)
-    .await
-    .map_err(|e| format!("cleanup agent_events select expired ids: {e}"))?;
-    let expired_event_ids: Vec<(String, String)> = expired_event_rows
-        .iter()
-        .map(decode_expired_agent_event_ref)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut edge_deleted = 0_u64;
-    if !expired_event_ids.is_empty() {
-        for chunk in expired_event_ids.chunks(AGENT_EVENT_DELETE_CHUNK_SIZE) {
-            let deleted = delete_agent_event_edges_for_owned_event_ids(&mut *tx, chunk)
-                .await
-                .map_err(|e| format!("cleanup agent_event_edges: {e}"))?;
-            edge_deleted = edge_deleted.saturating_add(deleted);
-        }
-    }
-    let deleted = if expired_event_ids.is_empty() {
-        0
-    } else {
-        let mut total_deleted = 0_u64;
-        for chunk in expired_event_ids.chunks(AGENT_EVENT_DELETE_CHUNK_SIZE) {
-            let mut builder = QueryBuilder::<MySql>::new(
-                "DELETE FROM agent_events WHERE (user_id, event_id) IN (",
-            );
-            let mut event_ids = builder.separated(", ");
-            for (user_id, event_id) in chunk {
-                event_ids
-                    .push_unseparated("(")
-                    .push_bind(user_id)
-                    .push_unseparated(", ")
-                    .push_bind(event_id)
-                    .push_unseparated(")");
-            }
-            event_ids.push_unseparated(")");
-            let deleted = builder
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("cleanup agent_events delete expired ids: {e}"))?;
-            total_deleted = total_deleted.saturating_add(deleted);
-        }
-        total_deleted
-    };
-    tx.commit()
-        .await
-        .map_err(|e| format!("cleanup agent_events commit transaction: {e}"))?;
-    results.push(CleanupResult {
-        table: "agent_event_edges",
-        rows_deleted: edge_deleted,
-    });
-    results.push(CleanupResult {
-        table: "agent_events",
         rows_deleted: deleted,
     });
 
@@ -8761,60 +8580,6 @@ mod tests {
                 sqlx::Error::ColumnNotFound(name) => assert_eq!(name, column),
                 err => panic!("expected ColumnNotFound({column}), got {err:?}"),
             }
-        }
-    }
-
-    struct FakeExpiredAgentEventRow {
-        failed_column: Option<&'static str>,
-    }
-
-    impl FakeExpiredAgentEventRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-            }
-        }
-    }
-
-    impl ExpiredAgentEventRow for FakeExpiredAgentEventRow {
-        fn string_column(&self, column: &str) -> Result<String, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            Ok(match column {
-                "user_id" => "user-1",
-                "event_id" => "event-1",
-                _ => return Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-            .to_string())
-        }
-    }
-
-    #[test]
-    fn expired_agent_event_ref_decode_preserves_owner_and_event_id() {
-        let (user_id, event_id) =
-            decode_expired_agent_event_ref(&FakeExpiredAgentEventRow::complete()).unwrap();
-
-        assert_eq!(user_id, "user-1");
-        assert_eq!(event_id, "event-1");
-    }
-
-    #[test]
-    fn expired_agent_event_ref_decode_fails_loudly_on_missing_columns() {
-        for column in ["user_id", "event_id"] {
-            let error = decode_expired_agent_event_ref(&FakeExpiredAgentEventRow::fail_on(column))
-                .unwrap_err();
-            assert!(
-                error.contains(column),
-                "cleanup decode error should identify `{column}`: {error}"
-            );
         }
     }
 

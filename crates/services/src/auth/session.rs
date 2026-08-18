@@ -655,6 +655,10 @@ impl SessionService for DatabaseSessionService {
         update_query.push_bind(&session_id);
         update_query.push(" AND user_id = ");
         update_query.push_bind(&user_id);
+        // A delete intent is irreversible: the foreground hard-delete may be
+        // retried by maintenance after this request returns, so do not let an
+        // ordinary session update revive or alter a session being deleted.
+        update_query.push(" AND delete_requested_at IS NULL");
 
         let rows_affected = update_query
             .build()

@@ -275,11 +275,13 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             state.metrics_registry(),
             bg_cancel.clone(),
         ));
-        bg_handles.push(astra_services::session_reaper::spawn_session_reaper(
-            pool.clone(),
-            state.session_fork_coordinator.clone(),
-            bg_cancel.clone(),
-        ));
+        bg_handles.push(
+            astra_services::runtime_maintenance::spawn_runtime_maintenance(
+                pool.clone(),
+                state.session_fork_coordinator.clone(),
+                bg_cancel.clone(),
+            ),
+        );
         // Spawn background cleanup-debt retry task
         {
             let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =
@@ -383,7 +385,8 @@ async fn http_shutdown_signal() {
     }
 }
 
-/// Spawn a background task that periodically cleans up expired data.
+/// Spawn a background task that periodically cleans up expired authentication
+/// and operational data.
 fn spawn_data_cleanup(
     pool: astra_core::SharedPool,
     cancel: tokio_util::sync::CancellationToken,
