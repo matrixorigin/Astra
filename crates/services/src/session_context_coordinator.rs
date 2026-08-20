@@ -826,7 +826,17 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                     && active.idempotency_key == idempotency_key
                 {
                     validate_lease_request(active, &key, &expected_cursor, &actor)?;
-                    return Ok(AcquireWriterOutcome::AlreadyAcquired(active.clone()));
+                    // An idempotent re-acquire by the same owner is a liveness
+                    // heartbeat: refresh the TTL so a long multi-round turn is
+                    // not pinned to its first admission time.
+                    let refreshed = state
+                        .active_writer
+                        .as_mut()
+                        .expect("matched active writer lease");
+                    refreshed.expires_at_unix_ms = expires_at;
+                    let refreshed = refreshed.clone();
+                    coordinator.store_state(session_dir, state)?;
+                    return Ok(AcquireWriterOutcome::AlreadyAcquired(refreshed));
                 }
                 if state.head.as_ref().map(|head| &head.cursor) != expected_cursor.as_ref() {
                     return Ok(AcquireWriterOutcome::Conflict {
@@ -1064,7 +1074,15 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                     && active.idempotency_key == idempotency_key
                 {
                     validate_reservation_request(active, &lease, &expected_cursor)?;
-                    return Ok(ReserveTurnOutcome::AlreadyReserved(active.clone()));
+                    let expires_at = checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms);
+                    let refreshed = state
+                        .active_reservation
+                        .as_mut()
+                        .expect("matched active reservation");
+                    refreshed.expires_at_unix_ms = expires_at;
+                    let refreshed = refreshed.clone();
+                    coordinator.store_state(session_dir, state)?;
+                    return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
                 }
                 validate_active_lease(state, &lease, now)?;
                 if state.head.as_ref().map(|head| &head.cursor) != expected_cursor.as_ref() {
@@ -1934,14 +1952,24 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             && active.idempotency_key == idempotency_key
         {
             validate_lease_request(&active, key, &expected_cursor.cloned(), actor)?;
+            // An idempotent re-acquire by the same owner is a liveness
+            // heartbeat: refresh the TTL so a long multi-round turn is
+            // not pinned to its first admission time.
+            let refreshed = state
+                .active_writer
+                .as_mut()
+                .expect("matched active writer lease");
+            refreshed.expires_at_unix_ms = expires_at;
+            let refreshed = refreshed.clone();
+            update_database_state(&mut tx, &state).await?;
             record_database_authority_event(
                 &mut tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "acquire_writer",
-                    outcome: "idempotent_replay",
+                    outcome: "idempotent_refreshed",
                     actor: Some(actor),
-                    lease_id: Some(&active.lease_id),
+                    lease_id: Some(&refreshed.lease_id),
                     reservation_id: None,
                     expected_cursor,
                 },
@@ -1950,7 +1978,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_retry", source))?;
-            return Ok(AcquireWriterOutcome::AlreadyAcquired(active.clone()));
+            return Ok(AcquireWriterOutcome::AlreadyAcquired(refreshed));
         }
         if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
             let outcome = AcquireWriterOutcome::Conflict {
@@ -2432,15 +2460,23 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             && active.idempotency_key == idempotency_key
         {
             validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
+            let expires_at = checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms);
+            let refreshed = state
+                .active_reservation
+                .as_mut()
+                .expect("matched active reservation");
+            refreshed.expires_at_unix_ms = expires_at;
+            let refreshed = refreshed.clone();
+            update_database_state(&mut tx, &state).await?;
             record_database_authority_event(
                 &mut tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "reserve_turn",
-                    outcome: "idempotent_replay",
+                    outcome: "idempotent_refreshed",
                     actor: Some(&lease.actor),
                     lease_id: Some(&lease.lease_id),
-                    reservation_id: Some(&active.reservation_id),
+                    reservation_id: Some(&refreshed.reservation_id),
                     expected_cursor,
                 },
             )
@@ -2448,7 +2484,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_reservation_retry", source))?;
-            return Ok(ReserveTurnOutcome::AlreadyReserved(active.clone()));
+            return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
         }
         if let Err(error) = validate_active_lease(&state, lease, now) {
             record_database_authority_event(
@@ -5288,6 +5324,102 @@ mod tests {
                 .unwrap(),
             AcquireWriterOutcome::Conflict { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn idempotent_reacquire_refreshes_liveness_after_window_elapsed() {
+        let temp = TempDir::new().unwrap();
+        let clock = Arc::new(ManualClock::new(1_000));
+        let coordinator = coordinator(&temp, clock.clone());
+        let key = key("owner-heartbeat");
+        let ttl = Duration::from_secs(30);
+
+        let first = acquired(
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &actor("owner-heartbeat"),
+                    ttl,
+                    "acquire-heartbeat",
+                )
+                .await
+                .unwrap(),
+        );
+        let first_reservation = reserved(
+            coordinator
+                .reserve_turn(&first, None, ttl, "reserve-heartbeat")
+                .await
+                .unwrap(),
+        );
+        assert_eq!(first.expires_at_unix_ms, 31_000);
+        assert_eq!(first_reservation.expires_at_unix_ms, 31_000);
+
+        // The whole original window elapses without a renewal tick.
+        clock.advance(31_000);
+
+        // Same-owner idempotent re-acquire refreshes the lease instead of
+        // replaying the stale window...
+        let refreshed = match coordinator
+            .acquire_writer(
+                &key,
+                None,
+                &actor("owner-heartbeat"),
+                ttl,
+                "acquire-heartbeat",
+            )
+            .await
+            .unwrap()
+        {
+            AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+            other => panic!("expected refreshed replay, got {other:?}"),
+        };
+        assert_eq!(refreshed.lease_id, first.lease_id);
+        assert_eq!(refreshed.writer_epoch, first.writer_epoch);
+        assert_eq!(refreshed.expires_at_unix_ms, 62_000);
+
+        // ...and the same-owner reservation replay refreshes as well, staying
+        // bounded by the lease.
+        let refreshed_reservation = match coordinator
+            .reserve_turn(&refreshed, None, ttl, "reserve-heartbeat")
+            .await
+            .unwrap()
+        {
+            ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
+            other => panic!("expected refreshed reservation replay, got {other:?}"),
+        };
+        assert_eq!(
+            refreshed_reservation.reservation_id,
+            first_reservation.reservation_id
+        );
+        assert_eq!(refreshed_reservation.expires_at_unix_ms, 62_000);
+
+        // A different owner can never piggyback on the heartbeat: while the
+        // refreshed lease is active, foreign keys still conflict.
+        assert!(matches!(
+            coordinator
+                .acquire_writer(
+                    &key,
+                    None,
+                    &actor("owner-heartbeat"),
+                    ttl,
+                    "acquire-intruder"
+                )
+                .await
+                .unwrap(),
+            AcquireWriterOutcome::Conflict { .. }
+        ));
+
+        // The commit succeeds even though the original window elapsed.
+        let mutation = coordinator
+            .commit_turn(&refreshed_reservation, delta(1, 1, 1), "commit-heartbeat")
+            .await
+            .unwrap();
+        let cursor = match mutation {
+            CoordinatorMutationV1::Applied { cursor } => cursor,
+            other => panic!("unexpected commit outcome {other:?}"),
+        };
+        assert_eq!(cursor.completed_turn, 1);
     }
 
     #[tokio::test]

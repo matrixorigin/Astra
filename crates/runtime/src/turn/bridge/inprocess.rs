@@ -761,14 +761,25 @@ async fn begin_bridge_canonical_admission(
             ));
         }
     };
-    if requested_turn.is_some_and(|turn| turn != reservation.reserved_turn) {
+    // Canonical turn numbering is server-owned: the reserved turn is the only
+    // authority. A client whose session_turn is *ahead* has counted
+    // user-visible turns that never committed canonically (a failed
+    // settlement still consumes a client-side turn); the transcript was
+    // already reconciled against the canonical head by
+    // `admit_canonical_bridge_prompt`, so proceeding with the reserved turn
+    // recovers the session instead of deadlocking it (issue #623). Only a
+    // session_turn *behind* the reservation replays a turn the canonical head
+    // has already moved past, which must stay rejected.
+    if let Some(requested) = requested_turn
+        && requested < reservation.reserved_turn
+    {
         if release_writer_on_admission_failure {
             let _ = release_bridge_canonical_writer(&coordinator, &lease).await;
         }
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "bridge session_turn does not match reserved canonical turn {}",
+                "bridge session_turn {requested} is behind reserved canonical turn {} (stale replay)",
                 reservation.reserved_turn
             ),
         ));
@@ -6291,7 +6302,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicI64, AtomicUsize, Ordering},
     };
 
     #[tokio::test]
@@ -6335,7 +6346,11 @@ mod tests {
         first.retain_for_continuation();
         drop(first);
 
-        let stale_retry = begin_bridge_canonical_admission(
+        // A retry whose session_turn is ahead of the canonical head has
+        // counted a turn that never committed; canonical numbering is
+        // server-owned, so it proceeds with the reserved turn instead of
+        // deadlocking the session (issue #623).
+        let ahead_retry = begin_bridge_canonical_admission(
             Some(&coordinator),
             "owner-1",
             "session-1",
@@ -6345,11 +6360,12 @@ mod tests {
             vec![user_message.clone()],
             CancellationToken::new(),
         )
-        .await;
-        let Err(stale_retry) = stale_retry else {
-            panic!("a retry with a mismatched turn must be rejected");
-        };
-        assert_eq!(stale_retry.0, StatusCode::CONFLICT);
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        assert_eq!(ahead_retry.reservation.reserved_turn, 1);
+        drop(ahead_retry);
         let key = astra_turn_types::SessionKeyV1::owner_session(
             "server",
             "owner-1",
@@ -6362,7 +6378,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some(),
-            "a rejected retry must not release the original request's writer lease"
+            "an ahead retry must not release the original request's writer lease"
         );
 
         let tool_call = json!({
@@ -6460,6 +6476,378 @@ mod tests {
                 .and_then(|message| message.get("content"))
                 .and_then(Value::as_str),
             Some("summary complete")
+        );
+    }
+
+    struct BridgeLeaseTestClock(AtomicI64);
+
+    impl BridgeLeaseTestClock {
+        fn new(now: i64) -> Self {
+            Self(AtomicI64::new(now))
+        }
+
+        fn advance(&self, millis: i64) {
+            self.0.fetch_add(millis, Ordering::SeqCst);
+        }
+    }
+
+    impl astra_services::CoordinatorClock for BridgeLeaseTestClock {
+        fn now_unix_ms(&self) -> Result<i64, astra_services::SessionContextCoordinatorError> {
+            Ok(self.0.load(Ordering::SeqCst))
+        }
+    }
+
+    fn long_turn_provisional_messages() -> Vec<Value> {
+        vec![
+            json!({"role": "user", "content": "do the long work"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-long",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"README.md\"}"}
+                }]
+            }),
+            json!({"role": "tool", "tool_call_id": "call-long", "content": "repository contents"}),
+        ]
+    }
+
+    // Issue #623 regression guard: a multi-round bridge turn must not pin
+    // canonical lease validity to the first admission. Every round boundary
+    // drops the admission (cancelling the renewal task) and the next round's
+    // idempotent re-acquire acts as a liveness heartbeat that refreshes
+    // `expires_at_unix_ms`, so a turn that outlives BRIDGE_CANONICAL_LEASE_TTL
+    // across many short rounds still commits. The virtual clock advances 15+
+    // minutes instantly while no round lives long enough for the 4-minute
+    // renewal tick, mirroring short production rounds. Before the fix this
+    // flow failed with "writer lease or turn reservation expired".
+    #[tokio::test]
+    async fn canonical_bridge_long_turn_readmission_refreshes_expired_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let clock = Arc::new(BridgeLeaseTestClock::new(1_000_000));
+        let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
+            astra_services::FileSessionContextCoordinator::with_clock(temp.path(), clock.clone()),
+        );
+        let messages = long_turn_provisional_messages();
+
+        // Round 1: admission opens the lease window, tool calls keep the turn
+        // alive, and the round boundary retains but drops the admission,
+        // cancelling the renewal task before it can ever fire.
+        let mut first = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-long-turn",
+            "session-long-turn",
+            "turn-chain-long",
+            Some(1),
+            None,
+            messages.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        let initial_lease_expiry = first.lease.expires_at_unix_ms;
+        first.retain_for_continuation();
+        drop(first);
+
+        // The turn keeps running past the lease TTL (virtual time only).
+        let elapsed = BRIDGE_CANONICAL_LEASE_TTL.as_millis() as i64 + 1_000;
+        clock.advance(elapsed);
+
+        // A later round of the same turn re-acquires idempotently...
+        let mut resumed = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-long-turn",
+            "session-long-turn",
+            "turn-chain-long",
+            Some(1),
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+
+        // ...and the idempotent replay refreshes the liveness window instead
+        // of replaying the stale one.
+        assert_eq!(
+            resumed.lease.expires_at_unix_ms,
+            initial_lease_expiry + elapsed
+        );
+        assert_eq!(
+            resumed.reservation.expires_at_unix_ms,
+            resumed.lease.expires_at_unix_ms
+        );
+
+        // Terminal commit of the over-long turn succeeds and advances the
+        // canonical head, releasing the writer.
+        resumed
+            .commit_terminal("final answer after a long turn")
+            .await
+            .unwrap();
+
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            "owner-long-turn",
+            "session-long-turn",
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(head.cursor.completed_turn, 1);
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Control for the regression above: the identical multi-round flow committed
+    // inside the lease window succeeds and advances the canonical head, proving
+    // the failure is driven purely by elapsed lease validity.
+    #[tokio::test]
+    async fn canonical_bridge_turn_commits_inside_lease_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let clock = Arc::new(BridgeLeaseTestClock::new(1_000_000));
+        let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
+            astra_services::FileSessionContextCoordinator::with_clock(temp.path(), clock.clone()),
+        );
+        let messages = long_turn_provisional_messages();
+
+        let mut first = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-inside-window",
+            "session-inside-window",
+            "turn-chain-inside",
+            Some(1),
+            None,
+            messages.clone(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        first.retain_for_continuation();
+        drop(first);
+
+        // Some virtual time elapses, but the turn stays inside the lease window.
+        clock.advance(60_000);
+
+        let mut resumed = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-inside-window",
+            "session-inside-window",
+            "turn-chain-inside",
+            Some(1),
+            None,
+            messages,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        resumed
+            .commit_terminal("final answer inside the window")
+            .await
+            .unwrap();
+
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            "owner-inside-window",
+            "session-inside-window",
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(head.cursor.completed_turn, 1);
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Issue #623 regression guard, divergence half: after a turn fails to
+    // commit canonically, the client's session_turn counter stays ahead of
+    // the canonical head by the number of failed turns. Canonical numbering
+    // is server-owned, so the ahead client must be admitted with the
+    // server's reserved turn and the session must keep advancing; only a
+    // session_turn behind the canonical head (a stale replay) may be
+    // rejected. Before the fix this cascade deadlocked every subsequent
+    // turn with "bridge session_turn does not match reserved canonical
+    // turn" until the session was restarted.
+    #[tokio::test]
+    async fn canonical_bridge_ahead_client_recovers_after_uncommitted_turn() {
+        let temp = tempfile::tempdir().unwrap();
+        let clock = Arc::new(BridgeLeaseTestClock::new(1_000_000));
+        let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
+            astra_services::FileSessionContextCoordinator::with_clock(temp.path(), clock.clone()),
+        );
+        let key = astra_turn_types::SessionKeyV1::owner_session(
+            "server",
+            "owner-ahead",
+            "session-ahead",
+            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
+        );
+
+        // Turn 1 commits normally; the client and canonical head agree.
+        let mut first = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-ahead",
+            "session-ahead",
+            "turn-chain-1",
+            Some(1),
+            None,
+            vec![json!({"role": "user", "content": "question one"})],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        first.commit_terminal("answer one").await.unwrap();
+        assert_eq!(
+            coordinator
+                .load_head(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor
+                .completed_turn,
+            1
+        );
+
+        // Turn 2 is admitted but outlives the lease TTL, so its reservation
+        // expires before settlement and the commit fails — the canonical head
+        // does not advance while the client still counts the turn.
+        let mut failed = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-ahead",
+            "session-ahead",
+            "turn-chain-2",
+            Some(2),
+            None,
+            vec![
+                json!({"role": "user", "content": "question one"}),
+                json!({"role": "assistant", "content": "answer one"}),
+                json!({"role": "user", "content": "question two"}),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        clock.advance(BRIDGE_CANONICAL_LEASE_TTL.as_millis() as i64 + 1_000);
+        let commit_error = failed
+            .commit_terminal("answer two")
+            .await
+            .expect_err("the expired reservation must fail the turn's commit");
+        assert!(
+            commit_error.contains("writer lease or turn reservation expired"),
+            "unexpected commit failure: {commit_error}"
+        );
+        drop(failed);
+        assert_eq!(
+            coordinator
+                .load_head(&key)
+                .await
+                .unwrap()
+                .unwrap()
+                .cursor
+                .completed_turn,
+            1,
+            "the failed turn must not advance the canonical head"
+        );
+
+        // The client counted the failed turn and now sends session_turn 3,
+        // but the canonical head still reserves turn 2. Admission must
+        // proceed with the server's reserved turn instead of rejecting the
+        // ahead client.
+        let mut recovered = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-ahead",
+            "session-ahead",
+            "turn-chain-3",
+            Some(3),
+            None,
+            vec![
+                json!({"role": "user", "content": "question one"}),
+                json!({"role": "assistant", "content": "answer one"}),
+                json!({"role": "user", "content": "question three"}),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        assert_eq!(recovered.reservation.reserved_turn, 2);
+        recovered.commit_terminal("answer three").await.unwrap();
+
+        // The client stays one ahead for the rest of the session and every
+        // turn keeps committing at the server-owned number.
+        let mut next = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-ahead",
+            "session-ahead",
+            "turn-chain-4",
+            Some(4),
+            None,
+            vec![
+                json!({"role": "user", "content": "question one"}),
+                json!({"role": "assistant", "content": "answer one"}),
+                json!({"role": "user", "content": "question three"}),
+                json!({"role": "assistant", "content": "answer three"}),
+                json!({"role": "user", "content": "question four"}),
+            ],
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .admission
+        .unwrap();
+        assert_eq!(next.reservation.reserved_turn, 3);
+        next.commit_terminal("answer four").await.unwrap();
+
+        let head = coordinator.load_head(&key).await.unwrap().unwrap();
+        assert_eq!(head.cursor.completed_turn, 3);
+        assert!(
+            coordinator
+                .load_active_writer(&key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A session_turn behind the canonical head is a stale replay and
+        // must stay rejected.
+        let stale_replay = begin_bridge_canonical_admission(
+            Some(&coordinator),
+            "owner-ahead",
+            "session-ahead",
+            "turn-chain-stale",
+            Some(1),
+            None,
+            vec![json!({"role": "user", "content": "question one"})],
+            CancellationToken::new(),
+        )
+        .await;
+        let Err((status, message)) = stale_replay else {
+            panic!("a session_turn behind the canonical head must stay rejected");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            message.contains("is behind reserved canonical turn"),
+            "unexpected rejection message: {message}"
         );
     }
 
