@@ -1058,7 +1058,7 @@ async fn ensure_sync_event_session_header(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    match add_agent_session_event_count_or_create(&mut **tx, session_id, user_id, 0, None).await {
+    match add_agent_session_event_count_or_create(tx, session_id, user_id, 0, None).await {
         Ok(()) => Ok(()),
         Err(sqlx::Error::RowNotFound) => {
             let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)

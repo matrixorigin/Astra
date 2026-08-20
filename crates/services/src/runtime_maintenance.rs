@@ -8,8 +8,6 @@
 //! Durable conversation history remains available until the user deletes the
 //! session through the normal API.
 
-use std::time::Duration;
-
 /// Bounded work configuration for runtime-storage maintenance.
 #[derive(Debug, Clone)]
 pub struct RuntimeMaintenancePolicy {
@@ -38,6 +36,10 @@ pub struct RuntimeMaintenanceSweepResult {
     pub explicit_delete_intents_reconciled: u64,
     /// Old diagnostic request-context records removed after retention.
     pub model_request_context_events_expired: u64,
+    /// Expired prompt-assembly request diagnostics removed after retention.
+    pub prompt_request_records_expired: u64,
+    /// Child prompt delta diagnostics removed before their parent requests.
+    pub prompt_deltas_expired: u64,
     /// Expired fork-retention pins released after their grace period.
     pub expired_fork_pins_released: u64,
     /// Fork records whose child session no longer exists.
@@ -86,6 +88,19 @@ pub async fn maintain_runtime_storage(
         crate::model_request_context::expire_model_request_context_events(pool, policy.batch_limit)
             .await,
     );
+    match crate::prompt_delta::expire_prompt_diagnostics(pool, policy.batch_limit).await {
+        Ok(expiry) => {
+            result.prompt_request_records_expired = expiry.prompt_request_records;
+            result.prompt_deltas_expired = expiry.prompt_deltas;
+        }
+        Err(error) => {
+            record_runtime_storage_maintenance(
+                &mut result.cleanup_errors,
+                "expire_prompt_diagnostics",
+                Err(error),
+            );
+        }
+    }
     if let Some(coordinator) = fork_coordinator {
         result.expired_fork_pins_released = record_runtime_storage_maintenance(
             &mut result.cleanup_errors,
@@ -126,60 +141,19 @@ pub async fn maintain_runtime_storage(
     result
 }
 
-/// Spawn the long-lived runtime-storage maintenance worker.
-///
-/// The worker receives the shared pool only for two narrow owner operations:
-/// retrying durable deleting intents and expiring diagnostics. It never
-/// derives deletion from session inactivity.
-pub fn spawn_runtime_maintenance(
-    pool: astra_core::SharedPool,
-    fork_coordinator: Option<std::sync::Arc<crate::DatabaseSessionForkCoordinator>>,
-    cancel: tokio_util::sync::CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    let maintenance_interval = Duration::from_secs(5 * 60);
-
-    tokio::spawn(async move {
-        let policy = RuntimeMaintenancePolicy::default();
-        let mut interval = tokio::time::interval(maintenance_interval);
-        interval.tick().await; // skip immediate first tick
-        loop {
-            tokio::select! {
-                _ = cancel.cancelled() => {
-                    tracing::info!(
-                        target: "astra_services::runtime_maintenance",
-                        "runtime storage maintenance received cancellation; exiting"
-                    );
-                    break;
-                }
-                _ = interval.tick() => {}
-            }
-
-            let result =
-                maintain_runtime_storage(&pool, fork_coordinator.as_deref(), &policy).await;
-            let total = result
-                .explicit_delete_intents_reconciled
-                .saturating_add(result.model_request_context_events_expired)
-                .saturating_add(result.expired_fork_pins_released)
-                .saturating_add(result.orphaned_forks_collected)
-                .saturating_add(result.orphaned_manifests_collected)
-                .saturating_add(result.orphaned_manifest_references_collected)
-                .saturating_add(result.unreferenced_segments_collected);
-            if total > 0 {
-                tracing::info!(
-                    target: "astra_services::runtime_maintenance",
-                    explicit_delete_intents_reconciled = result.explicit_delete_intents_reconciled,
-                    model_request_context_events_expired = result.model_request_context_events_expired,
-                    expired_fork_pins_released = result.expired_fork_pins_released,
-                    orphaned_forks_collected = result.orphaned_forks_collected,
-                    orphaned_manifests_collected = result.orphaned_manifests_collected,
-                    orphaned_manifest_references_collected = result.orphaned_manifest_references_collected,
-                    unreferenced_segments_collected = result.unreferenced_segments_collected,
-                    cleanup_error_count = result.cleanup_errors.len(),
-                    "runtime storage maintenance sweep"
-                );
-            }
-        }
-    })
+impl RuntimeMaintenanceSweepResult {
+    #[must_use]
+    pub fn total_processed(&self) -> u64 {
+        self.explicit_delete_intents_reconciled
+            .saturating_add(self.model_request_context_events_expired)
+            .saturating_add(self.prompt_request_records_expired)
+            .saturating_add(self.prompt_deltas_expired)
+            .saturating_add(self.expired_fork_pins_released)
+            .saturating_add(self.orphaned_forks_collected)
+            .saturating_add(self.orphaned_manifests_collected)
+            .saturating_add(self.orphaned_manifest_references_collected)
+            .saturating_add(self.unreferenced_segments_collected)
+    }
 }
 
 fn record_runtime_storage_maintenance<E: std::fmt::Display>(

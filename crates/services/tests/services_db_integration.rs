@@ -1096,6 +1096,13 @@ async fn cleanup_agent_sessions_and_events_for_owner(
             .bind(user_id)
             .execute(pool)
             .await;
+        let _ = sqlx::query(
+            "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+        )
+        .bind(sid)
+        .bind(user_id)
+        .execute(pool)
+        .await;
     }
 }
 
@@ -1405,6 +1412,7 @@ async fn cleanup_restore_fixture_for_owner(
             "prompt_deltas",
             "prompt_request_records",
             "agent_sessions",
+            "agent_session_lifecycle_fences",
         ] {
             let sql = format!("DELETE FROM {table} WHERE session_id = ? AND user_id = ?");
             let _ = sqlx::query(&sql)
@@ -1548,8 +1556,9 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     )
     .await;
 
+    let mut tx = pool.begin().await.expect("begin owner session count tx");
     astra_services::storage::add_agent_session_event_count_or_create(
-        &pool,
+        &mut tx,
         &session_id,
         &owner_user_id,
         2,
@@ -1557,9 +1566,11 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     )
     .await
     .expect("create owner session count");
+    tx.commit().await.expect("commit owner session count tx");
 
+    let mut tx = pool.begin().await.expect("begin owner session delta tx");
     astra_services::storage::add_agent_session_event_count_or_create(
-        &pool,
+        &mut tx,
         &session_id,
         &owner_user_id,
         3,
@@ -1567,6 +1578,7 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     )
     .await
     .expect("same-owner delta upsert");
+    tx.commit().await.expect("commit owner session delta tx");
 
     let row = sqlx::query(
         "SELECT user_id, status, event_count, last_event_id FROM agent_sessions WHERE session_id = ?",
@@ -1595,27 +1607,31 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
         "None last_event_id delta must preserve the previous summary pointer"
     );
 
+    let mut tx = pool.begin().await.expect("begin foreign owner tx");
     let foreign_owner = astra_services::storage::add_agent_session_event_count_or_create(
-        &pool,
+        &mut tx,
         &session_id,
         &other_user_id,
         1,
         Some("event-other"),
     )
     .await;
+    tx.rollback().await.expect("rollback foreign owner tx");
     assert!(
         matches!(foreign_owner, Err(sqlx::Error::RowNotFound)),
         "existing session_id owned by another user must fail closed: {foreign_owner:?}"
     );
 
+    let mut tx = pool.begin().await.expect("begin negative delta tx");
     let negative_delta = astra_services::storage::add_agent_session_event_count_or_create(
-        &pool,
+        &mut tx,
         &session_id,
         &owner_user_id,
         -1,
         Some("event-negative"),
     )
     .await;
+    tx.rollback().await.expect("rollback negative delta tx");
     assert!(
         matches!(negative_delta, Err(sqlx::Error::Protocol(_))),
         "create-or-add helper only supports non-negative insert deltas: {negative_delta:?}"
@@ -7932,8 +7948,9 @@ async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone()
     let owner_user_id = Uuid::new_v4().to_string();
     let other_user_id = Uuid::new_v4().to_string();
     let session_id = Uuid::new_v4().to_string();
+    let mut tx = pool.begin().await.expect("begin session header tx");
     astra_services::storage::add_agent_session_event_count_or_create(
-        &pool,
+        &mut tx,
         &session_id,
         &owner_user_id,
         0,
@@ -7941,6 +7958,7 @@ async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone()
     )
     .await
     .expect("create owner session header");
+    tx.commit().await.expect("commit session header tx");
 
     let mut journal_event = astra_services::session_journal::JournalEvent::config_change(
         Some(session_id.as_str()),

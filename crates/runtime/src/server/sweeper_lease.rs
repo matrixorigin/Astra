@@ -111,6 +111,7 @@ impl SweeperLease {
 
 pub(crate) fn spawn_runtime_sweepers(
     shared_pool: SharedPool,
+    fork_coordinator: Option<std::sync::Arc<astra_services::DatabaseSessionForkCoordinator>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let pod_id = std::env::var("ASTRA_POD_ID")
@@ -128,6 +129,12 @@ pub(crate) fn spawn_runtime_sweepers(
     // Each sweeper independently checks the lease before every work cycle.
     // No master loop — no risk of duplicate spawn.
     let handles = vec![
+        crate::server::runtime_maintenance_sweeper::spawn_runtime_maintenance_sweeper(
+            shared_pool.clone(),
+            fork_coordinator,
+            std::sync::Arc::clone(&lease),
+            cancel.clone(),
+        ),
         crate::server::device_lease_sweeper::spawn_device_lease_expiry_sweeper(
             shared_pool.clone(),
             std::sync::Arc::clone(&lease),

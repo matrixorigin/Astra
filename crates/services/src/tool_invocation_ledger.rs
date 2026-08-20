@@ -527,7 +527,7 @@ impl DatabaseToolInvocationLedger {
                 .into());
             }
             crate::storage::add_agent_session_event_count_or_create(
-                &mut *tx,
+                &mut tx,
                 session_id,
                 user_id,
                 inserted_events,
@@ -570,7 +570,7 @@ impl DatabaseToolInvocationLedger {
                 .execute(&mut *tx)
                 .await?;
                 crate::storage::add_agent_session_event_count_or_create(
-                    &mut *tx,
+                    &mut tx,
                     session_id,
                     user_id,
                     1,

@@ -2891,21 +2891,31 @@ impl crate::state_sync::MatrixOneSyncService {
         )?;
         let payload_size = metadata_json.len();
 
-        let result = sqlx::query(PUSH_SESSION_STATE_UPSERT_SQL)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(&metadata_json)
-            .execute(&self.pool)
-            .await
-            .and_then(|result| {
-                if result.rows_affected() == 0 {
-                    Err(sqlx::Error::RowNotFound)
-                } else {
-                    Ok(result)
-                }
-            })
-            .map(|_| ())
-            .map_err(|e| format!("push_session_state: {e}"));
+        let result: Result<(), String> = async {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| format!("push_session_state begin: {e}"))?;
+            crate::storage::lock_agent_session_write_fence(&mut tx, session_id, user_id)
+                .await
+                .map_err(|e| format!("push_session_state lifecycle fence: {e}"))?;
+            let result = sqlx::query(PUSH_SESSION_STATE_UPSERT_SQL)
+                .bind(session_id)
+                .bind(user_id)
+                .bind(&metadata_json)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| format!("push_session_state: {e}"))?;
+            if result.rows_affected() == 0 {
+                return Err("push_session_state: session owner mismatch".to_string());
+            }
+            tx.commit()
+                .await
+                .map_err(|e| format!("push_session_state commit: {e}"))?;
+            Ok(())
+        }
+        .await;
 
         let (status, error_msg) = match &result {
             Ok(()) => ("success", None),
@@ -3026,7 +3036,7 @@ impl crate::state_sync::MatrixOneSyncService {
         };
 
         if let Err(e) = crate::storage::add_agent_session_event_count_or_create(
-            &mut *tx,
+            &mut tx,
             session_id,
             user_id,
             inserted_events,

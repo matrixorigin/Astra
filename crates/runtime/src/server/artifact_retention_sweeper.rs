@@ -201,7 +201,7 @@ async fn record_artifact_retention_backlog_warning(
         }
     };
     astra_services::storage::add_agent_session_event_count_or_create(
-        &mut *tx,
+        &mut tx,
         "system",
         "system",
         inserted_events,

@@ -1529,6 +1529,33 @@ impl EventIngestionWorker {
                 continue;
             }
 
+            match crate::storage::lock_agent_session_write_fence(&mut tx, session_id, user_id).await
+            {
+                Ok(()) => {}
+                Err(sqlx::Error::RowNotFound) | Err(sqlx::Error::Protocol(_)) => {
+                    outcome.events_dropped_permanent = outcome
+                        .events_dropped_permanent
+                        .checked_add(session_event_count)
+                        .ok_or_else(|| {
+                            "event_ingestion.events_dropped_permanent: dropped event total overflow"
+                                .to_string()
+                        })?;
+                    tracing::warn!(
+                        target: "astra_services::event_ingestion",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        event_count = session_event_count,
+                        "dropping queued ingestion events rejected by the durable session lifecycle fence"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "session lifecycle fence for {user_id}/{session_id}: {error}"
+                    ));
+                }
+            }
+
             let mut plain_events = Vec::new();
             let mut plain_session_end_events = Vec::new();
             let mut parented_events = Vec::new();
@@ -1637,7 +1664,7 @@ impl EventIngestionWorker {
                 continue;
             }
             crate::storage::add_agent_session_event_count_or_create(
-                &mut *tx,
+                &mut tx,
                 session_id,
                 user_id,
                 session_rows_inserted,

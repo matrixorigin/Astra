@@ -53,6 +53,7 @@ mod request_trace;
 mod resource_handlers;
 mod router_builder;
 pub mod run;
+mod runtime_maintenance_sweeper;
 pub(crate) mod runtime_mcp;
 pub mod runtime_tool_executor;
 pub mod semantic_read_freshness;
@@ -275,13 +276,6 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             state.metrics_registry(),
             bg_cancel.clone(),
         ));
-        bg_handles.push(
-            astra_services::runtime_maintenance::spawn_runtime_maintenance(
-                pool.clone(),
-                state.session_fork_coordinator.clone(),
-                bg_cancel.clone(),
-            ),
-        );
         // Spawn background cleanup-debt retry task
         {
             let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =
@@ -295,6 +289,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         }
         bg_handles.extend(crate::server::sweeper_lease::spawn_runtime_sweepers(
             pool.clone(),
+            state.session_fork_coordinator.clone(),
             bg_cancel.clone(),
         ));
     }

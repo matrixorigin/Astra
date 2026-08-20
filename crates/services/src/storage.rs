@@ -6,7 +6,7 @@ use astra_core::{
 };
 use axum::{Json, http::StatusCode};
 use sha2::Digest;
-use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, query};
+use sqlx::{Execute, Executor, MySql, QueryBuilder, Row, Transaction, query};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-07-31-v24";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-08-21-v25";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1124,21 +1124,63 @@ const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_ses
          updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
          last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)";
 
-pub async fn add_agent_session_event_count_or_create<'e, E>(
-    executor: E,
+/// Acquire the durable lifecycle fence for one session write.
+///
+/// The fence row is created before the session root and survives hard delete.
+/// Every path that can create or upsert `agent_sessions` must call this in the
+/// same transaction as its write. A delete request locks the same row before
+/// removing the root, so an already-queued writer either commits before the
+/// delete or observes the tombstone and rolls its whole transaction back.
+pub async fn lock_agent_session_write_fence(
+    tx: &mut Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<(), sqlx::Error> {
+    query(
+        "INSERT IGNORE INTO agent_session_lifecycle_fences \
+         (session_id, user_id, created_at, updated_at) \
+         VALUES (?, ?, NOW(6), NOW(6))",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    let row = query(
+        "SELECT user_id, delete_requested_at \
+         FROM agent_session_lifecycle_fences \
+         WHERE session_id = ? FOR UPDATE",
+    )
+    .bind(session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let fence_owner: String = row.try_get("user_id")?;
+    if fence_owner != user_id {
+        return Err(sqlx::Error::RowNotFound);
+    }
+    let delete_requested_at: Option<chrono::NaiveDateTime> = row.try_get("delete_requested_at")?;
+    if delete_requested_at.is_some() {
+        return Err(sqlx::Error::Protocol(
+            "session has a durable deletion fence".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub async fn add_agent_session_event_count_or_create(
+    tx: &mut Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
     delta: i64,
     last_event_id: Option<&str>,
-) -> Result<(), sqlx::Error>
-where
-    E: Executor<'e, Database = MySql>,
-{
+) -> Result<(), sqlx::Error> {
     if delta < 0 {
         return Err(sqlx::Error::Protocol(
             "add_agent_session_event_count_or_create requires a non-negative delta".into(),
         ));
     }
+
+    lock_agent_session_write_fence(tx, session_id, user_id).await?;
 
     let result = query(ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL)
         .bind(session_id)
@@ -1147,7 +1189,7 @@ where
         .bind(last_event_id)
         .bind(session_id)
         .bind(user_id)
-        .execute(executor)
+        .execute(&mut **tx)
         .await?;
     if result.rows_affected() == 0 {
         return Err(sqlx::Error::RowNotFound);
@@ -2929,6 +2971,80 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE agent_sessions ADD INDEX idx_agent_sessions_delete_requested_owner (delete_requested_at, user_id, session_id)",
     )
     .await?;
+    let duplicate_session_owner: Option<(String,)> = sqlx::query_as(
+        "SELECT session_id
+         FROM agent_sessions
+         GROUP BY session_id
+         HAVING COUNT(DISTINCT user_id) > 1
+         ORDER BY session_id ASC
+         LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    if let Some((session_id,)) = duplicate_session_owner {
+        return Err(sqlx::Error::Protocol(format!(
+            "cannot install global session lifecycle fences: session_id {session_id:?} has multiple owners"
+        )));
+    }
+    core_schema_create!(
+        pool,
+        "agent_session_lifecycle_fences",
+        "CREATE TABLE IF NOT EXISTS agent_session_lifecycle_fences (
+            session_id VARCHAR(64) NOT NULL,
+            user_id VARCHAR(128) NOT NULL,
+            delete_requested_at DATETIME(6) NULL,
+            database_deleted_at DATETIME(6) NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (session_id),
+            INDEX idx_agent_session_fences_owner (user_id, session_id),
+            INDEX idx_agent_session_fences_pending_delete
+                (database_deleted_at, delete_requested_at, session_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    ensure_primary_key_shape(
+        &pool,
+        &settings.database,
+        "agent_session_lifecycle_fences",
+        &["session_id"],
+        "ALTER TABLE agent_session_lifecycle_fences ADD PRIMARY KEY (session_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_lifecycle_fences",
+        "idx_agent_session_fences_owner",
+        &["user_id", "session_id"],
+        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_owner (user_id, session_id)",
+    )
+    .await?;
+    ensure_index_shape(
+        &pool,
+        &settings.database,
+        "agent_session_lifecycle_fences",
+        "idx_agent_session_fences_pending_delete",
+        &["database_deleted_at", "delete_requested_at", "session_id"],
+        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_pending_delete (database_deleted_at, delete_requested_at, session_id)",
+    )
+    .await?;
+    let lifecycle_fences_backfilled = query(
+        "INSERT IGNORE INTO agent_session_lifecycle_fences
+         (session_id, user_id, delete_requested_at, created_at, updated_at)
+         SELECT session_id, user_id, delete_requested_at, created_at, updated_at
+         FROM agent_sessions",
+    )
+    .execute(&pool)
+    .await?
+    .rows_affected();
+    if lifecycle_fences_backfilled > 0 {
+        tracing::info!(
+            lifecycle_fences_backfilled,
+            "backfilled durable lifecycle fences for existing sessions"
+        );
+    }
     ensure_primary_key_shape(
         &pool,
         &settings.database,

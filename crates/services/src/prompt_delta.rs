@@ -4,6 +4,132 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
+const EXPIRED_PROMPT_REQUESTS_SQL: &str = "SELECT user_id, session_id, request_id
+     FROM prompt_request_records
+     WHERE created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL ? DAY)) * 1000
+     ORDER BY created_at_unix_ms ASC, user_id ASC, request_id ASC
+     LIMIT ?";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PromptDiagnosticExpiry {
+    pub prompt_request_records: u64,
+    pub prompt_deltas: u64,
+}
+
+fn push_prompt_request_key_predicates<'a>(
+    query: &mut sqlx::QueryBuilder<'a, sqlx::MySql>,
+    request_keys: &'a [(String, String, String)],
+) {
+    for (index, (user_id, session_id, request_id)) in request_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(user_id = ")
+            .push_bind(user_id)
+            .push(" AND session_id = ")
+            .push_bind(session_id)
+            .push(" AND request_id = ")
+            .push_bind(request_id)
+            .push(")");
+    }
+}
+
+fn delete_prompt_deltas_query(
+    request_keys: &[(String, String, String)],
+) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+    let mut query = sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_deltas WHERE ");
+    push_prompt_request_key_predicates(&mut query, request_keys);
+    query.push(" ORDER BY user_id ASC, session_id ASC, request_id ASC, delta_seq ASC");
+    query
+}
+
+fn delete_prompt_requests_query(
+    request_keys: &[(String, String, String)],
+) -> sqlx::QueryBuilder<'_, sqlx::MySql> {
+    let mut query =
+        sqlx::QueryBuilder::<sqlx::MySql>::new("DELETE FROM prompt_request_records WHERE ");
+    push_prompt_request_key_predicates(&mut query, request_keys);
+    query
+}
+
+/// Expire high-volume prompt-assembly diagnostics independently from durable
+/// conversation history. Parent candidates are selected through the retention
+/// index, then children and parents are removed in one bounded transaction.
+pub(crate) async fn expire_prompt_diagnostics(
+    pool: &SharedPool,
+    batch_limit: u32,
+) -> Result<PromptDiagnosticExpiry, String> {
+    let expired_requests =
+        sqlx::query_as::<_, (String, String, String)>(EXPIRED_PROMPT_REQUESTS_SQL)
+            .bind(PROMPT_DIAGNOSTIC_RETENTION_DAYS)
+            .bind(batch_limit)
+            .fetch_all(pool.get())
+            .await
+            .map_err(|error| format!("select expired prompt diagnostics: {error}"))?;
+    if expired_requests.is_empty() {
+        return Ok(PromptDiagnosticExpiry::default());
+    }
+
+    let mut tx = pool
+        .get()
+        .begin()
+        .await
+        .map_err(|error| format!("begin prompt diagnostic expiry: {error}"))?;
+    let mut delete_deltas = delete_prompt_deltas_query(&expired_requests);
+    let mut delete_requests = delete_prompt_requests_query(&expired_requests);
+    let prompt_deltas = delete_deltas
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| format!("expire prompt_deltas: {error}"))?;
+    let prompt_request_records = delete_requests
+        .build()
+        .execute(&mut *tx)
+        .await
+        .map(|result| result.rows_affected())
+        .map_err(|error| format!("expire prompt_request_records: {error}"))?;
+    tx.commit()
+        .await
+        .map_err(|error| format!("commit prompt diagnostic expiry: {error}"))?;
+    Ok(PromptDiagnosticExpiry {
+        prompt_request_records,
+        prompt_deltas,
+    })
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_diagnostic_expiry_is_indexed_bounded_and_child_first() {
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("WHERE created_at_unix_ms <"));
+        assert!(
+            EXPIRED_PROMPT_REQUESTS_SQL
+                .contains("ORDER BY created_at_unix_ms ASC, user_id ASC, request_id ASC")
+        );
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.ends_with("LIMIT ?"));
+
+        let keys = vec![(
+            "user-1".to_string(),
+            "session-1".to_string(),
+            "request-1".to_string(),
+        )];
+        let delete_deltas = delete_prompt_deltas_query(&keys);
+        let delete_requests = delete_prompt_requests_query(&keys);
+        assert!(delete_deltas.sql().starts_with("DELETE FROM prompt_deltas"));
+        assert!(delete_deltas.sql().contains("delta_seq ASC"));
+        assert!(
+            delete_requests
+                .sql()
+                .starts_with("DELETE FROM prompt_request_records")
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PromptDeltaCounts {
     pub reuse: u32,

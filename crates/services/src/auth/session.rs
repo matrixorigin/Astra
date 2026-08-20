@@ -443,6 +443,11 @@ impl SessionService for DatabaseSessionService {
             .unwrap_or_else(|| format!("Session {}", Utc::now().format("%Y-%m-%d %H:%M")));
         let metadata = serde_json::Value::Object(request.metadata.unwrap_or_default()).to_string();
 
+        let mut tx = pool.begin().await.map_err(internal_error)?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?;
+
         query(
             "INSERT INTO agent_sessions \
              (session_id, user_id, agent_id, title, status, event_count, created_at, updated_at, last_active_at, `metadata`) \
@@ -453,9 +458,10 @@ impl SessionService for DatabaseSessionService {
         .bind(&request.agent_id)
         .bind(&title)
         .bind(metadata)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
+        tx.commit().await.map_err(internal_error)?;
 
         let record = self
             .fetch_session_for_user(&pool, &session_id, &user_id)

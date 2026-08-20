@@ -6,6 +6,7 @@
 //!
 //! Or via: `make test-online`
 
+use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::config_version_cloud::{CONFIG_VERSIONS_SELECT_TOML_SQL, ConfigVersionPayload};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
 use astra_services::storage::{insert_agent_event_edges, load_agent_event_parent_ids};
@@ -118,6 +119,13 @@ async fn cleanup_session(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_
         .bind(user_id)
         .execute(pool)
         .await;
+    let _ = sqlx::query(
+        "DELETE FROM agent_session_lifecycle_fences WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(pool)
+    .await;
 }
 
 async fn cleanup_config_version(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, version_id: &str) {
@@ -174,6 +182,93 @@ async fn event_ingest_idempotent_duplicate_key_no_error() {
 
     // Cleanup
     cleanup_session(&pool, TEST_USER_ID, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn queued_ingestion_cannot_resurrect_a_hard_deleted_session() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let user_id = format!("delete-fence-user-{}", Uuid::new_v4().simple());
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = format!("queued-after-delete-{}", Uuid::new_v4().simple());
+    cleanup_session(&pool, &user_id, &session_id).await;
+    insert_session_root(&pool, &user_id, &session_id).await;
+
+    let config = IngestionConfig {
+        batch_size: 20,
+        flush_interval_secs: 300,
+        channel_capacity: 8,
+        ..Default::default()
+    };
+    let (sender, shutdown, stats, handle) = EventIngestionWorker::spawn(pool.clone(), config);
+    sender
+        .enqueue_async(test_event_for_user(
+            &user_id,
+            &event_id,
+            &session_id,
+            "queued_before_delete",
+        ))
+        .await;
+
+    let session_service = DatabaseSessionService::new(astra_core::MatrixOneSettings::from_env())
+        .with_pool(shared.clone());
+    session_service
+        .delete_session(session_id.clone(), user_id.clone())
+        .await
+        .expect("hard delete session while ingestion event remains queued");
+
+    shutdown.signal();
+    sender.shutdown();
+    handle.await.expect("drain queued ingestion after delete");
+
+    let session_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count deleted session roots");
+    let event_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE event_id = ? AND user_id = ?")
+            .bind(&event_id)
+            .bind(&user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count rejected queued event");
+    let completed_fence: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE session_id = ? AND user_id = ?
+           AND delete_requested_at IS NOT NULL AND database_deleted_at IS NOT NULL",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load durable completed deletion fence");
+    assert_eq!(
+        session_rows, 0,
+        "queued ingestion must not recreate the root"
+    );
+    assert_eq!(
+        event_rows, 0,
+        "queued ingestion must roll back its event row"
+    );
+    assert_eq!(
+        completed_fence, 1,
+        "deletion fence must survive root removal"
+    );
+    assert_eq!(
+        stats
+            .lock()
+            .expect("ingestion stats")
+            .events_dropped_permanent,
+        1,
+        "the deletion-fenced event is permanently invalid, not retryable"
+    );
+
+    cleanup_session(&pool, &user_id, &session_id).await;
 }
 
 /// Verifies that concurrent writes with the same event_id both succeed

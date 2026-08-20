@@ -657,7 +657,7 @@ impl DatabaseContextManifestStore {
             });
         }
         crate::storage::add_agent_session_event_count_or_create(
-            &mut *tx,
+            &mut tx,
             event.session_id,
             event.user_id,
             inserted_events,

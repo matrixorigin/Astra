@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, QueryBuilder, Row};
+use std::collections::BTreeSet;
 
 use astra_core::SharedPool;
 
@@ -70,12 +71,35 @@ fn oldest_complete_attempts_in_scope_sql(scope: ModelRequestContextScope<'_>) ->
     )
 }
 
-const EXPIRED_ATTEMPTS_SQL: &str = "SELECT user_id, attempt_id
+const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT user_id, attempt_id
      FROM model_request_context_events
-     GROUP BY user_id, attempt_id
-     HAVING MAX(created_at) < DATE_SUB(NOW(6), INTERVAL ? DAY)
-     ORDER BY MAX(created_at) ASC, user_id ASC, attempt_id ASC
+     WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+     ORDER BY created_at ASC, event_id ASC
      LIMIT ?";
+
+fn validate_expired_attempt_keys_query<'a>(
+    attempt_keys: &'a [(String, String)],
+) -> QueryBuilder<'a, MySql> {
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT user_id, attempt_id FROM model_request_context_events WHERE ",
+    );
+    for (index, (user_id, attempt_id)) in attempt_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(user_id = ")
+            .push_bind(user_id)
+            .push(" AND attempt_id = ")
+            .push_bind(attempt_id)
+            .push(")");
+    }
+    query
+        .push(" GROUP BY user_id, attempt_id HAVING MAX(created_at) < DATE_SUB(NOW(6), INTERVAL ")
+        .push_bind(i64::from(MODEL_REQUEST_CONTEXT_RETENTION_DAYS))
+        .push(" DAY)");
+    query
+}
 
 fn delete_complete_attempts_query<'a>(
     user_id: &'a str,
@@ -184,7 +208,7 @@ pub(crate) async fn expire_model_request_context_events(
     pool: &SharedPool,
     batch_limit: u32,
 ) -> ServiceResult<u64> {
-    let attempt_keys = sqlx::query_as::<_, (String, String)>(EXPIRED_ATTEMPTS_SQL)
+    let candidate_rows = sqlx::query_as::<_, (String, String)>(EXPIRED_ATTEMPT_CANDIDATES_SQL)
         .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
         .bind(batch_limit)
         .fetch_all(pool.get())
@@ -192,19 +216,66 @@ pub(crate) async fn expire_model_request_context_events(
         .map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "select expired model request context attempts",
+                "select bounded model request context expiry candidates",
                 error,
             )
         })?;
-
+    let attempt_keys = candidate_rows
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
     if attempt_keys.is_empty() {
         return Ok(0);
     }
 
-    let mut delete = delete_attempt_keys_query(&attempt_keys);
-    delete
+    let mut tx = pool.get().begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin model request context expiry",
+            error,
+        )
+    })?;
+    let mut validate = validate_expired_attempt_keys_query(&attempt_keys);
+    let expired_attempt_keys = validate
         .build()
-        .execute(pool.get())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "validate bounded model request context expiry candidates",
+                error,
+            )
+        })?
+        .into_iter()
+        .map(|row| {
+            let user_id = row.try_get::<String, _>("user_id")?;
+            let attempt_id = row.try_get::<String, _>("attempt_id")?;
+            Ok((user_id, attempt_id))
+        })
+        .collect::<Result<Vec<_>, sqlx::Error>>()
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode validated model request context expiry candidates",
+                error,
+            )
+        })?;
+    if expired_attempt_keys.is_empty() {
+        tx.commit().await.map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "commit empty model request context expiry",
+                error,
+            )
+        })?;
+        return Ok(0);
+    }
+    let mut delete = delete_attempt_keys_query(&expired_attempt_keys);
+    let rows_deleted = delete
+        .build()
+        .execute(&mut *tx)
         .await
         .map(|result| result.rows_affected())
         .map_err(|error| {
@@ -213,7 +284,15 @@ pub(crate) async fn expire_model_request_context_events(
                 "expire model request context attempts",
                 error,
             )
-        })
+        })?;
+    tx.commit().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "commit model request context expiry",
+            error,
+        )
+    })?;
+    Ok(rows_deleted)
 }
 
 #[cfg(test)]
@@ -249,8 +328,10 @@ mod retention_tests {
         let attempts = vec!["attempt-1".to_string()];
         let mut delete_builder = delete_complete_attempts_query("user-1", &attempts);
         let delete = delete_builder.build();
-        let expired_attempts = EXPIRED_ATTEMPTS_SQL;
+        let expired_attempts = EXPIRED_ATTEMPT_CANDIDATES_SQL;
         let attempt_keys = vec![("user-1".to_string(), "attempt-1".to_string())];
+        let mut expiry_validation_builder = validate_expired_attempt_keys_query(&attempt_keys);
+        let expiry_validation = expiry_validation_builder.build();
         let mut expiry_delete_builder = delete_attempt_keys_query(&attempt_keys);
         let expiry_delete = expiry_delete_builder.build();
 
@@ -260,10 +341,15 @@ mod retention_tests {
         assert!(completed_attempts.contains("ORDER BY MIN(created_at) ASC, attempt_id ASC"));
         assert!(delete.sql().contains("AND attempt_id IN"));
         assert!(!delete.sql().contains("event_id IN"));
-        assert!(expired_attempts.contains("GROUP BY user_id, attempt_id"));
-        assert!(expired_attempts.contains("HAVING MAX(created_at) <"));
-        assert!(expired_attempts.contains("ORDER BY MAX(created_at) ASC"));
-        assert!(!expired_attempts.contains("HAVING COUNT(*) = 2"));
+        assert!(expired_attempts.contains("WHERE created_at <"));
+        assert!(expired_attempts.contains("ORDER BY created_at ASC, event_id ASC"));
+        assert!(!expired_attempts.contains("GROUP BY"));
+        assert!(
+            expiry_validation
+                .sql()
+                .contains("GROUP BY user_id, attempt_id")
+        );
+        assert!(expiry_validation.sql().contains("HAVING MAX(created_at) <"));
         assert!(
             expiry_delete
                 .sql()

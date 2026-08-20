@@ -249,13 +249,13 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 
 ### 5.5 用户会话保留与运行时存储维护
 
-用户可见的 C1 会话历史（`agent_sessions`、对话事件及其关联状态）不会因空闲或年龄被后台任务改变或删除。显式删除会先持久化不可逆的 `delete_requested_at`；若前台删除中断，后台在短暂 grace 后按该时间戳重试完成删除。其他会话更新不得取消或推迟这一删除意图。
+用户可见的 C1 会话历史（`agent_sessions`、对话事件及其关联状态）不会因空闲或年龄被后台任务改变或删除。显式删除会先在独立于会话根记录的 `agent_session_lifecycle_fences` 中持久化不可逆的删除意图；该栅栏在数据库删除完成后继续保留，所有可能创建或更新会话根的写路径必须在同一事务中锁定并检查它。若前台删除中断，后台在短暂 grace 后按该意图重试完成删除；已经排队的延迟写入不得复活会话。
 
-C3 模型请求诊断（`model_request_context_events`）与 C1 历史分离：不包含消息或工具输出，完整 attempt 对保留 30 天；每个 owner/session 或 owner/harness scope 最多保留 2,048 条。scope 压缩只删除完整的 accepted/terminal attempt 对，未完成 attempt 可暂时超过上限；30 天过期清理则以 attempt 为原子单位，在该 attempt 的最新诊断事实超过保留期后删除其全部记录，因此进程崩溃留下的未完成 attempt 也会最终回收。后台维护还会清理过期 fork grace pin、孤儿 fork/manifest/reference，以及无引用 conversation segment。每次维护操作最多处理 500 个数据库对象或一个有界 attempt 批次，避免长期锁表。
+C3 运行时诊断与 C1 历史分离：模型请求诊断（`model_request_context_events`）不包含消息或工具输出，完整 attempt 对保留 30 天；prompt 组装诊断（`prompt_request_records`、`prompt_deltas`）保留 90 天，并按子表先于父表的顺序删除。每个 owner/session 或 owner/harness scope 最多保留 2,048 条模型请求诊断；scope 压缩只删除完整的 accepted/terminal attempt 对，未完成 attempt 可暂时超过上限。30 天过期清理以 attempt 为原子单位，在该 attempt 的最新诊断事实超过保留期后删除其全部记录，因此进程崩溃留下的未完成 attempt 也会最终回收。后台维护由分布式 lease 保证同一周期只有一个服务实例执行，并以索引有序的候选批次工作；它还会清理过期 fork grace pin、孤儿 fork/manifest/reference，以及无引用 conversation segment。默认每类维护每次最多选取 500 个数据库对象或一个有界 attempt 批次，避免全表聚合和长期锁表。
 
 **测试方式：**
-- 单元：验证删除重试只按 `delete_requested_at` 选取；运行时维护不会因 idle/ended/closed 删除 C1 会话；诊断压缩不会拆分 attempt 对
-- 集成：中断一次显式删除后触发维护，断言该 intent 收敛；创建孤儿运行时存储并触发维护，断言只有无引用对象被回收
+- 单元：验证删除重试只按持久删除栅栏选取；运行时维护不会因 idle/ended/closed 删除 C1 会话；诊断压缩不会拆分 attempt 对；诊断候选查询有索引顺序和批次上限
+- 集成：在会话删除前排入延迟事件，删除完成后再消费，断言会话不能复活；验证 90 天 prompt 父子诊断被删除而活跃会话和新诊断保留；创建孤儿运行时存储并触发维护，断言只有无引用对象被回收
 - Admin：`POST /admin/cleanup` 处理其授权范围内的 TTL 数据；不得删除未显式请求删除的 C1 会话历史
 
 ### 5.6 模型与 LLM 托管

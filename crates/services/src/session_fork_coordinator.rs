@@ -694,6 +694,13 @@ async fn insert_fork_child_session(
     tx: &mut Transaction<'_, MySql>,
     manifest: &SessionForkManifestV1,
 ) -> Result<(), SessionForkCoordinatorError> {
+    crate::storage::lock_agent_session_write_fence(
+        tx,
+        &manifest.child_key.session_id,
+        &manifest.child_key.owner_user_id,
+    )
+    .await
+    .map_err(|source| database_error("lock_fork_child_session_fence", source))?;
     let metadata = serde_json::json!({
         "fork_id": manifest.fork_id,
         "fork_parent_session_id": manifest.parent_key.session_id,

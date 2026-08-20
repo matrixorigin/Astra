@@ -22,10 +22,11 @@ const SESSION_DELETE_BATCH_LIMIT: i64 = 1000;
 pub(crate) const SESSION_DELETE_INTENT_RETRY_GRACE_SECS: u64 = 5 * 60;
 
 const SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL: &str = "SELECT session_id, user_id
-     FROM agent_sessions
+     FROM agent_session_lifecycle_fences
      WHERE delete_requested_at IS NOT NULL
+     AND database_deleted_at IS NULL
      AND delete_requested_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
-     ORDER BY delete_requested_at ASC, user_id ASC, session_id ASC
+     ORDER BY delete_requested_at ASC, session_id ASC
      LIMIT ?";
 
 const MARK_SESSION_DELETING_SQL: &str = "UPDATE agent_sessions
@@ -34,6 +35,24 @@ const MARK_SESSION_DELETING_SQL: &str = "UPDATE agent_sessions
          ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP(6)),
          updated_at = CURRENT_TIMESTAMP(6)
      WHERE session_id = ? AND user_id = ?";
+
+const MARK_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_fences
+     SET delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6)),
+         updated_at = CURRENT_TIMESTAMP(6)
+     WHERE session_id = ? AND user_id = ?";
+
+const LOCK_PENDING_SESSION_DELETE_FENCE_SQL: &str = "SELECT 1
+     FROM agent_session_lifecycle_fences
+     WHERE session_id = ? AND user_id = ?
+       AND delete_requested_at IS NOT NULL
+       AND database_deleted_at IS NULL
+     FOR UPDATE";
+
+const COMPLETE_SESSION_DELETE_FENCE_SQL: &str = "UPDATE agent_session_lifecycle_fences
+     SET database_deleted_at = COALESCE(database_deleted_at, CURRENT_TIMESTAMP(6)),
+         updated_at = CURRENT_TIMESTAMP(6)
+     WHERE session_id = ? AND user_id = ?
+       AND delete_requested_at IS NOT NULL";
 
 const SESSION_DELETE_DERIVED_FROM_AGENT_RUNS: &[SessionDeleteStatement] =
     &[SessionDeleteStatement {
@@ -896,6 +915,16 @@ pub(crate) async fn hard_delete_session_rows(
 ) -> Result<SessionDatabaseDeleteOutcome, String> {
     let mut outcome = SessionDatabaseDeleteOutcome::default();
 
+    query(LOCK_PENDING_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.lock_lifecycle_fence: {source}"))?
+        .ok_or_else(|| {
+            "delete_session.lock_lifecycle_fence: pending delete fence not found".to_string()
+        })?;
+
     // Inference settlement takes locks in invocation -> child-row order.
     // Acquire every invocation lock before deleting settlement debts or
     // provider attempts so session deletion follows the same global order.
@@ -1071,6 +1100,13 @@ pub(crate) async fn hard_delete_session_rows(
 
     verify_core_session_tables_deleted(tx, session_id, user_id).await?;
 
+    query(COMPLETE_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| format!("delete_session.complete_lifecycle_fence: {source}"))?;
+
     Ok(outcome)
 }
 
@@ -1163,10 +1199,37 @@ async fn mark_session_deleting(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.begin: {source}"))?;
+    query(
+        "INSERT IGNORE INTO agent_session_lifecycle_fences
+         (session_id, user_id, created_at, updated_at)
+         VALUES (?, ?, NOW(6), NOW(6))",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|source| format!("delete_session.mark_deleting.ensure_fence: {source}"))?;
+    let fence_owner: Option<String> =
+        query("SELECT user_id FROM agent_session_lifecycle_fences WHERE session_id = ? FOR UPDATE")
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?
+            .map(|row| row.try_get("user_id"))
+            .transpose()
+            .map_err(|source| format!("delete_session.mark_deleting.decode_fence: {source}"))?;
+    if fence_owner.as_deref() != Some(user_id) {
+        return Err("delete_session.mark_deleting: session not found or not owned by user".into());
+    }
+
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)
         .bind(user_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|source| format!("delete_session.mark_deleting: {source}"))?;
 
@@ -1175,17 +1238,26 @@ async fn mark_session_deleting(
             query("SELECT 1 FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1")
                 .bind(session_id)
                 .bind(user_id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *tx)
                 .await
                 .map_err(|source| format!("delete_session.mark_deleting.confirm: {source}"))?
                 .is_some();
-        if still_exists {
-            return Ok(());
+        if !still_exists {
+            return Err(
+                "delete_session.mark_deleting: session not found or not owned by user".to_string(),
+            );
         }
-        return Err(
-            "delete_session.mark_deleting: session not found or not owned by user".to_string(),
-        );
     }
+
+    query(MARK_SESSION_DELETE_FENCE_SQL)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.persist_fence: {source}"))?;
+    tx.commit()
+        .await
+        .map_err(|source| format!("delete_session.mark_deleting.commit: {source}"))?;
 
     Ok(())
 }
@@ -1532,7 +1604,9 @@ mod tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        assert!(normalized.contains("FROM agent_session_lifecycle_fences"));
         assert!(normalized.contains("WHERE delete_requested_at IS NOT NULL"));
+        assert!(normalized.contains("database_deleted_at IS NULL"));
         assert!(!normalized.contains("status IN"));
         assert!(normalized.contains("delete_requested_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)"));
         assert!(normalized.contains("ORDER BY delete_requested_at ASC"));
@@ -1545,6 +1619,27 @@ mod tests {
         assert!(
             mark_intent.contains(
                 "delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6))"
+            )
+        );
+
+        let durable_fence = MARK_SESSION_DELETE_FENCE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(durable_fence.contains("UPDATE agent_session_lifecycle_fences"));
+        assert!(
+            durable_fence.contains(
+                "delete_requested_at = COALESCE(delete_requested_at, CURRENT_TIMESTAMP(6))"
+            )
+        );
+
+        let complete_fence = COMPLETE_SESSION_DELETE_FENCE_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            complete_fence.contains(
+                "database_deleted_at = COALESCE(database_deleted_at, CURRENT_TIMESTAMP(6))"
             )
         );
     }
