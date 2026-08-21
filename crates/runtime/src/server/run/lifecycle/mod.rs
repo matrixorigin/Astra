@@ -76,7 +76,7 @@ use sqlx::Row;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeFileTransferMetadata {
+struct RuntimeFileTransferMetadataV1 {
     contract_version: u32,
     task_id: String,
     root: String,
@@ -85,6 +85,22 @@ struct RuntimeFileTransferMetadata {
     scratch_dir: String,
     max_file_bytes: u64,
     attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeFileTransferMetadataV2 {
+    contract_version: u32,
+    work_dir: String,
+    max_file_bytes: u64,
+    attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RuntimeFileTransferMetadata {
+    Legacy(RuntimeFileTransferMetadataV1),
+    Ephemeral(RuntimeFileTransferMetadataV2),
 }
 
 #[derive(Deserialize)]
@@ -5274,39 +5290,69 @@ impl AgenticRunLifecycleService {
         let metadata: RuntimeFileTransferMetadata =
             serde_json::from_value(Value::Object(descriptor.metadata.clone()))
                 .map_err(|error| format!("file_transfer metadata is invalid: {error}"))?;
-        if metadata.contract_version != 1
-            || metadata.task_id.trim().is_empty()
-            || Path::new(&metadata.task_id)
-                .file_name()
-                .and_then(|value| value.to_str())
-                != Some(metadata.task_id.as_str())
-            || metadata.max_file_bytes == 0
-            || metadata.max_file_bytes > 32 * 1024 * 1024
-        {
-            return Err("file_transfer metadata contract is unsupported".to_string());
-        }
         let workspace_root = edge_workspace
             .and_then(|binding| binding.root.as_deref())
             .ok_or_else(|| "file_transfer requires an explicit edge workspace root".to_string())?;
         let workspace_root = Path::new(workspace_root);
-        if workspace_root != Path::new("/sandbox") {
-            return Err("file_transfer workspace root is invalid".to_string());
-        }
-        let root = Path::new(&metadata.root);
-        let expected_root = workspace_root.join(".moi/runtime").join(&metadata.task_id);
-        let expected_sessions_root = workspace_root.join(".moi/sessions");
-        let session = Path::new(&metadata.session_dir);
-        if root != expected_root
-            || Path::new(&metadata.catalog_dir) != root.join("catalog")
-            || Path::new(&metadata.scratch_dir) != root.join("scratch")
-            || session.parent() != Some(expected_sessions_root.as_path())
-            || session.file_name().is_none()
-        {
-            return Err("file_transfer directory scope is invalid".to_string());
-        }
+        let (layout, max_file_bytes, attachments) = match metadata {
+            RuntimeFileTransferMetadata::Legacy(metadata) => {
+                if metadata.contract_version != 1
+                    || metadata.task_id.trim().is_empty()
+                    || Path::new(&metadata.task_id)
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        != Some(metadata.task_id.as_str())
+                    || metadata.max_file_bytes == 0
+                    || metadata.max_file_bytes > 32 * 1024 * 1024
+                    || workspace_root != Path::new("/sandbox")
+                {
+                    return Err("file_transfer metadata contract is unsupported".to_string());
+                }
+                let root = Path::new(&metadata.root);
+                let expected_root = workspace_root.join(".moi/runtime").join(&metadata.task_id);
+                let expected_sessions_root = workspace_root.join(".moi/sessions");
+                let session = Path::new(&metadata.session_dir);
+                if root != expected_root
+                    || Path::new(&metadata.catalog_dir) != root.join("catalog")
+                    || Path::new(&metadata.scratch_dir) != root.join("scratch")
+                    || session.parent() != Some(expected_sessions_root.as_path())
+                    || session.file_name().is_none()
+                {
+                    return Err("file_transfer directory scope is invalid".to_string());
+                }
+                (
+                    astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                        task_id: metadata.task_id,
+                        root: metadata.root,
+                        catalog_dir: metadata.catalog_dir,
+                        session_dir: metadata.session_dir,
+                        scratch_dir: metadata.scratch_dir,
+                    },
+                    metadata.max_file_bytes,
+                    metadata.attachments,
+                )
+            }
+            RuntimeFileTransferMetadata::Ephemeral(metadata) => {
+                if metadata.contract_version != 2
+                    || metadata.max_file_bytes == 0
+                    || metadata.max_file_bytes > 32 * 1024 * 1024
+                    || workspace_root != Path::new("/sandbox/.moi")
+                    || Path::new(&metadata.work_dir) != workspace_root
+                {
+                    return Err("file_transfer metadata contract is unsupported".to_string());
+                }
+                (
+                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
+                        work_dir: metadata.work_dir,
+                    },
+                    metadata.max_file_bytes,
+                    metadata.attachments,
+                )
+            }
+        };
         let mut file_ids = HashSet::new();
         let mut destination_names = HashSet::new();
-        for (index, attachment) in metadata.attachments.iter().enumerate() {
+        for (index, attachment) in attachments.iter().enumerate() {
             let destination_name =
                 astra_server_types::edge_ws_protocol::runtime_attachment_destination_name(
                     index,
@@ -5315,7 +5361,7 @@ impl AgenticRunLifecycleService {
             if attachment.file_id.trim().is_empty()
                 || !valid_runtime_attachment_name(&attachment.name)
                 || attachment.size < 0
-                || attachment.size as u64 > metadata.max_file_bytes
+                || attachment.size as u64 > max_file_bytes
                 || !valid_lowercase_md5(&attachment.md5)
                 || !file_ids.insert(attachment.file_id.clone())
                 || !destination_name.is_some_and(|name| destination_names.insert(name))
@@ -5327,14 +5373,10 @@ impl AgenticRunLifecycleService {
             astra_services::runs::RuntimeFileTransferContext {
                 endpoint_url: descriptor.endpoint_url.clone(),
                 authorization: auth.authorization.clone(),
-                task_id: metadata.task_id,
                 workspace_root: workspace_root.display().to_string(),
-                root: metadata.root,
-                catalog_dir: metadata.catalog_dir,
-                session_dir: metadata.session_dir,
-                scratch_dir: metadata.scratch_dir,
-                max_file_bytes: metadata.max_file_bytes,
-                attachments: metadata.attachments,
+                layout,
+                max_file_bytes,
+                attachments,
             },
         )))
     }

@@ -728,7 +728,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "publish_artifact",
-                "description": "Publish a file that was already generated in the current runtime workspace so the web UI can preview and download it. Managed runtimes accept only their declared catalog/session/scratch directories; server-local runtimes may also allow /tmp. Use this after creating the file; do not use it to generate content directly.",
+                "description": "Publish a file that was already generated in the current runtime workspace so the web UI can preview and download it. Use this after creating the file; do not use it to generate content directly.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -2095,6 +2095,21 @@ mod tests {
             task_board_tokens <= 1100,
             "task_board schema regressed to {task_board_tokens} tokens; keep the resource tool compact"
         );
+    }
+
+    #[test]
+    fn publish_artifact_schema_does_not_prescribe_a_runtime_layout() {
+        let schemas = all_tool_schemas();
+        let publish = find_schema(&schemas, "publish_artifact").expect("publish_artifact schema");
+        let description = publish["function"]["description"]
+            .as_str()
+            .expect("publish_artifact description");
+        for obsolete_dir in ["catalog_dir", "session_dir", "scratch_dir"] {
+            assert!(
+                !description.contains(obsolete_dir),
+                "publish_artifact schema leaked obsolete runtime directory {obsolete_dir}: {description}"
+            );
+        }
     }
 
     #[test]

@@ -1014,7 +1014,7 @@ fn route_boundary_builds_events_and_attaches_binding_metadata() {
 }
 
 #[test]
-fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
+fn route_boundary_tool_call_end_carries_explicit_artifacts() {
     let service = ToolExecutionService::new_for_test();
     let mut request = request_scoped_mcp_request("mcp__moi__write_file");
     request.args = serde_json::json!({
@@ -1062,8 +1062,8 @@ fn route_boundary_tool_call_end_includes_structured_artifact_result_metadata() {
         end_event["structuredContent"]["artifacts"][0]["artifact_id"],
         "artifact_file_1"
     );
+    assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
     assert!(end_event.get("output").is_none());
-    assert!(end_event.get("artifacts").is_none());
     assert!(end_event.get("artifact").is_none());
 }
 
@@ -1570,12 +1570,14 @@ fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
         astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer durable-secret-must-not-appear".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: "/sandbox".to_string(),
-            root: "/sandbox/.moi/runtime/task-1".to_string(),
-            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: "/sandbox/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            },
             max_file_bytes: 1024,
             attachments: Vec::new(),
         },
@@ -1611,12 +1613,14 @@ fn validated_transfer_context_authorizes_edge_interceptor_support() {
         astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: "/sandbox".to_string(),
-            root: "/sandbox/.moi/runtime/task-1".to_string(),
-            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: "/sandbox/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            },
             max_file_bytes: 1024,
             attachments: Vec::new(),
         },
@@ -1655,12 +1659,14 @@ fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
         astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: "/sandbox".to_string(),
-            root: "/sandbox/.moi/runtime/task-1".to_string(),
-            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: "/sandbox/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            },
             max_file_bytes: 1024,
             attachments: Vec::new(),
         },
@@ -3493,12 +3499,14 @@ async fn replayed_managed_transfer_without_context_fails_before_dispatch() {
         Some(Arc::new(astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer transfer-secret-must-not-appear".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: "/workspace".to_string(),
-            root: "/workspace/.moi/runtime/task-1".to_string(),
-            catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
-            session_dir: "/workspace/.moi/sessions/session-1".to_string(),
-            scratch_dir: "/workspace/.moi/runtime/task-1/scratch".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: "/workspace/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/workspace/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/workspace/.moi/runtime/task-1/scratch".to_string(),
+            },
             max_file_bytes: 1024,
             attachments: Vec::new(),
         }));

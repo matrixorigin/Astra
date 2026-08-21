@@ -862,6 +862,17 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
 
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
+    execute_bash_with_environment(ctx, args, &[]).await
+}
+
+/// Execute a bash command with bounded partial-output capture and a
+/// call-scoped process environment. Callers must never persist these values or
+/// expose them in model-visible tool arguments or output.
+pub async fn execute_bash_with_environment(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    environment: &[(String, String)],
+) -> ToolResult {
     let workspace_root = ctx.workspace_root.as_path();
     let command = match args.get("command").and_then(|v| v.as_str()) {
         Some(c) if !c.trim().is_empty() => c,
@@ -888,6 +899,7 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
         cmd.arg("-c").arg(command);
     }
     cmd.current_dir(workspace_root).kill_on_drop(true);
+    cmd.envs(environment.iter().map(|(key, value)| (key, value)));
 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
@@ -5187,6 +5199,24 @@ printf 'probe.txt:1:needle\n'
             "got: {}",
             result.output
         );
+    }
+
+    #[tokio::test]
+    async fn bash_call_scoped_environment_is_available_to_the_command() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash_with_environment(
+            &ctx,
+            &serde_json::json!({"command": "printf %s \"$MOI_RUNTIME_AUTHORIZATION\""}),
+            &[(
+                "MOI_RUNTIME_AUTHORIZATION".to_string(),
+                "Bearer task-scoped-grant".to_string(),
+            )],
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "Bearer task-scoped-grant");
     }
 
     #[tokio::test]

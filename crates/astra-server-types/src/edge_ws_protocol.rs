@@ -65,14 +65,25 @@ pub struct RuntimeFileTransferAttachment {
 pub struct RuntimeFileTransferContext {
     pub endpoint_url: String,
     pub authorization: String,
-    pub task_id: String,
     pub workspace_root: String,
-    pub root: String,
-    pub catalog_dir: String,
-    pub session_dir: String,
-    pub scratch_dir: String,
+    pub layout: RuntimeFileTransferLayout,
     pub max_file_bytes: u64,
     pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "layout", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeFileTransferLayout {
+    Legacy {
+        task_id: String,
+        root: String,
+        catalog_dir: String,
+        session_dir: String,
+        scratch_dir: String,
+    },
+    Ephemeral {
+        work_dir: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +110,8 @@ impl std::fmt::Debug for RuntimeFileTransferContext {
         f.debug_struct("RuntimeFileTransferContext")
             .field("endpoint_url", &self.endpoint_url)
             .field("authorization_present", &!self.authorization.is_empty())
-            .field("task_id", &self.task_id)
-            .field("root", &self.root)
+            .field("workspace_root", &self.workspace_root)
+            .field("layout", &self.layout)
             .field("attachment_count", &self.attachments.len())
             .finish()
     }
@@ -112,12 +123,27 @@ impl From<&astra_services::runs::RuntimeFileTransferContext> for RuntimeFileTran
         Self {
             endpoint_url: context.endpoint_url.clone(),
             authorization: context.authorization.clone(),
-            task_id: context.task_id.clone(),
             workspace_root: context.workspace_root.clone(),
-            root: context.root.clone(),
-            catalog_dir: context.catalog_dir.clone(),
-            session_dir: context.session_dir.clone(),
-            scratch_dir: context.scratch_dir.clone(),
+            layout: match &context.layout {
+                astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                    task_id,
+                    root,
+                    catalog_dir,
+                    session_dir,
+                    scratch_dir,
+                } => RuntimeFileTransferLayout::Legacy {
+                    task_id: task_id.clone(),
+                    root: root.clone(),
+                    catalog_dir: catalog_dir.clone(),
+                    session_dir: session_dir.clone(),
+                    scratch_dir: scratch_dir.clone(),
+                },
+                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { work_dir } => {
+                    RuntimeFileTransferLayout::Ephemeral {
+                        work_dir: work_dir.clone(),
+                    }
+                }
+            },
             max_file_bytes: context.max_file_bytes,
             attachments: context
                 .attachments
@@ -352,12 +378,14 @@ mod tests {
             runtime_file_transfer: Some(Box::new(RuntimeFileTransferContext {
                 endpoint_url: "https://moi.example/runtime-files".into(),
                 authorization: "Bearer runtime-grant".into(),
-                task_id: "task-1".into(),
                 workspace_root: "/sandbox".into(),
-                root: "/sandbox/.moi/runtime/task-1".into(),
-                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
-                session_dir: "/sandbox/.moi/sessions/session-1".into(),
-                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".into(),
+                layout: RuntimeFileTransferLayout::Legacy {
+                    task_id: "task-1".into(),
+                    root: "/sandbox/.moi/runtime/task-1".into(),
+                    catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
+                    session_dir: "/sandbox/.moi/sessions/session-1".into(),
+                    scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".into(),
+                },
                 max_file_bytes: 1024,
                 attachments: vec![RuntimeFileTransferAttachment {
                     file_id: "file-1".into(),
@@ -385,7 +413,10 @@ mod tests {
                 runtime_filesystem_boundary: Some(boundary),
                 ..
             } => {
-                assert_eq!(context.task_id, "task-1");
+                assert!(matches!(
+                    context.layout,
+                    RuntimeFileTransferLayout::Legacy { ref task_id, .. } if task_id == "task-1"
+                ));
                 assert_eq!(context.attachments[0].file_id, "file-1");
                 assert_eq!(context.authorization, "Bearer runtime-grant");
                 assert_eq!(boundary.workspace_root, "/sandbox");

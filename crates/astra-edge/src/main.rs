@@ -1530,15 +1530,17 @@ mod tests {
         let transfer_context = RuntimeFileTransferContext {
             endpoint_url: format!("{}/api/v1/runtime-files", runtime_files.uri()),
             authorization: "Bearer runtime-grant".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: workspace.display().to_string(),
-            root: transfer_root.display().to_string(),
-            catalog_dir: transfer_root.join("catalog").display().to_string(),
-            session_dir: workspace
-                .join(".moi/sessions/session-1")
-                .display()
-                .to_string(),
-            scratch_dir: transfer_root.join("scratch").display().to_string(),
+            layout: astra_server_types::edge_ws_protocol::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: transfer_root.display().to_string(),
+                catalog_dir: transfer_root.join("catalog").display().to_string(),
+                session_dir: workspace
+                    .join(".moi/sessions/session-1")
+                    .display()
+                    .to_string(),
+                scratch_dir: transfer_root.join("scratch").display().to_string(),
+            },
             max_file_bytes: 1024,
             attachments: vec![RuntimeFileTransferAttachment {
                 file_id: "file-1".to_string(),
@@ -1725,6 +1727,16 @@ mod tests {
                             tool_result_fields
                                 .as_ref()
                                 .and_then(|fields| fields.get("file_id"))
+                                .and_then(Value::as_str),
+                            Some("published-1")
+                        );
+                        assert_eq!(
+                            tool_result_fields
+                                .as_ref()
+                                .and_then(|fields| fields.get("artifacts"))
+                                .and_then(Value::as_array)
+                                .and_then(|artifacts| artifacts.first())
+                                .and_then(|artifact| artifact.get("artifact_id"))
                                 .and_then(Value::as_str),
                             Some("published-1")
                         );

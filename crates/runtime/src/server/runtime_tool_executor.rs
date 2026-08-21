@@ -2050,20 +2050,37 @@ impl RuntimeToolExecutor {
         &self,
         name: &str,
     ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
-        matches!(name, "materialize_attachment" | "publish_artifact")
-            .then(|| self.runtime_file_transfer.clone())
-            .flatten()
+        let context = self.runtime_file_transfer.clone()?;
+        if matches!(name, "materialize_attachment" | "publish_artifact")
+            || (name == "bash"
+                && matches!(
+                    &context.layout,
+                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
+                ))
+        {
+            return Some(context);
+        }
+        None
     }
 
     fn runtime_filesystem_boundary(
         &self,
     ) -> Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>> {
-        self.runtime_file_transfer.as_ref().map(|context| {
-            Arc::new(astra_services::runs::RuntimeFilesystemBoundaryContext {
+        let context = self.runtime_file_transfer.as_ref()?;
+        let astra_services::runs::RuntimeFileTransferLayout::Legacy {
+            root, session_dir, ..
+        } = &context.layout
+        else {
+            // eph-* owns its complete /sandbox/.moi work directory; there are
+            // no host-owned lanes to mount read-only inside that workspace.
+            return None;
+        };
+        Some(Arc::new(
+            astra_services::runs::RuntimeFilesystemBoundaryContext {
                 workspace_root: context.workspace_root.clone(),
-                read_only_paths: vec![context.root.clone(), context.session_dir.clone()],
-            })
-        })
+                read_only_paths: vec![root.clone(), session_dir.clone()],
+            },
+        ))
     }
 
     fn runtime_edge_dispatch_authorization_for_request(
@@ -4187,12 +4204,14 @@ mod tests {
         let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
             authorization: "Bearer request-scoped".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: "/sandbox".to_string(),
-            root: "/sandbox/.moi/runtime/task-1".to_string(),
-            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-            session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: "/sandbox/.moi/runtime/task-1".to_string(),
+                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
+                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
+                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
+            },
             max_file_bytes: 1024,
             attachments: Vec::new(),
         });
@@ -4212,6 +4231,31 @@ mod tests {
         assert!(bash.runtime_file_transfer.is_none());
         assert!(!bash.runtime_file_transfer_required);
         assert!(bash.runtime_filesystem_boundary.is_some());
+    }
+
+    #[test]
+    fn ephemeral_transfer_does_not_protect_its_owned_work_dir() {
+        let (exec, _dir) = test_executor();
+        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            workspace_root: "/sandbox/.moi".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/sandbox/.moi".to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        });
+        let exec = exec.with_runtime_file_transfer(Some(context));
+
+        let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
+        assert!(publish.runtime_file_transfer.is_some());
+        assert!(publish.runtime_filesystem_boundary.is_none());
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
+        assert!(bash.runtime_file_transfer.is_some());
+        assert!(bash.runtime_file_transfer_required);
+        assert!(bash.runtime_filesystem_boundary.is_none());
     }
 
     #[test]

@@ -225,6 +225,7 @@ pub(crate) fn tool_call_end_event(
         event.insert("error".to_string(), Value::String(result.output.clone()));
     }
     copy_result_structured_output_metadata(&mut event, result);
+    copy_result_artifacts_metadata(&mut event, result);
     copy_result_routing_metadata(&mut event, result);
     Some(event)
 }
@@ -336,6 +337,25 @@ fn copy_result_structured_output_metadata(
             .entry("structuredContent".to_string())
             .or_insert_with(|| value.clone());
     }
+}
+
+/// Carries the explicit artifact protocol field from a tool result onto the
+/// terminal event. The client event projection exposes this field directly.
+fn copy_result_artifacts_metadata(
+    event: &mut Map<String, Value>,
+    result: &astra_tools::ToolResult,
+) {
+    let Some(artifacts) = result
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("artifacts"))
+        .filter(|value| value.is_array())
+    else {
+        return;
+    };
+    event
+        .entry("artifacts".to_string())
+        .or_insert_with(|| artifacts.clone());
 }
 
 pub(crate) fn projected_tool_start_event_fields(

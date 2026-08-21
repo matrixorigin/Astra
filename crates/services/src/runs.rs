@@ -493,16 +493,29 @@ pub struct RuntimeFileTransferAttachment {
 pub struct RuntimeFileTransferContext {
     pub endpoint_url: String,
     pub authorization: String,
-    pub task_id: String,
     /// Canonical workspace root selected by the runtime binding. Relative
     /// model-visible file paths are resolved from this directory.
     pub workspace_root: String,
-    pub root: String,
-    pub catalog_dir: String,
-    pub session_dir: String,
-    pub scratch_dir: String,
+    pub layout: RuntimeFileTransferLayout,
     pub max_file_bytes: u64,
     pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "layout", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeFileTransferLayout {
+    /// Existing managed Runner layout. It is retained only for sbx-* while
+    /// eph-* moves to the single work-directory contract below.
+    Legacy {
+        task_id: String,
+        root: String,
+        catalog_dir: String,
+        session_dir: String,
+        scratch_dir: String,
+    },
+    /// Ephemeral Sandbox owns its whole local work directory. It has no
+    /// task-scoped subdirectories or durable mounted session/catalog lanes.
+    Ephemeral { work_dir: String },
 }
 
 /// Non-secret filesystem boundary for a provider-managed Edge workspace.
@@ -520,8 +533,8 @@ impl std::fmt::Debug for RuntimeFileTransferContext {
         f.debug_struct("RuntimeFileTransferContext")
             .field("endpoint_url", &self.endpoint_url)
             .field("authorization_present", &!self.authorization.is_empty())
-            .field("task_id", &self.task_id)
-            .field("root", &self.root)
+            .field("workspace_root", &self.workspace_root)
+            .field("layout", &self.layout)
             .field("attachment_count", &self.attachments.len())
             .finish()
     }
@@ -7386,6 +7399,7 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 .cloned()
                 .unwrap_or(serde_json::Value::String(String::new()));
             out.insert("result".to_string(), result);
+            copy_explicit_artifacts(&mut out, &data);
             copy_execution_boundary_fields(&mut out, &data);
             project_external_tool_call_end(serde_json::Value::Object(out))
         }
@@ -7722,6 +7736,7 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
             out.insert(key.to_string(), value.clone());
         }
     }
+    copy_explicit_artifacts(&mut out, source);
 
     if let Some(result) = source.get("result").or_else(|| source.get("output")) {
         let (result, evidence) = project_external_tool_result(result.clone());
@@ -7788,6 +7803,15 @@ fn project_external_tool_call_end(event: serde_json::Value) -> serde_json::Value
         "external tool event projection exceeded its hard byte limit"
     );
     projected
+}
+
+fn copy_explicit_artifacts(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    if let Some(artifacts) = source.get("artifacts") {
+        out.insert("artifacts".to_string(), artifacts.clone());
+    }
 }
 
 fn project_external_tool_result(
@@ -10578,6 +10602,48 @@ mod tests {
         assert_eq!(transformed["blocked"], true);
         assert_eq!(transformed["error_kind"], "executor_offline");
         assert!(transformed.get("provider_internal").is_none());
+    }
+
+    #[test]
+    fn external_tool_call_end_preserves_explicit_artifacts() {
+        let transformed = transform_run_event_for_client(json!({
+            "type": "tool_call_end",
+            "call_id": "call-artifact",
+            "tool": "publish_artifact",
+            "result": "Published artifact 'report.pptx'",
+            "artifacts": [{
+                "artifact_id": "file-1",
+                "name": "report.pptx",
+                "type": "file",
+                "data": {"file_id": "file-1"}
+            }],
+            "provider_internal": "must-not-cross-the-external-boundary",
+        }));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["artifacts"][0]["artifact_id"], "file-1");
+        assert!(transformed.get("provider_internal").is_none());
+    }
+
+    #[test]
+    fn stored_tool_result_preserves_explicit_artifacts() {
+        let transformed = transform_run_event_for_client(make_event(
+            "tool_result",
+            json!({
+                "tool_call_id": "call-artifact",
+                "name": "publish_artifact",
+                "output": "Published artifact 'report.pptx'",
+                "artifacts": [{
+                    "artifact_id": "file-1",
+                    "name": "report.pptx",
+                    "type": "file",
+                    "data": {"file_id": "file-1"}
+                }],
+            }),
+        ));
+
+        assert_eq!(transformed["type"], "tool_call_end");
+        assert_eq!(transformed["artifacts"][0]["artifact_id"], "file-1");
     }
 
     #[test]

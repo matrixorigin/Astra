@@ -534,10 +534,11 @@ fn runtime_workspace_provider_declares_tool(
     platform: RuntimePlatform,
 ) -> bool {
     match tool_name {
-        // Edge publication is implemented by the request-scoped managed file
-        // transfer interceptor, not by the generic Edge tool executor.  The
-        // server-local and CLI implementations remain ordinary runtime tools.
-        "publish_artifact" => !matches!(provider_type, CapacityProviderType::EdgeCapacity),
+        // The Edge request-scoped managed file-transfer interceptor owns the
+        // implementation, but it is still an Edge-executable tool.  Omitting
+        // it here prevents the coordinator from ever dispatching publication
+        // to an eph runner.
+        "publish_artifact" => true,
         // Terminal rendering is an access-surface affordance, not generic
         // workspace executor capacity.
         "display_sixel" => matches!(provider_type, CapacityProviderType::CliLocal),
@@ -824,7 +825,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_edge_provider_does_not_claim_managed_file_transfer_tools() {
+    fn generic_edge_provider_declares_publish_artifact_for_managed_transfer() {
         let registry = ToolRegistry::builtins();
         let provider = runtime_workspace_provider(
             CapacityProviderType::EdgeCapacity,
@@ -834,7 +835,7 @@ mod tests {
         );
 
         assert!(!provider.declares_tool("materialize_attachment"));
-        assert!(!provider.declares_tool("publish_artifact"));
+        assert!(provider.declares_tool("publish_artifact"));
         assert!(provider.declares_tool("read_file"));
 
         let server_sandbox = runtime_workspace_provider(
