@@ -135,6 +135,49 @@ fn delete_attempt_keys_query<'a>(attempt_keys: &'a [(String, String)]) -> QueryB
     query
 }
 
+fn lock_provider_attempts_for_context_expiry_query<'a>(
+    attempt_keys: &'a [(String, String)],
+) -> QueryBuilder<'a, MySql> {
+    let mut query = QueryBuilder::<MySql>::new(
+        "SELECT user_id, attempt_id FROM inference_provider_attempts WHERE ",
+    );
+    for (index, (user_id, attempt_id)) in attempt_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(user_id = ")
+            .push_bind(user_id)
+            .push(" AND attempt_id = ")
+            .push_bind(attempt_id)
+            .push(")");
+    }
+    query.push(" ORDER BY user_id ASC, attempt_id ASC FOR UPDATE");
+    query
+}
+
+fn mark_provider_attempt_context_expired_query<'a>(
+    attempt_keys: &'a [(String, String)],
+) -> QueryBuilder<'a, MySql> {
+    let mut query = QueryBuilder::<MySql>::new(
+        "UPDATE inference_provider_attempts
+         SET context_expired_at = COALESCE(context_expired_at, NOW(6))
+         WHERE ",
+    );
+    for (index, (user_id, attempt_id)) in attempt_keys.iter().enumerate() {
+        if index > 0 {
+            query.push(" OR ");
+        }
+        query
+            .push("(user_id = ")
+            .push_bind(user_id)
+            .push(" AND attempt_id = ")
+            .push_bind(attempt_id)
+            .push(")");
+    }
+    query
+}
+
 /// Keep a request-diagnostic scope bounded after appending an event.
 ///
 /// The event rows are diagnostic observability, not user-visible conversation
@@ -236,6 +279,33 @@ pub(crate) async fn expire_model_request_context_events(
             error,
         )
     })?;
+    let mut lock_attempts = lock_provider_attempts_for_context_expiry_query(&attempt_keys);
+    let locked_attempt_keys = lock_attempts
+        .build()
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "lock bounded model request context expiry attempts",
+                error,
+            )
+        })?
+        .into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get::<String, _>("user_id")?,
+                row.try_get::<String, _>("attempt_id")?,
+            ))
+        })
+        .collect::<Result<BTreeSet<_>, sqlx::Error>>()
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode locked model request context expiry attempts",
+                error,
+            )
+        })?;
     let mut validate = validate_expired_attempt_keys_query(&attempt_keys);
     let expired_attempt_keys = validate
         .build()
@@ -271,6 +341,21 @@ pub(crate) async fn expire_model_request_context_events(
             )
         })?;
         return Ok(0);
+    }
+    let provider_attempts_to_mark = expired_attempt_keys
+        .iter()
+        .filter(|attempt_key| locked_attempt_keys.contains(*attempt_key))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !provider_attempts_to_mark.is_empty() {
+        let mut mark = mark_provider_attempt_context_expired_query(&provider_attempts_to_mark);
+        mark.build().execute(&mut *tx).await.map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "mark model request context attempts expired",
+                error,
+            )
+        })?;
     }
     let mut delete = delete_attempt_keys_query(&expired_attempt_keys);
     let rows_deleted = delete
@@ -334,6 +419,11 @@ mod retention_tests {
         let expiry_validation = expiry_validation_builder.build();
         let mut expiry_delete_builder = delete_attempt_keys_query(&attempt_keys);
         let expiry_delete = expiry_delete_builder.build();
+        let mut lock_attempts_builder =
+            lock_provider_attempts_for_context_expiry_query(&attempt_keys);
+        let lock_attempts = lock_attempts_builder.build();
+        let mut mark_expired_builder = mark_provider_attempt_context_expired_query(&attempt_keys);
+        let mark_expired = mark_expired_builder.build();
 
         assert!(probe.contains("LIMIT 1 OFFSET ?"));
         assert!(completed_attempts.contains("GROUP BY attempt_id"));
@@ -355,6 +445,13 @@ mod retention_tests {
                 .sql()
                 .contains("user_id = ? AND attempt_id = ?")
         );
+        assert!(
+            lock_attempts
+                .sql()
+                .contains("FROM inference_provider_attempts")
+        );
+        assert!(lock_attempts.sql().ends_with("FOR UPDATE"));
+        assert!(mark_expired.sql().contains("context_expired_at"));
     }
 }
 

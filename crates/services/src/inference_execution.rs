@@ -486,6 +486,37 @@ async fn insert_model_request_context_event(
     stage: ModelRequestEventStage,
     terminal: Option<&InferenceInvocationTerminal>,
 ) -> ServiceResult<()> {
+    let context_expired_at = sqlx::query(
+        "SELECT context_expired_at
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?
+         FOR UPDATE",
+    )
+    .bind(&attempt.user_id)
+    .bind(&attempt.attempt_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "lock inference provider attempt for model request context",
+            error,
+        )
+    })?
+    .ok_or_else(|| {
+        ServiceError::conflict(format!(
+            "inference provider attempt {} is unavailable for model request context",
+            attempt.attempt_id
+        ))
+    })?
+    .try_get::<Option<chrono::NaiveDateTime>, _>("context_expired_at")
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode inference provider attempt context expiry",
+            error,
+        )
+    })?;
     let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
     let usage = event.usage.as_ref();
     let model_family = attempt
@@ -493,63 +524,65 @@ async fn insert_model_request_context_event(
         .model_family
         .as_deref()
         .unwrap_or("unspecified");
-    sqlx::query(
-        "INSERT INTO model_request_context_events
+    if context_expired_at.is_none() {
+        sqlx::query(
+            "INSERT INTO model_request_context_events
          (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-    )
-    .bind(event_id)
-    .bind(&attempt.user_id)
-    .bind(&attempt.attempt_id)
-    .bind(&attempt.invocation_id)
-    .bind(attempt.invocation_input.scope.session_id())
-    .bind(attempt.invocation_input.scope.run_id())
-    .bind(attempt.invocation_input.scope.harness_run_id())
-    .bind(stage.as_str())
-    .bind(event.terminal_status.as_deref())
-    .bind(event.identity.topology.as_str())
-    .bind(&event.identity.provider)
-    .bind(model_family)
-    .bind(&event.identity.inference_purpose)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.request_input_tokens),
-        "model request input_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.output_tokens),
-        "model request output_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.cache_read_tokens),
-        "model request cache_read_tokens",
-    )?)
-    .bind(checked_optional_i64(
-        usage.map(|usage| usage.cache_creation_tokens),
-        "model request cache_creation_tokens",
-    )?)
-    .bind(event_json)
-    .execute(&mut *connection)
-    .await
-    .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "insert model request context event",
-            error,
         )
-    })?;
-    let scope = match &attempt.invocation_input.scope {
-        InferenceInvocationScope::Run { session_id, .. }
-        | InferenceInvocationScope::Session { session_id, .. } => {
-            ModelRequestContextScope::Session(session_id)
-        }
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
-            ModelRequestContextScope::HarnessRun(harness_run_id)
-        }
-    };
-    compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+        .bind(event_id)
+        .bind(&attempt.user_id)
+        .bind(&attempt.attempt_id)
+        .bind(&attempt.invocation_id)
+        .bind(attempt.invocation_input.scope.session_id())
+        .bind(attempt.invocation_input.scope.run_id())
+        .bind(attempt.invocation_input.scope.harness_run_id())
+        .bind(stage.as_str())
+        .bind(event.terminal_status.as_deref())
+        .bind(event.identity.topology.as_str())
+        .bind(&event.identity.provider)
+        .bind(model_family)
+        .bind(&event.identity.inference_purpose)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.request_input_tokens),
+            "model request input_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.output_tokens),
+            "model request output_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.cache_read_tokens),
+            "model request cache_read_tokens",
+        )?)
+        .bind(checked_optional_i64(
+            usage.map(|usage| usage.cache_creation_tokens),
+            "model request cache_creation_tokens",
+        )?)
+        .bind(event_json)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert model request context event",
+                error,
+            )
+        })?;
+        let scope = match &attempt.invocation_input.scope {
+            InferenceInvocationScope::Run { session_id, .. }
+            | InferenceInvocationScope::Session { session_id, .. } => {
+                ModelRequestContextScope::Session(session_id)
+            }
+            InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
+                ModelRequestContextScope::HarnessRun(harness_run_id)
+            }
+        };
+        compact_model_request_context_scope(connection, &attempt.user_id, scope).await?;
+    }
     if let (Some(status), Some(usage)) = (event.terminal_status.as_deref(), usage) {
         sqlx::query(
             "INSERT INTO model_request_metric_shards

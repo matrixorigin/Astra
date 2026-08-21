@@ -9,7 +9,11 @@
 use astra_services::auth::session::{DatabaseSessionService, SessionService};
 use astra_services::config_version_cloud::{CONFIG_VERSIONS_SELECT_TOML_SQL, ConfigVersionPayload};
 use astra_services::event_ingestion::{EventIngestionWorker, IngestionConfig, IngestionEvent};
+use astra_services::events::{
+    DatabaseEventService, EventCreateRequestData, EventIngestionSource, EventService,
+};
 use astra_services::storage::{insert_agent_event_edges, load_agent_event_parent_ids};
+use axum::http::StatusCode;
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -267,6 +271,73 @@ async fn queued_ingestion_cannot_resurrect_a_hard_deleted_session() {
         1,
         "the deletion-fenced event is permanently invalid, not retryable"
     );
+
+    cleanup_session(&pool, &user_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn direct_event_api_rejects_a_session_with_a_pending_delete_fence() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let user_id = format!("direct-delete-fence-user-{}", Uuid::new_v4().simple());
+    let session_id = Uuid::new_v4().to_string();
+    cleanup_session(&pool, &user_id, &session_id).await;
+    insert_session_root(&pool, &user_id, &session_id).await;
+    let mut tx = pool.begin().await.expect("begin lifecycle fence fixture");
+    astra_services::storage::add_agent_session_event_count_or_create(
+        &mut tx,
+        &session_id,
+        &user_id,
+        0,
+        None,
+    )
+    .await
+    .expect("create lifecycle fence fixture");
+    tx.commit().await.expect("commit lifecycle fence fixture");
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET delete_requested_at = NOW(6)
+         WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .execute(&pool)
+    .await
+    .expect("mark pending session delete");
+
+    let event_service =
+        DatabaseEventService::new(astra_core::MatrixOneSettings::from_env()).with_pool(shared);
+    let error = event_service
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: EventIngestionSource::Client,
+                event_id: None,
+                session_id: session_id.clone(),
+                event_type: "write_during_delete".to_string(),
+                content: "must not persist".to_string(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: None,
+            },
+        )
+        .await
+        .expect_err("a pending delete fence must reject the direct event API");
+    assert_eq!(error.0, StatusCode::NOT_FOUND);
+
+    let event_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count rejected direct events");
+    assert_eq!(event_rows, 0, "the rejected event must not persist");
 
     cleanup_session(&pool, &user_id, &session_id).await;
 }

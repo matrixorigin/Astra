@@ -6,6 +6,7 @@
 
 mod common;
 
+use astra_services::runtime_maintenance::{RuntimeMaintenancePolicy, maintain_runtime_storage};
 use astra_services::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
     InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
@@ -398,6 +399,112 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &str
             .await
             .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
     }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("context-expiry-user-{suffix}");
+    let session_id = format!("context-expiry-session-{suffix}");
+    let run_id = format!("context-expiry-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "context_expiry_terminal_race".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "context-expiry-offering".to_string(),
+        resolved_model_name: "context-expiry-model".to_string(),
+        upstream_model_name: "context-expiry-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan context expiry invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit context expiry invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("persist accepted context event");
+    sqlx::query(
+        "UPDATE model_request_context_events
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 31 DAY)
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("age accepted context event past retention");
+
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some("provider_unavailable".to_string()),
+        error_message: Some("delayed terminal after diagnostic retention".to_string()),
+    };
+    let maintenance_policy = RuntimeMaintenancePolicy {
+        batch_limit: 1_000,
+        ..RuntimeMaintenancePolicy::default()
+    };
+    let (maintenance, terminal) = tokio::join!(
+        maintain_runtime_storage(&shared_pool, None, &maintenance_policy),
+        finish_inference_provider_attempt(&shared_pool, &attempt, &terminal),
+    );
+    assert!(
+        maintenance.cleanup_errors.is_empty(),
+        "runtime maintenance errors: {:?}",
+        maintenance.cleanup_errors
+    );
+    terminal.expect("terminal persistence must converge with context expiry");
+
+    let stages = sqlx::query(
+        "SELECT event_stage FROM model_request_context_events
+         WHERE user_id = ? AND attempt_id = ? ORDER BY event_stage",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_all(pool)
+    .await
+    .expect("load retained model request context stages")
+    .into_iter()
+    .map(|row| row.get::<String, _>("event_stage"))
+    .collect::<Vec<_>>();
+    assert!(
+        stages.is_empty() || stages == ["accepted", "terminal"],
+        "expiry and terminal must retain an atomic pair or no diagnostics, never {stages:?}"
+    );
+    if stages.is_empty() {
+        let expired: Option<chrono::NaiveDateTime> = sqlx::query_scalar(
+            "SELECT context_expired_at FROM inference_provider_attempts
+             WHERE user_id = ? AND attempt_id = ?",
+        )
+        .bind(&user_id)
+        .bind(attempt.attempt_id())
+        .fetch_one(pool)
+        .await
+        .expect("read durable context expiry marker");
+        assert!(
+            expired.is_some(),
+            "a delayed terminal may skip only diagnostics durably expired under its attempt lock"
+        );
+    }
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]

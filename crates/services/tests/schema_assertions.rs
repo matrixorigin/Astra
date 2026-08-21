@@ -218,6 +218,17 @@ async fn schema_rationalization_runtime_contract() {
         index_columns(
             &pool,
             &schema,
+            "prompt_request_records",
+            "idx_prompt_requests_owner_previous"
+        )
+        .await,
+        ["user_id", "session_id", "previous_request_id"],
+        "prompt retention must find reuse-prefix dependents without scanning all diagnostics"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
             "agent_session_lifecycle_fences",
             "idx_agent_session_fences_pending_delete"
         )

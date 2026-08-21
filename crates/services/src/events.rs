@@ -625,6 +625,15 @@ impl EventService for DatabaseEventService {
         }
         ensure_event_session_requirement(&mut tx, &session_id, &user_id, sync_outbox_ingestion)
             .await?;
+        crate::storage::lock_agent_session_write_fence(&mut tx, &session_id, &user_id)
+            .await
+            .map_err(|error| match error {
+                sqlx::Error::RowNotFound | sqlx::Error::Protocol(_) => error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} not found"),
+                ),
+                error => internal_error(error),
+            })?;
         if let Some(existing_id) = client_event_id.as_deref() {
             let select_sql = format!(
                 "SELECT {} FROM agent_events WHERE event_id = ? AND user_id = ?",

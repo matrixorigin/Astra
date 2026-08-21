@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-08-21-v25";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-08-21-v26";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -1124,13 +1124,50 @@ const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_ses
          updated_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), updated_at), \
          last_active_at = IF(user_id = VALUES(user_id) AND last_active_at < DATE_SUB(NOW(6), INTERVAL 1 SECOND), NOW(6), last_active_at)";
 
-/// Acquire the durable lifecycle fence for one session write.
+/// The state observed after locking a durable session lifecycle fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSessionWriteFenceState {
+    Writable,
+    Tombstoned,
+    Missing,
+}
+
+/// Lock an existing durable lifecycle fence without creating one.
+///
+/// Maintenance uses this form to serialize with session-bound writers while
+/// leaving already-deleted/orphaned state to the delete lifecycle.
+pub async fn lock_existing_agent_session_write_fence(
+    tx: &mut Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
+    let row = query(
+        "SELECT delete_requested_at \
+         FROM agent_session_lifecycle_fences \
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(AgentSessionWriteFenceState::Missing);
+    };
+    let delete_requested_at: Option<chrono::NaiveDateTime> = row.try_get("delete_requested_at")?;
+    Ok(if delete_requested_at.is_some() {
+        AgentSessionWriteFenceState::Tombstoned
+    } else {
+        AgentSessionWriteFenceState::Writable
+    })
+}
+
+/// Acquire the durable lifecycle fence for one session-bound write.
 ///
 /// The fence row is created before the session root and survives hard delete.
-/// Every path that can create or upsert `agent_sessions` must call this in the
-/// same transaction as its write. A delete request locks the same row before
-/// removing the root, so an already-queued writer either commits before the
-/// delete or observes the tombstone and rolls its whole transaction back.
+/// Every session-bound write must call this in the same transaction. A delete
+/// request locks the same row before removing data, so an already-queued
+/// writer either commits before the delete or observes the tombstone and rolls
+/// its whole transaction back.
 pub async fn lock_agent_session_write_fence(
     tx: &mut Transaction<'_, MySql>,
     session_id: &str,
@@ -1146,22 +1183,15 @@ pub async fn lock_agent_session_write_fence(
     .execute(&mut **tx)
     .await?;
 
-    let row = query(
-        "SELECT delete_requested_at \
-         FROM agent_session_lifecycle_fences \
-         WHERE user_id = ? AND session_id = ? FOR UPDATE",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .fetch_one(&mut **tx)
-    .await?;
-    let delete_requested_at: Option<chrono::NaiveDateTime> = row.try_get("delete_requested_at")?;
-    if delete_requested_at.is_some() {
-        return Err(sqlx::Error::Protocol(
+    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => Ok(()),
+        AgentSessionWriteFenceState::Tombstoned => Err(sqlx::Error::Protocol(
             "session has a durable deletion fence".into(),
-        ));
+        )),
+        AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(
+            "session lifecycle fence disappeared before it could be locked".into(),
+        )),
     }
-    Ok(())
 }
 
 pub async fn add_agent_session_event_count_or_create(
@@ -2092,6 +2122,18 @@ fn inference_provider_attempt_schema_mismatches(
                 column.character_maximum_length
             ));
         }
+    }
+
+    match columns.get("context_expired_at") {
+        Some(column) if column.nullable && column.data_type.eq_ignore_ascii_case("datetime") => {}
+        Some(column) if !column.nullable => {
+            reasons.push("non-nullable column context_expired_at".to_string());
+        }
+        Some(column) => reasons.push(format!(
+            "column context_expired_at has type {}, expected datetime",
+            column.data_type
+        )),
+        None => reasons.push("missing nullable column context_expired_at".to_string()),
     }
 
     for (name, expected_columns) in [
@@ -4534,6 +4576,7 @@ async fn ensure_core_schema_while_leased(
             UNIQUE KEY uq_prompt_request_attempt (user_id, session_id, turn, round, source, attempt),
             INDEX idx_prompt_requests_owner_session_created (user_id, session_id, created_at, turn, round, attempt),
             INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt),
+            INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id),
             INDEX idx_prompt_requests_retention_ms (created_at_unix_ms, user_id, request_id, session_id)
         )",
     )
@@ -4598,6 +4641,11 @@ async fn ensure_core_schema_while_leased(
                 "attempt",
             ][..],
             "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_run_created (user_id, run_id, created_at, turn, round, attempt)",
+        ),
+        (
+            "idx_prompt_requests_owner_previous",
+            &["user_id", "session_id", "previous_request_id"][..],
+            "ALTER TABLE prompt_request_records ADD INDEX idx_prompt_requests_owner_previous (user_id, session_id, previous_request_id)",
         ),
         (
             "idx_prompt_requests_retention_ms",
@@ -6101,6 +6149,7 @@ async fn ensure_core_schema_while_leased(
             error_message TEXT NULL,
             started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
+            context_expired_at DATETIME(6) NULL,
             PRIMARY KEY (user_id, attempt_id),
             CONSTRAINT chk_inference_provider_attempts_scope_owner
                 CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
@@ -6118,6 +6167,14 @@ async fn ensure_core_schema_while_leased(
         )",
     )
     .execute(&pool)
+    .await?;
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "inference_provider_attempts",
+        "context_expired_at",
+        "ALTER TABLE inference_provider_attempts ADD COLUMN context_expired_at DATETIME(6) NULL",
+    )
     .await?;
 
     core_schema_create!(
@@ -8853,6 +8910,14 @@ mod tests {
                     data_type: "bigint".to_string(),
                     character_maximum_length: None,
                     nullable: false,
+                },
+            ),
+            (
+                "context_expired_at",
+                ObservedColumnShape {
+                    data_type: "datetime".to_string(),
+                    character_maximum_length: None,
+                    nullable: true,
                 },
             ),
         ]
