@@ -1147,17 +1147,14 @@ pub async fn lock_agent_session_write_fence(
     .await?;
 
     let row = query(
-        "SELECT user_id, delete_requested_at \
+        "SELECT delete_requested_at \
          FROM agent_session_lifecycle_fences \
-         WHERE session_id = ? FOR UPDATE",
+         WHERE user_id = ? AND session_id = ? FOR UPDATE",
     )
+    .bind(user_id)
     .bind(session_id)
     .fetch_one(&mut **tx)
     .await?;
-    let fence_owner: String = row.try_get("user_id")?;
-    if fence_owner != user_id {
-        return Err(sqlx::Error::RowNotFound);
-    }
     let delete_requested_at: Option<chrono::NaiveDateTime> = row.try_get("delete_requested_at")?;
     if delete_requested_at.is_some() {
         return Err(sqlx::Error::Protocol(
@@ -2971,21 +2968,6 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE agent_sessions ADD INDEX idx_agent_sessions_delete_requested_owner (delete_requested_at, user_id, session_id)",
     )
     .await?;
-    let duplicate_session_owner: Option<(String,)> = sqlx::query_as(
-        "SELECT session_id
-         FROM agent_sessions
-         GROUP BY session_id
-         HAVING COUNT(DISTINCT user_id) > 1
-         ORDER BY session_id ASC
-         LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await?;
-    if let Some((session_id,)) = duplicate_session_owner {
-        return Err(sqlx::Error::Protocol(format!(
-            "cannot install global session lifecycle fences: session_id {session_id:?} has multiple owners"
-        )));
-    }
     core_schema_create!(
         pool,
         "agent_session_lifecycle_fences",
@@ -2996,10 +2978,9 @@ async fn ensure_core_schema_while_leased(
             database_deleted_at DATETIME(6) NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-            PRIMARY KEY (session_id),
-            INDEX idx_agent_session_fences_owner (user_id, session_id),
+            PRIMARY KEY (user_id, session_id),
             INDEX idx_agent_session_fences_pending_delete
-                (database_deleted_at, delete_requested_at, session_id)
+                (database_deleted_at, delete_requested_at, user_id, session_id)
         )",
     )
     .execute(&pool)
@@ -3008,17 +2989,8 @@ async fn ensure_core_schema_while_leased(
         &pool,
         &settings.database,
         "agent_session_lifecycle_fences",
-        &["session_id"],
-        "ALTER TABLE agent_session_lifecycle_fences ADD PRIMARY KEY (session_id)",
-    )
-    .await?;
-    ensure_index_shape(
-        &pool,
-        &settings.database,
-        "agent_session_lifecycle_fences",
-        "idx_agent_session_fences_owner",
         &["user_id", "session_id"],
-        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_owner (user_id, session_id)",
+        "ALTER TABLE agent_session_lifecycle_fences ADD PRIMARY KEY (user_id, session_id)",
     )
     .await?;
     ensure_index_shape(
@@ -3026,8 +2998,13 @@ async fn ensure_core_schema_while_leased(
         &settings.database,
         "agent_session_lifecycle_fences",
         "idx_agent_session_fences_pending_delete",
-        &["database_deleted_at", "delete_requested_at", "session_id"],
-        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_pending_delete (database_deleted_at, delete_requested_at, session_id)",
+        &[
+            "database_deleted_at",
+            "delete_requested_at",
+            "user_id",
+            "session_id",
+        ],
+        "ALTER TABLE agent_session_lifecycle_fences ADD INDEX idx_agent_session_fences_pending_delete (database_deleted_at, delete_requested_at, user_id, session_id)",
     )
     .await?;
     let lifecycle_fences_backfilled = query(

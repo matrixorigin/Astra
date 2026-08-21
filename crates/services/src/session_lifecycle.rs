@@ -26,7 +26,7 @@ const SELECT_EXPLICIT_SESSION_DELETE_INTENTS_SQL: &str = "SELECT session_id, use
      WHERE delete_requested_at IS NOT NULL
      AND database_deleted_at IS NULL
      AND delete_requested_at < DATE_SUB(NOW(6), INTERVAL ? SECOND)
-     ORDER BY delete_requested_at ASC, session_id ASC
+     ORDER BY delete_requested_at ASC, user_id ASC, session_id ASC
      LIMIT ?";
 
 const MARK_SESSION_DELETING_SQL: &str = "UPDATE agent_sessions
@@ -1213,18 +1213,16 @@ async fn mark_session_deleting(
     .execute(&mut *tx)
     .await
     .map_err(|source| format!("delete_session.mark_deleting.ensure_fence: {source}"))?;
-    let fence_owner: Option<String> =
-        query("SELECT user_id FROM agent_session_lifecycle_fences WHERE session_id = ? FOR UPDATE")
-            .bind(session_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?
-            .map(|row| row.try_get("user_id"))
-            .transpose()
-            .map_err(|source| format!("delete_session.mark_deleting.decode_fence: {source}"))?;
-    if fence_owner.as_deref() != Some(user_id) {
-        return Err("delete_session.mark_deleting: session not found or not owned by user".into());
-    }
+    query(
+        "SELECT 1 FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|source| format!("delete_session.mark_deleting.lock_fence: {source}"))?;
 
     let result = query(MARK_SESSION_DELETING_SQL)
         .bind(session_id)

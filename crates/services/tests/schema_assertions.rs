@@ -211,8 +211,8 @@ async fn schema_rationalization_runtime_contract() {
     }
     assert_eq!(
         primary_key_columns(&pool, &schema, "agent_session_lifecycle_fences").await,
-        ["session_id"],
-        "session lifecycle fence must survive the owner-bound session root"
+        ["user_id", "session_id"],
+        "session lifecycle fence identity must preserve the owner boundary"
     );
     assert_eq!(
         index_columns(
@@ -222,7 +222,12 @@ async fn schema_rationalization_runtime_contract() {
             "idx_agent_session_fences_pending_delete"
         )
         .await,
-        ["database_deleted_at", "delete_requested_at", "session_id"],
+        [
+            "database_deleted_at",
+            "delete_requested_at",
+            "user_id",
+            "session_id"
+        ],
         "delete reconciliation must scan only pending lifecycle fences"
     );
     assert_eq!(
