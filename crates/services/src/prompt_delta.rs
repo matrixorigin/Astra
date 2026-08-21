@@ -5,10 +5,32 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) const PROMPT_DIAGNOSTIC_RETENTION_DAYS: u32 = 90;
-const EXPIRED_PROMPT_REQUESTS_SQL: &str = "SELECT user_id, session_id, request_id
-     FROM prompt_request_records
-     WHERE created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL ? DAY)) * 1000
-     ORDER BY created_at_unix_ms ASC, user_id ASC, request_id ASC
+const EXPIRED_PROMPT_REQUESTS_SQL: &str =
+    "SELECT request.user_id, request.session_id, request.request_id
+     FROM prompt_request_records AS request
+     LEFT JOIN agent_session_lifecycle_fences AS fence
+       ON fence.user_id = request.user_id
+      AND fence.session_id = request.session_id
+     WHERE request.created_at_unix_ms < UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL ? DAY)) * 1000
+       AND (
+           fence.database_deleted_at IS NOT NULL
+           OR (
+               fence.delete_requested_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM prompt_request_records AS child
+                   INNER JOIN prompt_deltas AS child_delta
+                     ON child_delta.user_id = child.user_id
+                    AND child_delta.session_id = child.session_id
+                    AND child_delta.request_id = child.request_id
+                    AND child_delta.op = 'reuse_prefix'
+                   WHERE child.user_id = request.user_id
+                     AND child.session_id = request.session_id
+                     AND child.previous_request_id = request.request_id
+               )
+           )
+       )
+     ORDER BY request.created_at_unix_ms ASC, request.user_id ASC, request.request_id ASC
      LIMIT ?";
 
 const VALIDATE_EXPIRED_PROMPT_REQUEST_SQL: &str = "SELECT 1
@@ -105,7 +127,7 @@ pub(crate) async fn expire_prompt_diagnostics(
         .map_err(|error| format!("begin prompt diagnostic expiry: {error}"))?;
     let mut expired_requests = Vec::with_capacity(candidates.len());
     for (user_id, session_id, request_id) in candidates {
-        match crate::storage::lock_existing_agent_session_write_fence(
+        match crate::storage::lock_or_claim_orphaned_agent_session_write_fence(
             &mut tx,
             &session_id,
             &user_id,
@@ -113,20 +135,24 @@ pub(crate) async fn expire_prompt_diagnostics(
         .await
         .map_err(|error| format!("lock prompt diagnostic expiry session fence: {error}"))?
         {
-            crate::storage::AgentSessionWriteFenceState::Writable => {}
-            crate::storage::AgentSessionWriteFenceState::Tombstoned
+            crate::storage::AgentSessionWriteFenceState::Writable => {
+                let eligible: Option<i32> = sqlx::query_scalar(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL)
+                    .bind(&user_id)
+                    .bind(&session_id)
+                    .bind(&request_id)
+                    .bind(PROMPT_DIAGNOSTIC_RETENTION_DAYS)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(|error| format!("validate expired prompt diagnostic: {error}"))?;
+                if eligible.is_some() {
+                    expired_requests.push((user_id, session_id, request_id));
+                }
+            }
+            crate::storage::AgentSessionWriteFenceState::CompletedDelete => {
+                expired_requests.push((user_id, session_id, request_id));
+            }
+            crate::storage::AgentSessionWriteFenceState::PendingDelete
             | crate::storage::AgentSessionWriteFenceState::Missing => continue,
-        }
-        let eligible: Option<i32> = sqlx::query_scalar(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL)
-            .bind(&user_id)
-            .bind(&session_id)
-            .bind(&request_id)
-            .bind(PROMPT_DIAGNOSTIC_RETENTION_DAYS)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| format!("validate expired prompt diagnostic: {error}"))?;
-        if eligible.is_some() {
-            expired_requests.push((user_id, session_id, request_id));
         }
     }
     if expired_requests.is_empty() {
@@ -165,12 +191,15 @@ mod retention_tests {
 
     #[test]
     fn prompt_diagnostic_expiry_is_indexed_bounded_and_child_first() {
-        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("WHERE created_at_unix_ms <"));
-        assert!(
-            EXPIRED_PROMPT_REQUESTS_SQL
-                .contains("ORDER BY created_at_unix_ms ASC, user_id ASC, request_id ASC")
-        );
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("WHERE request.created_at_unix_ms <"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains(
+            "ORDER BY request.created_at_unix_ms ASC, request.user_id ASC, request.request_id ASC"
+        ));
         assert!(EXPIRED_PROMPT_REQUESTS_SQL.ends_with("LIMIT ?"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("fence.database_deleted_at IS NOT NULL"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("fence.delete_requested_at IS NULL"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("NOT EXISTS"));
+        assert!(EXPIRED_PROMPT_REQUESTS_SQL.contains("reuse_prefix"));
         assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.contains("NOT EXISTS"));
         assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.contains("reuse_prefix"));
         assert!(VALIDATE_EXPIRED_PROMPT_REQUEST_SQL.ends_with("FOR UPDATE"));

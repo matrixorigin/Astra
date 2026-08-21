@@ -162,6 +162,214 @@ async fn prompt_expiry_retains_an_expired_reuse_prefix_ancestor() {
     cleanup_fixture(&pool, &user_id, &session_id).await;
 }
 
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn prompt_expiry_skips_protected_oldest_request_and_advances_the_batch() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("prompt-hol-user-{suffix}");
+    let protected_session_id = format!("prompt-hol-protected-session-{suffix}");
+    let eligible_session_id = format!("prompt-hol-eligible-session-{suffix}");
+    let protected_request_id = format!("prompt-hol-protected-{suffix}");
+    let protected_child_id = format!("prompt-hol-protected-child-{suffix}");
+    let eligible_request_id = format!("prompt-hol-eligible-{suffix}");
+
+    for session_id in [&protected_session_id, &eligible_session_id] {
+        let mut tx = pool.begin().await.expect("begin active session fixture");
+        astra_services::storage::add_agent_session_event_count_or_create(
+            &mut tx, session_id, &user_id, 0, None,
+        )
+        .await
+        .expect("insert active session fixture");
+        tx.commit().await.expect("commit active session fixture");
+    }
+
+    insert_prompt_diagnostic(
+        &pool,
+        &user_id,
+        &protected_session_id,
+        &protected_request_id,
+        1,
+        true,
+    )
+    .await;
+    age_prompt_diagnostic(&pool, &user_id, &protected_request_id, 92).await;
+    insert_reuse_prefix_child(
+        &pool,
+        &user_id,
+        &protected_session_id,
+        &protected_child_id,
+        &protected_request_id,
+    )
+    .await;
+    insert_prompt_diagnostic(
+        &pool,
+        &user_id,
+        &eligible_session_id,
+        &eligible_request_id,
+        1,
+        true,
+    )
+    .await;
+
+    let result = maintain_runtime_storage(
+        &shared,
+        None,
+        &RuntimeMaintenancePolicy {
+            batch_limit: 1,
+            ..RuntimeMaintenancePolicy::default()
+        },
+    )
+    .await;
+    assert!(
+        result.cleanup_errors.is_empty(),
+        "runtime maintenance errors: {:?}",
+        result.cleanup_errors
+    );
+    assert_eq!(
+        prompt_diagnostic_count(&pool, &user_id, &protected_request_id).await,
+        (1, 1),
+        "a protected oldest request must not consume the only expiry candidate"
+    );
+    assert_eq!(
+        prompt_diagnostic_count(&pool, &user_id, &eligible_request_id).await,
+        (0, 0),
+        "the next eligible request must be selected before applying the batch limit"
+    );
+
+    cleanup_fixture(&pool, &user_id, &protected_session_id).await;
+    cleanup_fixture(&pool, &user_id, &eligible_session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn prompt_expiry_reclaims_completed_delete_diagnostics() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("prompt-completed-delete-user-{suffix}");
+    let session_id = format!("prompt-completed-delete-session-{suffix}");
+    let request_id = format!("prompt-completed-delete-request-{suffix}");
+
+    let mut tx = pool.begin().await.expect("begin active session fixture");
+    astra_services::storage::add_agent_session_event_count_or_create(
+        &mut tx,
+        &session_id,
+        &user_id,
+        0,
+        None,
+    )
+    .await
+    .expect("insert active session fixture");
+    tx.commit().await.expect("commit active session fixture");
+    insert_prompt_diagnostic(&pool, &user_id, &session_id, &request_id, 1, true).await;
+
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("remove session root after a completed delete");
+    sqlx::query(
+        "UPDATE agent_session_lifecycle_fences
+         SET delete_requested_at = NOW(6), database_deleted_at = NOW(6)
+         WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("complete lifecycle fence fixture");
+
+    let result = maintain_runtime_storage(
+        &shared,
+        None,
+        &RuntimeMaintenancePolicy {
+            batch_limit: 1,
+            ..RuntimeMaintenancePolicy::default()
+        },
+    )
+    .await;
+    assert!(
+        result.cleanup_errors.is_empty(),
+        "runtime maintenance errors: {:?}",
+        result.cleanup_errors
+    );
+    assert_eq!(
+        prompt_diagnostic_count(&pool, &user_id, &request_id).await,
+        (0, 0),
+        "completed delete tombstones must not retain prompt diagnostics forever"
+    );
+
+    cleanup_fixture(&pool, &user_id, &session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn prompt_expiry_tombstones_a_fenceless_historical_orphan() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("prompt-orphan-user-{suffix}");
+    let session_id = format!("prompt-orphan-session-{suffix}");
+    let request_id = format!("prompt-orphan-request-{suffix}");
+
+    insert_prompt_diagnostic(&pool, &user_id, &session_id, &request_id, 1, true).await;
+
+    let result = maintain_runtime_storage(
+        &shared,
+        None,
+        &RuntimeMaintenancePolicy {
+            batch_limit: 1,
+            ..RuntimeMaintenancePolicy::default()
+        },
+    )
+    .await;
+    assert!(
+        result.cleanup_errors.is_empty(),
+        "runtime maintenance errors: {:?}",
+        result.cleanup_errors
+    );
+    assert_eq!(
+        prompt_diagnostic_count(&pool, &user_id, &request_id).await,
+        (0, 0)
+    );
+    let tombstone_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_session_lifecycle_fences
+         WHERE user_id = ? AND session_id = ?
+           AND delete_requested_at IS NOT NULL AND database_deleted_at IS NOT NULL",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load orphan lifecycle tombstone");
+    assert_eq!(tombstone_count, 1);
+
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("begin rejected orphan recreation");
+    assert!(
+        astra_services::storage::add_agent_session_event_count_or_create(
+            &mut tx,
+            &session_id,
+            &user_id,
+            0,
+            None,
+        )
+        .await
+        .is_err(),
+        "expiry must establish a durable tombstone before removing an orphan diagnostic"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback rejected orphan recreation");
+
+    cleanup_fixture(&pool, &user_id, &session_id).await;
+}
+
 async fn insert_prompt_diagnostic(
     pool: &Pool<MySql>,
     user_id: &str,
@@ -206,6 +414,32 @@ async fn insert_prompt_diagnostic(
         .execute(pool)
         .await
         .expect("insert prompt delta diagnostic");
+}
+
+async fn age_prompt_diagnostic(pool: &Pool<MySql>, user_id: &str, request_id: &str, days: u32) {
+    let request_sql = format!(
+        "UPDATE prompt_request_records
+         SET created_at = DATE_SUB(NOW(6), INTERVAL {days} DAY),
+             created_at_unix_ms = UNIX_TIMESTAMP(DATE_SUB(NOW(6), INTERVAL {days} DAY)) * 1000
+         WHERE user_id = ? AND request_id = ?"
+    );
+    sqlx::query(&request_sql)
+        .bind(user_id)
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .expect("age prompt request diagnostic");
+    let delta_sql = format!(
+        "UPDATE prompt_deltas
+         SET created_at = DATE_SUB(NOW(6), INTERVAL {days} DAY)
+         WHERE user_id = ? AND request_id = ?"
+    );
+    sqlx::query(&delta_sql)
+        .bind(user_id)
+        .bind(request_id)
+        .execute(pool)
+        .await
+        .expect("age prompt delta diagnostic");
 }
 
 async fn insert_reuse_prefix_child(

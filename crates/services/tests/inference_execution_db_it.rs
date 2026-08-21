@@ -510,6 +510,142 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
 #[tokio::test]
 #[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
 #[serial]
+async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("context-expiry-hol-user-{suffix}");
+    let session_id = format!("context-expiry-hol-session-{suffix}");
+    let run_id = format!("context-expiry-hol-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let failure = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        provider_response_id: None,
+        error_kind: Some("provider_unavailable".to_string()),
+        error_message: Some("retention candidate fixture".to_string()),
+    };
+    let protected_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "context_expiry_head_of_line".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "context-expiry-hol-offering".to_string(),
+        resolved_model_name: "context-expiry-hol-model".to_string(),
+        upstream_model_name: "context-expiry-hol-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan protected context attempt");
+    admit_inference_invocation(&shared_pool, &protected_plan)
+        .await
+        .expect("admit protected context attempt");
+    let protected_attempt = provider_attempt(&protected_plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &protected_attempt)
+        .await
+        .expect("begin protected context attempt");
+    finish_inference_provider_attempt(&shared_pool, &protected_attempt, &failure)
+        .await
+        .expect("finish protected context attempt");
+    sqlx::query(
+        "UPDATE model_request_context_events
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 32 DAY)
+         WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted'",
+    )
+    .bind(&user_id)
+    .bind(protected_attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("age only the protected accepted event");
+
+    let eligible_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "context_expiry_head_of_line".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "context-expiry-hol-offering".to_string(),
+        resolved_model_name: "context-expiry-hol-model".to_string(),
+        upstream_model_name: "context-expiry-hol-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan eligible context attempt");
+    admit_inference_invocation(&shared_pool, &eligible_plan)
+        .await
+        .expect("admit eligible context attempt");
+    let eligible_attempt = provider_attempt(&eligible_plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &eligible_attempt)
+        .await
+        .expect("begin eligible context attempt");
+    finish_inference_provider_attempt(&shared_pool, &eligible_attempt, &failure)
+        .await
+        .expect("finish eligible context attempt");
+    sqlx::query(
+        "UPDATE model_request_context_events
+         SET created_at = DATE_SUB(NOW(6), INTERVAL 31 DAY)
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(eligible_attempt.attempt_id())
+    .execute(pool)
+    .await
+    .expect("age the eligible context attempt");
+
+    let maintenance = maintain_runtime_storage(
+        &shared_pool,
+        None,
+        &RuntimeMaintenancePolicy {
+            batch_limit: 1,
+            ..RuntimeMaintenancePolicy::default()
+        },
+    )
+    .await;
+    assert!(
+        maintenance.cleanup_errors.is_empty(),
+        "runtime maintenance errors: {:?}",
+        maintenance.cleanup_errors
+    );
+    let protected_stages = sqlx::query_scalar::<_, String>(
+        "SELECT event_stage FROM model_request_context_events
+         WHERE user_id = ? AND attempt_id = ? ORDER BY event_stage",
+    )
+    .bind(&user_id)
+    .bind(protected_attempt.attempt_id())
+    .fetch_all(pool)
+    .await
+    .expect("load protected context stages");
+    assert_eq!(protected_stages, ["accepted", "terminal"]);
+    let eligible_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_request_context_events WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(eligible_attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("count expired context events");
+    assert_eq!(eligible_event_count, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
 async fn provider_attempt_terminal_fails_closed_on_durable_wire_identity_drift() {
     let (shared_pool, _) = common::setup_pool_and_settings().await;
     let pool = shared_pool.get();

@@ -1128,21 +1128,23 @@ const ADD_AGENT_SESSION_EVENT_COUNT_OR_CREATE_SQL: &str = "INSERT INTO agent_ses
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentSessionWriteFenceState {
     Writable,
-    Tombstoned,
+    PendingDelete,
+    CompletedDelete,
     Missing,
 }
 
 /// Lock an existing durable lifecycle fence without creating one.
 ///
 /// Maintenance uses this form to serialize with session-bound writers while
-/// leaving already-deleted/orphaned state to the delete lifecycle.
+/// retaining the distinction between a delete still owned by reconciliation
+/// and a completed durable tombstone.
 pub async fn lock_existing_agent_session_write_fence(
     tx: &mut Transaction<'_, MySql>,
     session_id: &str,
     user_id: &str,
 ) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
     let row = query(
-        "SELECT delete_requested_at \
+        "SELECT delete_requested_at, database_deleted_at \
          FROM agent_session_lifecycle_fences \
          WHERE user_id = ? AND session_id = ? FOR UPDATE",
     )
@@ -1154,11 +1156,65 @@ pub async fn lock_existing_agent_session_write_fence(
         return Ok(AgentSessionWriteFenceState::Missing);
     };
     let delete_requested_at: Option<chrono::NaiveDateTime> = row.try_get("delete_requested_at")?;
-    Ok(if delete_requested_at.is_some() {
-        AgentSessionWriteFenceState::Tombstoned
-    } else {
-        AgentSessionWriteFenceState::Writable
+    let database_deleted_at: Option<chrono::NaiveDateTime> = row.try_get("database_deleted_at")?;
+    Ok(match (delete_requested_at, database_deleted_at) {
+        (None, None) => AgentSessionWriteFenceState::Writable,
+        (Some(_), None) => AgentSessionWriteFenceState::PendingDelete,
+        (_, Some(_)) => AgentSessionWriteFenceState::CompletedDelete,
     })
+}
+
+/// Lock a session fence for diagnostic expiry, claiming a fence-less session
+/// only when its durable root no longer exists.
+///
+/// A historical prompt diagnostic can outlive both its session row and fence.
+/// The claim is serialized with every session writer: if no root exists while
+/// holding the fence, record a completed tombstone before deleting the
+/// diagnostic so a later writer cannot recreate that session identity.
+pub(crate) async fn lock_or_claim_orphaned_agent_session_write_fence(
+    tx: &mut Transaction<'_, MySql>,
+    session_id: &str,
+    user_id: &str,
+) -> Result<AgentSessionWriteFenceState, sqlx::Error> {
+    query(
+        "INSERT IGNORE INTO agent_session_lifecycle_fences \
+         (session_id, user_id, created_at, updated_at) \
+         VALUES (?, ?, NOW(6), NOW(6))",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+
+    match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
+        AgentSessionWriteFenceState::Writable => {
+            let session_exists: Option<i32> = sqlx::query_scalar(
+                "SELECT 1 FROM agent_sessions \
+                 WHERE user_id = ? AND session_id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if session_exists.is_some() {
+                return Ok(AgentSessionWriteFenceState::Writable);
+            }
+
+            query(
+                "UPDATE agent_session_lifecycle_fences \
+                 SET delete_requested_at = COALESCE(delete_requested_at, NOW(6)), \
+                     database_deleted_at = COALESCE(database_deleted_at, NOW(6)), \
+                     updated_at = NOW(6) \
+                 WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+            lock_existing_agent_session_write_fence(tx, session_id, user_id).await
+        }
+        state => Ok(state),
+    }
 }
 
 /// Acquire the durable lifecycle fence for one session-bound write.
@@ -1185,7 +1241,8 @@ pub async fn lock_agent_session_write_fence(
 
     match lock_existing_agent_session_write_fence(tx, session_id, user_id).await? {
         AgentSessionWriteFenceState::Writable => Ok(()),
-        AgentSessionWriteFenceState::Tombstoned => Err(sqlx::Error::Protocol(
+        AgentSessionWriteFenceState::PendingDelete
+        | AgentSessionWriteFenceState::CompletedDelete => Err(sqlx::Error::Protocol(
             "session has a durable deletion fence".into(),
         )),
         AgentSessionWriteFenceState::Missing => Err(sqlx::Error::Protocol(

@@ -71,10 +71,18 @@ fn oldest_complete_attempts_in_scope_sql(scope: ModelRequestContextScope<'_>) ->
     )
 }
 
-const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT user_id, attempt_id
-     FROM model_request_context_events
-     WHERE created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
-     ORDER BY created_at ASC, event_id ASC
+const EXPIRED_ATTEMPT_CANDIDATES_SQL: &str = "SELECT candidate.user_id, candidate.attempt_id
+     FROM model_request_context_events AS candidate
+     WHERE candidate.created_at < DATE_SUB(NOW(6), INTERVAL ? DAY)
+       AND NOT EXISTS (
+           SELECT 1
+           FROM model_request_context_events AS newer
+           WHERE newer.user_id = candidate.user_id
+             AND newer.attempt_id = candidate.attempt_id
+             AND newer.created_at >= DATE_SUB(NOW(6), INTERVAL ? DAY)
+       )
+     GROUP BY candidate.user_id, candidate.attempt_id
+     ORDER BY MIN(candidate.created_at) ASC, candidate.user_id ASC, candidate.attempt_id ASC
      LIMIT ?";
 
 fn validate_expired_attempt_keys_query<'a>(
@@ -252,6 +260,7 @@ pub(crate) async fn expire_model_request_context_events(
     batch_limit: u32,
 ) -> ServiceResult<u64> {
     let candidate_rows = sqlx::query_as::<_, (String, String)>(EXPIRED_ATTEMPT_CANDIDATES_SQL)
+        .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
         .bind(MODEL_REQUEST_CONTEXT_RETENTION_DAYS)
         .bind(batch_limit)
         .fetch_all(pool.get())
@@ -431,9 +440,11 @@ mod retention_tests {
         assert!(completed_attempts.contains("ORDER BY MIN(created_at) ASC, attempt_id ASC"));
         assert!(delete.sql().contains("AND attempt_id IN"));
         assert!(!delete.sql().contains("event_id IN"));
-        assert!(expired_attempts.contains("WHERE created_at <"));
-        assert!(expired_attempts.contains("ORDER BY created_at ASC, event_id ASC"));
-        assert!(!expired_attempts.contains("GROUP BY"));
+        assert!(expired_attempts.contains("WHERE candidate.created_at <"));
+        assert!(expired_attempts.contains("NOT EXISTS"));
+        assert!(expired_attempts.contains("newer.created_at >="));
+        assert!(expired_attempts.contains("GROUP BY candidate.user_id, candidate.attempt_id"));
+        assert!(expired_attempts.contains("ORDER BY MIN(candidate.created_at) ASC"));
         assert!(
             expiry_validation
                 .sql()
