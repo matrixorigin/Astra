@@ -1,7 +1,7 @@
 use astra_core::{
     ErrorResponse, STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DELEGATED, STATUS_FAILED,
     STATUS_PAUSED, STATUS_RUNNING, STATUS_WAITING, SharedPool, SubRunState, error_response,
-    error_response_coded,
+    error_response_coded, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
 };
 use astra_turn_types::{
     ModelSelection, TOOL_INVOCATION_RESULT_ARTIFACT_METADATA_KEY, ToolInvocationContractError,
@@ -3685,7 +3685,7 @@ impl DatabaseRunStateStore {
         &self,
         projection: &DurableRunDisplayProjectionRecord,
     ) -> DbStoreResult<()> {
-        sqlx::query(
+        let upsert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO run_display_projections
              (run_id, user_id, session_id, status, waiting_for, error_message,
               projection_event_idx, latest_event_type, latest_checkpoint_id,
@@ -3706,25 +3706,34 @@ impl DatabaseRunStateStore {
                total_tool_calls = VALUES(total_tool_calls),
                projection_hash = VALUES(projection_hash),
                updated_at = NOW(6)",
-        )
-        .bind(&projection.run_id)
-        .bind(&projection.user_id)
-        .bind(&projection.session_id)
-        .bind(&projection.status)
-        .bind(&projection.waiting_for)
-        .bind(&projection.error_message)
-        .bind(projection.projection_event_idx)
-        .bind(&projection.latest_event_type)
-        .bind(&projection.latest_checkpoint_id)
-        .bind(&projection.latest_checkpoint_kind)
-        .bind(&projection.latest_checkpoint_version)
-        .bind(projection.total_prompt_tokens as i64)
-        .bind(projection.total_completion_tokens as i64)
-        .bind(projection.total_tool_calls as i64)
-        .bind(&projection.projection_hash)
-        .execute(self.pool.get())
-        .await
-        .map_err(|source| db_error("upsert_run_projection", &projection.run_id, source))?;
+            [
+                projection.waiting_for.is_some(),
+                projection.error_message.is_some(),
+                projection.latest_event_type.is_some(),
+                projection.latest_checkpoint_id.is_some(),
+                projection.latest_checkpoint_kind.is_some(),
+                projection.latest_checkpoint_version.is_some(),
+            ],
+        );
+        sqlx::query(&upsert_sql)
+            .bind(&projection.run_id)
+            .bind(&projection.user_id)
+            .bind(&projection.session_id)
+            .bind(&projection.status)
+            .bind(&projection.waiting_for)
+            .bind(&projection.error_message)
+            .bind(projection.projection_event_idx)
+            .bind(&projection.latest_event_type)
+            .bind(&projection.latest_checkpoint_id)
+            .bind(&projection.latest_checkpoint_kind)
+            .bind(&projection.latest_checkpoint_version)
+            .bind(projection.total_prompt_tokens as i64)
+            .bind(projection.total_completion_tokens as i64)
+            .bind(projection.total_tool_calls as i64)
+            .bind(&projection.projection_hash)
+            .execute(self.pool.get())
+            .await
+            .map_err(|source| db_error("upsert_run_projection", &projection.run_id, source))?;
         Ok(())
     }
 
@@ -4090,6 +4099,9 @@ impl DatabaseRunStateStore {
                 .push_bind(&event.payload_json)
                 .push("NOW(6)");
         });
+        builder.push(matrixone_null_shape_comment(
+            rows.iter().flat_map(RunEventInsertRow::nullable_shape),
+        ));
 
         match builder.build().execute(self.pool.get()).await {
             Ok(_) => {}
@@ -4218,13 +4230,32 @@ impl DatabaseRunStateStore {
             record.last_event_idx = -1;
         }
 
+        let run_insert_null_shape = [
+            record.parent_run_id.is_some(),
+            record.delegation_id.is_some(),
+            record.agent_id.is_some(),
+            record.retry_of.is_some(),
+            record.waiting_for.is_some(),
+            record.checkpoint_version.is_some(),
+            record.checkpoint_json.is_some(),
+            record.error_code.is_some(),
+            record.error_message.is_some(),
+            record.agent_binding_id.is_some(),
+            record.agent_binding_name.is_some(),
+            record.agent_binding_schema_version.is_some(),
+            record.model_offering_id.is_some(),
+            record.resolved_model_name.is_some(),
+            record.runtime_profile.is_some(),
+            record.provider_request_fingerprint.is_some(),
+        ];
+
         let insert_result = if run_requires_session_execution_slot(&record)
             && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
         {
             let mut tx = self.pool.get().begin().await.map_err(|source| {
                 db_error("insert_run_begin", &record.run_id, source).to_string()
             })?;
-            let result = sqlx::query(
+            let insert_sql = matrixone_statement_with_null_shape(
                 "INSERT INTO agent_runs
                  (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
                   delegation_id, agent_id, retry_of, retry_scope, status, waiting_for,
@@ -4235,41 +4266,43 @@ impl DatabaseRunStateStore {
                   model_offering_id, resolved_model_name, runtime_profile, provider_request_fingerprint,
                   created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-            )
-            .bind(&record.run_id)
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.parent_run_id)
-            .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
-            .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
-            .bind(record.depth as i64)
-            .bind(&record.delegation_id)
-            .bind(&record.agent_id)
-            .bind(&record.retry_of)
-            .bind(&retry_scope)
-            .bind(&record.status)
-            .bind(&record.waiting_for)
-            .bind(&self.owner_pod_id)
-            .bind(lease_expires_at)
-            .bind(record.run_generation as i64)
-            .bind(record.last_event_idx)
-            .bind(&record.checkpoint_version)
-            .bind(&record.checkpoint_json)
-            .bind(&record.error_code)
-            .bind(&record.error_message)
-            .bind(record.retry_count as i64)
-            .bind(record.total_prompt_tokens as i64)
-            .bind(record.total_completion_tokens as i64)
-            .bind(record.total_tool_calls as i64)
-            .bind(&record.agent_binding_id)
-            .bind(&record.agent_binding_name)
-            .bind(&record.agent_binding_schema_version)
-            .bind(&record.model_offering_id)
-            .bind(&record.resolved_model_name)
-            .bind(&record.runtime_profile)
-            .bind(&record.provider_request_fingerprint)
-            .execute(&mut *tx)
-            .await;
+                run_insert_null_shape,
+            );
+            let result = sqlx::query(&insert_sql)
+                .bind(&record.run_id)
+                .bind(&record.user_id)
+                .bind(&record.session_id)
+                .bind(&record.parent_run_id)
+                .bind(record.root_run_id.as_deref().unwrap_or(&record.run_id))
+                .bind(record.ancestor_path.as_deref().unwrap_or(&record.run_id))
+                .bind(record.depth as i64)
+                .bind(&record.delegation_id)
+                .bind(&record.agent_id)
+                .bind(&record.retry_of)
+                .bind(&retry_scope)
+                .bind(&record.status)
+                .bind(&record.waiting_for)
+                .bind(&self.owner_pod_id)
+                .bind(lease_expires_at)
+                .bind(record.run_generation as i64)
+                .bind(record.last_event_idx)
+                .bind(&record.checkpoint_version)
+                .bind(&record.checkpoint_json)
+                .bind(&record.error_code)
+                .bind(&record.error_message)
+                .bind(record.retry_count as i64)
+                .bind(record.total_prompt_tokens as i64)
+                .bind(record.total_completion_tokens as i64)
+                .bind(record.total_tool_calls as i64)
+                .bind(&record.agent_binding_id)
+                .bind(&record.agent_binding_name)
+                .bind(&record.agent_binding_schema_version)
+                .bind(&record.model_offering_id)
+                .bind(&record.resolved_model_name)
+                .bind(&record.runtime_profile)
+                .bind(&record.provider_request_fingerprint)
+                .execute(&mut *tx)
+                .await;
             let result = match result {
                 Ok(result) => result,
                 Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
@@ -4341,7 +4374,8 @@ impl DatabaseRunStateStore {
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))
                  ON DUPLICATE KEY UPDATE updated_at = NOW(6)"
             };
-            let result = sqlx::query(insert_sql)
+            let insert_sql = matrixone_statement_with_null_shape(insert_sql, run_insert_null_shape);
+            let result = sqlx::query(&insert_sql)
                 .bind(&record.run_id)
                 .bind(&record.user_id)
                 .bind(&record.session_id)
@@ -4889,28 +4923,30 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(false);
         }
 
-        let insert_result = sqlx::query(
+        let event_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO agent_run_events
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
               subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&event_row.id)
-        .bind(&event_row.run_id)
-        .bind(event_row.event_idx)
-        .bind(&event_row.user_id)
-        .bind(&event_row.session_id)
-        .bind(&event_row.event_type)
-        .bind(&event_row.event_id)
-        .bind(&event_row.agent_id)
-        .bind(&event_row.subject_run_id)
-        .bind(&event_row.interaction_request_id)
-        .bind(&event_row.idempotency_key)
-        .bind(&event_row.event_hash)
-        .bind(&event_row.producer_pod_id)
-        .bind(&event_row.payload_json)
-        .execute(&mut *tx)
-        .await;
+            event_row.nullable_shape(),
+        );
+        let insert_result = sqlx::query(&event_insert_sql)
+            .bind(&event_row.id)
+            .bind(&event_row.run_id)
+            .bind(event_row.event_idx)
+            .bind(&event_row.user_id)
+            .bind(&event_row.session_id)
+            .bind(&event_row.event_type)
+            .bind(&event_row.event_id)
+            .bind(&event_row.agent_id)
+            .bind(&event_row.subject_run_id)
+            .bind(&event_row.interaction_request_id)
+            .bind(&event_row.idempotency_key)
+            .bind(&event_row.event_hash)
+            .bind(&event_row.producer_pod_id)
+            .bind(&event_row.payload_json)
+            .execute(&mut *tx)
+            .await;
         if let Err(source) = insert_result {
             let rollback_error = tx.rollback().await.err();
             let mut detail = db_error(
@@ -5121,28 +5157,30 @@ impl RunStateStore for DatabaseRunStateStore {
             return Ok(GuardedRunStatusTransition::SessionBlocked);
         }
 
-        let insert_result = sqlx::query(
+        let event_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO agent_run_events
              (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id,
               subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&event_row.id)
-        .bind(&event_row.run_id)
-        .bind(event_row.event_idx)
-        .bind(&event_row.user_id)
-        .bind(&event_row.session_id)
-        .bind(&event_row.event_type)
-        .bind(&event_row.event_id)
-        .bind(&event_row.agent_id)
-        .bind(&event_row.subject_run_id)
-        .bind(&event_row.interaction_request_id)
-        .bind(&event_row.idempotency_key)
-        .bind(&event_row.event_hash)
-        .bind(&event_row.producer_pod_id)
-        .bind(&event_row.payload_json)
-        .execute(&mut *tx)
-        .await;
+            event_row.nullable_shape(),
+        );
+        let insert_result = sqlx::query(&event_insert_sql)
+            .bind(&event_row.id)
+            .bind(&event_row.run_id)
+            .bind(event_row.event_idx)
+            .bind(&event_row.user_id)
+            .bind(&event_row.session_id)
+            .bind(&event_row.event_type)
+            .bind(&event_row.event_id)
+            .bind(&event_row.agent_id)
+            .bind(&event_row.subject_run_id)
+            .bind(&event_row.interaction_request_id)
+            .bind(&event_row.idempotency_key)
+            .bind(&event_row.event_hash)
+            .bind(&event_row.producer_pod_id)
+            .bind(&event_row.payload_json)
+            .execute(&mut *tx)
+            .await;
         if let Err(source) = insert_result {
             let rollback_error = tx.rollback().await.err();
             let mut detail = db_error(
@@ -5340,6 +5378,11 @@ impl RunStateStore for DatabaseRunStateStore {
                     .push_bind(&event.payload_json)
                     .push("NOW(6)");
             });
+            insert.push(matrixone_null_shape_comment(
+                event_rows
+                    .iter()
+                    .flat_map(RunEventInsertRow::nullable_shape),
+            ));
             let insert_result = insert.build().execute(&mut *tx).await;
             if let Err(source) = insert_result {
                 let rollback_error = tx.rollback().await.err();
@@ -5823,6 +5866,11 @@ impl RunStateStore for DatabaseRunStateStore {
                     .push_bind(&event.payload_json)
                     .push("NOW(6)");
             });
+            insert.push(matrixone_null_shape_comment(
+                event_rows
+                    .iter()
+                    .flat_map(RunEventInsertRow::nullable_shape),
+            ));
             insert.build().execute(&mut *tx).await.map_err(|source| {
                 db_error("resolve_run_interaction_insert_events", run_id, source).to_string()
             })?;
@@ -7044,6 +7092,16 @@ struct RunEventInsertRow {
     event_hash: String,
     producer_pod_id: String,
     payload_json: String,
+}
+
+impl RunEventInsertRow {
+    fn nullable_shape(&self) -> [bool; 3] {
+        [
+            self.subject_run_id.is_some(),
+            self.interaction_request_id.is_some(),
+            self.idempotency_key.is_some(),
+        ]
+    }
 }
 
 fn build_run_event_insert_row(

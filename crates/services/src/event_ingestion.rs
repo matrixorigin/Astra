@@ -34,6 +34,7 @@ use tokio::sync::mpsc;
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name, normalize_optional_name,
 };
+use astra_core::{matrixone_null_shape_comment, matrixone_statement_with_null_shape};
 
 const SESSION_END_EVENT_TYPE: &str = "session_end";
 pub const MIN_INGESTION_BATCH_SIZE: usize = 1;
@@ -1124,6 +1125,24 @@ impl<'a> IngestionEventInsertValues<'a> {
             created_at: iso8601_to_mysql_datetime(&event.created_at),
         })
     }
+
+    fn nullable_shape(&self) -> [bool; 13] {
+        [
+            self.event.content.is_some(),
+            self.token_usage_json.is_some(),
+            self.event.llm_model_used.is_some(),
+            self.skill_name.is_some(),
+            self.metadata_json.is_some(),
+            self.event.parent_event_id.is_some(),
+            self.event.causal_chain_id.is_some(),
+            self.tool_call_id.is_some(),
+            self.meta_tool_name.is_some(),
+            self.meta_duration_ms.is_some(),
+            self.token_input.is_some(),
+            self.token_output.is_some(),
+            self.token_total.is_some(),
+        ]
+    }
 }
 
 fn canonical_token_usage_db_fields_or_null(
@@ -1604,6 +1623,11 @@ impl EventIngestionWorker {
                         .push_bind(values.token_output)
                         .push_bind(values.token_total);
                 });
+                builder.push(matrixone_null_shape_comment(
+                    plain_event_rows
+                        .iter()
+                        .flat_map(IngestionEventInsertValues::nullable_shape),
+                ));
 
                 let insert_result = builder
                     .build()
@@ -1619,21 +1643,20 @@ impl EventIngestionWorker {
 
             for event in plain_session_end_events.into_iter().chain(parented_events) {
                 let values = IngestionEventInsertValues::from_event(event)?;
-                let insert_result = bind_ingestion_event(
-                    sqlx::query(
-                        "INSERT IGNORE INTO agent_events \
-                         (event_id, session_id, user_id, event_type, content, \
-                          token_usage, llm_model_used, skill_name, metadata, \
-                          created_at, parent_event_id, causal_chain_id, \
-                          tool_call_id, meta_tool_name, meta_duration_ms, \
-                          token_input, token_output, token_total) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ),
-                    &values,
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
+                let insert_sql = matrixone_statement_with_null_shape(
+                    "INSERT IGNORE INTO agent_events \
+                     (event_id, session_id, user_id, event_type, content, \
+                      token_usage, llm_model_used, skill_name, metadata, \
+                      created_at, parent_event_id, causal_chain_id, \
+                      tool_call_id, meta_tool_name, meta_duration_ms, \
+                      token_input, token_output, token_total) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    values.nullable_shape(),
+                );
+                let insert_result = bind_ingestion_event(sqlx::query(&insert_sql), &values)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("event insert ({user_id}/{session_id}): {e}"))?;
                 if insert_result.rows_affected() == 0 {
                     continue;
                 }

@@ -2,7 +2,7 @@ mod test_support;
 
 use std::{collections::BTreeSet, net::SocketAddr, sync::Arc, time::Duration};
 
-use astra_core::{MatrixOneSettings, SharedPool};
+use astra_core::{MatrixOneSettings, SharedPool, matrixone_statement_with_null_shape};
 use astra_runtime::{
     AppState, AuthLoginRequestData, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
     AuthTokenRecord, AuthUserRecord, DatabaseSessionService, ErrorResponse, HealthChecker,
@@ -205,25 +205,27 @@ async fn insert_run_row(
     retry_of: Option<&str>,
     retry_scope: &str,
 ) {
-    sqlx::query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth,
           retry_of, retry_scope, status, last_event_idx, created_at, updated_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, -1, NOW(6), NOW(6))",
-    )
-    .bind(run_id)
-    .bind(user_id)
-    .bind(session_id)
-    .bind(parent_run_id)
-    .bind(root_run_id)
-    .bind(ancestor_path)
-    .bind(depth)
-    .bind(retry_of)
-    .bind(retry_scope)
-    .bind(status)
-    .execute(pool.get())
-    .await
-    .expect("insert_run_row must persist run tree node");
+        [parent_run_id.is_some(), retry_of.is_some()],
+    );
+    sqlx::query(&insert_sql)
+        .bind(run_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(parent_run_id)
+        .bind(root_run_id)
+        .bind(ancestor_path)
+        .bind(depth)
+        .bind(retry_of)
+        .bind(retry_scope)
+        .bind(status)
+        .execute(pool.get())
+        .await
+        .expect("insert_run_row must persist run tree node");
 }
 
 async fn insert_state_item(
