@@ -34,23 +34,28 @@ use astra_services::session_workspace::{
     WorkspaceMetadata, persist_remote_workspace,
 };
 use astra_services::{
-    AdminAuditFilter, AdminAuditReader, ContextService, DatabaseAdminAuditReader,
-    DatabaseContextManifestStore, DatabaseContextService, DatabaseDecisionService,
-    DatabaseEventService, DatabaseIntrospectionService, DatabaseMarketplaceService,
-    DatabaseMarketplaceStatsService, DatabaseReflectService, DatabaseReplayService,
-    DatabaseSessionArtifactStore, DatabaseSessionService, DatabaseSkillService,
-    DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
-    DurableTaskLifecycle, EventCreateRequestData, EventListFilter, EventService,
-    IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService,
-    MatrixOneDurableTaskLifecycle, MatrixOneSyncService, ReflectService, ReplayService,
-    RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
-    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
-    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
-    SnapshotListFilter,
+    AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
+    DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
+    DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
+    DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabaseReflectService,
+    DatabaseReplayService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
+    DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
+    DecisionCreateRequestData, DecisionListFilter, DecisionService, DurableTaskLifecycle,
+    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
+    MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
+    MatrixOneSyncService, ReflectService, ReplayService, ReserveTurnOutcome, RetrievalStage,
+    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
+    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
+    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillSearchQuery,
+    SkillService, SnapshotCreateRequestData, SnapshotListFilter,
+};
+use astra_turn_types::{
+    ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
 };
 use sqlx::Row;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 mod common;
@@ -8307,4 +8312,145 @@ async fn it_publish_skill_idempotent_retry_returns_200() {
         .execute(&raw_pool)
         .await
         .ok();
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn database_expired_reservation_fences_refreshed_writer() {
+    let (shared_pool, _) = setup_pool_and_settings().await;
+    let pool = shared_pool.get().clone();
+    let owner = format!("it-context-owner-{}", Uuid::new_v4().simple());
+    let session_id = format!("it-context-session-{}", Uuid::new_v4().simple());
+    let key = SessionKeyV1::owner_session("test", &owner, &session_id, "main");
+    let actor = ActorContextV1::owner_user(
+        &owner,
+        "bridge-owner",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Cli,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    let coordinator = DatabaseSessionContextCoordinator::new(shared_pool);
+
+    let lease = match coordinator
+        .acquire_writer(
+            &key,
+            None,
+            &actor,
+            Duration::from_secs(30),
+            "writer-heartbeat",
+        )
+        .await
+        .expect("acquire writer")
+    {
+        AcquireWriterOutcome::Acquired(lease) => lease,
+        other => panic!("expected new writer, got {other:?}"),
+    };
+    let reservation = match coordinator
+        .reserve_turn(&lease, None, Duration::from_secs(30), "turn-heartbeat")
+        .await
+        .expect("reserve turn")
+    {
+        ReserveTurnOutcome::Reserved(reservation) => reservation,
+        other => panic!("expected new reservation, got {other:?}"),
+    };
+
+    // Make only the durable reservation stale. The writer remains live, which
+    // deterministically exercises the acquire/reserve boundary without a sleep.
+    let mut expired_reservation = reservation;
+    expired_reservation.expires_at_unix_ms = 0;
+    sqlx::query(
+        "UPDATE session_context_heads
+         SET active_reservation_json = ?, active_reservation_expires_at_ms = ?
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(serde_json::to_string(&expired_reservation).expect("serialize reservation"))
+    .bind(0_i64)
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .execute(&pool)
+    .await
+    .expect("expire durable reservation");
+
+    let refreshed_lease = match coordinator
+        .acquire_writer(
+            &key,
+            None,
+            &actor,
+            Duration::from_secs(30),
+            "writer-heartbeat",
+        )
+        .await
+        .expect("refresh writer")
+    {
+        AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+        other => panic!("expected writer heartbeat, got {other:?}"),
+    };
+    assert!(matches!(
+        coordinator
+            .reserve_turn(
+                &refreshed_lease,
+                None,
+                Duration::from_secs(30),
+                "turn-heartbeat",
+            )
+            .await,
+        Err(SessionContextCoordinatorError::Expired)
+    ));
+    assert!(
+        coordinator
+            .load_active_writer(&key)
+            .await
+            .unwrap()
+            .is_none(),
+        "expired reservation must fence the just-refreshed writer"
+    );
+
+    let recovery_actor = ActorContextV1::owner_user(
+        &owner,
+        "bridge-recovery",
+        ActorKindV1::Server,
+        SessionSurfaceV1::Cli,
+        None,
+        AuthorityEpochsV1::default(),
+    );
+    assert!(matches!(
+        coordinator
+            .acquire_writer(
+                &key,
+                None,
+                &recovery_actor,
+                Duration::from_secs(30),
+                "writer-recovery",
+            )
+            .await
+            .expect("recover writer after expiry fence"),
+        AcquireWriterOutcome::Acquired(_)
+    ));
+
+    let _ = sqlx::query(
+        "DELETE FROM session_context_authority_events
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "DELETE FROM session_context_heads
+         WHERE isolation_domain = ? AND owner_user_id = ?
+           AND session_id = ? AND branch_id = ?",
+    )
+    .bind(&key.isolation_domain)
+    .bind(&key.owner_user_id)
+    .bind(&key.session_id)
+    .bind(&key.branch_id)
+    .execute(&pool)
+    .await;
 }

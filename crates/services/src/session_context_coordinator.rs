@@ -1074,11 +1074,18 @@ impl SessionContextCoordinator for FileSessionContextCoordinator {
                     validate_reservation_request(&receipt.reservation, &lease, &expected_cursor)?;
                     return Ok(ReserveTurnOutcome::AlreadyReserved(receipt.reservation));
                 }
-                if let Some(active) = &state.active_reservation
+                if let Some(active) = state.active_reservation.clone()
                     && active.idempotency_key == idempotency_key
                 {
-                    validate_reservation_request(active, &lease, &expected_cursor)?;
+                    validate_reservation_request(&active, &lease, &expected_cursor)?;
                     validate_active_lease(state, &lease, now)?;
+                    if fence_expired_reservation_authority(state, &lease, now) {
+                        // acquire_writer may have refreshed this writer immediately
+                        // before the reservation check. Persist the fence in this
+                        // same state lock so that failed readmissions cannot pin it.
+                        coordinator.store_state(session_dir, state)?;
+                        return Err(SessionContextCoordinatorError::Expired);
+                    }
                     let expires_at = refreshed_live_expiry(
                         now,
                         ttl,
@@ -2472,6 +2479,29 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         {
             validate_reservation_request(&active, lease, &expected_cursor.cloned())?;
             validate_active_lease(&state, lease, now)?;
+            if fence_expired_reservation_authority(&mut state, lease, now) {
+                // The preceding acquire_writer replay can have refreshed the
+                // writer. Fence that refresh in this transaction when its
+                // paired reservation has already expired.
+                update_database_state(&mut tx, &state).await?;
+                record_database_authority_event(
+                    &mut tx,
+                    &state,
+                    AuthorityAuditFact {
+                        operation: "reserve_turn",
+                        outcome: "expired_authority_fenced",
+                        actor: Some(&lease.actor),
+                        lease_id: Some(&lease.lease_id),
+                        reservation_id: Some(&active.reservation_id),
+                        expected_cursor,
+                    },
+                )
+                .await?;
+                tx.commit()
+                    .await
+                    .map_err(|source| database_error("commit_reservation_expiry_fence", source))?;
+                return Err(SessionContextCoordinatorError::Expired);
+            }
             let expires_at = refreshed_live_expiry(
                 now,
                 ttl,
@@ -4628,6 +4658,42 @@ fn refreshed_live_expiry(
     Ok(ceiling_expires_at_unix_ms.map_or(refreshed, |ceiling| refreshed.min(ceiling)))
 }
 
+/// Fences a writer whose in-flight reservation has expired.
+///
+/// A bridge readmission first replays `acquire_writer`, then replays
+/// `reserve_turn`. The first step can extend a still-live writer just before
+/// the reservation crosses its expiry boundary. Keeping that writer after the
+/// second step fails lets retries extend it indefinitely. Both backends call
+/// this helper while holding their durable state lock/transaction, so the
+/// failed reservation atomically removes the matching writer as well.
+///
+/// Deliberately do not archive either object as an idempotency receipt: their
+/// authority has expired and a retry must acquire a fresh writer epoch.
+fn fence_expired_reservation_authority(
+    state: &mut CoordinatorStateV1,
+    lease: &ConversationWriterLeaseV1,
+    now_unix_ms: i64,
+) -> bool {
+    let reservation_matches_and_expired =
+        state
+            .active_reservation
+            .as_ref()
+            .is_some_and(|reservation| {
+                reservation.lease_id == lease.lease_id
+                    && reservation.writer_epoch == lease.writer_epoch
+                    && reservation.expires_at_unix_ms <= now_unix_ms
+            });
+    let writer_matches = state.active_writer.as_ref().is_some_and(|active| {
+        active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
+    });
+    if !reservation_matches_and_expired || !writer_matches {
+        return false;
+    }
+    state.active_reservation = None;
+    state.active_writer = None;
+    true
+}
+
 fn validate_lease_request(
     lease: &ConversationWriterLeaseV1,
     key: &SessionKeyV1,
@@ -5461,15 +5527,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idempotent_replay_cannot_revive_expired_authority() {
+    async fn expired_reservation_fences_refreshed_writer_across_retries() {
         let temp = TempDir::new().unwrap();
         let clock = Arc::new(ManualClock::new(1_000));
         let coordinator = coordinator(&temp, clock.clone());
         let key = key("owner-expired-heartbeat");
         let actor = actor("owner-expired-heartbeat");
 
-        let lease = acquired(
-            coordinator
+        // Reproduce the acquire/reserve boundary repeatedly. The writer is
+        // still live when acquire_writer refreshes it, while the reservation
+        // has already expired by the time reserve_turn runs.
+        for attempt in 0..3 {
+            let lease = acquired(
+                coordinator
+                    .acquire_writer(
+                        &key,
+                        None,
+                        &actor,
+                        Duration::from_secs(30),
+                        "acquire-expired-heartbeat",
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let _reservation = reserved(
+                coordinator
+                    .reserve_turn(
+                        &lease,
+                        None,
+                        Duration::from_secs(10),
+                        "reserve-expired-heartbeat",
+                    )
+                    .await
+                    .unwrap(),
+            );
+
+            clock.advance(11_000);
+            let refreshed_lease = match coordinator
                 .acquire_writer(
                     &key,
                     None,
@@ -5478,61 +5572,79 @@ mod tests {
                     "acquire-expired-heartbeat",
                 )
                 .await
-                .unwrap(),
-        );
-        let _reservation = reserved(
+                .unwrap()
+            {
+                AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
+                other => panic!("expected writer heartbeat, got {other:?}"),
+            };
+            assert!(matches!(
+                coordinator
+                    .reserve_turn(
+                        &refreshed_lease,
+                        None,
+                        Duration::from_secs(10),
+                        "reserve-expired-heartbeat",
+                    )
+                    .await,
+                Err(SessionContextCoordinatorError::Expired)
+            ));
+            assert!(
+                coordinator
+                    .load_active_writer(&key)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "attempt {attempt} retained a writer after the failed reservation heartbeat"
+            );
+
+            // A new chain is immediately admissible; retries cannot leave the
+            // session in a live-writer conflict until the original TTL expires.
+            let recovery = acquired(
+                coordinator
+                    .acquire_writer(
+                        &key,
+                        None,
+                        &actor_at(
+                            "owner-expired-heartbeat",
+                            &format!("recovery-{attempt}"),
+                            &format!("recovery-device-{attempt}"),
+                        ),
+                        Duration::from_secs(30),
+                        &format!("acquire-recovery-{attempt}"),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            coordinator.release_writer(&recovery).await.unwrap();
+        }
+
+        // The original chain can retry too, but receives a new fencing epoch
+        // rather than reviving the expired writer/reservation pair.
+        let retried_lease = match coordinator
+            .acquire_writer(
+                &key,
+                None,
+                &actor,
+                Duration::from_secs(30),
+                "acquire-expired-heartbeat",
+            )
+            .await
+            .unwrap()
+        {
+            AcquireWriterOutcome::Acquired(lease) => lease,
+            other => panic!("expected a fresh writer epoch, got {other:?}"),
+        };
+        assert!(matches!(
             coordinator
                 .reserve_turn(
-                    &lease,
+                    &retried_lease,
                     None,
                     Duration::from_secs(10),
                     "reserve-expired-heartbeat",
                 )
                 .await
                 .unwrap(),
-        );
-
-        // A live lease may be refreshed, but an expired reservation cannot be
-        // revived with the same idempotency key.
-        clock.advance(11_000);
-        let refreshed_lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor,
-                    Duration::from_secs(30),
-                    "acquire-expired-heartbeat",
-                )
-                .await
-                .unwrap(),
-        );
-        assert!(matches!(
-            coordinator
-                .reserve_turn(
-                    &refreshed_lease,
-                    None,
-                    Duration::from_secs(10),
-                    "reserve-expired-heartbeat",
-                )
-                .await,
-            Err(SessionContextCoordinatorError::Expired)
-        ));
-
-        // Once the writer lease itself expires, the original idempotency key
-        // cannot retain its fencing epoch either.
-        clock.advance(31_000);
-        assert!(matches!(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor,
-                    Duration::from_secs(30),
-                    "acquire-expired-heartbeat",
-                )
-                .await,
-            Err(SessionContextCoordinatorError::Expired)
+            ReserveTurnOutcome::Reserved(_)
         ));
     }
 
