@@ -22,6 +22,30 @@ const RUNTIME_FILE_TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_FILE_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MOI_RUNTIME_AUTHORIZATION_ENV: &str = "MOI_RUNTIME_AUTHORIZATION";
 
+/// Ensure a server-supplied managed transfer context belongs to this Edge.
+///
+/// The Edge workspace is authenticated as part of the WebSocket connection,
+/// while this context is carried by an individual tool request.  They must
+/// agree before the request is admitted to the durable journal or a tool can
+/// consume its paths or task-scoped credential.
+pub(crate) fn validate_connected_edge_workspace(
+    context: Option<&RuntimeFileTransferContext>,
+    edge_workspace: &Path,
+) -> Result<(), &'static str> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if Path::new(&context.workspace_root) != edge_workspace {
+        return Err("Managed runtime workspace does not match the connected Edge workspace");
+    }
+    if let RuntimeFileTransferLayout::Ephemeral { work_dir } = &context.layout
+        && Path::new(work_dir) != edge_workspace
+    {
+        return Err("Ephemeral runtime work directory does not match the connected Edge workspace");
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute(
     tool: &str,
     args: &Value,
