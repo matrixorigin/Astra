@@ -132,7 +132,7 @@ impl EdgeBoundExecutionPlan {
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: self.dispatch_request_id.clone(),
-            identity: self.identity.clone(),
+            identity: Box::new(self.identity.clone()),
             delivery_generation: 1,
             tool: self.tool_name.clone(),
             args: self.args.clone(),

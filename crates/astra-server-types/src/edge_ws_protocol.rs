@@ -315,7 +315,9 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_tool_request")]
     ToolRequest {
         request_id: String,
-        identity: ToolInvocationIdentity,
+        /// Kept indirect so the WebSocket envelope remains compact while the
+        /// serialized wire field stays the exact established identity shape.
+        identity: Box<ToolInvocationIdentity>,
         delivery_generation: u64,
         tool: String,
         args: Value,
@@ -450,7 +452,7 @@ mod tests {
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-456".into(),
-            identity: identity(),
+            identity: Box::new(identity()),
             delivery_generation: 1,
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
@@ -469,7 +471,7 @@ mod tests {
     fn edge_tool_request_round_trips_hidden_file_transfer_context() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-transfer".into(),
-            identity: identity(),
+            identity: Box::new(identity()),
             delivery_generation: 1,
             tool: "materialize_attachment".into(),
             args: json!({"file_id": "file-1"}),
@@ -532,7 +534,7 @@ mod tests {
     fn edge_tool_request_round_trips_v2_file_transfer_context_separately_from_v1() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-eph-transfer".into(),
-            identity: identity(),
+            identity: Box::new(identity()),
             delivery_generation: 1,
             tool: "bash".into(),
             args: json!({"command": "ls"}),

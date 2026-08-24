@@ -136,6 +136,26 @@ struct CompletedEdgeInvocation {
     duration_ms: u64,
 }
 
+/// Decode the two separately negotiated managed-file-transfer wire versions.
+/// A server dispatch must carry at most one: V1 is converted for a new Edge,
+/// while V2 is already the internal representation used for eph execution.
+fn decode_runtime_file_transfer(
+    v1: Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContext>>,
+    v2: Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContextV2>>,
+) -> Result<
+    Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContextV2>>,
+    &'static str,
+> {
+    match (v1, v2) {
+        (None, None) => Ok(None),
+        (Some(v1), None) => Ok(Some(Box::new((*v1).into()))),
+        (None, Some(v2)) => Ok(Some(v2)),
+        (Some(_), Some(_)) => Err(
+            "Invalid edge tool request: runtime_file_transfer and runtime_file_transfer_v2 are mutually exclusive",
+        ),
+    }
+}
+
 struct InFlightEdgeInvocation {
     generation: u64,
     cancel: CancellationToken,
@@ -1051,12 +1071,29 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 runtime_filesystem_boundary,
                                 timeout_secs,
                             }) => {
-                                // V1 is the frozen Runner wire format. V2 is
-                                // the separately negotiated eph layout; the
-                                // server sends exactly one context version.
-                                let runtime_file_transfer = runtime_file_transfer_v2.or_else(|| {
-                                    runtime_file_transfer.map(|context| Box::new((*context).into()))
-                                });
+                                let runtime_file_transfer = match decode_runtime_file_transfer(
+                                    runtime_file_transfer,
+                                    runtime_file_transfer_v2,
+                                ) {
+                                    Ok(context) => context,
+                                    Err(message) => {
+                                        let result = DurableEdgeResult::from_tool_result(
+                                            astra_tools::ToolResult::error(message.to_string()),
+                                            0,
+                                        );
+                                        let message = result.client_message(
+                                            request_id,
+                                            *identity,
+                                            delivery_generation,
+                                        );
+                                        write
+                                            .send(Message::Text(
+                                                serde_json::to_string(&message)?.into(),
+                                            ))
+                                            .await?;
+                                        continue;
+                                    }
+                                };
                                 let execution_permit = execution_budget.try_acquire();
                                 match journal
                                     .prepare(
@@ -1072,7 +1109,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     Ok(PrepareOutcome::Replay(result)) => {
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1106,7 +1143,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         .with_journal_status(&journal_status);
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1121,7 +1158,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         );
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1401,7 +1438,8 @@ async fn main() {
 mod tests {
     use super::*;
     use astra_server_types::edge_ws_protocol::{
-        RuntimeFileTransferAttachment, RuntimeFileTransferContext,
+        RuntimeFileTransferAttachment, RuntimeFileTransferContext, RuntimeFileTransferContextV2,
+        RuntimeFileTransferLayout,
     };
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -1444,6 +1482,56 @@ mod tests {
         tracker.begin("request-1", next_generation).unwrap();
         assert!(!tracker.finish_if_current("request-1", generation));
         assert!(tracker.finish_if_current("request-1", next_generation));
+    }
+
+    fn transfer_context_v1() -> RuntimeFileTransferContext {
+        RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".into(),
+            authorization: "Bearer runtime-grant".into(),
+            task_id: "task-1".into(),
+            workspace_root: "/sandbox".into(),
+            root: "/sandbox/.moi/runtime/task-1".into(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
+            session_dir: "/sandbox/.moi/sessions/session-1".into(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".into(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn transfer_context_v2() -> RuntimeFileTransferContextV2 {
+        RuntimeFileTransferContextV2 {
+            endpoint_url: "https://moi.example/runtime-files".into(),
+            authorization: "Bearer runtime-grant".into(),
+            workspace_root: "/sandbox".into(),
+            layout: RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/sandbox/.moi".into(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn managed_file_transfer_wire_versions_are_mutually_exclusive() {
+        assert!(matches!(decode_runtime_file_transfer(None, None), Ok(None)));
+        assert!(matches!(
+            decode_runtime_file_transfer(Some(Box::new(transfer_context_v1())), None),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            decode_runtime_file_transfer(None, Some(Box::new(transfer_context_v2()))),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            decode_runtime_file_transfer(
+                Some(Box::new(transfer_context_v1())),
+                Some(Box::new(transfer_context_v2())),
+            ),
+            Err(
+                "Invalid edge tool request: runtime_file_transfer and runtime_file_transfer_v2 are mutually exclusive"
+            )
+        ));
     }
 
     #[test]
@@ -1601,7 +1689,7 @@ mod tests {
 
             let request = EdgeServerMessage::ToolRequest {
                 request_id: identity.storage_key(),
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
                 delivery_generation: 1,
                 tool: "materialize_attachment".to_string(),
                 args: json!({"file_id": "file-1"}),
@@ -1666,7 +1754,7 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: write_identity.storage_key(),
-                        identity: write_identity.clone(),
+                        identity: Box::new(write_identity.clone()),
                         delivery_generation: 1,
                         tool: "write_file".to_string(),
                         args: json!({"path": "report.txt", "content": "protocol report"}),
@@ -1710,7 +1798,7 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: publish_identity.storage_key(),
-                        identity: publish_identity.clone(),
+                        identity: Box::new(publish_identity.clone()),
                         delivery_generation: 1,
                         tool: "publish_artifact".to_string(),
                         args: json!({"path": "report.txt"}),
@@ -1772,7 +1860,7 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: denied_identity.storage_key(),
-                        identity: denied_identity.clone(),
+                        identity: Box::new(denied_identity.clone()),
                         delivery_generation: 1,
                         tool: "materialize_attachment".to_string(),
                         args: json!({"file_id": "file-1"}),

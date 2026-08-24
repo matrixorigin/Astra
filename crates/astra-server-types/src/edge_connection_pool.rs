@@ -686,7 +686,7 @@ impl EdgeConnectionPool {
         };
         let msg = EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
-            identity: identity.clone(),
+            identity: Box::new(identity.clone()),
             delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
