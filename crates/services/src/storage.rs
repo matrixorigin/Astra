@@ -145,10 +145,8 @@ const CORE_SCHEMA_TABLE_CONTRACT_SQL: &str =
     INDEX idx_schema_table_contract_component (component, contract_version, table_name)
 )";
 const AGENT_RUNS_TABLE: &str = "agent_runs";
-// Keep the original physical names so an interrupted deployment of the first
-// shadow-table migration remains recoverable after this migration is extended.
-const AGENT_RUNS_REBUILD_SHADOW_TABLE: &str = "agent_runs_model_authority_v1_shadow";
-const AGENT_RUNS_REBUILD_ARCHIVE_TABLE: &str = "agent_runs_pre_model_authority_v1";
+const AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE: &str = "agent_runs_model_authority_v1_shadow";
+const AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE: &str = "agent_runs_pre_model_authority_v1";
 const AGENT_RUNS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS agent_runs (
     run_id VARCHAR(64) NOT NULL,
     user_id VARCHAR(128) NOT NULL,
@@ -210,7 +208,6 @@ const AGENT_RUNS_LEGACY_MODEL_COLUMNS: &[&str] = &[
     "selected_model_name",
     "selected_model_gateway",
 ];
-const AGENT_RUNS_LEGACY_RUNTIME_COLUMNS: &[&str] = &["capability_server_refs_json"];
 const AGENT_RUNS_PRESERVED_COLUMNS: &[&str] = &[
     "run_id",
     "user_id",
@@ -1728,7 +1725,9 @@ async fn table_exists(
     .map(|row| row.is_some())
 }
 
-fn agent_runs_requires_canonical_rebuild(columns: &BTreeSet<String>) -> Result<bool, sqlx::Error> {
+fn agent_runs_requires_model_authority_rebuild(
+    columns: &BTreeSet<String>,
+) -> Result<bool, sqlx::Error> {
     if columns.is_empty() {
         return Ok(false);
     }
@@ -1740,7 +1739,7 @@ fn agent_runs_requires_canonical_rebuild(columns: &BTreeSet<String>) -> Result<b
         .collect::<Vec<_>>();
     if !missing_preserved.is_empty() {
         return Err(sqlx::Error::Protocol(format!(
-            "agent_runs cannot migrate to the canonical schema because preserved columns are missing: {}",
+            "agent_runs cannot migrate to the model-authority schema because preserved columns are missing: {}",
             missing_preserved.join(", ")
         )));
     }
@@ -1748,12 +1747,11 @@ fn agent_runs_requires_canonical_rebuild(columns: &BTreeSet<String>) -> Result<b
     let current_complete = AGENT_RUNS_MODEL_AUTHORITY_COLUMNS
         .iter()
         .all(|column| columns.contains(*column));
-    let obsolete_column_present = AGENT_RUNS_LEGACY_MODEL_COLUMNS
+    let legacy_present = AGENT_RUNS_LEGACY_MODEL_COLUMNS
         .iter()
-        .chain(AGENT_RUNS_LEGACY_RUNTIME_COLUMNS)
         .any(|column| columns.contains(*column));
     if current_complete {
-        return Ok(obsolete_column_present);
+        return Ok(legacy_present);
     }
 
     let legacy_complete = AGENT_RUNS_LEGACY_MODEL_COLUMNS
@@ -1791,7 +1789,7 @@ fn agent_runs_shadow_create_sql() -> Result<String, sqlx::Error> {
         &canonical_prefix,
         &format!(
             "CREATE TABLE {}",
-            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_SHADOW_TABLE)
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE)
         ),
         1,
     ))
@@ -1805,7 +1803,7 @@ fn quoted_column_list(columns: &[&str]) -> String {
         .join(", ")
 }
 
-fn agent_runs_canonical_copy_sql(columns: &BTreeSet<String>) -> String {
+fn agent_runs_model_authority_copy_sql(columns: &BTreeSet<String>) -> String {
     let mut target_columns = AGENT_RUNS_PRESERVED_COLUMNS.to_vec();
     target_columns.extend(AGENT_RUNS_MODEL_AUTHORITY_COLUMNS);
 
@@ -1837,7 +1835,7 @@ fn agent_runs_canonical_copy_sql(columns: &BTreeSet<String>) -> String {
 
     format!(
         "INSERT INTO {} ({}) SELECT {} FROM {}",
-        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_SHADOW_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
         quoted_column_list(&target_columns),
         select_expressions.join(", "),
         crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
@@ -1862,14 +1860,14 @@ async fn agent_runs_missing_shadow_keys(pool: &sqlx::Pool<MySql>) -> Result<i64,
            ON shadow.user_id = source.user_id AND shadow.run_id = source.run_id \
          WHERE shadow.run_id IS NULL",
         crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
-        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_SHADOW_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
     ))
     .fetch_one(pool)
     .await?
     .try_get("missing_count")
 }
 
-async fn migrate_agent_runs_canonical_schema_if_needed(
+async fn migrate_agent_runs_model_authority_if_needed(
     pool: &sqlx::Pool<MySql>,
     database: &str,
 ) -> Result<(), sqlx::Error> {
@@ -1878,24 +1876,20 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
         return Ok(());
     }
 
-    let shadow_exists = table_exists(pool, database, AGENT_RUNS_REBUILD_SHADOW_TABLE).await?;
-    let archive_exists = table_exists(pool, database, AGENT_RUNS_REBUILD_ARCHIVE_TABLE).await?;
-    let requires_rebuild = agent_runs_requires_canonical_rebuild(&columns)?;
+    let shadow_exists =
+        table_exists(pool, database, AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE).await?;
+    let archive_exists =
+        table_exists(pool, database, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
+    let requires_rebuild = agent_runs_requires_model_authority_rebuild(&columns)?;
 
     if archive_exists {
-        let current_model_authority_complete = AGENT_RUNS_MODEL_AUTHORITY_COLUMNS
-            .iter()
-            .all(|column| columns.contains(*column));
-        let legacy_model_columns_absent = AGENT_RUNS_LEGACY_MODEL_COLUMNS
-            .iter()
-            .all(|column| !columns.contains(*column));
-        if shadow_exists || !current_model_authority_complete || !legacy_model_columns_absent {
+        if requires_rebuild || shadow_exists {
             return Err(sqlx::Error::Protocol(format!(
-                "agent_runs canonical migration is in an inconsistent state: canonical_requires_rebuild={requires_rebuild}, current_model_authority_complete={current_model_authority_complete}, legacy_model_columns_absent={legacy_model_columns_absent}, shadow_exists={shadow_exists}, archive_exists=true"
+                "agent_runs model-authority migration is in an inconsistent state: canonical_requires_rebuild={requires_rebuild}, shadow_exists={shadow_exists}, archive_exists=true"
             )));
         }
         let canonical_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
-        let archive_rows = table_row_count(pool, AGENT_RUNS_REBUILD_ARCHIVE_TABLE).await?;
+        let archive_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
         if canonical_rows != archive_rows {
             return Err(sqlx::Error::Protocol(format!(
                 "agent_runs model-authority migration archive row count mismatch: canonical={canonical_rows}, archive={archive_rows}"
@@ -1903,25 +1897,23 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
         }
         query(&format!(
             "DROP TABLE {}",
-            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_ARCHIVE_TABLE)
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE)
         ))
         .execute(pool)
         .await?;
         tracing::info!(
-            table = AGENT_RUNS_REBUILD_ARCHIVE_TABLE,
+            table = AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE,
             rows = canonical_rows,
             "removed verified agent_runs migration archive after interrupted cleanup"
         );
-        if !requires_rebuild {
-            return Ok(());
-        }
+        return Ok(());
     }
 
     if !requires_rebuild {
         if shadow_exists {
             return Err(sqlx::Error::Protocol(format!(
                 "unexpected {} exists while agent_runs already has the canonical model-authority schema",
-                AGENT_RUNS_REBUILD_SHADOW_TABLE
+                AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE
             )));
         }
         return Ok(());
@@ -1938,12 +1930,12 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
     if shadow_exists {
         query(&format!(
             "DROP TABLE {}",
-            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_SHADOW_TABLE)
+            crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE)
         ))
         .execute(pool)
         .await?;
         tracing::info!(
-            table = AGENT_RUNS_REBUILD_SHADOW_TABLE,
+            table = AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE,
             "removed incomplete agent_runs migration shadow before retry"
         );
     }
@@ -1951,12 +1943,12 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
     query(&agent_runs_shadow_create_sql()?)
         .execute(pool)
         .await?;
-    query(&agent_runs_canonical_copy_sql(&columns))
+    query(&agent_runs_model_authority_copy_sql(&columns))
         .execute(pool)
         .await?;
 
     let source_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
-    let shadow_rows = table_row_count(pool, AGENT_RUNS_REBUILD_SHADOW_TABLE).await?;
+    let shadow_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE).await?;
     let missing_keys = agent_runs_missing_shadow_keys(pool).await?;
     if source_rows != shadow_rows || missing_keys != 0 {
         return Err(sqlx::Error::Protocol(format!(
@@ -1967,21 +1959,21 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
     query(&format!(
         "RENAME TABLE {} TO {}, {} TO {}",
         crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
-        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_ARCHIVE_TABLE),
-        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_SHADOW_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE),
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE),
         crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_TABLE),
     ))
     .execute(pool)
     .await?;
 
     let migrated_columns = existing_table_columns(pool, database, AGENT_RUNS_TABLE).await?;
-    if agent_runs_requires_canonical_rebuild(&migrated_columns)? {
+    if agent_runs_requires_model_authority_rebuild(&migrated_columns)? {
         return Err(sqlx::Error::Protocol(
-            "agent_runs still requires canonical migration after table swap".to_string(),
+            "agent_runs still requires model-authority migration after table swap".to_string(),
         ));
     }
     let migrated_rows = table_row_count(pool, AGENT_RUNS_TABLE).await?;
-    let archive_rows = table_row_count(pool, AGENT_RUNS_REBUILD_ARCHIVE_TABLE).await?;
+    let archive_rows = table_row_count(pool, AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE).await?;
     if migrated_rows != source_rows || archive_rows != source_rows {
         return Err(sqlx::Error::Protocol(format!(
             "agent_runs model-authority migration post-swap row count mismatch: source={source_rows}, migrated={migrated_rows}, archive={archive_rows}"
@@ -1990,13 +1982,13 @@ async fn migrate_agent_runs_canonical_schema_if_needed(
 
     query(&format!(
         "DROP TABLE {}",
-        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_REBUILD_ARCHIVE_TABLE)
+        crate::snapshot_sql::quote_mysql_identifier(AGENT_RUNS_MODEL_AUTHORITY_ARCHIVE_TABLE)
     ))
     .execute(pool)
     .await?;
     tracing::info!(
         rows = migrated_rows,
-        "migrated agent_runs to the canonical schema"
+        "migrated legacy agent_runs to the model-authority schema"
     );
     Ok(())
 }
@@ -3258,7 +3250,7 @@ async fn ensure_core_schema_while_leased(
     crate::workspace_records::verify_workspace_record_tables(&workspace_schema).await?;
 
     // ── Durable web-agent run state (Phase 1 / G15 + G19) ────────────────
-    migrate_agent_runs_canonical_schema_if_needed(&pool, &settings.database).await?;
+    migrate_agent_runs_model_authority_if_needed(&pool, &settings.database).await?;
     core_schema_create!(pool, "agent_runs", AGENT_RUNS_CREATE_SQL)
         .execute(&pool)
         .await?;
@@ -3383,6 +3375,15 @@ async fn ensure_core_schema_while_leased(
         "idx_agent_runs_model_gateway",
     )
     .await?;
+    for obsolete_column in [
+        "selected_model_json",
+        "selected_model_name",
+        "selected_model_gateway",
+        "capability_server_refs_json",
+    ] {
+        drop_column_if_present(&pool, &settings.database, "agent_runs", obsolete_column).await?;
+    }
+
     core_schema_create!(
         pool,
         "agent_session_execution_slots",
@@ -8909,18 +8910,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_runs_canonical_shape_rebuilds_only_supported_legacy_states() {
+    fn agent_runs_model_authority_shape_rebuilds_only_supported_legacy_states() {
         let current = agent_runs_columns(AGENT_RUNS_MODEL_AUTHORITY_COLUMNS);
-        assert!(!agent_runs_requires_canonical_rebuild(&current).unwrap());
-
-        let mut current_with_legacy_runtime_column = current.clone();
-        current_with_legacy_runtime_column.insert(AGENT_RUNS_LEGACY_RUNTIME_COLUMNS[0].to_string());
-        assert!(
-            agent_runs_requires_canonical_rebuild(&current_with_legacy_runtime_column).unwrap()
-        );
+        assert!(!agent_runs_requires_model_authority_rebuild(&current).unwrap());
 
         let legacy = agent_runs_columns(AGENT_RUNS_LEGACY_MODEL_COLUMNS);
-        assert!(agent_runs_requires_canonical_rebuild(&legacy).unwrap());
+        assert!(agent_runs_requires_model_authority_rebuild(&legacy).unwrap());
 
         let partially_upgraded = agent_runs_columns(&[
             "selected_model_json",
@@ -8928,10 +8923,10 @@ mod tests {
             "selected_model_gateway",
             "model_offering_id",
         ]);
-        assert!(agent_runs_requires_canonical_rebuild(&partially_upgraded).unwrap());
+        assert!(agent_runs_requires_model_authority_rebuild(&partially_upgraded).unwrap());
 
         let unsupported = agent_runs_columns(&["selected_model_name"]);
-        let error = agent_runs_requires_canonical_rebuild(&unsupported)
+        let error = agent_runs_requires_model_authority_rebuild(&unsupported)
             .unwrap_err()
             .to_string();
         assert!(
@@ -9029,7 +9024,9 @@ mod tests {
     fn agent_runs_shadow_ddl_reuses_the_canonical_schema() {
         let shadow = agent_runs_shadow_create_sql().unwrap();
 
-        assert!(shadow.starts_with(&format!("CREATE TABLE `{AGENT_RUNS_REBUILD_SHADOW_TABLE}`")));
+        assert!(shadow.starts_with(&format!(
+            "CREATE TABLE `{AGENT_RUNS_MODEL_AUTHORITY_SHADOW_TABLE}`"
+        )));
         assert!(shadow.contains("PRIMARY KEY (user_id, run_id)"));
         assert!(shadow.contains("model_offering_id VARCHAR(64) NULL"));
         assert!(shadow.contains("provider_request_fingerprint VARCHAR(64) NULL"));
@@ -9038,9 +9035,8 @@ mod tests {
 
     #[test]
     fn agent_runs_copy_sql_maps_legacy_model_identity_explicitly() {
-        let mut legacy = agent_runs_columns(AGENT_RUNS_LEGACY_MODEL_COLUMNS);
-        legacy.insert(AGENT_RUNS_LEGACY_RUNTIME_COLUMNS[0].to_string());
-        let sql = agent_runs_canonical_copy_sql(&legacy);
+        let legacy = agent_runs_columns(AGENT_RUNS_LEGACY_MODEL_COLUMNS);
+        let sql = agent_runs_model_authority_copy_sql(&legacy);
 
         assert!(!sql.contains("SELECT *"));
         assert!(sql.contains("`model_offering_id`"));
@@ -9049,7 +9045,6 @@ mod tests {
         assert!(sql.contains("NULL, `selected_model_name`, NULL"));
         assert!(!sql.contains("`selected_model_json`"));
         assert!(!sql.contains("`selected_model_gateway`"));
-        assert!(!sql.contains("`capability_server_refs_json`"));
     }
 
     #[test]
