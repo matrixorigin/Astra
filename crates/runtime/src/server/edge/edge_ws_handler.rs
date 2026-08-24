@@ -1365,10 +1365,16 @@ fn validate_edge_capabilities(
     _user_id: &str,
 ) -> Option<serde_json::Value> {
     let capabilities = capabilities?;
-    let managed_file_transfer_v1 = capabilities
-        .get("protocol_capabilities")
+    let protocol_capabilities = capabilities.get("protocol_capabilities");
+    let managed_file_transfer_v1 = protocol_capabilities
         .and_then(|value| {
             value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
+        })
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let managed_file_transfer_v2 = protocol_capabilities
+        .and_then(|value| {
+            value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY)
         })
         .and_then(serde_json::Value::as_bool)
         == Some(true);
@@ -1458,10 +1464,23 @@ fn validate_edge_capabilities(
     }
 
     let mut sanitized = serde_json::to_value(&advert).ok()?;
-    if managed_file_transfer_v1 {
-        sanitized["protocol_capabilities"] = serde_json::json!({
-            "managed_file_transfer_v1": true,
-        });
+    if managed_file_transfer_v1 || managed_file_transfer_v2 {
+        let mut accepted = serde_json::Map::new();
+        if managed_file_transfer_v1 {
+            accepted.insert(
+                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY
+                    .to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if managed_file_transfer_v2 {
+            accepted.insert(
+                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY
+                    .to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        sanitized["protocol_capabilities"] = serde_json::Value::Object(accepted);
     }
     Some(sanitized)
 }
@@ -1715,6 +1734,7 @@ mod tests {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["protocol_capabilities"] = serde_json::json!({
             "managed_file_transfer_v1": true,
+            "managed_file_transfer_v2": true,
             "unrecognized_future_protocol": true,
         });
 
@@ -1724,6 +1744,11 @@ mod tests {
         assert_eq!(
             sanitized["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            sanitized["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY],
             true
         );
         assert!(

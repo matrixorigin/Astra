@@ -473,6 +473,9 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         advertisement["protocol_capabilities"]
             [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY] =
             Value::Bool(true);
+        advertisement["protocol_capabilities"]
+            [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY] =
+            Value::Bool(true);
     }
     advertisement
 }
@@ -1044,9 +1047,16 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 tool,
                                 args: tool_args,
                                 runtime_file_transfer,
+                                runtime_file_transfer_v2,
                                 runtime_filesystem_boundary,
                                 timeout_secs,
                             }) => {
+                                // V1 is the frozen Runner wire format. V2 is
+                                // the separately negotiated eph layout; the
+                                // server sends exactly one context version.
+                                let runtime_file_transfer = runtime_file_transfer_v2.or_else(|| {
+                                    runtime_file_transfer.map(|context| Box::new((*context).into()))
+                                });
                                 let execution_permit = execution_budget.try_acquire();
                                 match journal
                                     .prepare(
@@ -1527,20 +1537,20 @@ mod tests {
             .expect("bind websocket test server");
         let address = listener.local_addr().expect("websocket server address");
         let expected_catalog_file = transfer_root.join("catalog/000000-input.txt");
+        // This simulates an older server: the current Edge must continue to
+        // consume the frozen V1 wire payload during a rolling upgrade.
         let transfer_context = RuntimeFileTransferContext {
             endpoint_url: format!("{}/api/v1/runtime-files", runtime_files.uri()),
             authorization: "Bearer runtime-grant".to_string(),
+            task_id: "task-1".to_string(),
             workspace_root: workspace.display().to_string(),
-            layout: astra_server_types::edge_ws_protocol::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: transfer_root.display().to_string(),
-                catalog_dir: transfer_root.join("catalog").display().to_string(),
-                session_dir: workspace
-                    .join(".moi/sessions/session-1")
-                    .display()
-                    .to_string(),
-                scratch_dir: transfer_root.join("scratch").display().to_string(),
-            },
+            root: transfer_root.display().to_string(),
+            catalog_dir: transfer_root.join("catalog").display().to_string(),
+            session_dir: workspace
+                .join(".moi/sessions/session-1")
+                .display()
+                .to_string(),
+            scratch_dir: transfer_root.join("scratch").display().to_string(),
             max_file_bytes: 1024,
             attachments: vec![RuntimeFileTransferAttachment {
                 file_id: "file-1".to_string(),
@@ -1596,6 +1606,7 @@ mod tests {
                 tool: "materialize_attachment".to_string(),
                 args: json!({"file_id": "file-1"}),
                 runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                runtime_file_transfer_v2: None,
                 runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                 timeout_secs: 10,
             };
@@ -1660,6 +1671,7 @@ mod tests {
                         tool: "write_file".to_string(),
                         args: json!({"path": "report.txt", "content": "protocol report"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -1703,6 +1715,7 @@ mod tests {
                         tool: "publish_artifact".to_string(),
                         args: json!({"path": "report.txt"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -1764,6 +1777,7 @@ mod tests {
                         tool: "materialize_attachment".to_string(),
                         args: json!({"file_id": "file-1"}),
                         runtime_file_transfer: None,
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: None,
                         timeout_secs: 10,
                     })
@@ -1895,6 +1909,11 @@ mod tests {
         assert_eq!(
             value["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY],
             true
         );
     }

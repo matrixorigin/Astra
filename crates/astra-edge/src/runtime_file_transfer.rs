@@ -3,8 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use astra_server_types::edge_ws_protocol::{
-    RuntimeFileTransferAttachment, RuntimeFileTransferContext, RuntimeFileTransferLayout,
-    runtime_attachment_destination_name,
+    RuntimeFileTransferAttachment, RuntimeFileTransferContextV2 as RuntimeFileTransferContext,
+    RuntimeFileTransferLayout, runtime_attachment_destination_name,
 };
 use astra_tools::ToolResult;
 use astra_tools::artifact_metadata::{

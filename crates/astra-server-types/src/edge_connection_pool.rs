@@ -16,7 +16,10 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::edge_ws_protocol::{EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, ToolInvocationIdentity};
+use crate::edge_ws_protocol::{
+    EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeFileTransferContext,
+    RuntimeFileTransferContextV2, ToolInvocationIdentity,
+};
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
 /// When exceeded, the oldest entry (by dispatch time) is evicted before inserting.
@@ -665,13 +668,30 @@ impl EdgeConnectionPool {
             },
         );
 
+        let (runtime_file_transfer, runtime_file_transfer_v2) = match runtime_file_transfer {
+            Some(context) => match &context.layout {
+                astra_services::runs::RuntimeFileTransferLayout::Legacy { .. } => (
+                    Some(Box::new(
+                        RuntimeFileTransferContext::from_legacy(context)
+                            .expect("legacy runtime file transfer must encode as V1"),
+                    )),
+                    None,
+                ),
+                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. } => (
+                    None,
+                    Some(Box::new(RuntimeFileTransferContextV2::from(context))),
+                ),
+            },
+            None => (None, None),
+        };
         let msg = EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
             identity: identity.clone(),
             delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
-            runtime_file_transfer: runtime_file_transfer.map(|context| Box::new(context.into())),
+            runtime_file_transfer,
+            runtime_file_transfer_v2,
             runtime_filesystem_boundary: runtime_filesystem_boundary
                 .map(|context| Box::new(context.into())),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,

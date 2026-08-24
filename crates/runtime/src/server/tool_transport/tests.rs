@@ -1697,6 +1697,52 @@ fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
 }
 
 #[test]
+fn ephemeral_transfer_requires_v2_edge_protocol_capability() {
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "Ephemeral sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-v1-only",
+            "Ephemeral sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.runtime_file_transfer = Some(std::sync::Arc::new(
+        astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            workspace_root: "/sandbox".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/sandbox/.moi".to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        },
+    ));
+    request.runtime_file_transfer_required = true;
+    let agent = edge_agent_record("edge-v1-only");
+
+    let denial = super::super::tool_edge_selection::select_capable_edge_agent(
+        std::slice::from_ref(&agent),
+        Some("edge-v1-only"),
+        &request,
+        &astra_runtime_env::ToolRegistry::builtins(),
+    )
+    .expect_err("an eph transfer must not be sent through the V1 wire protocol");
+
+    assert!(matches!(
+        denial.1,
+        astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(ref reason)
+            if reason == "managed_file_transfer_v2_not_advertised"
+    ));
+}
+
+#[test]
 fn edge_bound_execution_plan_uses_policy_timeout_from_binding() {
     let registry = astra_runtime_env::ToolRegistry::builtins();
     let mut request = request(
