@@ -208,11 +208,11 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 
 | 限额项 | 默认值（参考） | 测试场景 |
 |--------|----------------|----------|
-| `max_sessions_per_day` | 50 | 第 51 个 Session → Denied |
-| `max_concurrent_sessions` | 5 | 第 6 个活跃 Session → Denied |
-| `max_tokens_per_day` | unlimited (`0`) | 显式配置有限额度后，超限 Turn → Denied |
-| `max_concurrent_bash` | 3 | Edge 并发 bash 超限 |
-| `max_disk_bytes` | 1GB | 工作区/upload 超限 |
+| `max_sessions_per_day` | 5000 | 第 5001 个 Session → Denied |
+| `max_concurrent_sessions` | 10 | 第 11 个活跃 Session → Denied |
+| `max_tokens_per_day` | 10,000,000,000 | 达到每日预算后，后续 Turn → Denied；显式 `0` 仍表示不限量 |
+| `max_concurrent_bash` | 10 | 配置读写（执行侧并发限流尚未接入） |
+| `max_disk_bytes` | 1GB | 配置读写（执行侧磁盘限流尚未接入） |
 
 | 测试项 | 通过标准 |
 |--------|----------|

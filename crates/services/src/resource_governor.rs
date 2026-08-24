@@ -12,8 +12,8 @@
 //!
 //! * **Fail-open**: DB errors log a warning and return defaults / proceed.
 //! * **Atomic counters**: `ON DUPLICATE KEY UPDATE` for race-free increments.
-//! * **No implicit token price policy**: daily tokens are unlimited unless an
-//!   administrator writes a finite per-user limit; `0` means no cap.
+//! * **Explicit default budget**: users without an administrator override receive
+//!   the product defaults below; an explicit `0` still means no cap.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -33,14 +33,22 @@ pub struct ResourceLimits {
     pub max_sessions_per_day: u32,
 }
 
+impl ResourceLimits {
+    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 10;
+    pub const DEFAULT_MAX_TOKENS_PER_DAY: u64 = 10_000_000_000;
+    pub const DEFAULT_MAX_DISK_BYTES: u64 = 1_073_741_824;
+    pub const DEFAULT_MAX_CONCURRENT_BASH: u32 = 10;
+    pub const DEFAULT_MAX_SESSIONS_PER_DAY: u32 = 5_000;
+}
+
 impl Default for ResourceLimits {
     fn default() -> Self {
         Self {
-            max_concurrent_sessions: 5,
-            max_tokens_per_day: 0,
-            max_disk_bytes: 1_073_741_824, // 1 GB
-            max_concurrent_bash: 3,
-            max_sessions_per_day: 50,
+            max_concurrent_sessions: Self::DEFAULT_MAX_CONCURRENT_SESSIONS,
+            max_tokens_per_day: Self::DEFAULT_MAX_TOKENS_PER_DAY,
+            max_disk_bytes: Self::DEFAULT_MAX_DISK_BYTES,
+            max_concurrent_bash: Self::DEFAULT_MAX_CONCURRENT_BASH,
+            max_sessions_per_day: Self::DEFAULT_MAX_SESSIONS_PER_DAY,
         }
     }
 }
@@ -197,21 +205,27 @@ impl DatabaseResourceGovernor {
 
     /// Create tables if they don't exist.  Called once at startup from state_builder.
     pub async fn ensure_tables(&self) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        let resource_limits_ddl = format!(
             r#"
             CREATE TABLE IF NOT EXISTS resource_limits (
                 user_id       VARCHAR(255) PRIMARY KEY,
-                max_concurrent_sessions INT     NOT NULL DEFAULT 5,
-                max_tokens_per_day      BIGINT  NOT NULL DEFAULT 0,
-                max_disk_bytes          BIGINT  NOT NULL DEFAULT 1073741824,
-                max_concurrent_bash     INT     NOT NULL DEFAULT 3,
-                max_sessions_per_day    INT     NOT NULL DEFAULT 50,
+                max_concurrent_sessions INT     NOT NULL DEFAULT {},
+                max_tokens_per_day      BIGINT  NOT NULL DEFAULT {},
+                max_disk_bytes          BIGINT  NOT NULL DEFAULT {},
+                max_concurrent_bash     INT     NOT NULL DEFAULT {},
+                max_sessions_per_day    INT     NOT NULL DEFAULT {},
                 updated_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             "#,
-        )
-        .execute(self.pool.get())
-        .await?;
+            ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS,
+            ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY,
+            ResourceLimits::DEFAULT_MAX_DISK_BYTES,
+            ResourceLimits::DEFAULT_MAX_CONCURRENT_BASH,
+            ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY,
+        );
+        sqlx::query(&resource_limits_ddl)
+            .execute(self.pool.get())
+            .await?;
 
         sqlx::query(
             r#"
@@ -597,6 +611,16 @@ impl ResourceGovernor for InMemoryResourceGovernor {
 mod tests {
     use super::*;
 
+    #[test]
+    fn product_default_limits_match_contract() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.max_concurrent_sessions, 10);
+        assert_eq!(limits.max_tokens_per_day, 10_000_000_000);
+        assert_eq!(limits.max_disk_bytes, 1_073_741_824);
+        assert_eq!(limits.max_concurrent_bash, 10);
+        assert_eq!(limits.max_sessions_per_day, 5_000);
+    }
+
     #[tokio::test]
     async fn default_limits_allow_session_create() {
         let gov = InMemoryResourceGovernor::new();
@@ -613,7 +637,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        active_sessions: 5,
+                        active_sessions: ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS,
                         ..Default::default()
                     },
                 },
@@ -638,7 +662,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        sessions_created: 50,
+                        sessions_created: ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY,
                         ..Default::default()
                     },
                 },
@@ -713,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_token_budget_is_unlimited() {
+    async fn default_token_budget_is_enforced() {
         let gov = InMemoryResourceGovernor::new();
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
@@ -722,15 +746,27 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        tokens_consumed: 999_999_999,
+                        tokens_consumed: ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY - 1,
                         ..Default::default()
                     },
                 },
             );
         }
-        assert_eq!(gov.get_limits("u1").await.max_tokens_per_day, 0);
+        assert_eq!(
+            gov.get_limits("u1").await.max_tokens_per_day,
+            ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY
+        );
         assert_eq!(gov.check_session_create("u1").await, LimitCheck::Allowed);
         assert_eq!(gov.check_token_budget("u1").await, LimitCheck::Allowed);
+
+        gov.record_tokens("u1", 1).await;
+        assert!(matches!(
+            gov.check_token_budget("u1").await,
+            LimitCheck::Denied {
+                limit: ResourceLimitKind::DailyTokens,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -796,7 +832,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        active_sessions: 5,
+                        active_sessions: ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS,
                         ..Default::default()
                     },
                 },
