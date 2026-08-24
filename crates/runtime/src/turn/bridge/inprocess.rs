@@ -6513,17 +6513,12 @@ mod tests {
         ]
     }
 
-    // Issue #623 regression guard: a multi-round bridge turn must not pin
-    // canonical lease validity to the first admission. Every round boundary
-    // drops the admission (cancelling the renewal task) and the next round's
-    // idempotent re-acquire acts as a liveness heartbeat that refreshes
-    // `expires_at_unix_ms`, so a turn that outlives BRIDGE_CANONICAL_LEASE_TTL
-    // across many short rounds still commits. The virtual clock advances 15+
-    // minutes instantly while no round lives long enough for the 4-minute
-    // renewal tick, mirroring short production rounds. Before the fix this
-    // flow failed with "writer lease or turn reservation expired".
+    // Issue #623 regression guard: each short bridge round must refresh the
+    // still-live lease/reservation. The virtual clock advances past the
+    // 15-minute TTL in one-minute increments, while every readmission occurs
+    // before expiry and every renewal task is cancelled at the round boundary.
     #[tokio::test]
-    async fn canonical_bridge_long_turn_readmission_refreshes_expired_lease() {
+    async fn canonical_bridge_long_turn_readmission_refreshes_live_lease() {
         let temp = tempfile::tempdir().unwrap();
         let clock = Arc::new(BridgeLeaseTestClock::new(1_000_000));
         let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
@@ -6552,11 +6547,29 @@ mod tests {
         first.retain_for_continuation();
         drop(first);
 
-        // The turn keeps running past the lease TTL (virtual time only).
-        let elapsed = BRIDGE_CANONICAL_LEASE_TTL.as_millis() as i64 + 1_000;
-        clock.advance(elapsed);
+        // Fifteen short rounds keep the turn alive. Each admission is a
+        // liveness heartbeat, rather than a revival after the TTL elapsed.
+        for _ in 0..15 {
+            clock.advance(60_000);
+            let mut continued = begin_bridge_canonical_admission(
+                Some(&coordinator),
+                "owner-long-turn",
+                "session-long-turn",
+                "turn-chain-long",
+                Some(1),
+                None,
+                messages.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .admission
+            .unwrap();
+            continued.retain_for_continuation();
+            drop(continued);
+        }
 
-        // A later round of the same turn re-acquires idempotently...
+        clock.advance(60_000);
         let mut resumed = begin_bridge_canonical_admission(
             Some(&coordinator),
             "owner-long-turn",
@@ -6572,8 +6585,7 @@ mod tests {
         .admission
         .unwrap();
 
-        // ...and the idempotent replay refreshes the liveness window instead
-        // of replaying the stale one.
+        let elapsed = 16 * 60_000;
         assert_eq!(
             resumed.lease.expires_at_unix_ms,
             initial_lease_expiry + elapsed
@@ -6594,74 +6606,6 @@ mod tests {
             "server",
             "owner-long-turn",
             "session-long-turn",
-            astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
-        );
-        let head = coordinator.load_head(&key).await.unwrap().unwrap();
-        assert_eq!(head.cursor.completed_turn, 1);
-        assert!(
-            coordinator
-                .load_active_writer(&key)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    // Control for the regression above: the identical multi-round flow committed
-    // inside the lease window succeeds and advances the canonical head, proving
-    // the failure is driven purely by elapsed lease validity.
-    #[tokio::test]
-    async fn canonical_bridge_turn_commits_inside_lease_window() {
-        let temp = tempfile::tempdir().unwrap();
-        let clock = Arc::new(BridgeLeaseTestClock::new(1_000_000));
-        let coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
-            astra_services::FileSessionContextCoordinator::with_clock(temp.path(), clock.clone()),
-        );
-        let messages = long_turn_provisional_messages();
-
-        let mut first = begin_bridge_canonical_admission(
-            Some(&coordinator),
-            "owner-inside-window",
-            "session-inside-window",
-            "turn-chain-inside",
-            Some(1),
-            None,
-            messages.clone(),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .admission
-        .unwrap();
-        first.retain_for_continuation();
-        drop(first);
-
-        // Some virtual time elapses, but the turn stays inside the lease window.
-        clock.advance(60_000);
-
-        let mut resumed = begin_bridge_canonical_admission(
-            Some(&coordinator),
-            "owner-inside-window",
-            "session-inside-window",
-            "turn-chain-inside",
-            Some(1),
-            None,
-            messages,
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .admission
-        .unwrap();
-        resumed
-            .commit_terminal("final answer inside the window")
-            .await
-            .unwrap();
-
-        let key = astra_turn_types::SessionKeyV1::owner_session(
-            "server",
-            "owner-inside-window",
-            "session-inside-window",
             astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID,
         );
         let head = coordinator.load_head(&key).await.unwrap().unwrap();

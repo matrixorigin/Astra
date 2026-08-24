@@ -654,46 +654,30 @@ async fn prepare_chat_turn_bridge_identifiers(
         let cache_key = bridge_cache_key(user_id, session_id);
         let mut cache = state.chat_turn_bridge_cache.lock().await;
         let mut updated_entry = cache.get(&cache_key, now).unwrap_or_default();
-        let cached_turn = cached_bridge_session_turn(&updated_entry).map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("bridge cache session_turn is corrupt: {error}"),
-            )
-        })?;
-        let same_identity = cached_turn.is_some()
-            && updated_entry
-                .get("turn_chain_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(identity.turn_chain_id.as_str())
-            && updated_entry
-                .get("user_query_event_id")
-                .and_then(serde_json::Value::as_str)
-                == Some(identity.user_query_event_id.as_str());
-        let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
-        let minimum_session_turn = if is_continuation || same_identity {
-            cached_turn.unwrap_or(next_session_turn)
-        } else {
-            cached_turn
-                .map(|turn| turn.saturating_add(1))
-                .unwrap_or(next_session_turn)
-        };
-        if identity.session_turn < minimum_session_turn {
-            return Err(astra_core::error_response_coded_with_metadata(
+        let canonical_session_turn = canonicalize_explicit_bridge_session_turn(
+            identity.session_turn,
+            next_session_turn,
+        )
+        .map_err(|expected_session_turn| {
+            astra_core::error_response_coded_with_metadata(
                 StatusCode::CONFLICT,
                 format!(
                     "explicit bridge session_turn {} is stale for session {}; expected at least {}",
-                    identity.session_turn, session_id, minimum_session_turn
+                    identity.session_turn, session_id, expected_session_turn
                 ),
                 "bridge_session_turn_stale",
                 serde_json::json!({
                     "session_id": session_id,
                     "actual_session_turn": identity.session_turn,
-                    "expected_session_turn": minimum_session_turn,
+                    "expected_session_turn": expected_session_turn,
                     "turn_chain_id": identity.turn_chain_id.as_str(),
                     "user_query_event_id": identity.user_query_event_id.as_str(),
                 }),
-            ));
-        }
+            )
+        })?;
+        // Older entries may contain this field. The cache retains bridge identity,
+        // never sequence authority.
+        updated_entry.remove("session_turn");
         updated_entry.insert(
             "turn_chain_id".to_string(),
             serde_json::Value::String(identity.turn_chain_id.clone()),
@@ -702,15 +686,11 @@ async fn prepare_chat_turn_bridge_identifiers(
             "user_query_event_id".to_string(),
             serde_json::Value::String(identity.user_query_event_id.clone()),
         );
-        updated_entry.insert(
-            "session_turn".to_string(),
-            serde_json::json!(identity.session_turn),
-        );
         cache.insert(cache_key, updated_entry, now);
         return Ok((
             identity.turn_chain_id.clone(),
             identity.user_query_event_id.clone(),
-            identity.session_turn,
+            canonical_session_turn,
         ));
     }
     let next_session_turn = bridge_next_canonical_turn(state, user_id, session_id).await?;
@@ -718,7 +698,6 @@ async fn prepare_chat_turn_bridge_identifiers(
     let cache_key = bridge_cache_key(user_id, session_id);
     let mut cache = state.chat_turn_bridge_cache.lock().await;
     let mut prev_entry = cache.get(&cache_key, now);
-    let is_continuation = bridge_turn_is_continuation(messages, has_tool_results);
     let new_turn_chain_id = Uuid::now_v7().to_string();
     let new_user_query_event_id = Uuid::now_v7().to_string();
     let (turn_chain_id, user_query_event_id) = resolve_turn_identifiers(
@@ -728,21 +707,10 @@ async fn prepare_chat_turn_bridge_identifiers(
         &new_turn_chain_id,
         &new_user_query_event_id,
     );
-    let session_turn = if is_continuation {
-        let cached_turn = match prev_entry.as_ref() {
-            Some(entry) => cached_bridge_session_turn(entry).map_err(|error| {
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("bridge cache session_turn is corrupt: {error}"),
-                )
-            })?,
-            None => None,
-        };
-        cached_turn.unwrap_or(next_session_turn)
-    } else {
-        next_session_turn
-    };
+    let session_turn = next_session_turn;
     let mut updated_entry = prev_entry.unwrap_or_default();
+    // Drop any pre-canonicalization value left by an older process version.
+    updated_entry.remove("session_turn");
     updated_entry.insert(
         "turn_chain_id".to_string(),
         serde_json::Value::String(turn_chain_id.clone()),
@@ -751,7 +719,6 @@ async fn prepare_chat_turn_bridge_identifiers(
         "user_query_event_id".to_string(),
         serde_json::Value::String(user_query_event_id.clone()),
     );
-    updated_entry.insert("session_turn".to_string(), serde_json::json!(session_turn));
     cache.insert(cache_key, updated_entry, now);
     Ok((turn_chain_id, user_query_event_id, session_turn))
 }
@@ -793,30 +760,18 @@ async fn bridge_next_canonical_turn(
     })
 }
 
-fn cached_bridge_session_turn(
-    entry: &serde_json::Map<String, serde_json::Value>,
-) -> Result<Option<u32>, String> {
-    let Some(value) = entry.get("session_turn") else {
-        return Ok(None);
-    };
-    value
-        .as_u64()
-        .and_then(|turn| u32::try_from(turn).ok())
-        .filter(|turn| *turn > 0)
-        .map(Some)
-        .ok_or_else(|| format!("expected positive u32, got {value}"))
-}
-
-fn bridge_turn_is_continuation(messages: &[serde_json::Value], has_tool_results: bool) -> bool {
-    let latest_conversation_role = messages.iter().rev().find_map(|message| {
-        match message.get("role").and_then(serde_json::Value::as_str) {
-            Some("user" | "assistant" | "tool") => {
-                message.get("role").and_then(serde_json::Value::as_str)
-            }
-            _ => None,
-        }
-    });
-    latest_conversation_role != Some("user") && has_tool_results
+/// The canonical head, not a client's local journal or process cache, owns the
+/// session turn number. A client can be ahead after a failed local settlement,
+/// but cannot replay a turn that the durable head has already passed.
+fn canonicalize_explicit_bridge_session_turn(
+    requested_session_turn: u32,
+    next_canonical_turn: u32,
+) -> Result<u32, u32> {
+    if requested_session_turn < next_canonical_turn {
+        Err(next_canonical_turn)
+    } else {
+        Ok(next_canonical_turn)
+    }
 }
 
 async fn prepare_chat_turn_bridge_cached_inputs(
@@ -1538,7 +1493,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_body_reuses_cached_session_turn_for_continuation() {
+    async fn prepare_body_uses_canonical_turn_for_continuation_despite_cached_turn() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
         {
@@ -1567,13 +1522,21 @@ mod tests {
                 .await
                 .expect("continuation should prepare");
 
-        assert_eq!(prepared.session_turn.as_deref(), Some("6"));
+        assert_eq!(prepared.session_turn.as_deref(), Some("1"));
         assert_eq!(prepared.turn_chain_id.as_deref(), Some("chain-6"));
         assert_eq!(prepared.user_query_event_id.as_deref(), Some("query-6"));
+        let mut cache = state.chat_turn_bridge_cache.lock().await;
+        let entry = cache
+            .get(
+                &bridge_cache_key("u1", "bound-session"),
+                current_unix_seconds(),
+            )
+            .expect("continuation identity should remain cached");
+        assert!(!entry.contains_key("session_turn"));
     }
 
     #[tokio::test]
-    async fn prepare_body_rejects_corrupt_cached_session_turn_for_continuation() {
+    async fn prepare_body_ignores_legacy_cached_session_turn_for_continuation() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
         {
@@ -1597,16 +1560,17 @@ mod tests {
             .expect("body should serialize"),
         );
 
-        let (status, body) =
-            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
+        let prepared =
+            prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
                 .await
-            {
-                Ok(_) => panic!("corrupt cached session_turn must not be silently inferred"),
-                Err(error) => error,
-            };
+                .expect("legacy cache entries must not override canonical turn authority");
 
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(body.0.detail.contains("bridge cache session_turn"));
+        assert_eq!(prepared.session_turn.as_deref(), Some("1"));
+        assert_eq!(prepared.turn_chain_id.as_deref(), Some("chain-corrupt"));
+        assert_eq!(
+            prepared.user_query_event_id.as_deref(),
+            Some("query-corrupt")
+        );
     }
 
     #[tokio::test]
@@ -1649,7 +1613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_body_prefers_explicit_payload_turn_identity() {
+    async fn prepare_body_canonicalizes_an_ahead_explicit_turn() {
         let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
         let now = current_unix_seconds();
         {
@@ -1677,63 +1641,17 @@ mod tests {
                 .await
                 .expect("explicit identity should prepare");
 
-        assert_eq!(prepared.session_turn.as_deref(), Some("10"));
+        assert_eq!(prepared.session_turn.as_deref(), Some("1"));
         assert_eq!(prepared.turn_chain_id.as_deref(), Some("root-chain"));
         assert_eq!(prepared.user_query_event_id.as_deref(), Some("root-query"));
-    }
-
-    #[tokio::test]
-    async fn prepare_body_rejects_explicit_session_turn_regression_for_new_root_turn() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-        let now = current_unix_seconds();
-        {
-            let mut cache = state.chat_turn_bridge_cache.lock().await;
-            let mut entry = serde_json::Map::new();
-            entry.insert("turn_chain_id".to_string(), json!("previous-chain"));
-            entry.insert("user_query_event_id".to_string(), json!("previous-query"));
-            entry.insert("session_turn".to_string(), json!(1));
-            cache.insert(bridge_cache_key("u1", "bound-session"), entry, now);
-        }
-        let body = Bytes::from(
-            serde_json::to_vec(&json!({
-                "model_selection": model_selection(),
-                "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-                "session_turn": 1,
-                "turn_chain_id": "new-chain",
-                "user_query_event_id": "new-query",
-                "messages": [{"role": "user", "content": "second turn"}]
-            }))
-            .expect("body should serialize"),
-        );
-
-        let (status, body) =
-            match prepare_chat_turn_bridge_body(&state, &test_user(), body, Some("bound-session"))
-                .await
-            {
-                Ok(_) => panic!("new root turn must not reuse a stale explicit session_turn"),
-                Err(error) => error,
-            };
-
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            body.0
-                .detail
-                .contains("explicit bridge session_turn 1 is stale"),
-            "{}",
-            body.0.detail
-        );
-        assert_eq!(
-            body.0.error_code.as_deref(),
-            Some("bridge_session_turn_stale")
-        );
-        let metadata = body
-            .0
-            .metadata
-            .as_ref()
-            .expect("stale turn conflict should carry reconciliation metadata");
-        assert_eq!(metadata["actual_session_turn"], json!(1));
-        assert_eq!(metadata["expected_session_turn"], json!(2));
-        assert_eq!(metadata["session_id"], json!("bound-session"));
+        let mut cache = state.chat_turn_bridge_cache.lock().await;
+        let entry = cache
+            .get(
+                &bridge_cache_key("u1", "bound-session"),
+                current_unix_seconds(),
+            )
+            .expect("explicit identity should remain cached");
+        assert!(!entry.contains_key("session_turn"));
     }
 
     #[tokio::test]
@@ -2244,30 +2162,10 @@ mod tests {
     }
 
     #[test]
-    fn cached_bridge_session_turn_preserves_valid_and_rejects_corrupt_values() {
-        let mut entry = serde_json::Map::new();
-        assert_eq!(
-            cached_bridge_session_turn(&entry).expect("missing session_turn is absent"),
-            None
-        );
-
-        entry.insert("session_turn".to_string(), json!(7));
-        assert_eq!(
-            cached_bridge_session_turn(&entry).expect("valid session_turn"),
-            Some(7)
-        );
-
-        for value in [
-            json!(0),
-            json!(-1),
-            json!("7"),
-            json!(u64::from(u32::MAX) + 1),
-        ] {
-            entry.insert("session_turn".to_string(), value);
-            let err = cached_bridge_session_turn(&entry)
-                .expect_err("corrupt cached session_turn must fail loud");
-            assert!(err.contains("expected positive u32"));
-        }
+    fn explicit_turn_is_canonicalized_or_rejected_as_stale() {
+        assert_eq!(canonicalize_explicit_bridge_session_turn(3, 3), Ok(3));
+        assert_eq!(canonicalize_explicit_bridge_session_turn(9, 3), Ok(3));
+        assert_eq!(canonicalize_explicit_bridge_session_turn(2, 3), Err(3));
     }
 
     // ── inject_bridge_cache_state_into ──────────────────────────────
