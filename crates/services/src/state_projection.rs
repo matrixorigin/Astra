@@ -172,6 +172,19 @@ pub struct DelegationProjectionUpsert {
     pub sibling_exposed_artifacts_json: Option<String>,
 }
 
+impl DelegationProjectionUpsert {
+    fn nullable_shape(&self) -> [bool; 6] {
+        [
+            self.agent_id.is_some(),
+            self.title.is_some(),
+            self.retry_of.is_some(),
+            self.last_summary_ref.is_some(),
+            self.last_summary_text.is_some(),
+            self.sibling_exposed_artifacts_json.is_some(),
+        ]
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StateItemUpsert {
     pub item_id: Option<String>,
@@ -832,12 +845,7 @@ impl DatabaseStateProjectionStore {
               last_summary_text = VALUES(last_summary_text),
               sibling_exposed_artifacts_json = VALUES(sibling_exposed_artifacts_json),
               updated_at = NOW(6)",
-            [
-                record.retry_of.is_some(),
-                record.last_summary_ref.is_some(),
-                record.last_summary_text.is_some(),
-                record.sibling_exposed_artifacts_json.is_some(),
-            ],
+            record.nullable_shape(),
         );
         sqlx::query(&delegation_insert_sql)
             .bind(&record.delegation_id)
@@ -1600,6 +1608,47 @@ pub fn validate_state_mutation(mutation: &str) -> Result<(), StateProjectionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn delegation_projection_upsert() -> DelegationProjectionUpsert {
+        DelegationProjectionUpsert {
+            delegation_id: "delegation-1".to_string(),
+            user_id: "user-1".to_string(),
+            session_id: "session-1".to_string(),
+            parent_run_id: "run-parent".to_string(),
+            child_run_id: "run-child".to_string(),
+            root_run_id: "run-root".to_string(),
+            ancestor_path: "run-root/run-child".to_string(),
+            depth: 1,
+            agent_id: None,
+            title: None,
+            status: "running".to_string(),
+            retry_of: None,
+            retry_scope: "node".to_string(),
+            last_summary_ref: None,
+            last_summary_text: None,
+            sibling_exposed_artifacts_json: None,
+        }
+    }
+
+    #[test]
+    fn delegation_statement_identity_includes_agent_and_title_nullness() {
+        let without_agent = delegation_projection_upsert();
+        let without_agent_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO session_delegations VALUES (?)",
+            without_agent.nullable_shape(),
+        );
+
+        let mut with_agent = delegation_projection_upsert();
+        with_agent.agent_id = Some("agent-1".to_string());
+        with_agent.title = Some("Delegated run agent-1".to_string());
+        let with_agent_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO session_delegations VALUES (?)",
+            with_agent.nullable_shape(),
+        );
+
+        assert_ne!(without_agent_sql, with_agent_sql);
+        assert!(with_agent_sql.contains("astra-null-shape:11"));
+    }
 
     #[derive(Clone)]
     struct FakeStateProjectionRow {

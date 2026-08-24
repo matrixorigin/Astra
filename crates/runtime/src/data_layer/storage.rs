@@ -54,6 +54,31 @@ struct TraceEventInsertValues {
     created_at: String,
 }
 
+impl TraceEventInsertValues {
+    fn nullable_shape(&self, event: &TraceEvent) -> [bool; 18] {
+        [
+            event.content.is_some(),
+            event.parent_event_id.is_some(),
+            event.causal_chain_id.is_some(),
+            event.run_id.is_some(),
+            event.parent_run_id.is_some(),
+            event.turn_id.is_some(),
+            event.turn_seq.is_some(),
+            event.round_index.is_some(),
+            event.tool_call_id.is_some(),
+            event.parent_agent_id.is_some(),
+            self.token_usage_json.is_some(),
+            event.llm_model_used.is_some(),
+            event.reasoning_content.is_some(),
+            self.token_input.is_some(),
+            self.token_output.is_some(),
+            self.token_total.is_some(),
+            event.meta_tool_name.is_some(),
+            event.meta_duration_ms.is_some(),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CanonicalTokenUsageColumns {
     input_tokens: i64,
@@ -199,25 +224,7 @@ pub(crate) async fn insert_trace_event(
           llm_model_used, reasoning_content, token_input, token_output, token_total, \
           meta_tool_name, meta_duration_ms, metadata, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            event.content.is_some(),
-            event.parent_event_id.is_some(),
-            event.run_id.is_some(),
-            event.parent_run_id.is_some(),
-            event.turn_id.is_some(),
-            event.turn_seq.is_some(),
-            event.round_index.is_some(),
-            event.tool_call_id.is_some(),
-            event.parent_agent_id.is_some(),
-            values.token_usage_json.is_some(),
-            event.llm_model_used.is_some(),
-            event.reasoning_content.is_some(),
-            values.token_input.is_some(),
-            values.token_output.is_some(),
-            values.token_total.is_some(),
-            event.meta_tool_name.is_some(),
-            event.meta_duration_ms.is_some(),
-        ],
+        values.nullable_shape(event),
     );
     let result = query(&insert_sql)
         .bind(&event.event_id)
@@ -424,6 +431,7 @@ mod tests {
         INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_string,
         metadata_tool_name, trace_event_insert_values,
     };
+    use astra_core::matrixone_statement_with_null_shape;
     use astra_turn_core::contracts::TurnCoreEventRecord;
     use astra_turn_core::trace_event::TraceEvent;
 
@@ -552,6 +560,32 @@ mod tests {
         assert_eq!(persisted["cache_read"], 4);
         assert_eq!(persisted["cache_write"], 3);
         assert_eq!(persisted["total"], 22);
+    }
+
+    #[test]
+    fn trace_event_statement_identity_includes_causal_chain_nullness() {
+        let mut event = TraceEvent::new(
+            "trace-shape",
+            "session-1",
+            "user-1",
+            "platform_event",
+            "platform",
+        );
+        let without_chain = trace_event_insert_values(&event).unwrap();
+        let without_chain_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO agent_events VALUES (?)",
+            without_chain.nullable_shape(&event),
+        );
+
+        event.causal_chain_id = Some("chain-1".to_string());
+        let with_chain = trace_event_insert_values(&event).unwrap();
+        let with_chain_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO agent_events VALUES (?)",
+            with_chain.nullable_shape(&event),
+        );
+
+        assert_ne!(without_chain_sql, with_chain_sql);
+        assert!(with_chain_sql.contains("astra-null-shape:001"));
     }
 
     #[test]
