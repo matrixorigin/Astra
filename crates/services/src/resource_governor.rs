@@ -34,10 +34,10 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 10;
+    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 100;
     pub const DEFAULT_MAX_TOKENS_PER_DAY: u64 = 10_000_000_000;
-    pub const DEFAULT_MAX_DISK_BYTES: u64 = 1_073_741_824;
-    pub const DEFAULT_MAX_CONCURRENT_BASH: u32 = 10;
+    pub const DEFAULT_MAX_DISK_BYTES: u64 = 10_737_418_240;
+    pub const DEFAULT_MAX_CONCURRENT_BASH: u32 = 100;
     pub const DEFAULT_MAX_SESSIONS_PER_DAY: u32 = 5_000;
 }
 
@@ -614,10 +614,10 @@ mod tests {
     #[test]
     fn product_default_limits_match_contract() {
         let limits = ResourceLimits::default();
-        assert_eq!(limits.max_concurrent_sessions, 10);
+        assert_eq!(limits.max_concurrent_sessions, 100);
         assert_eq!(limits.max_tokens_per_day, 10_000_000_000);
-        assert_eq!(limits.max_disk_bytes, 1_073_741_824);
-        assert_eq!(limits.max_concurrent_bash, 10);
+        assert_eq!(limits.max_disk_bytes, 10_737_418_240);
+        assert_eq!(limits.max_concurrent_bash, 100);
         assert_eq!(limits.max_sessions_per_day, 5_000);
     }
 

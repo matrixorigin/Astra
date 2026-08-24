@@ -209,10 +209,10 @@ SaaS 按用户计量与限流，表：`resource_limits`、`resource_usage`。
 | 限额项 | 默认值（参考） | 测试场景 |
 |--------|----------------|----------|
 | `max_sessions_per_day` | 5000 | 第 5001 个 Session → Denied |
-| `max_concurrent_sessions` | 10 | 第 11 个活跃 Session → Denied |
+| `max_concurrent_sessions` | 100 | 第 101 个活跃 Session → Denied |
 | `max_tokens_per_day` | 10,000,000,000 | 达到每日预算后，后续 Turn → Denied；显式 `0` 仍表示不限量 |
-| `max_concurrent_bash` | 10 | 配置读写（执行侧并发限流尚未接入） |
-| `max_disk_bytes` | 1GB | 配置读写（执行侧磁盘限流尚未接入） |
+| `max_concurrent_bash` | 100 | 配置读写（执行侧并发限流尚未接入） |
+| `max_disk_bytes` | 10 GiB | 配置读写（执行侧磁盘限流尚未接入） |
 
 | 测试项 | 通过标准 |
 |--------|----------|

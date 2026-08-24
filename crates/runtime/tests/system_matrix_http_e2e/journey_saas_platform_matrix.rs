@@ -135,7 +135,7 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
     assert_eq!(st_lim, StatusCode::OK, "GET /resources/limits: {lim_j}");
     assert_eq!(
         lim_j["limits"]["max_concurrent_sessions"].as_u64(),
-        Some(10),
+        Some(100),
         "default concurrent cap: {lim_j}"
     );
     assert_eq!(
