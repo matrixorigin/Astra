@@ -1043,9 +1043,9 @@ async fn load_session_projection_observability(
         .find(|record| record.stage == astra_services::ModelRequestEventStage::Terminal);
     let authority_status = sqlx::query(
         "SELECT
-            COALESCE(SUM(CASE WHEN outcome = 'cursor_conflict' THEN 1 ELSE 0 END), 0)
+            CAST(COALESCE(SUM(CASE WHEN outcome = 'cursor_conflict' THEN 1 ELSE 0 END), 0) AS SIGNED)
                 AS cursor_conflicts,
-            COALESCE(SUM(CASE WHEN outcome = 'stale_fenced' THEN 1 ELSE 0 END), 0)
+            CAST(COALESCE(SUM(CASE WHEN outcome = 'stale_fenced' THEN 1 ELSE 0 END), 0) AS SIGNED)
                 AS stale_epoch_rejections
          FROM session_context_authority_events
          WHERE owner_user_id = ? AND session_id = ?",

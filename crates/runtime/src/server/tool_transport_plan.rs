@@ -129,20 +129,15 @@ impl EdgeBoundExecutionPlan {
         Duration::from_secs(self.timeout_secs.saturating_add(Self::WAIT_GRACE_SECS))
     }
 
-    fn dispatch_message(
-        &self,
-        include_runtime_file_transfer: bool,
-    ) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
+    fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: self.dispatch_request_id.clone(),
-            identity: self.identity.clone(),
+            identity: Box::new(self.identity.clone()),
             delivery_generation: 1,
             tool: self.tool_name.clone(),
             args: self.args.clone(),
-            runtime_file_transfer: include_runtime_file_transfer
-                .then_some(self.runtime_file_transfer.as_deref())
-                .flatten()
-                .map(|context| Box::new(context.into())),
+            runtime_file_transfer: None,
+            runtime_file_transfer_v2: None,
             runtime_filesystem_boundary: self
                 .runtime_filesystem_boundary
                 .as_deref()
@@ -155,7 +150,7 @@ impl EdgeBoundExecutionPlan {
         // Durable dispatch rows are replayable database state. RuntimeGrant
         // bearer credentials are request-scoped secrets and must only be
         // attached by the live websocket delivery boundary.
-        serde_json::to_string(&self.dispatch_message(false))
+        serde_json::to_string(&self.dispatch_message())
     }
 
     pub(crate) fn delivered_result_with_fields(

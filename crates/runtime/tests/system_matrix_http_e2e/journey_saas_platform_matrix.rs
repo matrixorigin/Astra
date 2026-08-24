@@ -135,13 +135,13 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
     assert_eq!(st_lim, StatusCode::OK, "GET /resources/limits: {lim_j}");
     assert_eq!(
         lim_j["limits"]["max_concurrent_sessions"].as_u64(),
-        Some(5),
+        Some(100),
         "default concurrent cap: {lim_j}"
     );
     assert_eq!(
         lim_j["limits"]["max_tokens_per_day"].as_u64(),
-        Some(0),
-        "token quota must require an explicit per-user override: {lim_j}"
+        Some(10_000_000_000),
+        "default daily token budget: {lim_j}"
     );
 
     let (st_use, use_j) = get_json(app, "/resources/usage", Some(auth), &[]).await;

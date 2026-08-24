@@ -30,6 +30,10 @@ pub use astra_turn_types::ToolInvocationIdentity;
 /// Versioned Edge handshake capability required for request-scoped managed
 /// attachment materialization and artifact publication.
 pub const MANAGED_FILE_TRANSFER_V1_CAPABILITY: &str = "managed_file_transfer_v1";
+/// Successor of [`MANAGED_FILE_TRANSFER_V1_CAPABILITY`]. V2 is required for
+/// the eph work-directory layout; V1 remains frozen for managed Runner
+/// connections during a rolling upgrade.
+pub const MANAGED_FILE_TRANSFER_V2_CAPABILITY: &str = "managed_file_transfer_v2";
 
 /// Produce the deterministic, collision-free catalog filename used for one
 /// attachment inventory entry. Every entry is namespaced by its stable
@@ -75,6 +79,54 @@ pub struct RuntimeFileTransferContext {
     pub attachments: Vec<RuntimeFileTransferAttachment>,
 }
 
+/// V2 of the managed Edge file-transfer wire contract. Unlike V1, it models
+/// the runtime-owned filesystem shape explicitly and can therefore represent
+/// eph's single local work directory without inventing legacy mount paths.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeFileTransferContextV2 {
+    pub endpoint_url: String,
+    pub authorization: String,
+    pub workspace_root: String,
+    pub layout: RuntimeFileTransferLayout,
+    pub max_file_bytes: u64,
+    pub attachments: Vec<RuntimeFileTransferAttachment>,
+}
+
+impl From<RuntimeFileTransferContext> for RuntimeFileTransferContextV2 {
+    fn from(context: RuntimeFileTransferContext) -> Self {
+        Self {
+            endpoint_url: context.endpoint_url,
+            authorization: context.authorization,
+            workspace_root: context.workspace_root,
+            layout: RuntimeFileTransferLayout::Legacy {
+                task_id: context.task_id,
+                root: context.root,
+                catalog_dir: context.catalog_dir,
+                session_dir: context.session_dir,
+                scratch_dir: context.scratch_dir,
+            },
+            max_file_bytes: context.max_file_bytes,
+            attachments: context.attachments,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "layout", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RuntimeFileTransferLayout {
+    Legacy {
+        task_id: String,
+        root: String,
+        catalog_dir: String,
+        session_dir: String,
+        scratch_dir: String,
+    },
+    Ephemeral {
+        work_dir: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeFilesystemBoundaryContext {
@@ -106,18 +158,84 @@ impl std::fmt::Debug for RuntimeFileTransferContext {
     }
 }
 
+impl std::fmt::Debug for RuntimeFileTransferContextV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeFileTransferContextV2")
+            .field("endpoint_url", &self.endpoint_url)
+            .field("authorization_present", &!self.authorization.is_empty())
+            .field("workspace_root", &self.workspace_root)
+            .field("layout", &self.layout)
+            .field("attachment_count", &self.attachments.len())
+            .finish()
+    }
+}
+
 #[cfg(feature = "server")]
-impl From<&astra_services::runs::RuntimeFileTransferContext> for RuntimeFileTransferContext {
+impl RuntimeFileTransferContext {
+    /// Build the frozen V1 payload only for the legacy Runner layout. An eph
+    /// context must never be projected into fake V1 paths.
+    pub fn from_legacy(context: &astra_services::runs::RuntimeFileTransferContext) -> Option<Self> {
+        let astra_services::runs::RuntimeFileTransferLayout::Legacy {
+            task_id,
+            root,
+            catalog_dir,
+            session_dir,
+            scratch_dir,
+        } = &context.layout
+        else {
+            return None;
+        };
+        Some(Self {
+            endpoint_url: context.endpoint_url.clone(),
+            authorization: context.authorization.clone(),
+            task_id: task_id.clone(),
+            workspace_root: context.workspace_root.clone(),
+            root: root.clone(),
+            catalog_dir: catalog_dir.clone(),
+            session_dir: session_dir.clone(),
+            scratch_dir: scratch_dir.clone(),
+            max_file_bytes: context.max_file_bytes,
+            attachments: context
+                .attachments
+                .iter()
+                .map(|attachment| RuntimeFileTransferAttachment {
+                    file_id: attachment.file_id.clone(),
+                    name: attachment.name.clone(),
+                    size: attachment.size,
+                    md5: attachment.md5.clone(),
+                })
+                .collect(),
+        })
+    }
+}
+
+#[cfg(feature = "server")]
+impl From<&astra_services::runs::RuntimeFileTransferContext> for RuntimeFileTransferContextV2 {
     fn from(context: &astra_services::runs::RuntimeFileTransferContext) -> Self {
         Self {
             endpoint_url: context.endpoint_url.clone(),
             authorization: context.authorization.clone(),
-            task_id: context.task_id.clone(),
             workspace_root: context.workspace_root.clone(),
-            root: context.root.clone(),
-            catalog_dir: context.catalog_dir.clone(),
-            session_dir: context.session_dir.clone(),
-            scratch_dir: context.scratch_dir.clone(),
+            layout: match &context.layout {
+                astra_services::runs::RuntimeFileTransferLayout::Legacy {
+                    task_id,
+                    root,
+                    catalog_dir,
+                    session_dir,
+                    scratch_dir,
+                } => RuntimeFileTransferLayout::Legacy {
+                    task_id: task_id.clone(),
+                    root: root.clone(),
+                    catalog_dir: catalog_dir.clone(),
+                    session_dir: session_dir.clone(),
+                    scratch_dir: scratch_dir.clone(),
+                },
+                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { work_dir } => {
+                    RuntimeFileTransferLayout::Ephemeral {
+                        work_dir: work_dir.clone(),
+                    }
+                }
+            },
             max_file_bytes: context.max_file_bytes,
             attachments: context
                 .attachments
@@ -197,7 +315,9 @@ pub enum EdgeServerMessage {
     #[serde(rename = "edge_tool_request")]
     ToolRequest {
         request_id: String,
-        identity: ToolInvocationIdentity,
+        /// Kept indirect so the WebSocket envelope remains compact while the
+        /// serialized wire field stays the exact established identity shape.
+        identity: Box<ToolInvocationIdentity>,
         delivery_generation: u64,
         tool: String,
         args: Value,
@@ -206,6 +326,11 @@ pub enum EdgeServerMessage {
         /// journal; its Debug implementation redacts authorization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_file_transfer: Option<Box<RuntimeFileTransferContext>>,
+        /// V2 managed file-transfer contract. It is separately negotiated so
+        /// an old Edge can continue receiving the exact V1 payload while an
+        /// eph Edge requires this explicit layout-aware contract.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_file_transfer_v2: Option<Box<RuntimeFileTransferContextV2>>,
         /// Non-secret mount boundary for host-owned lanes within the writable
         /// workspace. Unlike transfer credentials this field is durable.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,11 +452,12 @@ mod tests {
     fn edge_tool_request_serializes() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-456".into(),
-            identity: identity(),
+            identity: Box::new(identity()),
             delivery_generation: 1,
             tool: "bash".into(),
             args: json!({"command": "echo hello"}),
             runtime_file_transfer: None,
+            runtime_file_transfer_v2: None,
             runtime_filesystem_boundary: None,
             timeout_secs: 120,
         };
@@ -345,7 +471,7 @@ mod tests {
     fn edge_tool_request_round_trips_hidden_file_transfer_context() {
         let msg = EdgeServerMessage::ToolRequest {
             request_id: "req-transfer".into(),
-            identity: identity(),
+            identity: Box::new(identity()),
             delivery_generation: 1,
             tool: "materialize_attachment".into(),
             args: json!({"file_id": "file-1"}),
@@ -366,6 +492,7 @@ mod tests {
                     md5: "0123456789abcdef0123456789abcdef".into(),
                 }],
             })),
+            runtime_file_transfer_v2: None,
             runtime_filesystem_boundary: Some(Box::new(RuntimeFilesystemBoundaryContext {
                 workspace_root: "/sandbox".into(),
                 read_only_paths: vec![
@@ -377,11 +504,20 @@ mod tests {
         };
 
         let encoded = serde_json::to_string(&msg).unwrap();
+        let encoded_value: Value = serde_json::from_str(&encoded).unwrap();
+        let v1 = &encoded_value["runtime_file_transfer"];
+        assert_eq!(v1["task_id"], "task-1");
+        assert_eq!(v1["catalog_dir"], "/sandbox/.moi/runtime/task-1/catalog");
+        assert!(
+            v1.get("layout").is_none(),
+            "the frozen V1 payload must not acquire V2's layout field"
+        );
         let decoded: EdgeServerMessage = serde_json::from_str(&encoded).unwrap();
 
         match decoded {
             EdgeServerMessage::ToolRequest {
                 runtime_file_transfer: Some(context),
+                runtime_file_transfer_v2: None,
                 runtime_filesystem_boundary: Some(boundary),
                 ..
             } => {
@@ -391,6 +527,45 @@ mod tests {
                 assert_eq!(boundary.workspace_root, "/sandbox");
             }
             other => panic!("expected tool request with transfer context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn edge_tool_request_round_trips_v2_file_transfer_context_separately_from_v1() {
+        let msg = EdgeServerMessage::ToolRequest {
+            request_id: "req-eph-transfer".into(),
+            identity: Box::new(identity()),
+            delivery_generation: 1,
+            tool: "bash".into(),
+            args: json!({"command": "ls"}),
+            runtime_file_transfer: None,
+            runtime_file_transfer_v2: Some(Box::new(RuntimeFileTransferContextV2 {
+                endpoint_url: "https://moi.example/runtime-files".into(),
+                authorization: "Bearer runtime-grant".into(),
+                workspace_root: "/sandbox".into(),
+                layout: RuntimeFileTransferLayout::Ephemeral {
+                    work_dir: "/sandbox/.moi".into(),
+                },
+                max_file_bytes: 1024,
+                attachments: Vec::new(),
+            })),
+            runtime_filesystem_boundary: None,
+            timeout_secs: 120,
+        };
+
+        let encoded = serde_json::to_string(&msg).unwrap();
+        assert!(encoded.contains("runtime_file_transfer_v2"));
+        let decoded: EdgeServerMessage = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            EdgeServerMessage::ToolRequest {
+                runtime_file_transfer: None,
+                runtime_file_transfer_v2: Some(context),
+                ..
+            } => assert!(matches!(
+                context.layout,
+                RuntimeFileTransferLayout::Ephemeral { ref work_dir } if work_dir == "/sandbox/.moi"
+            )),
+            other => panic!("expected v2 transfer context, got {other:?}"),
         }
     }
 

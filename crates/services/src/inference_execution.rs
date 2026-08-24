@@ -1,4 +1,4 @@
-use astra_core::SharedPool;
+use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -525,53 +525,69 @@ async fn insert_model_request_context_event(
         .as_deref()
         .unwrap_or("unspecified");
     if context_expired_at.is_none() {
-        sqlx::query(
+        let session_id = attempt.invocation_input.scope.session_id();
+        let run_id = attempt.invocation_input.scope.run_id();
+        let harness_run_id = attempt.invocation_input.scope.harness_run_id();
+        let terminal_status = event.terminal_status.as_deref();
+        let usage_present = usage.is_some();
+        let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO model_request_context_events
          (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
           event_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(event_id)
-        .bind(&attempt.user_id)
-        .bind(&attempt.attempt_id)
-        .bind(&attempt.invocation_id)
-        .bind(attempt.invocation_input.scope.session_id())
-        .bind(attempt.invocation_input.scope.run_id())
-        .bind(attempt.invocation_input.scope.harness_run_id())
-        .bind(stage.as_str())
-        .bind(event.terminal_status.as_deref())
-        .bind(event.identity.topology.as_str())
-        .bind(&event.identity.provider)
-        .bind(model_family)
-        .bind(&event.identity.inference_purpose)
-        .bind(checked_optional_i64(
-            usage.map(|usage| usage.request_input_tokens),
-            "model request input_tokens",
-        )?)
-        .bind(checked_optional_i64(
-            usage.map(|usage| usage.output_tokens),
-            "model request output_tokens",
-        )?)
-        .bind(checked_optional_i64(
-            usage.map(|usage| usage.cache_read_tokens),
-            "model request cache_read_tokens",
-        )?)
-        .bind(checked_optional_i64(
-            usage.map(|usage| usage.cache_creation_tokens),
-            "model request cache_creation_tokens",
-        )?)
-        .bind(event_json)
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert model request context event",
-                error,
-            )
-        })?;
+            [
+                session_id.is_some(),
+                run_id.is_some(),
+                harness_run_id.is_some(),
+                terminal_status.is_some(),
+                usage_present,
+                usage_present,
+                usage_present,
+                usage_present,
+            ],
+        );
+        sqlx::query(&insert_sql)
+            .bind(event_id)
+            .bind(&attempt.user_id)
+            .bind(&attempt.attempt_id)
+            .bind(&attempt.invocation_id)
+            .bind(session_id)
+            .bind(run_id)
+            .bind(harness_run_id)
+            .bind(stage.as_str())
+            .bind(terminal_status)
+            .bind(event.identity.topology.as_str())
+            .bind(&event.identity.provider)
+            .bind(model_family)
+            .bind(&event.identity.inference_purpose)
+            .bind(checked_optional_i64(
+                usage.map(|usage| usage.request_input_tokens),
+                "model request input_tokens",
+            )?)
+            .bind(checked_optional_i64(
+                usage.map(|usage| usage.output_tokens),
+                "model request output_tokens",
+            )?)
+            .bind(checked_optional_i64(
+                usage.map(|usage| usage.cache_read_tokens),
+                "model request cache_read_tokens",
+            )?)
+            .bind(checked_optional_i64(
+                usage.map(|usage| usage.cache_creation_tokens),
+                "model request cache_creation_tokens",
+            )?)
+            .bind(event_json)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "insert model request context event",
+                    error,
+                )
+            })?;
         let scope = match &attempt.invocation_input.scope {
             InferenceInvocationScope::Run { session_id, .. }
             | InferenceInvocationScope::Session { session_id, .. } => {
@@ -854,65 +870,79 @@ pub async fn admit_inference_invocation(
     })?;
     let write_result: ServiceResult<()> = async {
         ensure_invocation_scope(&mut tx, &plan.input).await?;
-        sqlx::query(
+        let route_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO inference_routes
              (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
               offering_id, resolved_model_name,
               upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        )
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(plan.input.scope.session_id())
-        .bind(plan.input.scope.kind())
-        .bind(plan.input.scope.run_id())
-        .bind(plan.input.scope.harness_run_id())
-        .bind(&plan.input.offering_id)
-        .bind(&plan.input.resolved_model_name)
-        .bind(&plan.input.upstream_model_name)
-        .bind(&plan.input.provider)
-        .bind(plan.input.execution_placement.as_str())
-        .bind(plan.input.access_kind.as_str())
-        .bind(plan.input.purpose.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert inference route",
-                error,
-            )
-        })?;
+            [
+                plan.input.scope.session_id().is_some(),
+                plan.input.scope.run_id().is_some(),
+                plan.input.scope.harness_run_id().is_some(),
+            ],
+        );
+        sqlx::query(&route_insert_sql)
+            .bind(&plan.route_id)
+            .bind(&plan.input.user_id)
+            .bind(plan.input.scope.session_id())
+            .bind(plan.input.scope.kind())
+            .bind(plan.input.scope.run_id())
+            .bind(plan.input.scope.harness_run_id())
+            .bind(&plan.input.offering_id)
+            .bind(&plan.input.resolved_model_name)
+            .bind(&plan.input.upstream_model_name)
+            .bind(&plan.input.provider)
+            .bind(plan.input.execution_placement.as_str())
+            .bind(plan.input.access_kind.as_str())
+            .bind(plan.input.purpose.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "insert inference route",
+                    error,
+                )
+            })?;
 
-        sqlx::query(
+        let invocation_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO inference_invocations
              (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
               admission_token, turn_index,
               round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
-        )
-        .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(plan.input.scope.session_id())
-        .bind(plan.input.scope.kind())
-        .bind(plan.input.scope.run_id())
-        .bind(plan.input.scope.harness_run_id())
-        .bind(&plan.admission_token)
-        .bind(plan.input.scope.turn().map(i64::from))
-        .bind(plan.input.scope.round().map(i64::from))
-        .bind(plan.input.scope.operation_id())
-        .bind(i64::from(plan.input.scope.logical_attempt()))
-        .bind(plan.input.purpose.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert inference invocation",
-                error,
-            )
-        })?;
+            [
+                plan.input.scope.session_id().is_some(),
+                plan.input.scope.run_id().is_some(),
+                plan.input.scope.harness_run_id().is_some(),
+                plan.input.scope.turn().is_some(),
+                plan.input.scope.round().is_some(),
+            ],
+        );
+        sqlx::query(&invocation_insert_sql)
+            .bind(&plan.invocation_id)
+            .bind(&plan.route_id)
+            .bind(&plan.input.user_id)
+            .bind(plan.input.scope.session_id())
+            .bind(plan.input.scope.kind())
+            .bind(plan.input.scope.run_id())
+            .bind(plan.input.scope.harness_run_id())
+            .bind(&plan.admission_token)
+            .bind(plan.input.scope.turn().map(i64::from))
+            .bind(plan.input.scope.round().map(i64::from))
+            .bind(plan.input.scope.operation_id())
+            .bind(i64::from(plan.input.scope.logical_attempt()))
+            .bind(plan.input.purpose.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "insert inference invocation",
+                    error,
+                )
+            })?;
 
         Ok(())
     }

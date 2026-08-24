@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use astra_core::{
     ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error,
-    is_duplicate_key_error,
+    is_duplicate_key_error, matrixone_statement_with_null_shape,
 };
 
 use crate::db_row::RowExt as EventDbRow;
@@ -691,28 +691,35 @@ impl EventService for DatabaseEventService {
         let meta_tool_name = metadata_tool_name(metadata.as_ref());
         let meta_duration_ms = metadata_duration_ms(metadata.as_ref());
 
-        let insert_result = match query(
+        let insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO agent_events \
              (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
               parent_event_id, causal_chain_id, `metadata`, tool_call_id, meta_tool_name, \
               meta_duration_ms, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-        )
-        .bind(&event_id)
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(&agent_id)
-        .bind(&agent_version)
-        .bind(&event_type)
-        .bind(&content)
-        .bind(&primary_parent_event_id)
-        .bind(&causal_chain_id)
-        .bind(&metadata_str)
-        .bind(&tool_call_id)
-        .bind(&meta_tool_name)
-        .bind(meta_duration_ms)
-        .execute(&mut *tx)
-        .await
+            [
+                primary_parent_event_id.is_some(),
+                tool_call_id.is_some(),
+                meta_tool_name.is_some(),
+                meta_duration_ms.is_some(),
+            ],
+        );
+        let insert_result = match query(&insert_sql)
+            .bind(&event_id)
+            .bind(&session_id)
+            .bind(&user_id)
+            .bind(&agent_id)
+            .bind(&agent_version)
+            .bind(&event_type)
+            .bind(&content)
+            .bind(&primary_parent_event_id)
+            .bind(&causal_chain_id)
+            .bind(&metadata_str)
+            .bind(&tool_call_id)
+            .bind(&meta_tool_name)
+            .bind(meta_duration_ms)
+            .execute(&mut *tx)
+            .await
         {
             Ok(result) => result,
             Err(error) if client_supplied_event_id && is_duplicate_key_error(&error) => {

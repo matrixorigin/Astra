@@ -117,16 +117,24 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
-    // Managed transfer tools and their filesystem boundary require the same
-    // Edge protocol implementation. Transfer credentials prove authority;
-    // this independently advertised version proves implementation support for
-    // both the interceptor and ordinary-tool mount boundary.
+    // Managed transfer tools and their filesystem boundary require a matching
+    // Edge wire contract. The legacy Runner layout is V1; eph's single work
+    // directory requires V2 and must never be projected into fabricated V1
+    // mount paths.
     if request.runtime_filesystem_boundary.is_some() || request.runtime_file_transfer.is_some() {
+        let required_capability = match request
+            .runtime_file_transfer
+            .as_deref()
+            .map(|context| &context.layout)
+        {
+            Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
+                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY
+            }
+            _ => astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY,
+        };
         if capabilities
             .get("protocol_capabilities")
-            .and_then(|value| {
-                value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
-            })
+            .and_then(|value| value.get(required_capability))
             .and_then(Value::as_bool)
             == Some(true)
         {
@@ -134,9 +142,9 @@ fn edge_advertised_tool_check(
         }
         return Err(Box::new((
             advert.binding,
-            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(
-                "managed_file_transfer_v1_not_advertised".to_string(),
-            ),
+            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(format!(
+                "{required_capability}_not_advertised"
+            )),
         )));
     }
     astra_runtime_env::CapabilityResolver

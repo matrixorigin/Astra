@@ -5929,6 +5929,43 @@ fn file_transfer_request_with_attachments(
     request
 }
 
+fn ephemeral_file_transfer_request_with_attachments(
+    attachments: Vec<Value>,
+) -> astra_services::runs::ChatRequestData {
+    let mut request = file_transfer_request_with_attachments(attachments);
+    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
+        display_name: Some("Ephemeral sandbox".to_string()),
+        root: Some("/sandbox/.moi".to_string()),
+        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
+            path: "/sandbox/.moi".to_string(),
+        }),
+        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
+    });
+    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
+        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
+        executor_id: Some("eph-test".to_string()),
+        display_name: Some("Ephemeral sandbox".to_string()),
+        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
+        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
+    });
+    let descriptor = request
+        .capability_descriptors
+        .as_mut()
+        .and_then(|descriptors| descriptors.file_transfer.as_mut())
+        .expect("file transfer descriptor");
+    descriptor.metadata = json!({
+        "contract_version": 2,
+        "work_dir": "/sandbox/.moi",
+        "max_file_bytes": 1024,
+        "attachments": descriptor.metadata["attachments"].clone(),
+    })
+    .as_object()
+    .expect("ephemeral file transfer metadata")
+    .clone();
+    request
+}
+
 #[test]
 fn runtime_file_transfer_assigns_pairwise_distinct_names_at_request_boundary() {
     let request = file_transfer_request_with_attachments(vec![
@@ -5956,6 +5993,20 @@ fn runtime_file_transfer_assigns_pairwise_distinct_names_at_request_boundary() {
     assert!(names.contains("000000-input.txt"));
     assert!(names.contains("000001-input.txt"));
     assert!(names.contains("000002-000000-input.txt"));
+}
+
+#[test]
+fn ephemeral_file_transfer_uses_one_flat_work_dir() {
+    let request = ephemeral_file_transfer_request_with_attachments(Vec::new());
+    let context = AgenticRunLifecycleService::runtime_file_transfer_context(&request)
+        .expect("ephemeral file transfer must be valid")
+        .expect("ephemeral file transfer context");
+    assert_eq!(context.workspace_root, "/sandbox/.moi");
+    assert!(matches!(
+        context.layout,
+        astra_services::runs::RuntimeFileTransferLayout::Ephemeral { ref work_dir }
+            if work_dir == "/sandbox/.moi"
+    ));
 }
 
 #[test]

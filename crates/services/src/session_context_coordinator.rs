@@ -13,7 +13,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use astra_core::SharedPool;
+use astra_core::{
+    SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
+};
 use astra_turn_types::{
     ActorContextV1, AuthorityEpochsV1, CANONICAL_TURN_DELTA_SCHEMA_VERSION, CanonicalDeltaModeV1,
     CanonicalTurnDeltaV1, ContextManifestNodeV1, ConversationSegmentV1, ConversationWriterLeaseV1,
@@ -3165,18 +3167,15 @@ impl DatabaseSessionContextCoordinator {
         for chunk in hashes.chunks(256) {
             let mut query = QueryBuilder::<MySql>::new(
                 "SELECT segment_hash, segment_json FROM conversation_segments \
-                 WHERE isolation_domain = ",
+                 INNER JOIN ",
             );
+            push_matrixone_bound_string_set(&mut query, chunk.iter().map(String::as_str));
             query
+                .push(" AS requested_segment ON requested_segment.value = segment_hash")
+                .push(" WHERE isolation_domain = ")
                 .push_bind(&key.isolation_domain)
                 .push(" AND owner_user_id = ")
-                .push_bind(&key.owner_user_id)
-                .push(" AND segment_hash IN (");
-            let mut separated = query.separated(", ");
-            for hash in chunk {
-                separated.push_bind(hash);
-            }
-            separated.push_unseparated(")");
+                .push_bind(&key.owner_user_id);
             let rows = query
                 .build()
                 .fetch_all(self.pool.get())
@@ -3266,45 +3265,47 @@ impl DatabaseSessionContextCoordinator {
                         )
                     })
                 })?;
-        let result = sqlx::query(
+        let manifest_insert_sql = matrixone_statement_with_null_shape(
             "INSERT IGNORE INTO conversation_manifest_nodes
              (isolation_domain, owner_user_id, session_id, branch_id, manifest_root,
               parent_manifest_root, completed_turn, conversation_seq,
               compaction_generation, canonical_segment_bytes, total_canonical_bytes,
               total_message_count, manifest_json)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&key.isolation_domain)
-        .bind(&key.owner_user_id)
-        .bind(&key.session_id)
-        .bind(&key.branch_id)
-        .bind(&node.manifest_root)
-        .bind(&node.parent_manifest_root)
-        .bind(i64::from(node.completed_turn))
-        .bind(i64_from_u64(
-            "conversation sequence",
-            node.conversation_seq,
-        )?)
-        .bind(i64_from_u64(
-            "manifest compaction generation",
-            node.compaction_generation,
-        )?)
-        .bind(i64_from_u64(
-            "manifest segment bytes",
-            canonical_segment_bytes,
-        )?)
-        .bind(i64_from_u64(
-            "manifest total canonical bytes",
-            total_canonical_bytes,
-        )?)
-        .bind(i64_from_u64(
-            "manifest total message count",
-            total_message_count,
-        )?)
-        .bind(database_to_json("manifest", node)?)
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| database_error("persist_manifest", source))?;
+            [node.parent_manifest_root.is_some()],
+        );
+        let result = sqlx::query(&manifest_insert_sql)
+            .bind(&key.isolation_domain)
+            .bind(&key.owner_user_id)
+            .bind(&key.session_id)
+            .bind(&key.branch_id)
+            .bind(&node.manifest_root)
+            .bind(&node.parent_manifest_root)
+            .bind(i64::from(node.completed_turn))
+            .bind(i64_from_u64(
+                "conversation sequence",
+                node.conversation_seq,
+            )?)
+            .bind(i64_from_u64(
+                "manifest compaction generation",
+                node.compaction_generation,
+            )?)
+            .bind(i64_from_u64(
+                "manifest segment bytes",
+                canonical_segment_bytes,
+            )?)
+            .bind(i64_from_u64(
+                "manifest total canonical bytes",
+                total_canonical_bytes,
+            )?)
+            .bind(i64_from_u64(
+                "manifest total message count",
+                total_message_count,
+            )?)
+            .bind(database_to_json("manifest", node)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| database_error("persist_manifest", source))?;
         if result.rows_affected() == 0 {
             let stored = sqlx::query(
                 "SELECT manifest_json FROM conversation_manifest_nodes

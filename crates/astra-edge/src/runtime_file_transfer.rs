@@ -3,7 +3,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use astra_server_types::edge_ws_protocol::{
-    RuntimeFileTransferAttachment, RuntimeFileTransferContext, runtime_attachment_destination_name,
+    RuntimeFileTransferAttachment, RuntimeFileTransferContextV2 as RuntimeFileTransferContext,
+    RuntimeFileTransferLayout, runtime_attachment_destination_name,
 };
 use astra_tools::ToolResult;
 use astra_tools::artifact_metadata::{
@@ -19,6 +20,31 @@ use tokio_util::io::ReaderStream;
 
 const RUNTIME_FILE_TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_FILE_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MOI_RUNTIME_AUTHORIZATION_ENV: &str = "MOI_RUNTIME_AUTHORIZATION";
+
+/// Ensure a server-supplied managed transfer context belongs to this Edge.
+///
+/// The Edge workspace is authenticated as part of the WebSocket connection,
+/// while this context is carried by an individual tool request.  They must
+/// agree before the request is admitted to the durable journal or a tool can
+/// consume its paths or task-scoped credential.
+pub(crate) fn validate_connected_edge_workspace(
+    context: Option<&RuntimeFileTransferContext>,
+    edge_workspace: &Path,
+) -> Result<(), &'static str> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    if Path::new(&context.workspace_root) != edge_workspace {
+        return Err("Managed runtime workspace does not match the connected Edge workspace");
+    }
+    if let RuntimeFileTransferLayout::Ephemeral { work_dir } = &context.layout
+        && Path::new(work_dir) != edge_workspace
+    {
+        return Err("Ephemeral runtime work directory does not match the connected Edge workspace");
+    }
+    Ok(())
+}
 
 pub(crate) async fn execute(
     tool: &str,
@@ -41,6 +67,24 @@ pub(crate) async fn execute_default_tool(
     boundary: Option<&astra_server_types::edge_ws_protocol::RuntimeFilesystemBoundaryContext>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> ToolResult {
+    if tool == "bash"
+        && let Some(context) = context
+        && matches!(&context.layout, RuntimeFileTransferLayout::Ephemeral { .. })
+    {
+        if context.authorization.is_empty() {
+            return ToolResult::error("Ephemeral runtime authorization is unavailable".to_string());
+        }
+        let environment = vec![(
+            MOI_RUNTIME_AUTHORIZATION_ENV.to_string(),
+            context.authorization.clone(),
+        )];
+        return astra_tools::shell_ops::execute_bash_with_environment(
+            executor.context(),
+            args,
+            &environment,
+        )
+        .await;
+    }
     let Some(boundary) = boundary else {
         return astra_tools::ToolExecutor::execute_with_cancel(executor, tool, args, Some(cancel))
             .await;
@@ -74,9 +118,17 @@ pub(crate) async fn execute_default_tool(
         }
     }
     if let Some(context) = context {
+        let RuntimeFileTransferLayout::Legacy {
+            root, session_dir, ..
+        } = &context.layout
+        else {
+            return ToolResult::error(
+                "Ephemeral runtime must not install a managed filesystem boundary".to_string(),
+            );
+        };
         if context.workspace_root != boundary.workspace_root
-            || !boundary.read_only_paths.contains(&context.root)
-            || !boundary.read_only_paths.contains(&context.session_dir)
+            || !boundary.read_only_paths.contains(root)
+            || !boundary.read_only_paths.contains(session_dir)
         {
             return ToolResult::error(
                 "Managed transfer paths do not match the filesystem boundary".to_string(),
@@ -122,8 +174,9 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
     if attachment.size < 0 || attachment.size as u64 > context.max_file_bytes {
         return ToolResult::error("attachment exceeds the runtime transfer limit".to_string());
     }
-    let destination = Path::new(&context.catalog_dir).join(&filename);
-    let catalog_root = PathBuf::from(&context.catalog_dir);
+    let destination_root = materialize_destination_root(context);
+    let destination = destination_root.join(&filename);
+    let catalog_root = destination_root.clone();
     let trusted_root = trusted_sandbox_root(context);
     let cached_filename = filename.clone();
     let max_file_bytes = context.max_file_bytes;
@@ -185,7 +238,7 @@ async fn materialize(args: &Value, context: Option<&RuntimeFileTransferContext>)
             "attachment download exceeds the runtime transfer limit".to_string(),
         );
     }
-    let catalog_root = PathBuf::from(&context.catalog_dir);
+    let catalog_root = destination_root;
     let trusted_root = trusted_sandbox_root(context);
     if let Err(error) = stream_attachment_beneath(
         response,
@@ -311,21 +364,15 @@ async fn publish(
         Ok(metadata) => metadata,
         Err(error) => return ToolResult::error(error),
     };
-    let allowed_roots = [
-        PathBuf::from(&context.workspace_root),
-        PathBuf::from(&context.catalog_dir),
-        PathBuf::from(&context.session_dir),
-        PathBuf::from(&context.scratch_dir),
-    ];
+    let (allowed_roots, staging_root) = publish_scope(context);
     let max_file_bytes = context.max_file_bytes;
     let trusted_root = trusted_sandbox_root(context);
-    let scratch_root = PathBuf::from(&context.scratch_dir);
     let opened = match tokio::task::spawn_blocking(move || {
         snapshot_scoped_artifact(
             &requested,
             &allowed_roots,
             &trusted_root,
-            &scratch_root,
+            &staging_root,
             max_file_bytes,
         )
     })
@@ -389,7 +436,7 @@ async fn publish(
     let artifact = json!({
         "artifact_id": artifact_id,
         "name": uploaded.filename,
-        "type": normalized_metadata.artifact_kind.clone(),
+        "type": "file",
         "description": args.description.as_deref().unwrap_or("Managed runtime artifact"),
         "parts": [{
             "kind": if uploaded.content_type.starts_with("image/") { "image" } else { "file" },
@@ -397,7 +444,7 @@ async fn publish(
             "metadata": {"file_id": uploaded.file_id, "byte_size": uploaded.size}
         }],
         "data": {"file_id": uploaded.file_id, "name": uploaded.filename, "mime_type": uploaded.content_type, "byte_size": uploaded.size, "download_url": uploaded.download_url},
-        "metadata": {"source": "managed_edge", "tool_id": "publish_artifact", "file_id": uploaded.file_id, "sha256": uploaded.sha256}
+        "metadata": {"source": "managed_edge", "tool_id": "publish_artifact", "file_id": uploaded.file_id, "sha256": uploaded.sha256, "artifact_kind": normalized_metadata.artifact_kind.clone()}
     });
     let mut result_metadata = Map::from_iter([
         (
@@ -434,7 +481,11 @@ async fn publish(
             args.description.map(Value::String).unwrap_or(Value::Null),
         ),
     ]);
-    result_metadata.insert("artifact".to_string(), artifact);
+    // `tool_call_end.artifacts` is the cross-runtime contract consumed by
+    // MOI's runtime event projector. Keep the artifact structured all the
+    // way through the Edge callback instead of relying on the human-readable
+    // tool output below.
+    result_metadata.insert("artifacts".to_string(), json!([artifact]));
     ToolResult {
         output: format!("Published artifact '{}'", uploaded.filename),
         metadata: Some(result_metadata),
@@ -477,6 +528,35 @@ async fn bounded_json_response<T: for<'de> Deserialize<'de>>(
         .map_err(|error| format!("artifact upload response is invalid: {error}"))
 }
 
+fn materialize_destination_root(context: &RuntimeFileTransferContext) -> PathBuf {
+    match &context.layout {
+        RuntimeFileTransferLayout::Legacy { catalog_dir, .. } => PathBuf::from(catalog_dir),
+        RuntimeFileTransferLayout::Ephemeral { work_dir } => PathBuf::from(work_dir),
+    }
+}
+
+fn publish_scope(context: &RuntimeFileTransferContext) -> (Vec<PathBuf>, PathBuf) {
+    match &context.layout {
+        RuntimeFileTransferLayout::Legacy {
+            catalog_dir,
+            session_dir,
+            scratch_dir,
+            ..
+        } => (
+            vec![
+                PathBuf::from(&context.workspace_root),
+                PathBuf::from(catalog_dir),
+                PathBuf::from(session_dir),
+                PathBuf::from(scratch_dir),
+            ],
+            PathBuf::from(scratch_dir),
+        ),
+        RuntimeFileTransferLayout::Ephemeral { work_dir } => {
+            (vec![PathBuf::from(work_dir)], PathBuf::from(work_dir))
+        }
+    }
+}
+
 #[cfg(not(test))]
 fn trusted_sandbox_root(_context: &RuntimeFileTransferContext) -> PathBuf {
     PathBuf::from("/sandbox")
@@ -487,12 +567,7 @@ fn trusted_sandbox_root(_context: &RuntimeFileTransferContext) -> PathBuf {
 #[cfg(test)]
 fn trusted_sandbox_root(context: &RuntimeFileTransferContext) -> PathBuf {
     let sandbox = Path::new("/sandbox");
-    if Path::new(&context.root).starts_with(sandbox)
-        && Path::new(&context.workspace_root) == sandbox
-        && Path::new(&context.catalog_dir).starts_with(sandbox)
-        && Path::new(&context.session_dir).starts_with(sandbox)
-        && Path::new(&context.scratch_dir).starts_with(sandbox)
-    {
+    if Path::new(&context.workspace_root).starts_with(sandbox) {
         sandbox.to_path_buf()
     } else {
         PathBuf::from(&context.workspace_root)
@@ -1057,11 +1132,16 @@ fn open_beneath_without_symlinks(
 
 async fn prepare_scope_dirs(context: &RuntimeFileTransferContext) -> Result<(), String> {
     let trusted_root = trusted_sandbox_root(context);
-    for path in [
-        &context.catalog_dir,
-        &context.session_dir,
-        &context.scratch_dir,
-    ] {
+    let paths: Vec<&str> = match &context.layout {
+        RuntimeFileTransferLayout::Legacy {
+            catalog_dir,
+            session_dir,
+            scratch_dir,
+            ..
+        } => vec![catalog_dir, session_dir, scratch_dir],
+        RuntimeFileTransferLayout::Ephemeral { work_dir } => vec![work_dir],
+    };
+    for path in paths {
         let trusted_root = trusted_root.clone();
         let path = PathBuf::from(path);
         tokio::task::spawn_blocking(move || create_dir_all_beneath(&trusted_root, &path))
@@ -1081,12 +1161,14 @@ mod tests {
         RuntimeFileTransferContext {
             endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
             authorization: "Bearer secret-that-must-be-redacted".to_string(),
-            task_id: "task-1".to_string(),
             workspace_root: root.display().to_string(),
-            root: root.display().to_string(),
-            catalog_dir: root.join("catalog").display().to_string(),
-            session_dir: root.join("session").display().to_string(),
-            scratch_dir: root.join("scratch").display().to_string(),
+            layout: RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: root.display().to_string(),
+                catalog_dir: root.join("catalog").display().to_string(),
+                session_dir: root.join("session").display().to_string(),
+                scratch_dir: root.join("scratch").display().to_string(),
+            },
             max_file_bytes: 1024,
             attachments: vec![RuntimeFileTransferAttachment {
                 file_id: "file-1".to_string(),
@@ -1095,6 +1177,63 @@ mod tests {
                 md5: md5_hex(b"hello"),
             }],
         }
+    }
+
+    #[test]
+    fn ephemeral_layout_owns_one_flat_local_work_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join(".moi");
+        let context = RuntimeFileTransferContext {
+            endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
+            authorization: "Bearer secret-that-must-be-redacted".to_string(),
+            workspace_root: work_dir.display().to_string(),
+            layout: RuntimeFileTransferLayout::Ephemeral {
+                work_dir: work_dir.display().to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        };
+
+        let (allowed_roots, staging_root) = publish_scope(&context);
+        assert_eq!(allowed_roots, vec![work_dir.clone()]);
+        assert_eq!(staging_root, work_dir);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_bash_receives_call_scoped_runtime_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let work_dir = temp.path().join(".moi");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let context = RuntimeFileTransferContext {
+            endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
+            authorization: "Bearer task-scoped-grant".to_string(),
+            workspace_root: work_dir.display().to_string(),
+            layout: RuntimeFileTransferLayout::Ephemeral {
+                work_dir: work_dir.display().to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        };
+        let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+            &work_dir,
+            "user-1",
+            "session-1",
+            "astra-edge/test",
+            Duration::from_secs(30),
+        );
+
+        let result = execute_default_tool(
+            &executor,
+            "bash",
+            &json!({"command": "printf %s \"$MOI_RUNTIME_AUTHORIZATION\""}),
+            Some(&context),
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(result.output, "Bearer task-scoped-grant");
     }
 
     #[tokio::test]
@@ -1202,6 +1341,26 @@ mod tests {
             result
                 .metadata
                 .as_ref()
+                .and_then(|metadata| metadata.get("artifact_kind")),
+            Some(&Value::String("pdf".to_string()))
+        );
+        let artifacts = result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("artifacts"))
+            .and_then(Value::as_array)
+            .expect("publish result must contain artifacts");
+        let artifact = artifacts
+            .first()
+            .expect("publish result must contain one artifact");
+        assert_eq!(
+            artifact.get("type"),
+            Some(&Value::String("file".to_string()))
+        );
+        assert_eq!(
+            artifact
+                .get("metadata")
+                .and_then(Value::as_object)
                 .and_then(|metadata| metadata.get("artifact_kind")),
             Some(&Value::String("pdf".to_string()))
         );

@@ -579,11 +579,12 @@ async fn edge_ws_disconnect_preserves_inflight_dispatch_for_result_replay() {
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
         request_id: request_id.clone(),
-        identity: tool_identity,
+        identity: Box::new(tool_identity),
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
         runtime_file_transfer: None,
+        runtime_file_transfer_v2: None,
         runtime_filesystem_boundary: None,
         timeout_secs: 30,
     };
@@ -639,11 +640,12 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
     );
     let payload = astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
         request_id: request_id.clone(),
-        identity: tool_identity.clone(),
+        identity: Box::new(tool_identity.clone()),
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
         runtime_file_transfer: None,
+        runtime_file_transfer_v2: None,
         runtime_filesystem_boundary: None,
         timeout_secs: 30,
     };

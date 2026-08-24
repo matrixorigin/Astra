@@ -3030,34 +3030,36 @@ async fn cross_session_stats_and_audit_list_sessions_match_seeded_events() {
             "2026-06-15 10:05:00.000000",
         ),
     ] {
-        sqlx::query(
+        let insert_sql = astra_core::matrixone_statement_with_null_shape(
             "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, \
              causal_chain_id, token_usage, token_input, token_output, token_total, meta_tool_name, llm_model_used, created_at) \
              VALUES (?, ?, ?, ?, '{}', '', CAST(? AS JSON), ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(eid)
-        .bind(&s1)
-        .bind(&user_id)
-        .bind(typ)
-        .bind(
-            serde_json::json!({
-                "input_tokens": tin,
-                "cached_input_tokens": 0,
-                "cache_creation_tokens": 0,
-                "output_tokens": tout,
-                "total_tokens": ttot,
-            })
-            .to_string(),
-        )
-        .bind(tin)
-        .bind(tout)
-        .bind(ttot)
-        .bind(tool)
-        .bind(model)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert event s1");
+            [tool.is_some(), model.is_some()],
+        );
+        sqlx::query(&insert_sql)
+            .bind(eid)
+            .bind(&s1)
+            .bind(&user_id)
+            .bind(typ)
+            .bind(
+                serde_json::json!({
+                    "input_tokens": tin,
+                    "cached_input_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "output_tokens": tout,
+                    "total_tokens": ttot,
+                })
+                .to_string(),
+            )
+            .bind(tin)
+            .bind(tout)
+            .bind(ttot)
+            .bind(tool)
+            .bind(model)
+            .bind(ts)
+            .execute(&pool)
+            .await
+            .expect("insert event s1");
     }
 
     sqlx::query(

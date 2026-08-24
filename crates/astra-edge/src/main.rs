@@ -136,6 +136,36 @@ struct CompletedEdgeInvocation {
     duration_ms: u64,
 }
 
+/// Decode the two separately negotiated managed-file-transfer wire versions.
+/// A server dispatch must carry at most one: V1 is converted for a new Edge,
+/// while V2 is already the internal representation used for eph execution.
+fn decode_runtime_file_transfer(
+    v1: Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContext>>,
+    v2: Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContextV2>>,
+) -> Result<
+    Option<Box<astra_server_types::edge_ws_protocol::RuntimeFileTransferContextV2>>,
+    &'static str,
+> {
+    match (v1, v2) {
+        (None, None) => Ok(None),
+        (Some(v1), None) => Ok(Some(Box::new((*v1).into()))),
+        (None, Some(v2)) => Ok(Some(v2)),
+        (Some(_), Some(_)) => Err(
+            "Invalid edge tool request: runtime_file_transfer and runtime_file_transfer_v2 are mutually exclusive",
+        ),
+    }
+}
+
+fn rejected_tool_message(
+    request_id: String,
+    identity: astra_turn_types::ToolInvocationIdentity,
+    delivery_generation: u64,
+    message: impl Into<String>,
+) -> EdgeClientMessage {
+    DurableEdgeResult::from_tool_result(astra_tools::ToolResult::error(message.into()), 0)
+        .client_message(request_id, identity, delivery_generation)
+}
+
 struct InFlightEdgeInvocation {
     generation: u64,
     cancel: CancellationToken,
@@ -472,6 +502,9 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
     if managed_file_transfer_supported {
         advertisement["protocol_capabilities"]
             [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY] =
+            Value::Bool(true);
+        advertisement["protocol_capabilities"]
+            [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY] =
             Value::Bool(true);
     }
     advertisement
@@ -1044,9 +1077,47 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 tool,
                                 args: tool_args,
                                 runtime_file_transfer,
+                                runtime_file_transfer_v2,
                                 runtime_filesystem_boundary,
                                 timeout_secs,
                             }) => {
+                                let runtime_file_transfer = match decode_runtime_file_transfer(
+                                    runtime_file_transfer,
+                                    runtime_file_transfer_v2,
+                                ) {
+                                    Ok(context) => context,
+                                    Err(message) => {
+                                        let message = rejected_tool_message(
+                                            request_id,
+                                            *identity,
+                                            delivery_generation,
+                                            message,
+                                        );
+                                        write
+                                            .send(Message::Text(
+                                                serde_json::to_string(&message)?.into(),
+                                            ))
+                                            .await?;
+                                        continue;
+                                    }
+                                };
+                                if let Err(message) = runtime_file_transfer::validate_connected_edge_workspace(
+                                    runtime_file_transfer.as_deref(),
+                                    executor.workspace_root(),
+                                ) {
+                                    let message = rejected_tool_message(
+                                        request_id,
+                                        *identity,
+                                        delivery_generation,
+                                        message,
+                                    );
+                                    write
+                                        .send(Message::Text(
+                                            serde_json::to_string(&message)?.into(),
+                                        ))
+                                        .await?;
+                                    continue;
+                                }
                                 let execution_permit = execution_budget.try_acquire();
                                 match journal
                                     .prepare(
@@ -1062,7 +1133,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     Ok(PrepareOutcome::Replay(result)) => {
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1096,7 +1167,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         .with_journal_status(&journal_status);
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1111,7 +1182,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         );
                                         let message = result.client_message(
                                             request_id,
-                                            identity,
+                                            *identity,
                                             delivery_generation,
                                         );
                                         write.send(Message::Text(serde_json::to_string(&message)?.into())).await?;
@@ -1391,7 +1462,8 @@ async fn main() {
 mod tests {
     use super::*;
     use astra_server_types::edge_ws_protocol::{
-        RuntimeFileTransferAttachment, RuntimeFileTransferContext,
+        RuntimeFileTransferAttachment, RuntimeFileTransferContext, RuntimeFileTransferContextV2,
+        RuntimeFileTransferLayout,
     };
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -1434,6 +1506,209 @@ mod tests {
         tracker.begin("request-1", next_generation).unwrap();
         assert!(!tracker.finish_if_current("request-1", generation));
         assert!(tracker.finish_if_current("request-1", next_generation));
+    }
+
+    fn transfer_context_v1() -> RuntimeFileTransferContext {
+        RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".into(),
+            authorization: "Bearer runtime-grant".into(),
+            task_id: "task-1".into(),
+            workspace_root: "/sandbox".into(),
+            root: "/sandbox/.moi/runtime/task-1".into(),
+            catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".into(),
+            session_dir: "/sandbox/.moi/sessions/session-1".into(),
+            scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".into(),
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        }
+    }
+
+    fn transfer_context_v2() -> RuntimeFileTransferContextV2 {
+        RuntimeFileTransferContextV2 {
+            endpoint_url: "https://moi.example/runtime-files".into(),
+            authorization: "Bearer runtime-grant".into(),
+            workspace_root: "/sandbox".into(),
+            layout: RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/sandbox/.moi".into(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn managed_file_transfer_wire_versions_are_mutually_exclusive() {
+        assert!(matches!(decode_runtime_file_transfer(None, None), Ok(None)));
+        assert!(matches!(
+            decode_runtime_file_transfer(Some(Box::new(transfer_context_v1())), None),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            decode_runtime_file_transfer(None, Some(Box::new(transfer_context_v2()))),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            decode_runtime_file_transfer(
+                Some(Box::new(transfer_context_v1())),
+                Some(Box::new(transfer_context_v2())),
+            ),
+            Err(
+                "Invalid edge tool request: runtime_file_transfer and runtime_file_transfer_v2 are mutually exclusive"
+            )
+        ));
+    }
+
+    #[tokio::test]
+    async fn websocket_receive_loop_rejects_v2_transfer_context_for_other_edge_workspace() {
+        let temp = tempfile::tempdir().expect("temporary edge workspace");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create edge workspace");
+        let workspace = workspace
+            .canonicalize()
+            .expect("canonicalize edge workspace");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind websocket test server");
+        let address = listener.local_addr().expect("websocket server address");
+        let journal_root = temp.path().join("state");
+        let journal_path = edge_invocation_journal_path_in_root(
+            "edge-test",
+            &workspace,
+            Some(journal_root.clone()),
+        );
+        let mismatched_context = RuntimeFileTransferContextV2 {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer runtime-grant".to_string(),
+            workspace_root: "/another-edge/.moi".to_string(),
+            layout: RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/another-edge/.moi".to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        };
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept edge connection");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("upgrade edge websocket");
+            let auth = websocket
+                .next()
+                .await
+                .expect("edge auth frame")
+                .expect("edge auth");
+            assert!(matches!(auth, Message::Text(_)));
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::AuthOk {
+                        user_id: "user-1".to_string(),
+                    })
+                    .expect("encode auth ok")
+                    .into(),
+                ))
+                .await
+                .expect("send auth ok");
+
+            for (index, tool) in ["bash", "materialize_attachment", "publish_artifact"]
+                .into_iter()
+                .enumerate()
+            {
+                let identity = astra_turn_types::ToolInvocationIdentity::new(
+                    "user-1",
+                    "session-1",
+                    "run-1",
+                    "turn-1",
+                    format!("call-{index}"),
+                )
+                .expect("complete invocation identity");
+                let args = match tool {
+                    "bash" => json!({"command": "true"}),
+                    "materialize_attachment" => json!({"file_id": "file-1"}),
+                    "publish_artifact" => json!({"path": "report.txt"}),
+                    _ => unreachable!(),
+                };
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&EdgeServerMessage::ToolRequest {
+                            request_id: identity.storage_key(),
+                            identity: Box::new(identity.clone()),
+                            delivery_generation: 1,
+                            tool: tool.to_string(),
+                            args,
+                            runtime_file_transfer: None,
+                            runtime_file_transfer_v2: Some(Box::new(mismatched_context.clone())),
+                            runtime_filesystem_boundary: None,
+                            timeout_secs: 10,
+                        })
+                        .expect("encode tool request")
+                        .into(),
+                    ))
+                    .await
+                    .expect("send tool request");
+
+                loop {
+                    let frame = websocket
+                        .next()
+                        .await
+                        .expect("edge result frame")
+                        .expect("edge result");
+                    let Message::Text(text) = frame else {
+                        continue;
+                    };
+                    match serde_json::from_str::<EdgeClientMessage>(&text)
+                        .expect("decode edge result")
+                    {
+                        EdgeClientMessage::ToolResult {
+                            request_id,
+                            output,
+                            is_error,
+                            ..
+                        } if request_id == identity.storage_key() => {
+                            assert!(is_error, "{tool} must be rejected before execution");
+                            assert!(
+                                output.contains("does not match the connected Edge workspace"),
+                                "unexpected {tool} rejection: {output}"
+                            );
+                            break;
+                        }
+                        EdgeClientMessage::Ping | EdgeClientMessage::Auth { .. } => {}
+                        EdgeClientMessage::ToolResult { .. } => {}
+                    }
+                }
+            }
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&EdgeServerMessage::Closing {
+                        reason: "test complete".to_string(),
+                    })
+                    .expect("encode closing")
+                    .into(),
+                ))
+                .await
+                .expect("close edge connection");
+        });
+
+        let config = EdgeConfig {
+            server_url: format!("ws://{address}/edge/ws"),
+            token_manager: token_manager::TokenManager::new(
+                "test-token".to_string(),
+                None,
+                temp.path().join("edge-token"),
+            ),
+            workspace_dir: workspace,
+            edge_id: "edge-test".to_string(),
+            reconnect: false,
+            invocation_journal_root: Some(journal_root),
+        };
+
+        run_edge_connection(&config)
+            .await
+            .expect("edge websocket transfer loop");
+        server.await.expect("websocket test server");
+        assert!(
+            !journal_path.exists(),
+            "mismatched contexts must be rejected before journal admission"
+        );
     }
 
     #[test]
@@ -1527,6 +1802,8 @@ mod tests {
             .expect("bind websocket test server");
         let address = listener.local_addr().expect("websocket server address");
         let expected_catalog_file = transfer_root.join("catalog/000000-input.txt");
+        // This simulates an older server: the current Edge must continue to
+        // consume the frozen V1 wire payload during a rolling upgrade.
         let transfer_context = RuntimeFileTransferContext {
             endpoint_url: format!("{}/api/v1/runtime-files", runtime_files.uri()),
             authorization: "Bearer runtime-grant".to_string(),
@@ -1589,11 +1866,12 @@ mod tests {
 
             let request = EdgeServerMessage::ToolRequest {
                 request_id: identity.storage_key(),
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
                 delivery_generation: 1,
                 tool: "materialize_attachment".to_string(),
                 args: json!({"file_id": "file-1"}),
                 runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                runtime_file_transfer_v2: None,
                 runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                 timeout_secs: 10,
             };
@@ -1653,11 +1931,12 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: write_identity.storage_key(),
-                        identity: write_identity.clone(),
+                        identity: Box::new(write_identity.clone()),
                         delivery_generation: 1,
                         tool: "write_file".to_string(),
                         args: json!({"path": "report.txt", "content": "protocol report"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -1696,11 +1975,12 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: publish_identity.storage_key(),
-                        identity: publish_identity.clone(),
+                        identity: Box::new(publish_identity.clone()),
                         delivery_generation: 1,
                         tool: "publish_artifact".to_string(),
                         args: json!({"path": "report.txt"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -1728,6 +2008,16 @@ mod tests {
                                 .and_then(Value::as_str),
                             Some("published-1")
                         );
+                        assert_eq!(
+                            tool_result_fields
+                                .as_ref()
+                                .and_then(|fields| fields.get("artifacts"))
+                                .and_then(Value::as_array)
+                                .and_then(|artifacts| artifacts.first())
+                                .and_then(|artifact| artifact.get("artifact_id"))
+                                .and_then(Value::as_str),
+                            Some("published-1")
+                        );
                         break;
                     }
                     EdgeClientMessage::Ping | EdgeClientMessage::Auth { .. } => {}
@@ -1747,11 +2037,12 @@ mod tests {
                 .send(Message::Text(
                     serde_json::to_string(&EdgeServerMessage::ToolRequest {
                         request_id: denied_identity.storage_key(),
-                        identity: denied_identity.clone(),
+                        identity: Box::new(denied_identity.clone()),
                         delivery_generation: 1,
                         tool: "materialize_attachment".to_string(),
                         args: json!({"file_id": "file-1"}),
                         runtime_file_transfer: None,
+                        runtime_file_transfer_v2: None,
                         runtime_filesystem_boundary: None,
                         timeout_secs: 10,
                     })
@@ -1883,6 +2174,11 @@ mod tests {
         assert_eq!(
             value["protocol_capabilities"]
                 [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
+            true
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY],
             true
         );
     }

@@ -9,13 +9,104 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
+use sqlx::{MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
 
 pub mod history_work;
 pub mod history_work_baseline;
 pub mod identity;
 pub mod local_state;
 pub mod work_unit;
+
+/// Give MatrixOne a distinct prepared-statement identity for each nullable
+/// parameter shape used by one SQL statement.
+///
+/// MatrixOne 4.2 can retain a `NULL` bit from the first execution of a cached
+/// prepared statement. Reusing that statement with a non-`NULL` value in the
+/// same position then stores `NULL`. MatrixOne 4.1.4 accepts the distinct SQL
+/// identities as normal statements, so this preserves one write contract on
+/// both versions without disabling prepared-statement caching globally.
+pub fn matrixone_statement_with_null_shape(
+    sql: &str,
+    nullable_values_present: impl IntoIterator<Item = bool>,
+) -> String {
+    let mut statement = String::with_capacity(sql.len() + 48);
+    statement.push_str(sql);
+    statement.push_str(&matrixone_null_shape_comment(nullable_values_present));
+    statement
+}
+
+/// Return the MatrixOne prepared-statement discriminator used by dynamic SQL
+/// builders after all bind parameters have been appended.
+pub fn matrixone_null_shape_comment(
+    nullable_values_present: impl IntoIterator<Item = bool>,
+) -> String {
+    let mut comment = String::from(" /* astra-null-shape:");
+    for present in nullable_values_present {
+        comment.push(if present { '1' } else { '0' });
+    }
+    comment.push_str(" */");
+    comment
+}
+
+/// Append a parameterized one-column string relation for joins against a
+/// bounded in-memory identity set.
+///
+/// MatrixOne 4.2 can return only a prefix of matching rows for a prepared
+/// `IN (?, ...)` predicate across joins. A derived `UNION ALL` relation keeps
+/// every value bound and returns the complete result on both 4.1.4 and 4.2.
+pub fn push_matrixone_bound_string_set<'args>(
+    query: &mut QueryBuilder<'args, MySql>,
+    values: impl IntoIterator<Item = &'args str>,
+) {
+    query.push("(");
+    for (index, value) in values.into_iter().enumerate() {
+        if index > 0 {
+            query.push(" UNION ALL ");
+        }
+        query
+            .push("SELECT CAST(")
+            .push_bind(value)
+            .push(" AS CHAR) AS value");
+    }
+    query.push(")");
+}
+
+#[cfg(test)]
+mod matrixone_statement_tests {
+    use super::{
+        matrixone_null_shape_comment, matrixone_statement_with_null_shape,
+        push_matrixone_bound_string_set,
+    };
+    use sqlx::{MySql, QueryBuilder};
+
+    #[test]
+    fn nullable_shapes_produce_stable_distinct_statement_identities() {
+        let sql = "INSERT INTO records (optional_a, optional_b) VALUES (?, ?)";
+        assert_eq!(
+            matrixone_statement_with_null_shape(sql, [false, true]),
+            format!("{sql} /* astra-null-shape:01 */")
+        );
+        assert_eq!(
+            matrixone_null_shape_comment([true, false]),
+            " /* astra-null-shape:10 */"
+        );
+        assert_ne!(
+            matrixone_statement_with_null_shape(sql, [false, true]),
+            matrixone_statement_with_null_shape(sql, [true, false])
+        );
+    }
+
+    #[test]
+    fn bound_string_set_uses_a_parameterized_derived_relation() {
+        let mut query = QueryBuilder::<MySql>::new("SELECT requested.value FROM ");
+        push_matrixone_bound_string_set(&mut query, ["a", "b"]);
+        query.push(" AS requested");
+        assert_eq!(
+            query.sql(),
+            "SELECT requested.value FROM (SELECT CAST(? AS CHAR) AS value UNION ALL SELECT CAST(? AS CHAR) AS value) AS requested"
+        );
+    }
+}
 
 pub mod canonical_names;
 #[cfg(any(test, feature = "dev-defaults"))]

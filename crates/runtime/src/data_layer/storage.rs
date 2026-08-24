@@ -8,6 +8,7 @@ use sqlx::{MySql, query};
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
 };
+use astra_core::matrixone_statement_with_null_shape;
 use astra_turn_core::contracts::{
     TurnCoreEventRecord, TurnDecisionAuditRecord, TurnSkillSelectionRecord, TurnToolEventRecord,
 };
@@ -51,6 +52,31 @@ struct TraceEventInsertValues {
     token_total: Option<i64>,
     metadata_json: String,
     created_at: String,
+}
+
+impl TraceEventInsertValues {
+    fn nullable_shape(&self, event: &TraceEvent) -> [bool; 18] {
+        [
+            event.content.is_some(),
+            event.parent_event_id.is_some(),
+            event.causal_chain_id.is_some(),
+            event.run_id.is_some(),
+            event.parent_run_id.is_some(),
+            event.turn_id.is_some(),
+            event.turn_seq.is_some(),
+            event.round_index.is_some(),
+            event.tool_call_id.is_some(),
+            event.parent_agent_id.is_some(),
+            self.token_usage_json.is_some(),
+            event.llm_model_used.is_some(),
+            event.reasoning_content.is_some(),
+            self.token_input.is_some(),
+            self.token_output.is_some(),
+            self.token_total.is_some(),
+            event.meta_tool_name.is_some(),
+            event.meta_duration_ms.is_some(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,7 +216,7 @@ pub(crate) async fn insert_trace_event(
     event: &TraceEvent,
 ) -> Result<bool, sqlx::Error> {
     let values = trace_event_insert_values(event)?;
-    let result = query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, run_id, parent_run_id, turn_id, turn_seq, \
@@ -198,36 +224,38 @@ pub(crate) async fn insert_trace_event(
           llm_model_used, reasoning_content, token_input, token_output, token_total, \
           meta_tool_name, meta_duration_ms, metadata, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&event.event_id)
-    .bind(&event.session_id)
-    .bind(&event.user_id)
-    .bind(event.agent_id.as_deref().unwrap_or("astra-server"))
-    .bind(env!("CARGO_PKG_VERSION"))
-    .bind(&event.event_type)
-    .bind(&event.content)
-    .bind(&event.parent_event_id)
-    .bind(&event.causal_chain_id)
-    .bind(&event.run_id)
-    .bind(&event.parent_run_id)
-    .bind(&event.turn_id)
-    .bind(event.turn_seq)
-    .bind(event.round_index)
-    .bind(&event.tool_call_id)
-    .bind(&event.parent_agent_id)
-    .bind(&event.trace_kind)
-    .bind(values.token_usage_json)
-    .bind(&event.llm_model_used)
-    .bind(&event.reasoning_content)
-    .bind(values.token_input)
-    .bind(values.token_output)
-    .bind(values.token_total)
-    .bind(&event.meta_tool_name)
-    .bind(event.meta_duration_ms)
-    .bind(values.metadata_json)
-    .bind(values.created_at)
-    .execute(&mut **tx)
-    .await?;
+        values.nullable_shape(event),
+    );
+    let result = query(&insert_sql)
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.user_id)
+        .bind(event.agent_id.as_deref().unwrap_or("astra-server"))
+        .bind(env!("CARGO_PKG_VERSION"))
+        .bind(&event.event_type)
+        .bind(&event.content)
+        .bind(&event.parent_event_id)
+        .bind(&event.causal_chain_id)
+        .bind(&event.run_id)
+        .bind(&event.parent_run_id)
+        .bind(&event.turn_id)
+        .bind(event.turn_seq)
+        .bind(event.round_index)
+        .bind(&event.tool_call_id)
+        .bind(&event.parent_agent_id)
+        .bind(&event.trace_kind)
+        .bind(values.token_usage_json)
+        .bind(&event.llm_model_used)
+        .bind(&event.reasoning_content)
+        .bind(values.token_input)
+        .bind(values.token_output)
+        .bind(values.token_total)
+        .bind(&event.meta_tool_name)
+        .bind(event.meta_duration_ms)
+        .bind(values.metadata_json)
+        .bind(values.created_at)
+        .execute(&mut **tx)
+        .await?;
     let inserted = result.rows_affected() > 0;
     if inserted {
         insert_agent_event_edges(
@@ -252,7 +280,22 @@ pub(crate) async fn insert_core_turn_event(
     event: &TurnCoreEventRecord,
 ) -> Result<bool, sqlx::Error> {
     let values = core_turn_event_insert_values(event)?;
-    let result = query(INSERT_CORE_TURN_EVENT_SQL)
+    let insert_sql = matrixone_statement_with_null_shape(
+        INSERT_CORE_TURN_EVENT_SQL,
+        [
+            event.parent_event_id.is_some(),
+            event.run_id.is_some(),
+            values.turn_seq.is_some(),
+            values.token_usage_json.is_some(),
+            event.llm_model_used.is_some(),
+            values.llm_params_json.is_some(),
+            event.reasoning_content.is_some(),
+            values.token_input.is_some(),
+            values.token_output.is_some(),
+            values.token_total.is_some(),
+        ],
+    );
+    let result = query(&insert_sql)
         .bind(&event.event_id)
         .bind(&event.session_id)
         .bind(&event.user_id)
@@ -293,42 +336,58 @@ pub(crate) async fn insert_tool_turn_event(
     event: &TurnToolEventRecord,
     skill_version: Option<&String>,
 ) -> Result<bool, sqlx::Error> {
-    let result = query(
+    let run_id = event
+        .run_id
+        .clone()
+        .or_else(|| metadata_string(event.metadata.as_ref(), "run_id"));
+    let tool_call_id = event
+        .tool_call_id
+        .clone()
+        .or_else(|| metadata_tool_call_id(event.metadata.as_ref()));
+    let metadata_json = event.metadata.as_ref().map(serde_json::Value::to_string);
+    let skill_version = skill_version
+        .cloned()
+        .or_else(|| event.skill_version.clone());
+    let meta_tool_name = metadata_tool_name(event.metadata.as_ref());
+    let meta_duration_ms = metadata_duration_ms(event.metadata.as_ref());
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT IGNORE INTO agent_events \
          (event_id, session_id, user_id, agent_id, agent_version, event_type, content, \
           parent_event_id, causal_chain_id, run_id, tool_call_id, metadata, skill_name, skill_version, reasoning_content, \
           meta_tool_name, meta_duration_ms, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
-    )
-    .bind(&event.event_id)
-    .bind(&event.session_id)
-    .bind(&event.user_id)
-    .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
-    .bind(env!("CARGO_PKG_VERSION"))
-    .bind(&event.event_type)
-    .bind(&event.content)
-    .bind(&event.parent_event_id)
-    .bind(&event.causal_chain_id)
-    .bind(
-        event
-            .run_id
-            .clone()
-            .or_else(|| metadata_string(event.metadata.as_ref(), "run_id")),
-    )
-    .bind(
-        event
-            .tool_call_id
-            .clone()
-            .or_else(|| metadata_tool_call_id(event.metadata.as_ref())),
-    )
-    .bind(event.metadata.as_ref().map(serde_json::Value::to_string))
-    .bind(&event.skill_name)
-    .bind(skill_version.cloned().or_else(|| event.skill_version.clone()))
-    .bind(&event.reasoning_content)
-    .bind(metadata_tool_name(event.metadata.as_ref()))
-    .bind(metadata_duration_ms(event.metadata.as_ref()))
-    .execute(&mut **tx)
-    .await?;
+        [
+            event.parent_event_id.is_some(),
+            run_id.is_some(),
+            tool_call_id.is_some(),
+            metadata_json.is_some(),
+            event.skill_name.is_some(),
+            skill_version.is_some(),
+            event.reasoning_content.is_some(),
+            meta_tool_name.is_some(),
+            meta_duration_ms.is_some(),
+        ],
+    );
+    let result = query(&insert_sql)
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.user_id)
+        .bind(event.agent_id.as_deref().unwrap_or("astra-cli"))
+        .bind(env!("CARGO_PKG_VERSION"))
+        .bind(&event.event_type)
+        .bind(&event.content)
+        .bind(&event.parent_event_id)
+        .bind(&event.causal_chain_id)
+        .bind(run_id)
+        .bind(tool_call_id)
+        .bind(metadata_json)
+        .bind(&event.skill_name)
+        .bind(skill_version)
+        .bind(&event.reasoning_content)
+        .bind(meta_tool_name)
+        .bind(meta_duration_ms)
+        .execute(&mut **tx)
+        .await?;
     let inserted = result.rows_affected() > 0;
     if inserted {
         insert_agent_event_edges(
@@ -372,6 +431,7 @@ mod tests {
         INSERT_CORE_TURN_EVENT_SQL, core_turn_event_insert_values, metadata_string,
         metadata_tool_name, trace_event_insert_values,
     };
+    use astra_core::matrixone_statement_with_null_shape;
     use astra_turn_core::contracts::TurnCoreEventRecord;
     use astra_turn_core::trace_event::TraceEvent;
 
@@ -500,6 +560,32 @@ mod tests {
         assert_eq!(persisted["cache_read"], 4);
         assert_eq!(persisted["cache_write"], 3);
         assert_eq!(persisted["total"], 22);
+    }
+
+    #[test]
+    fn trace_event_statement_identity_includes_causal_chain_nullness() {
+        let mut event = TraceEvent::new(
+            "trace-shape",
+            "session-1",
+            "user-1",
+            "platform_event",
+            "platform",
+        );
+        let without_chain = trace_event_insert_values(&event).unwrap();
+        let without_chain_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO agent_events VALUES (?)",
+            without_chain.nullable_shape(&event),
+        );
+
+        event.causal_chain_id = Some("chain-1".to_string());
+        let with_chain = trace_event_insert_values(&event).unwrap();
+        let with_chain_sql = matrixone_statement_with_null_shape(
+            "INSERT INTO agent_events VALUES (?)",
+            with_chain.nullable_shape(&event),
+        );
+
+        assert_ne!(without_chain_sql, with_chain_sql);
+        assert!(with_chain_sql.contains("astra-null-shape:001"));
     }
 
     #[test]

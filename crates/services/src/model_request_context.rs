@@ -899,11 +899,11 @@ pub async fn aggregate_model_request_metrics(
 ) -> ServiceResult<Vec<ModelRequestMetricsRow>> {
     let rows = sqlx::query(
         "SELECT topology, provider, model_family, purpose, terminal_status,
-                COALESCE(SUM(requests), 0) AS requests,
-                COALESCE(SUM(input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(output_tokens), 0) AS output_tokens,
-                COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
-                COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens
+                CAST(COALESCE(SUM(requests), 0) AS SIGNED) AS requests,
+                CAST(COALESCE(SUM(input_tokens), 0) AS SIGNED) AS input_tokens,
+                CAST(COALESCE(SUM(output_tokens), 0) AS SIGNED) AS output_tokens,
+                CAST(COALESCE(SUM(cache_read_tokens), 0) AS SIGNED) AS cache_read_tokens,
+                CAST(COALESCE(SUM(cache_creation_tokens), 0) AS SIGNED) AS cache_creation_tokens
          FROM model_request_metric_shards
          GROUP BY topology, provider, model_family, purpose, terminal_status
          ORDER BY topology, provider, model_family, purpose, terminal_status",
@@ -942,9 +942,9 @@ pub async fn model_request_trace_coverage(
 ) -> ServiceResult<ModelRequestTraceCoverage> {
     let row = sqlx::query(
         "SELECT
-            SUM(CASE WHEN accepted.event_stage = 'accepted' THEN 1 ELSE 0 END)
+            CAST(SUM(CASE WHEN accepted.event_stage = 'accepted' THEN 1 ELSE 0 END) AS SIGNED)
                 AS accepted_requests,
-            SUM(CASE WHEN terminal.event_stage = 'terminal' THEN 1 ELSE 0 END)
+            CAST(SUM(CASE WHEN terminal.event_stage = 'terminal' THEN 1 ELSE 0 END) AS SIGNED)
                 AS terminal_requests
          FROM model_request_context_events AS accepted
          LEFT JOIN model_request_context_events AS terminal

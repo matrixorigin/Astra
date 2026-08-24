@@ -1,5 +1,8 @@
 use crate::db_row::RowExt as PromptDeltaDbRow;
-use astra_core::SharedPool;
+use astra_core::{
+    SharedPool, matrixone_null_shape_comment, matrixone_statement_with_null_shape,
+    push_matrixone_bound_string_set,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -719,13 +722,19 @@ pub async fn persist_prompt_request(
     });
 
     let write_result: Result<(), String> = async {
-        sqlx::query(
+        let request_insert_sql = matrixone_statement_with_null_shape(
             "INSERT INTO prompt_request_records
              (request_id, session_id, user_id, run_id, turn, round, attempt, source,
               model, provider, max_output_tokens, message_count, tool_count,
               previous_request_id, request_hash, summary_json, created_at, created_at_unix_ms)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), UNIX_TIMESTAMP(NOW(6)) * 1000)",
-        )
+            [
+                input.run_id.is_some(),
+                plan.max_output_tokens.is_some(),
+                previous_request_id.is_some(),
+            ],
+        );
+        sqlx::query(&request_insert_sql)
         .bind(&plan.request_id)
         .bind(&input.session_id)
         .bind(&input.user_id)
@@ -1150,20 +1159,18 @@ async fn load_request_chunks(
            ON request.user_id = delta.user_id
           AND request.session_id = delta.session_id
           AND request.request_id = delta.request_id
-         WHERE delta.user_id = ",
+         INNER JOIN ",
+    );
+    push_matrixone_bound_string_set(
+        &mut query,
+        chain.iter().map(|(request_id, _, _)| request_id.as_str()),
     );
     query
+        .push(" AS selected_request ON selected_request.value = delta.request_id")
+        .push(" WHERE delta.user_id = ")
         .push_bind(&input.user_id)
         .push(" AND delta.session_id = ")
-        .push_bind(&input.session_id)
-        .push(" AND delta.request_id IN (");
-    {
-        let mut separated = query.separated(", ");
-        for (request_id, _, _) in &chain {
-            separated.push_bind(request_id);
-        }
-    }
-    query.push(")");
+        .push_bind(&input.session_id);
     let rows = query
         .build()
         .fetch_all(&mut *connection)
@@ -1311,6 +1318,20 @@ async fn insert_prompt_delta_batch(
                     .and_then(|value| i64::try_from(value).ok()),
             );
     });
+    query.push(matrixone_null_shape_comment(deltas.iter().flat_map(
+        |delta| {
+            [
+                delta.reuse_count.is_some(),
+                delta.chunk_id.is_some(),
+                delta.chunk_hash.is_some(),
+                delta.previous_chunk_hash.is_some(),
+                delta.chunk_tokens.is_some(),
+                delta.chunk_bytes.is_some(),
+                delta.previous_chunk_tokens.is_some(),
+                delta.previous_chunk_bytes.is_some(),
+            ]
+        },
+    )));
     query
         .build()
         .execute(&mut **tx)

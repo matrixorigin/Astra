@@ -25,6 +25,7 @@
 //!   — never UPDATE, never DELETE.
 
 use crate::state::PlanModeState;
+use astra_core::matrixone_statement_with_null_shape;
 use astra_services::task_orchestrator::TaskStatus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -527,24 +528,26 @@ impl PlanRepository for CloudPlanRepository {
                 let plan_json = serde_json::to_string(state)
                     .map_err(|e| PlanLoadError::Internal(e.to_string()))?;
                 let subtask_count = state.plan.subtasks.len() as i32;
-                let res = sqlx::query(
+                let insert_sql = matrixone_statement_with_null_shape(
                     "INSERT INTO plans \
                          (plan_id, user_id, session_id, goal, phase, version, plan_json, plan_md, \
                           progress_pct, subtask_count, created_by, created_at, updated_at) \
                      VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
-                )
-                .bind(plan_id)
-                .bind(user_id)
-                .bind(state.session_hint.as_deref())
-                .bind(&goal)
-                .bind(phase)
-                .bind(&plan_json)
-                .bind(state.plan_md.as_deref())
-                .bind(progress)
-                .bind(subtask_count)
-                .bind(user_id)
-                .execute(&self.pool)
-                .await;
+                    [state.session_hint.is_some(), state.plan_md.is_some()],
+                );
+                let res = sqlx::query(&insert_sql)
+                    .bind(plan_id)
+                    .bind(user_id)
+                    .bind(state.session_hint.as_deref())
+                    .bind(&goal)
+                    .bind(phase)
+                    .bind(&plan_json)
+                    .bind(state.plan_md.as_deref())
+                    .bind(progress)
+                    .bind(subtask_count)
+                    .bind(user_id)
+                    .execute(&self.pool)
+                    .await;
                 match res {
                     Ok(_) => Ok(()),
                     Err(sqlx::Error::Database(db_err))
