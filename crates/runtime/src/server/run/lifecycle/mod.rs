@@ -856,6 +856,13 @@ fn should_restore_prior_prompt_history(
     request_targets_existing_session && session_has_prior_prompt_history
 }
 
+fn should_build_session_resume_hydration_hint(
+    restore_prior_prompt_history: bool,
+    prompt_message_count: usize,
+) -> bool {
+    restore_prior_prompt_history && prompt_message_count <= 1
+}
+
 fn task_board_settlement_payload(
     snapshot: &crate::turn::agentic_loop::host::TaskBoardSnapshot,
 ) -> Option<Value> {
@@ -9011,18 +9018,8 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             self.session_has_prior_prompt_history(&user_id, &session_id)
                 .await,
         );
-        let session_resume_hint = self
-            .session_resume_hydration_hint_for_session(
-                &user_id,
-                &session_id,
-                &run_id,
-                restore_prior_prompt_history,
-            )
-            .await;
-        let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
-            session_resume_hint,
-            plan_resume_snapshot.prompt_hint,
-        );
+        let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
+        let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
         let task_board_resume_hint = self
             .task_board_resume_hint_for_session(&user_id, &session_id)
@@ -9201,6 +9198,23 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
+
+        if should_build_session_resume_hydration_hint(
+            restore_prior_prompt_history,
+            loop_state.messages.len(),
+        ) {
+            let session_resume_hint = self
+                .session_resume_hydration_hint_for_session(&user_id, &session_id, &run_id, true)
+                .await;
+            let merged_hint = astra_turn_core::resume_hydration::merge_resume_hints(
+                session_resume_hint,
+                plan_snapshot_resume_hint,
+            );
+            match host.plan_resume_hint_handle().write() {
+                Ok(mut hint) => *hint = merged_hint,
+                Err(poisoned) => *poisoned.into_inner() = merged_hint,
+            }
+        }
 
         self.configure_loop_state_runtime_controls(
             &mut loop_state,
@@ -10613,7 +10627,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &user_id,
                 &session_id,
                 &run_id,
-                restore_prior_prompt_history,
+                should_build_session_resume_hydration_hint(
+                    restore_prior_prompt_history,
+                    state.messages.len(),
+                ),
             )
             .await;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(

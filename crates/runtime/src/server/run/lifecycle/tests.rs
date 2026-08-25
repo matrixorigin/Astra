@@ -3507,6 +3507,16 @@ fn resume_hydration_requires_existing_session_with_prior_prompt_history() {
     );
 }
 
+#[test]
+fn session_resume_hydration_hint_is_only_needed_without_restored_prompt_messages() {
+    assert!(should_build_session_resume_hydration_hint(true, 1));
+    assert!(
+        !should_build_session_resume_hydration_hint(true, 3),
+        "restored user/assistant history already carries the resume context"
+    );
+    assert!(!should_build_session_resume_hydration_hint(false, 1));
+}
+
 #[tokio::test]
 async fn server_resume_hydration_failure_is_not_prompt_facing() {
     let service = test_service();
