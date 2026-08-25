@@ -10560,14 +10560,24 @@ async fn request_scoped_runtime_skill_resolver_is_installed_from_provider_capabi
 }
 
 #[tokio::test]
-async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
+async fn agent_binding_runtime_discovers_descriptor_capabilities_concurrently() {
     use axum::{Router, extract::State, http::HeaderMap, routing::post};
-    use tokio::sync::Mutex;
+    use tokio::sync::{Barrier, Mutex};
 
-    #[derive(Default)]
     struct Capture {
         mcp_authorization: Mutex<Option<String>>,
         skill_authorization: Mutex<Option<String>>,
+        discovery_barrier: Barrier,
+    }
+
+    impl Default for Capture {
+        fn default() -> Self {
+            Self {
+                mcp_authorization: Mutex::new(None),
+                skill_authorization: Mutex::new(None),
+                discovery_barrier: Barrier::new(2),
+            }
+        }
     }
 
     async fn mcp_handler(
@@ -10579,6 +10589,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        capture.discovery_barrier.wait().await;
         Json(json!({
             "jsonrpc": "2.0",
             "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -10595,6 +10606,7 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             .get(reqwest::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
+        capture.discovery_barrier.wait().await;
         Json(json!({
             "jsonrpc": "2.0",
             "id": body.get("id").cloned().unwrap_or(Value::Null),
@@ -10657,10 +10669,13 @@ async fn agent_binding_runtime_ignores_legacy_endpoint_urls() {
             file_transfer: None,
         });
 
-    let capabilities = service
-        .prepare_runtime_capabilities(&request, &RequestConstraints::default())
-        .await
-        .expect("agent binding descriptors should prepare capabilities");
+    let capabilities = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.prepare_runtime_capabilities(&request, &RequestConstraints::default()),
+    )
+    .await
+    .expect("MCP and skill discovery must overlap")
+    .expect("agent binding descriptors should prepare capabilities");
 
     assert!(capabilities.mcp_bundle.is_some());
     assert!(capabilities.agent_binding.is_some());

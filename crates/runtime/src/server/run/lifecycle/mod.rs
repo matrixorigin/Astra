@@ -4142,25 +4142,13 @@ impl AgenticRunLifecycleService {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn wire_server_dynamic_agent_tools(
+    async fn restore_server_dynamic_agents(
         &self,
-        executor: &mut runtime_tool_executor::RuntimeToolExecutor,
+        entry: &ServerAgentSpawnerEntry,
         user_id: &str,
         session_id: &str,
-        run_id: &str,
-        turn_seq: u32,
-        request: &ChatRequestData,
-        workspace: &std::path::Path,
-        work_surface_event_tx: Option<mpsc::Sender<Value>>,
-        work_surface_gap_tracker: Option<WorkSurfaceAgentLiveGapTracker>,
-        pause_flag: Option<Arc<AtomicBool>>,
-        cancel_token: Option<Arc<CancellationToken>>,
-        #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
-    ) -> Arc<astra_core::work_unit::ActiveWorkRegistry> {
-        let entry = self
-            .server_agent_spawner_for_session(user_id, session_id)
-            .await;
-        if let Err(error) = entry
+    ) -> Result<(), String> {
+        entry
             .durable_restore
             .get_or_try_init(|| async {
                 let reconciler = Arc::new(ServerDurableAgentReconciler {
@@ -4178,7 +4166,28 @@ impl AgenticRunLifecycleService {
                 Ok::<(), String>(())
             })
             .await
-        {
+            .copied()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn wire_server_dynamic_agent_tools(
+        &self,
+        entry: &ServerAgentSpawnerEntry,
+        durable_restore: Result<(), String>,
+        executor: &mut runtime_tool_executor::RuntimeToolExecutor,
+        user_id: &str,
+        session_id: &str,
+        run_id: &str,
+        turn_seq: u32,
+        request: &ChatRequestData,
+        workspace: &std::path::Path,
+        work_surface_event_tx: Option<mpsc::Sender<Value>>,
+        work_surface_gap_tracker: Option<WorkSurfaceAgentLiveGapTracker>,
+        pause_flag: Option<Arc<AtomicBool>>,
+        cancel_token: Option<Arc<CancellationToken>>,
+        #[cfg(feature = "harness")] harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
+    ) -> Arc<astra_core::work_unit::ActiveWorkRegistry> {
+        if let Err(error) = durable_restore {
             tracing::warn!(
                 %user_id,
                 %session_id,
@@ -4240,7 +4249,7 @@ impl AgenticRunLifecycleService {
             recursion_depth: 0,
             is_fork_child: false,
             working_dir: workspace.to_path_buf(),
-            spawner: entry.spawner,
+            spawner: Arc::clone(&entry.spawner),
             inherited_permissions: Self::inherited_permissions_from_request(
                 request,
                 &request_constraints,
@@ -6164,24 +6173,29 @@ impl AgenticRunLifecycleService {
             skill_descriptor_id = %skill_descriptor.id,
             "resolved Agent Binding Set runtime capabilities"
         );
-        let bundle = runtime_mcp::prepare_agent_binding_mcp_bundle(
-            &mcp_descriptor.id,
-            &mcp_endpoint_url,
-            &runtime_auth.authorization,
-            mcp_descriptor.semantic_read.as_ref(),
-        )
-        .await?;
         let binding_ids = resolved
             .iter()
             .map(|binding| binding.binding.id.clone())
             .collect::<Vec<_>>();
-        let prepared_skills = agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
-            &skill_descriptor.id,
-            &skill_endpoint_url,
-            &runtime_auth.authorization,
-            &binding_ids,
-        )
-        .await?;
+        // Tool and skill discovery are independent reads from the same
+        // provider runtime. Keep binding validation ahead of both calls, then
+        // overlap their network latency before constructing the shared prompt.
+        let (bundle, prepared_skills) = tokio::join!(
+            runtime_mcp::prepare_agent_binding_mcp_bundle(
+                &mcp_descriptor.id,
+                &mcp_endpoint_url,
+                &runtime_auth.authorization,
+                mcp_descriptor.semantic_read.as_ref(),
+            ),
+            agent_binding_skill_runtime::prepare_agent_binding_skill_resolver(
+                &skill_descriptor.id,
+                &skill_endpoint_url,
+                &runtime_auth.authorization,
+                &binding_ids,
+            ),
+        );
+        let bundle = bundle?;
+        let prepared_skills = prepared_skills?;
         let skill_resolver =
             apply_normalized_skill_allowlist(prepared_skills.resolver, request_constraints)
                 .map_err(|detail| error_response(StatusCode::BAD_REQUEST, detail))?;
@@ -9368,8 +9382,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             ));
             host.set_execution_metadata(executor.binding_metadata());
 
+            let agent_spawner_entry = self
+                .server_agent_spawner_for_session(&user_id, &session_id)
+                .await;
+            let durable_agent_restore = self
+                .restore_server_dynamic_agents(&agent_spawner_entry, &user_id, &session_id)
+                .await;
             let active_work_registry = self
                 .wire_server_dynamic_agent_tools(
+                    &agent_spawner_entry,
+                    durable_agent_restore,
                     &mut executor,
                     &user_id,
                     &session_id,
@@ -10271,10 +10293,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             None
         };
-        let stream_agent_spawner = self
+        let stream_agent_spawner_entry = self
             .server_agent_spawner_for_session(&user_id, &session_id)
-            .await
-            .spawner;
+            .await;
+        let stream_agent_spawner = Arc::clone(&stream_agent_spawner_entry.spawner);
 
         // Network observer delivery is bounded. Internal producers are
         // drained independently below so browser backpressure cannot drop an
@@ -10499,16 +10521,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 agent_id: None,
                 event_tx: Some(event_tx.clone()),
             });
-        let canonical_turn = match self
-            .prepare_canonical_turn(
+        // The session-scoped durable-agent snapshot and canonical turn
+        // admission are independent database reads. Restore them together so
+        // first-turn recovery does not add another full round trip chain to
+        // SSE response-header latency.
+        let (canonical_turn, mut durable_agent_restore) = tokio::join!(
+            self.prepare_canonical_turn(
                 &user_id,
                 &session_id,
                 &run_id,
                 &request,
                 (*llm_cancel_token).clone(),
-            )
-            .await
-        {
+            ),
+            async {
+                if server_tool_executor_workspace.is_some() {
+                    Some(
+                        self.restore_server_dynamic_agents(
+                            &stream_agent_spawner_entry,
+                            &user_id,
+                            &session_id,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                }
+            },
+        );
+        let canonical_turn = match canonical_turn {
             Ok(admission) => admission,
             Err(error) => {
                 self.fail_started_run_before_spawn(
@@ -10558,8 +10598,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         state.harness.set_user_id(&user_id);
 
-        state.session_turn =
-            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
         if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
         {
@@ -10585,62 +10623,76 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
             });
 
-        // ── Runtime warm-start from step checkpoint ────────────────
-        let restore_prior_prompt_history = should_restore_prior_prompt_history(
-            request.session_id.is_some(),
-            self.session_has_prior_prompt_history(&user_id, &session_id)
-                .await,
-        );
+        let history_restore = async {
+            // ── Runtime warm-start from step checkpoint ────────────────
+            let restore_prior_prompt_history = should_restore_prior_prompt_history(
+                request.session_id.is_some(),
+                self.session_has_prior_prompt_history(&user_id, &session_id)
+                    .await,
+            );
 
-        if restore_prior_prompt_history {
-            if let Ok(Some(restored)) =
-                astra_pipeline::step_restore::restore_session(&user_id, &session_id)
-            {
-                restore_step_checkpoint_runtime_state(
-                    restored,
-                    &fresh_session_current_date,
-                    &mut state,
-                );
+            if restore_prior_prompt_history {
+                if let Ok(Some(restored)) =
+                    astra_pipeline::step_restore::restore_session(&user_id, &session_id)
+                {
+                    restore_step_checkpoint_runtime_state(
+                        restored,
+                        &fresh_session_current_date,
+                        &mut state,
+                    );
+                }
             }
-        }
 
-        // ── CSL: Load conversation history from the log ─────────────
-        let csl_manager = if restore_prior_prompt_history
-            && canonical_turn
-                .as_ref()
-                .is_none_or(|admission| !admission.had_canonical_head)
-        {
-            self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
-                .await
-        } else {
-            None
-        };
+            // ── CSL: Load conversation history from the log ─────────────
+            let csl_manager = if restore_prior_prompt_history
+                && canonical_turn
+                    .as_ref()
+                    .is_none_or(|admission| !admission.had_canonical_head)
+            {
+                self.restore_csl_history(&user_id, &session_id, &run_id, &mut state)
+                    .await
+            } else {
+                None
+            };
 
-        let plan_resume_snapshot = if let Some(shared) = &self.shared_pool {
-            let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
-            astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
-        } else {
-            astra_plan::PlanResumeSnapshot::default()
+            let session_resume_hint = self
+                .session_resume_hydration_hint_for_session(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    should_build_session_resume_hydration_hint(
+                        restore_prior_prompt_history,
+                        state.messages.len(),
+                    ),
+                )
+                .await;
+            (csl_manager, session_resume_hint)
         };
-        let session_resume_hint = self
-            .session_resume_hydration_hint_for_session(
-                &user_id,
-                &session_id,
-                &run_id,
-                should_build_session_resume_hydration_hint(
-                    restore_prior_prompt_history,
-                    state.messages.len(),
-                ),
-            )
-            .await;
+        let plan_resume = async {
+            if let Some(shared) = &self.shared_pool {
+                let repo = astra_plan::CloudPlanRepository::new(shared.get().clone());
+                astra_plan::plan_resume_snapshot_for_session(&repo, &user_id, &session_id).await
+            } else {
+                astra_plan::PlanResumeSnapshot::default()
+            }
+        };
+        let (
+            session_turn,
+            (csl_manager, session_resume_hint),
+            plan_resume_snapshot,
+            task_board_resume_hint,
+        ) = tokio::join!(
+            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id),
+            history_restore,
+            plan_resume,
+            self.task_board_resume_hint_for_session(&user_id, &session_id),
+        );
+        state.session_turn = session_turn;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
             session_resume_hint,
             plan_resume_snapshot.prompt_hint,
         );
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
-        let task_board_resume_hint = self
-            .task_board_resume_hint_for_session(&user_id, &session_id)
-            .await;
         let mut host = self.build_host(
             &user_id,
             &session_id,
@@ -11023,6 +11075,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             executor.set_work_surface_event_tx(event_tx.clone());
             let active_work_registry = self
                 .wire_server_dynamic_agent_tools(
+                    &stream_agent_spawner_entry,
+                    durable_agent_restore
+                        .take()
+                        .expect("durable agent restore ran for server tool executor"),
                     &mut executor,
                     &user_id,
                     &session_id,
