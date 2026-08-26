@@ -3987,16 +3987,16 @@ impl DatabaseRunStateStore {
     async fn patch_run_projection_status_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
-        user_id: &str,
-        run_id: &str,
+        run: &DurableRunRecord,
         status: &str,
         waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        requested_error_message: Option<&str>,
         projection_event_idx: i64,
         latest_event_type: Option<&str>,
     ) -> DbStoreResult<u64> {
+        let error_message = requested_error_message.or(run.error_message.as_deref());
         let projection_hash = status_projection_patch_hash(
-            run_id,
+            &run.run_id,
             status,
             waiting_for,
             error_message,
@@ -4020,12 +4020,12 @@ impl DatabaseRunStateStore {
         .bind(projection_event_idx)
         .bind(latest_event_type)
         .bind(&projection_hash)
-        .bind(user_id)
-        .bind(run_id)
+        .bind(&run.user_id)
+        .bind(&run.run_id)
         .bind(projection_event_idx)
         .execute(&mut **tx)
         .await
-        .map_err(|source| db_error("patch_run_projection_status", run_id, source))?;
+        .map_err(|source| db_error("patch_run_projection_status", &run.run_id, source))?;
         Ok(result.rows_affected())
     }
 
@@ -4960,8 +4960,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let projection_update = self
             .patch_run_projection_status_tx(
                 &mut tx,
-                user_id,
-                run_id,
+                &run,
                 status,
                 waiting_for,
                 error_message,
@@ -5078,8 +5077,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let projection_update = self
             .patch_run_projection_status_tx(
                 &mut tx,
-                user_id,
-                run_id,
+                &run,
                 status,
                 waiting_for,
                 error_message,
@@ -5274,8 +5272,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let projection_update = self
             .patch_run_projection_status_tx(
                 &mut tx,
-                user_id,
-                run_id,
+                &run,
                 status,
                 waiting_for,
                 error_message,
@@ -5516,8 +5513,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let projection_update = self
             .patch_run_projection_status_tx(
                 &mut tx,
-                user_id,
-                run_id,
+                &run,
                 status,
                 waiting_for,
                 error_message,
@@ -5728,8 +5724,7 @@ impl RunStateStore for DatabaseRunStateStore {
         let projection_update = self
             .patch_run_projection_status_tx(
                 &mut tx,
-                user_id,
-                run_id,
+                &run,
                 status,
                 waiting_for,
                 error_message,
@@ -6190,8 +6185,7 @@ impl RunStateStore for DatabaseRunStateStore {
             let projection_update = self
                 .patch_run_projection_status_tx(
                     &mut tx,
-                    user_id,
-                    run_id,
+                    &run,
                     STATUS_RUNNING,
                     None,
                     None,
@@ -9517,6 +9511,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_memory_terminal_status_replay_preserves_run_and_projection_error() {
+        let store = InMemoryRunStateStore::new();
+        store
+            .insert_run(durable_run_record("terminal-error-replay"))
+            .await
+            .unwrap();
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "terminal-error-replay",
+                    &[STATUS_RUNNING],
+                    STATUS_FAILED,
+                    None,
+                    Some("boom"),
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .update_run_status_if_current(
+                    "u1",
+                    "terminal-error-replay",
+                    &[STATUS_FAILED],
+                    STATUS_FAILED,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+        );
+
+        let run = store
+            .load_run("u1", "terminal-error-replay")
+            .await
+            .unwrap()
+            .expect("run exists after replay");
+        let projection = store
+            .load_run_projection("u1", "terminal-error-replay")
+            .await
+            .unwrap()
+            .expect("projection exists after replay");
+        assert_eq!(run.error_message.as_deref(), Some("boom"));
+        assert_eq!(projection.error_message.as_deref(), Some("boom"));
+    }
+
+    #[tokio::test]
     async fn in_memory_store_allows_new_root_run_when_existing_run_is_paused_without_waiting() {
         let store = InMemoryRunStateStore::new();
 
@@ -12741,6 +12784,65 @@ mod tests {
         assert_eq!(persisted.error_message.as_deref(), Some("boom"));
         assert_eq!(persisted.projection_event_idx, 1);
         assert_eq!(persisted.latest_event_type.as_deref(), Some("run_finished"));
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_terminal_status_replay_preserves_run_and_projection_error_on_matrixone() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-replay-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-replay-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-replay-session-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut record = durable_run_record(&run_id);
+        record.user_id = user_id.clone();
+        record.session_id = session_id;
+        record.root_run_id = Some(run_id.clone());
+        record.ancestor_path = Some(run_id.clone());
+        store.insert_run(record).await.expect("insert replay run");
+
+        assert!(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_RUNNING],
+                    STATUS_FAILED,
+                    None,
+                    Some("boom"),
+                )
+                .await
+                .expect("persist failed status")
+        );
+        assert!(
+            store
+                .update_run_status_if_current(
+                    &user_id,
+                    &run_id,
+                    &[STATUS_FAILED],
+                    STATUS_FAILED,
+                    None,
+                    None,
+                )
+                .await
+                .expect("replay failed status without error")
+        );
+
+        let run = store
+            .load_run(&user_id, &run_id)
+            .await
+            .expect("load replayed run")
+            .expect("replayed run exists");
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load replayed projection")
+            .expect("replayed projection exists");
+        assert_eq!(run.error_message.as_deref(), Some("boom"));
+        assert_eq!(projection.error_message.as_deref(), Some("boom"));
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
     }
