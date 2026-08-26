@@ -3,6 +3,10 @@
 //! Callers own semantic purpose and causal scope. This module owns the invariant
 //! that route/invocation admission happens before provider I/O, every physical
 //! request is observed, and the logical terminal matches the provider terminal.
+//! Planning is not itself a durable ledger event: a process that exits before
+//! admitting its first provider attempt or terminal settlement leaves no
+//! invocation row, because it could not have caused provider I/O. The ledger
+//! records provider delivery and terminal outcomes, not abandoned local intent.
 
 use std::{
     collections::BTreeMap,
@@ -457,6 +461,12 @@ impl DurableInferenceLedger {
         .await
     }
 
+    /// Prepare a durable invocation plan for a later provider call.
+    ///
+    /// This does not write an `admitted` ledger row. The first provider attempt
+    /// atomically admits the invocation with that attempt; a terminal path with
+    /// no provider delivery admits before settlement. Thus a process exit after
+    /// planning but before either boundary intentionally leaves no ledger row.
     pub(crate) async fn admit_with_request_context(
         &self,
         scope: astra_turn_types::InferenceInvocationScope,
@@ -1364,7 +1374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_provider_attempt_atomically_admits_the_invocation() {
+    async fn planned_invocation_is_durable_only_with_its_first_provider_attempt() {
         let persistence = TestInferenceLedgerPersistence::default();
         let invocation = test_invocation(persistence.clone()).await;
         {
