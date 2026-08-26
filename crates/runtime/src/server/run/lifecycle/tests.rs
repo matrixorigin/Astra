@@ -8251,9 +8251,10 @@ async fn provider_stream_session_exclusion_is_scoped_by_user() {
 #[tokio::test]
 async fn stream_chat_tracks_run_for_status_and_replay() {
     let (svc, _llm) = terminal_test_service().await;
-    let stream = ok(svc
-        .stream_chat("user-1".into(), test_request("hello"))
-        .await);
+    let mut request = test_request("hello");
+    request.execution_policy.skill_auto_route =
+        astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+    let stream = ok(svc.stream_chat("user-1".into(), request).await);
 
     let status = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -8276,6 +8277,7 @@ async fn stream_chat_tracks_run_for_status_and_replay() {
     assert!(status.events_count > 0);
     assert_eq!(replay.len(), status.events_count as usize);
     assert_eq!(replay[0]["event_type"], "run_started");
+    assert_eq!(replay[0]["data"]["skill_auto_route_policy"], "disabled");
     assert_eq!(
         svc.test_llm_cancel_token_is_cancelled(&stream.run_id).await,
         Some(false)

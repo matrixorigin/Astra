@@ -41,7 +41,8 @@ use astra_services::{
         DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, GuardedRunStatusTransition,
         GuardedRunStatusTransitionRequest, RUN_RECOVERY_CLAIM_BATCH_SIZE,
         RequestedTurnInteractionMode, ResolvedModelSelection, RunListCursor, RunStateStore,
-        RuntimeProfileRequest, TurnIntentExecutionPolicy, durable_run_status_kind,
+        RuntimeProfileRequest, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
+        durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -148,6 +149,7 @@ pub struct RunStartContext {
     pub interaction_mode: Option<RequestedTurnInteractionMode>,
     pub interactive_client: Option<bool>,
     pub turn_intent_policy: TurnIntentExecutionPolicy,
+    pub skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     pub execution_metadata: Option<serde_json::Map<String, serde_json::Value>>,
     pub agent_binding_ids: Vec<String>,
     pub agent_binding_id: Option<String>,
@@ -263,6 +265,13 @@ fn turn_intent_policy_label(policy: TurnIntentExecutionPolicy) -> &'static str {
     match policy {
         TurnIntentExecutionPolicy::Auto => "auto",
         TurnIntentExecutionPolicy::FixedDefault => "fixed_default",
+    }
+}
+
+fn skill_auto_route_policy_label(policy: SkillAutoRouteExecutionPolicy) -> &'static str {
+    match policy {
+        SkillAutoRouteExecutionPolicy::Auto => "auto",
+        SkillAutoRouteExecutionPolicy::Disabled => "disabled",
     }
 }
 
@@ -418,6 +427,12 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
     data.insert(
         "turn_intent_policy".to_string(),
         serde_json::Value::String(turn_intent_policy_label(context.turn_intent_policy).to_string()),
+    );
+    data.insert(
+        "skill_auto_route_policy".to_string(),
+        serde_json::Value::String(
+            skill_auto_route_policy_label(context.skill_auto_route_policy).to_string(),
+        ),
     );
     if let Some(mode_label) = effective_mode_label(context) {
         data.insert(
@@ -3168,6 +3183,7 @@ mod tests {
                     interaction_mode: Some(RequestedTurnInteractionMode::Auto),
                     interactive_client: Some(true),
                     turn_intent_policy: TurnIntentExecutionPolicy::FixedDefault,
+                    skill_auto_route_policy: SkillAutoRouteExecutionPolicy::Disabled,
                     execution_metadata: None,
                     ..Default::default()
                 },
@@ -3179,6 +3195,7 @@ mod tests {
         assert_eq!(run.events[0]["data"]["interaction_mode"], "auto");
         assert_eq!(run.events[0]["data"]["interactive_client"], true);
         assert_eq!(run.events[0]["data"]["turn_intent_policy"], "fixed_default");
+        assert_eq!(run.events[0]["data"]["skill_auto_route_policy"], "disabled");
     }
 
     #[test]

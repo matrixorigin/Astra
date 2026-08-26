@@ -250,6 +250,7 @@ pub(crate) fn run_start_context_from_request(
         interaction_mode: request.interaction_mode,
         interactive_client: Some(request.interactive_client),
         turn_intent_policy: request.execution_policy.turn_intent,
+        skill_auto_route_policy: request.execution_policy.skill_auto_route,
         execution_metadata: execution_bindings
             .map(|snapshot| binding_event_fields(&snapshot.workspace, &snapshot.executor)),
         agent_binding_ids,
@@ -633,6 +634,20 @@ mod tests {
         assert_eq!(
             context.runtime_profile,
             Some(astra_services::runs::RuntimeProfileRequest::AgentBindingRegistry)
+        );
+    }
+
+    #[test]
+    fn run_start_context_records_skill_auto_route_policy() {
+        let mut request = test_request("hello");
+        request.execution_policy.skill_auto_route =
+            astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled;
+
+        let context = run_start_context_from_request(&request, None, None);
+
+        assert_eq!(
+            context.skill_auto_route_policy,
+            astra_services::runs::SkillAutoRouteExecutionPolicy::Disabled
         );
     }
 

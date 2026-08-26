@@ -7580,6 +7580,13 @@ pub fn transform_run_event_for_client(event: serde_json::Value) -> serde_json::V
                 if let Some(turn_intent_policy) = data.get("turn_intent_policy").cloned() {
                     obj.insert("turn_intent_policy".to_string(), turn_intent_policy);
                 }
+                if let Some(skill_auto_route_policy) = data.get("skill_auto_route_policy").cloned()
+                {
+                    obj.insert(
+                        "skill_auto_route_policy".to_string(),
+                        skill_auto_route_policy,
+                    );
+                }
                 if let Some(workspace) = data.get("workspace").cloned() {
                     obj.insert("workspace".to_string(), workspace);
                 }
@@ -11003,6 +11010,7 @@ mod tests {
                         "run_id": "run-1", "session_id": "sess-1", "interaction_mode": "auto",
                         "interactive_client": true,
                         "turn_intent_policy": "fixed_default",
+                        "skill_auto_route_policy": "disabled",
                         "workspace": {"kind": "server_sandbox", "cwd": "/tmp/astra-workspaces/run-1"},
                         "executor": {"kind": "server_local", "status": "online"},
                         "transport": "server_local"
@@ -11013,6 +11021,7 @@ mod tests {
                     assert_eq!(o["run_id"], "run-1");
                     assert_eq!(o["interaction_mode"], "auto");
                     assert_eq!(o["turn_intent_policy"], "fixed_default");
+                    assert_eq!(o["skill_auto_route_policy"], "disabled");
                 },
             ),
             (
