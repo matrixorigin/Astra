@@ -61,7 +61,9 @@ use crate::{FernetTokenEncryptor, MatrixOneSettings};
 use astra_core::SharedPool;
 use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
-use astra_services::runs::{RequestedTurnInteractionMode, TurnIntentExecutionPolicy};
+use astra_services::runs::{
+    RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
+};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
@@ -1203,6 +1205,8 @@ pub struct ServerAgenticLoopHost {
     interaction_mode: Option<RequestedTurnInteractionMode>,
     /// Request-scoped policy for Astra's auxiliary TurnIntent LLM.
     turn_intent_policy: TurnIntentExecutionPolicy,
+    /// Request-scoped policy for Astra's auxiliary skill auto-route LLM.
+    skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
     /// Whether tool-call validation should admit Astra's static tool catalog
@@ -1430,6 +1434,7 @@ pub struct ServerAgenticLoopHostBuilder {
     interactive_client: bool,
     interaction_mode: Option<RequestedTurnInteractionMode>,
     turn_intent_policy: TurnIntentExecutionPolicy,
+    skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
     full_llm_capture: bool,
     static_tool_catalog_admissible: bool,
     plan_resume_hint: Option<String>,
@@ -1490,6 +1495,7 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: false,
             interaction_mode: None,
             turn_intent_policy: TurnIntentExecutionPolicy::Auto,
+            skill_auto_route_policy: SkillAutoRouteExecutionPolicy::Auto,
             full_llm_capture: false,
             static_tool_catalog_admissible: true,
             plan_resume_hint: None,
@@ -1676,6 +1682,11 @@ impl ServerAgenticLoopHostBuilder {
 
     pub fn with_turn_intent_policy(mut self, policy: TurnIntentExecutionPolicy) -> Self {
         self.turn_intent_policy = policy;
+        self
+    }
+
+    pub fn with_skill_auto_route_policy(mut self, policy: SkillAutoRouteExecutionPolicy) -> Self {
+        self.skill_auto_route_policy = policy;
         self
     }
 
@@ -1884,6 +1895,7 @@ impl ServerAgenticLoopHostBuilder {
             interactive_client: self.interactive_client,
             interaction_mode: self.interaction_mode,
             turn_intent_policy: self.turn_intent_policy,
+            skill_auto_route_policy: self.skill_auto_route_policy,
             full_llm_capture: self.full_llm_capture,
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
@@ -5267,6 +5279,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &AgenticLoopState,
         ctx: SkillAutoRouteJudgeContext<'_>,
     ) -> Option<SkillAutoRouteDecision> {
+        if self.skill_auto_route_policy == SkillAutoRouteExecutionPolicy::Disabled {
+            tracing::info!(
+                target: "astra::skill_auto_route_judge",
+                operation = "skill_auto_route.phase",
+                status = "skipped",
+                policy = "disabled",
+                reason = "request_execution_policy",
+                duration_ms = 0_u64,
+                "skill auto-route judge skipped by request execution policy"
+            );
+            return None;
+        }
         if ctx.query.trim().is_empty() || ctx.visible_skills.is_empty() {
             return None;
         }
@@ -15295,7 +15319,7 @@ mod tests {
     mod turn_intent_judge_wiring {
         use super::*;
         use astra_config::user_profile::{Scenario, TurnIntent};
-        use astra_services::runs::TurnIntentExecutionPolicy;
+        use astra_services::runs::{SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy};
         use astra_services::{
             AdmittedModelExecution, SkillAutoRouteJudge, SkillAutoRouteJudgeContext,
             SkillAutoRouteJudgeError, TurnIntentJudge, TurnIntentJudgeContext,
@@ -15420,6 +15444,22 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
+            .build();
+            host.set_skill_auto_route_judge(judge);
+            host
+        }
+
+        fn host_with_skill_route_policy_and_judge(
+            policy: SkillAutoRouteExecutionPolicy,
+            judge: Arc<dyn SkillAutoRouteJudge>,
+        ) -> ServerAgenticLoopHost {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u".to_string(),
+                "s".to_string(),
+            )
+            .with_skill_auto_route_policy(policy)
             .build();
             host.set_skill_auto_route_judge(judge);
             host
@@ -15585,6 +15625,37 @@ mod tests {
             assert_eq!(calls[0].visible_skills.len(), 1);
             assert_eq!(calls[0].visible_skills[0].name, "review-changes");
             assert_eq!(calls[0].visible_skills[0].aliases, vec!["review"]);
+        }
+
+        #[tokio::test]
+        async fn disabled_skill_auto_route_policy_skips_even_an_injected_judge() {
+            let judge = ScriptedSkillRouteJudge::ok(Some("review-changes"));
+            let mut host = host_with_skill_route_policy_and_judge(
+                SkillAutoRouteExecutionPolicy::Disabled,
+                judge.clone() as Arc<dyn SkillAutoRouteJudge>,
+            );
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+            let visible_skills = vec![crate::turn::skill_tool::SkillToolInfo {
+                name: "review-changes".into(),
+                description: "Review local changes".into(),
+                ..Default::default()
+            }];
+
+            assert_eq!(
+                host.judge_skill_auto_route(
+                    &state,
+                    crate::turn::agentic_loop::host::SkillAutoRouteJudgeContext {
+                        query: "review current branch",
+                        visible_skills: &visible_skills,
+                    },
+                )
+                .await,
+                None
+            );
+            assert!(
+                judge.calls().is_empty(),
+                "disabled policy must not invoke the skill auto-route LLM"
+            );
         }
 
         #[tokio::test]

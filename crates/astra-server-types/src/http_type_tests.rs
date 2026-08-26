@@ -1,5 +1,8 @@
 use super::*;
-use astra_services::runs::{ExecutionBudget, ExecutionPolicyRequest, TurnIntentExecutionPolicy};
+use astra_services::runs::{
+    ExecutionBudget, ExecutionPolicyRequest, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy,
+};
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 
@@ -163,7 +166,10 @@ fn chat_request_all_fields() {
             {"id": "binding-extension"}
         ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
-        "execution_policy": {"turn_intent": "fixed_default"},
+        "execution_policy": {
+            "turn_intent": "fixed_default",
+            "skill_auto_route": "disabled"
+        },
         "explain": true
     });
     let req: ChatRequest = serde_json::from_value(input).unwrap();
@@ -210,6 +216,10 @@ fn chat_request_all_fields() {
     assert_eq!(
         req.execution_policy.turn_intent,
         TurnIntentExecutionPolicy::FixedDefault
+    );
+    assert_eq!(
+        req.execution_policy.skill_auto_route,
+        SkillAutoRouteExecutionPolicy::Disabled
     );
     let ctx = req.context.unwrap();
     assert_eq!(ctx.get("key").unwrap(), "value");
@@ -1283,6 +1293,7 @@ fn chat_request_into_data_maps_all_fields() {
         }),
         execution_policy: ExecutionPolicyRequest {
             turn_intent: TurnIntentExecutionPolicy::FixedDefault,
+            skill_auto_route: SkillAutoRouteExecutionPolicy::Disabled,
         },
         explain: true,
         interaction_mode: Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
@@ -1348,6 +1359,10 @@ fn chat_request_into_data_maps_all_fields() {
     assert_eq!(
         data.execution_policy.turn_intent,
         TurnIntentExecutionPolicy::FixedDefault
+    );
+    assert_eq!(
+        data.execution_policy.skill_auto_route,
+        SkillAutoRouteExecutionPolicy::Disabled
     );
     assert_eq!(
         data.interaction_mode,

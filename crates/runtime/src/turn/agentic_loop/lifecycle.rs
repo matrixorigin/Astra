@@ -368,10 +368,10 @@ async fn maybe_pre_route_skill<H: AgenticLoopHost>(host: &mut H, state: &mut Age
         )
         .await
     else {
-        tracing::warn!(
+        tracing::debug!(
             query_length = query.len(),
             visible_skill_count = visible.len(),
-            "skill auto-route judge failed; skipping auto-route for this turn"
+            "skill auto-route produced no decision; continuing without pre-route"
         );
         return;
     };

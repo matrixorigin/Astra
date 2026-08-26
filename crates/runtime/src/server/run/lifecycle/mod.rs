@@ -7026,6 +7026,7 @@ impl AgenticRunLifecycleService {
         .with_edge_callback_ledger(self.edge_callback_ledger.clone())
         .with_interaction_mode(request.interaction_mode)
         .with_turn_intent_policy(request.execution_policy.turn_intent)
+        .with_skill_auto_route_policy(request.execution_policy.skill_auto_route)
         .with_interactive_client(request.interactive_client)
         .with_plan_resume_hint(plan_resume_hint)
         .with_plan_authoring_active(plan_authoring_active)

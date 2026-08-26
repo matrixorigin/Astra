@@ -256,6 +256,8 @@ pub struct ExecutionBudget {
 pub struct ExecutionPolicyRequest {
     #[serde(default)]
     pub turn_intent: TurnIntentExecutionPolicy,
+    #[serde(default)]
+    pub skill_auto_route: SkillAutoRouteExecutionPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +268,16 @@ pub enum TurnIntentExecutionPolicy {
     /// Do not call Astra's auxiliary TurnIntent LLM. The request keeps the
     /// deterministic baseline profile selected when its loop state is built.
     FixedDefault,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillAutoRouteExecutionPolicy {
+    #[default]
+    Auto,
+    /// Do not call Astra's auxiliary skill auto-route LLM. Skills remain
+    /// visible to the primary model and can still be invoked explicitly.
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
