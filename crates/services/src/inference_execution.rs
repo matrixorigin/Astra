@@ -685,28 +685,44 @@ async fn ensure_invocation_scope(
     let exists = match &input.scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
-        } => sqlx::query(
-            "SELECT 1
-             FROM agent_sessions AS session
-             JOIN agent_runs AS run
-               ON run.user_id = session.user_id AND run.session_id = session.session_id
-             WHERE session.user_id = ? AND session.session_id = ?
-               AND session.status <> 'deleting' AND run.run_id = ?
-             LIMIT 1 FOR UPDATE",
-        )
-        .bind(&input.user_id)
-        .bind(session_id)
-        .bind(run_id)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "verify inference run scope",
-                error,
+        } => {
+            let session_exists = sqlx::query(
+                "SELECT 1 FROM agent_sessions
+                 WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
+                 LIMIT 1 FOR UPDATE",
             )
-        })?
-        .is_some(),
+            .bind(&input.user_id)
+            .bind(session_id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "verify inference session scope",
+                    error,
+                )
+            })?
+            .is_some();
+            session_exists
+                && sqlx::query(
+                    "SELECT 1 FROM agent_runs
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                     LIMIT 1 FOR UPDATE",
+                )
+                .bind(&input.user_id)
+                .bind(session_id)
+                .bind(run_id)
+                .fetch_optional(&mut *connection)
+                .await
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "verify inference run scope",
+                        error,
+                    )
+                })?
+                .is_some()
+        }
         InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
             "SELECT 1 FROM agent_sessions
              WHERE user_id = ? AND session_id = ? AND status <> 'deleting'

@@ -10637,6 +10637,13 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let reserved_session_turn = canonical_turn
             .as_ref()
             .map(|admission| admission.reservation.reserved_turn);
+        let session_turn = match reserved_session_turn {
+            Some(turn) => turn,
+            None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
+        };
+        // Legacy CSL resume cursors derive their completed turn from this
+        // field, so establish it before history restoration.
+        state.session_turn = session_turn;
         let history_restore = async {
             // ── Runtime warm-start from step checkpoint ────────────────
             let restore_prior_prompt_history = should_restore_prior_prompt_history(
@@ -10694,24 +10701,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_plan::PlanResumeSnapshot::default()
             }
         };
-        let session_turn = async {
-            match reserved_session_turn {
-                Some(turn) => turn,
-                None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
-            }
-        };
-        let (
-            session_turn,
-            (csl_manager, session_resume_hint),
-            plan_resume_snapshot,
-            task_board_resume_hint,
-        ) = tokio::join!(
-            session_turn,
+        let ((csl_manager, session_resume_hint), plan_resume_snapshot, task_board_resume_hint) = tokio::join!(
             history_restore,
             plan_resume,
             self.task_board_resume_hint_for_session(&user_id, &session_id),
         );
-        state.session_turn = session_turn;
         let plan_resume_hint = astra_turn_core::resume_hydration::merge_resume_hints(
             session_resume_hint,
             plan_resume_snapshot.prompt_hint,
