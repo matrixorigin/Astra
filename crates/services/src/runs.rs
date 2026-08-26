@@ -12494,6 +12494,62 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn database_run_projection_upsert_does_not_regress_a_newer_event_index() {
+        let (store, pool) = setup_database_run_state_store_it().await;
+        let user_id = format!("runs-it-projection-user-{}", Uuid::new_v4());
+        let run_id = format!("runs-it-projection-run-{}", Uuid::new_v4());
+        let session_id = format!("runs-it-projection-session-{}", Uuid::new_v4());
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+
+        let mut stale_run = durable_run_record(&run_id);
+        stale_run.user_id = user_id.clone();
+        stale_run.session_id = session_id;
+        stale_run.root_run_id = Some(run_id.clone());
+        stale_run.ancestor_path = Some(run_id.clone());
+        stale_run.last_event_idx = 0;
+        store
+            .insert_run(stale_run.clone())
+            .await
+            .expect("insert projection fixture run");
+
+        let mut newer_run = stale_run.clone();
+        newer_run.status = STATUS_COMPLETED.to_string();
+        newer_run.last_event_idx = 1;
+        newer_run.total_prompt_tokens = 13;
+        newer_run.total_completion_tokens = 5;
+        let newer_projection =
+            build_run_display_projection(&newer_run, Some("run_finished".to_string()), None);
+        store
+            .upsert_run_projection(&newer_projection)
+            .await
+            .expect("persist newer projection");
+
+        let stale_projection =
+            build_run_display_projection(&stale_run, Some("run_started".to_string()), None);
+        store
+            .upsert_run_projection(&stale_projection)
+            .await
+            .expect("stale projection write is harmless");
+
+        let projection = store
+            .load_run_projection(&user_id, &run_id)
+            .await
+            .expect("load monotonic projection")
+            .expect("projection exists");
+        assert_eq!(projection.projection_event_idx, 1);
+        assert_eq!(projection.status, STATUS_COMPLETED);
+        assert_eq!(
+            projection.latest_event_type.as_deref(),
+            Some("run_finished")
+        );
+        assert_eq!(projection.total_prompt_tokens, 13);
+        assert_eq!(projection.total_completion_tokens, 5);
+
+        cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
+    }
+
+    #[tokio::test]
     async fn rebuild_run_projection_repairs_stale_projection_from_facts() {
         let store = InMemoryRunStateStore::new();
         store
