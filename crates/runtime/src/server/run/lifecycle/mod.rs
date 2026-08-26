@@ -9028,11 +9028,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         } else {
             astra_plan::PlanResumeSnapshot::default()
         };
-        let restore_prior_prompt_history = should_restore_prior_prompt_history(
-            request.session_id.is_some(),
-            self.session_has_prior_prompt_history(&user_id, &session_id)
-                .await,
-        );
         let plan_snapshot_resume_hint = plan_resume_snapshot.prompt_hint;
         let plan_resume_hint = plan_snapshot_resume_hint.clone();
         let plan_authoring_active = plan_resume_snapshot.authoring_active;
@@ -9123,6 +9118,16 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 return Err(error);
             }
         };
+        let restore_prior_prompt_history = should_restore_prior_prompt_history(
+            request.session_id.is_some(),
+            match canonical_turn.as_ref() {
+                Some(admission) if admission.had_canonical_head => true,
+                _ => {
+                    self.session_has_prior_prompt_history(&user_id, &session_id)
+                        .await
+                }
+            },
+        );
         let mut loop_state = self.build_initial_state_inner(
             &user_id,
             &request,
@@ -9150,8 +9155,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         #[cfg(feature = "harness")]
         loop_state.harness.set_user_id(&user_id);
 
-        loop_state.session_turn =
-            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await;
+        loop_state.session_turn = match canonical_turn.as_ref() {
+            Some(admission) => admission.reservation.reserved_turn,
+            None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
+        };
         if let Some(admission) = canonical_turn.as_ref()
             && admission.had_canonical_head
         {
@@ -10624,12 +10631,22 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 )
             });
 
+        let canonical_has_prior_prompt_history = canonical_turn
+            .as_ref()
+            .is_some_and(|admission| admission.had_canonical_head);
+        let reserved_session_turn = canonical_turn
+            .as_ref()
+            .map(|admission| admission.reservation.reserved_turn);
         let history_restore = async {
             // ── Runtime warm-start from step checkpoint ────────────────
             let restore_prior_prompt_history = should_restore_prior_prompt_history(
                 request.session_id.is_some(),
-                self.session_has_prior_prompt_history(&user_id, &session_id)
-                    .await,
+                if canonical_has_prior_prompt_history {
+                    true
+                } else {
+                    self.session_has_prior_prompt_history(&user_id, &session_id)
+                        .await
+                },
             );
 
             if restore_prior_prompt_history {
@@ -10677,13 +10694,19 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 astra_plan::PlanResumeSnapshot::default()
             }
         };
+        let session_turn = async {
+            match reserved_session_turn {
+                Some(turn) => turn,
+                None => infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id).await,
+            }
+        };
         let (
             session_turn,
             (csl_manager, session_resume_hint),
             plan_resume_snapshot,
             task_board_resume_hint,
         ) = tokio::join!(
-            infer_session_turn(self.shared_pool.as_ref(), &user_id, &session_id),
+            session_turn,
             history_restore,
             plan_resume,
             self.task_board_resume_hint_for_session(&user_id, &session_id),

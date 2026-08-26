@@ -11,9 +11,10 @@ use astra_services::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
     InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
     InferenceUsage, ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind,
-    admit_inference_invocation, begin_inference_provider_attempt, declare_inference_settlement,
-    finish_inference_invocation, finish_inference_provider_attempt, plan_inference_invocation,
-    plan_inference_provider_attempt, reconcile_inference_settlements,
+    admit_inference_invocation, admit_inference_invocation_with_first_provider_attempt,
+    begin_inference_provider_attempt, declare_inference_settlement, finish_inference_invocation,
+    finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
+    reconcile_inference_settlements,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
@@ -65,6 +66,81 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     .execute(pool)
     .await
     .expect("seed inference run");
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("combined-admission-user-{suffix}");
+    let session_id = format!("combined-admission-session-{suffix}");
+    let run_id = format!("combined-admission-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "combined_admission".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "combined-admission-offering".to_string(),
+        resolved_model_name: "combined-admission-model".to_string(),
+        upstream_model_name: "combined-admission-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan combined admission");
+    let attempt = provider_attempt(&plan, 0);
+
+    admit_inference_invocation_with_first_provider_attempt(&shared_pool, &plan, &attempt)
+        .await
+        .expect("atomically admit invocation and first provider attempt");
+
+    let counts = sqlx::query(
+        "SELECT
+            (SELECT COUNT(*) FROM inference_routes
+             WHERE user_id = ? AND route_id = ?) AS route_count,
+            (SELECT COUNT(*) FROM inference_invocations
+             WHERE user_id = ? AND invocation_id = ?) AS invocation_count,
+            (SELECT COUNT(*) FROM inference_provider_attempts
+             WHERE user_id = ? AND attempt_id = ?) AS attempt_count,
+            (SELECT COUNT(*) FROM model_request_context_events
+             WHERE user_id = ? AND attempt_id = ? AND event_stage = 'accepted') AS context_count",
+    )
+    .bind(&user_id)
+    .bind(plan.route_id())
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load combined admission facts");
+    assert_eq!(counts.get::<i64, _>("route_count"), 1);
+    assert_eq!(counts.get::<i64, _>("invocation_count"), 1);
+    assert_eq!(counts.get::<i64, _>("attempt_count"), 1);
+    assert_eq!(counts.get::<i64, _>("context_count"), 1);
+
+    assert_eq!(
+        admit_inference_invocation_with_first_provider_attempt(&shared_pool, &plan, &attempt)
+            .await
+            .expect_err("combined admission replay must not authorize provider redelivery")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]

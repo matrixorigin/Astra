@@ -214,7 +214,8 @@ pub use harness::{
 pub use inference_execution::{
     InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
     InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
-    InferenceUsage, admit_inference_invocation, begin_inference_provider_attempt,
+    InferenceUsage, admit_inference_invocation,
+    admit_inference_invocation_with_first_provider_attempt, begin_inference_provider_attempt,
     declare_inference_settlement, finish_inference_invocation, finish_inference_provider_attempt,
     plan_inference_invocation, plan_inference_provider_attempt,
     plan_inference_provider_attempt_with_context, reconcile_inference_settlements,

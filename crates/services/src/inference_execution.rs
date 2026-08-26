@@ -517,6 +517,23 @@ async fn insert_model_request_context_event(
             error,
         )
     })?;
+    insert_model_request_context_event_with_expiry(
+        connection,
+        attempt,
+        stage,
+        terminal,
+        context_expired_at,
+    )
+    .await
+}
+
+async fn insert_model_request_context_event_with_expiry(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+    stage: ModelRequestEventStage,
+    terminal: Option<&InferenceInvocationTerminal>,
+    context_expired_at: Option<chrono::NaiveDateTime>,
+) -> ServiceResult<()> {
     let (event_id, event_json, event) = model_request_event(attempt, stage, terminal)?;
     let usage = event.usage.as_ref();
     let model_family = attempt
@@ -668,44 +685,28 @@ async fn ensure_invocation_scope(
     let exists = match &input.scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
-        } => {
-            let session_exists = sqlx::query(
-                "SELECT 1 FROM agent_sessions
-                 WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
-                 LIMIT 1 FOR UPDATE",
+        } => sqlx::query(
+            "SELECT 1
+             FROM agent_sessions AS session
+             JOIN agent_runs AS run
+               ON run.user_id = session.user_id AND run.session_id = session.session_id
+             WHERE session.user_id = ? AND session.session_id = ?
+               AND session.status <> 'deleting' AND run.run_id = ?
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(&input.user_id)
+        .bind(session_id)
+        .bind(run_id)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "verify inference run scope",
+                error,
             )
-            .bind(&input.user_id)
-            .bind(session_id)
-            .fetch_optional(&mut *connection)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "verify inference session scope",
-                    error,
-                )
-            })?
-            .is_some();
-            session_exists
-                && sqlx::query(
-                    "SELECT 1 FROM agent_runs
-                     WHERE user_id = ? AND session_id = ? AND run_id = ?
-                     LIMIT 1 FOR UPDATE",
-                )
-                .bind(&input.user_id)
-                .bind(session_id)
-                .bind(run_id)
-                .fetch_optional(&mut *connection)
-                .await
-                .map_err(|error| {
-                    ServiceError::with_source(
-                        ServiceErrorKind::Persistence,
-                        "verify inference run scope",
-                        error,
-                    )
-                })?
-                .is_some()
-        }
+        })?
+        .is_some(),
         InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
             "SELECT 1 FROM agent_sessions
              WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
@@ -846,6 +847,88 @@ fn validate_ambiguous_invocation_admission(
     )))
 }
 
+async fn insert_inference_invocation_admission(
+    connection: &mut sqlx::MySqlConnection,
+    plan: &InferenceInvocationPlan,
+) -> ServiceResult<()> {
+    ensure_invocation_scope(connection, &plan.input).await?;
+    let route_insert_sql = matrixone_statement_with_null_shape(
+        "INSERT INTO inference_routes
+         (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+          offering_id, resolved_model_name,
+          upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        [
+            plan.input.scope.session_id().is_some(),
+            plan.input.scope.run_id().is_some(),
+            plan.input.scope.harness_run_id().is_some(),
+        ],
+    );
+    sqlx::query(&route_insert_sql)
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(plan.input.scope.session_id())
+        .bind(plan.input.scope.kind())
+        .bind(plan.input.scope.run_id())
+        .bind(plan.input.scope.harness_run_id())
+        .bind(&plan.input.offering_id)
+        .bind(&plan.input.resolved_model_name)
+        .bind(&plan.input.upstream_model_name)
+        .bind(&plan.input.provider)
+        .bind(plan.input.execution_placement.as_str())
+        .bind(plan.input.access_kind.as_str())
+        .bind(plan.input.purpose.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert inference route",
+                error,
+            )
+        })?;
+
+    let invocation_insert_sql = matrixone_statement_with_null_shape(
+        "INSERT INTO inference_invocations
+         (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+          admission_token, turn_index,
+          round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
+        [
+            plan.input.scope.session_id().is_some(),
+            plan.input.scope.run_id().is_some(),
+            plan.input.scope.harness_run_id().is_some(),
+            plan.input.scope.turn().is_some(),
+            plan.input.scope.round().is_some(),
+        ],
+    );
+    sqlx::query(&invocation_insert_sql)
+        .bind(&plan.invocation_id)
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(plan.input.scope.session_id())
+        .bind(plan.input.scope.kind())
+        .bind(plan.input.scope.run_id())
+        .bind(plan.input.scope.harness_run_id())
+        .bind(&plan.admission_token)
+        .bind(plan.input.scope.turn().map(i64::from))
+        .bind(plan.input.scope.round().map(i64::from))
+        .bind(plan.input.scope.operation_id())
+        .bind(i64::from(plan.input.scope.logical_attempt()))
+        .bind(plan.input.purpose.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert inference invocation",
+                error,
+            )
+        })?;
+
+    Ok(())
+}
+
 /// Durably admit one logical inference.
 ///
 /// Success is the caller's permission to contact the provider. Replaying the
@@ -868,85 +951,7 @@ pub async fn admit_inference_invocation(
             error,
         )
     })?;
-    let write_result: ServiceResult<()> = async {
-        ensure_invocation_scope(&mut tx, &plan.input).await?;
-        let route_insert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO inference_routes
-             (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
-              offering_id, resolved_model_name,
-              upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-            [
-                plan.input.scope.session_id().is_some(),
-                plan.input.scope.run_id().is_some(),
-                plan.input.scope.harness_run_id().is_some(),
-            ],
-        );
-        sqlx::query(&route_insert_sql)
-            .bind(&plan.route_id)
-            .bind(&plan.input.user_id)
-            .bind(plan.input.scope.session_id())
-            .bind(plan.input.scope.kind())
-            .bind(plan.input.scope.run_id())
-            .bind(plan.input.scope.harness_run_id())
-            .bind(&plan.input.offering_id)
-            .bind(&plan.input.resolved_model_name)
-            .bind(&plan.input.upstream_model_name)
-            .bind(&plan.input.provider)
-            .bind(plan.input.execution_placement.as_str())
-            .bind(plan.input.access_kind.as_str())
-            .bind(plan.input.purpose.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "insert inference route",
-                    error,
-                )
-            })?;
-
-        let invocation_insert_sql = matrixone_statement_with_null_shape(
-            "INSERT INTO inference_invocations
-             (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
-              admission_token, turn_index,
-              round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
-            [
-                plan.input.scope.session_id().is_some(),
-                plan.input.scope.run_id().is_some(),
-                plan.input.scope.harness_run_id().is_some(),
-                plan.input.scope.turn().is_some(),
-                plan.input.scope.round().is_some(),
-            ],
-        );
-        sqlx::query(&invocation_insert_sql)
-            .bind(&plan.invocation_id)
-            .bind(&plan.route_id)
-            .bind(&plan.input.user_id)
-            .bind(plan.input.scope.session_id())
-            .bind(plan.input.scope.kind())
-            .bind(plan.input.scope.run_id())
-            .bind(plan.input.scope.harness_run_id())
-            .bind(&plan.admission_token)
-            .bind(plan.input.scope.turn().map(i64::from))
-            .bind(plan.input.scope.round().map(i64::from))
-            .bind(plan.input.scope.operation_id())
-            .bind(i64::from(plan.input.scope.logical_attempt()))
-            .bind(plan.input.purpose.as_str())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "insert inference invocation",
-                    error,
-                )
-            })?;
-
-        Ok(())
-    }
-    .await;
+    let write_result = insert_inference_invocation_admission(&mut tx, plan).await;
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation").await;
@@ -1100,6 +1105,209 @@ fn validate_ambiguous_provider_attempt_admission(
     )))
 }
 
+fn validate_first_provider_attempt_binding(
+    invocation: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<()> {
+    let mut mismatches = Vec::new();
+    if attempt.invocation_id != invocation.invocation_id {
+        mismatches.push("invocation_id");
+    }
+    if attempt.user_id != invocation.input.user_id {
+        mismatches.push("user_id");
+    }
+    if attempt.provider != invocation.input.provider {
+        mismatches.push("provider");
+    }
+    if attempt.invocation_input != invocation.input {
+        mismatches.push("invocation_input");
+    }
+    if mismatches.is_empty() {
+        return Ok(());
+    }
+    Err(ServiceError::invalid(format!(
+        "first provider attempt does not belong to inference invocation {}: {}",
+        invocation.invocation_id,
+        mismatches.join(", ")
+    )))
+}
+
+async fn insert_inference_provider_attempt_admission(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+) -> ServiceResult<()> {
+    let result = sqlx::query(
+        "INSERT INTO inference_provider_attempts
+         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+          provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
+          status, started_at, terminal_at)
+         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+                ?, ?, ?, ?, ?, ?, 'started', NOW(6), NULL
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+           AND NOT EXISTS (
+                SELECT 1
+                FROM inference_invocation_settlement_debts AS settlement_debt
+                WHERE settlement_debt.user_id = inference_invocations.user_id
+                  AND settlement_debt.invocation_id = inference_invocations.invocation_id
+           )",
+    )
+    .bind(&attempt.attempt_id)
+    .bind(i64::from(attempt.attempt_index))
+    .bind(&attempt.provider)
+    .bind(&attempt.admission_token)
+    .bind(&attempt.wire.protocol)
+    .bind(&attempt.wire.provider_wire_hash)
+    .bind(provider_wire_bytes)
+    .bind(&attempt.user_id)
+    .bind(&attempt.invocation_id)
+    .execute(&mut *connection)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "insert inference provider attempt",
+            error,
+        )
+    })?;
+    if result.rows_affected() != 1 {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {} is not admitted for provider attempt {}",
+            attempt.invocation_id, attempt.attempt_id
+        )));
+    }
+    // This row was inserted immediately above in the same transaction, so its
+    // context-expiry fact is exactly NULL. Re-reading and locking it would add
+    // a database round trip without adding any concurrency protection.
+    insert_model_request_context_event_with_expiry(
+        connection,
+        attempt,
+        ModelRequestEventStage::Accepted,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn validate_ambiguous_invocation_with_first_attempt_admission(
+    db: &sqlx::Pool<sqlx::MySql>,
+    invocation: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+    provider_wire_bytes: i64,
+) -> ServiceResult<()> {
+    let invocation_fact = load_invocation_admission_fact(db, invocation)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "inference invocation {} is missing after an ambiguous combined admission commit",
+                invocation.invocation_id
+            ))
+        })?;
+    validate_ambiguous_invocation_admission(&invocation_fact, invocation)?;
+    let attempt_fact = load_provider_attempt_fact(db, attempt)
+        .await?
+        .ok_or_else(|| {
+            ServiceError::conflict(format!(
+                "inference provider attempt {} is missing after an ambiguous combined admission commit",
+                attempt.attempt_id
+            ))
+        })?;
+    validate_ambiguous_provider_attempt_admission(&attempt_fact, attempt, provider_wire_bytes)
+}
+
+/// Atomically admit a logical invocation and its first physical provider
+/// request. Success is returned only after the route, invocation, attempt, and
+/// accepted request-context event are all durable, so provider I/O never
+/// observes a partial admission.
+pub async fn admit_inference_invocation_with_first_provider_attempt(
+    pool: &SharedPool,
+    invocation: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+) -> ServiceResult<()> {
+    validate_first_provider_attempt_binding(invocation, attempt)?;
+    let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
+    let db = pool.get();
+    let mut tx = db.begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin combined inference admission",
+            error,
+        )
+    })?;
+    let write_result: ServiceResult<()> = async {
+        insert_inference_invocation_admission(&mut tx, invocation).await?;
+        insert_inference_provider_attempt_admission(&mut tx, attempt, provider_wire_bytes).await
+    }
+    .await;
+    if let Err(error) = write_result {
+        rollback_inference_tx(tx, "admit_inference_invocation_with_first_provider_attempt").await;
+        match load_invocation_admission_fact(db, invocation).await {
+            Ok(Some(persisted)) => return Err(existing_invocation_error(invocation, &persisted)),
+            Ok(None) => {}
+            Err(read_error) => {
+                tracing::warn!(
+                    invocation_id = %invocation.invocation_id,
+                    %error,
+                    %read_error,
+                    "combined inference admission failed and invocation re-read also failed"
+                );
+                return Err(error);
+            }
+        }
+        match load_provider_attempt_fact(db, attempt).await {
+            Ok(Some(persisted)) => {
+                validate_persisted_provider_attempt_identity(
+                    &persisted,
+                    attempt,
+                    provider_wire_bytes,
+                )?;
+                return Err(ServiceError::conflict(format!(
+                    "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
+                    attempt.attempt_id, persisted.status
+                )));
+            }
+            Ok(None) => {}
+            Err(read_error) => {
+                tracing::warn!(
+                    attempt_id = %attempt.attempt_id,
+                    %error,
+                    %read_error,
+                    "combined inference admission failed and provider-attempt re-read also failed"
+                );
+            }
+        }
+        return Err(error);
+    }
+    let Err(error) = tx.commit().await else {
+        return Ok(());
+    };
+    let commit_error = ServiceError::with_source(
+        ServiceErrorKind::Persistence,
+        "commit combined inference admission",
+        error,
+    );
+    match validate_ambiguous_invocation_with_first_attempt_admission(
+        db,
+        invocation,
+        attempt,
+        provider_wire_bytes,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(read_error) => {
+            tracing::warn!(
+                invocation_id = %invocation.invocation_id,
+                attempt_id = %attempt.attempt_id,
+                %read_error,
+                "combined inference admission commit is unresolved after authoritative re-read"
+            );
+            Err(commit_error)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PersistedProviderTerminalMatch {
     Started,
@@ -1225,94 +1433,39 @@ pub async fn begin_inference_provider_attempt(
             attempt.invocation_id
         )));
     }
-    let result = sqlx::query(
-        "INSERT INTO inference_provider_attempts
-         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
-          provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
-          status, started_at, terminal_at)
-         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, 'started', NOW(6), NULL
-         FROM inference_invocations
-         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
-           AND NOT EXISTS (
-                SELECT 1
-                FROM inference_invocation_settlement_debts AS settlement_debt
-                WHERE settlement_debt.user_id = inference_invocations.user_id
-                  AND settlement_debt.invocation_id = inference_invocations.invocation_id
-           )",
-    )
-    .bind(&attempt.attempt_id)
-    .bind(i64::from(attempt.attempt_index))
-    .bind(&attempt.provider)
-    .bind(&attempt.admission_token)
-    .bind(&attempt.wire.protocol)
-    .bind(&attempt.wire.provider_wire_hash)
-    .bind(provider_wire_bytes)
-    .bind(&attempt.user_id)
-    .bind(&attempt.invocation_id)
-    .execute(&mut *tx)
-    .await;
-    match result {
-        Ok(result) if result.rows_affected() == 1 => {
-            if let Err(error) = insert_model_request_context_event(
-                &mut tx,
-                attempt,
-                ModelRequestEventStage::Accepted,
-                None,
-            )
-            .await
-            {
-                rollback_inference_tx(tx, "record accepted model request context").await;
-                return Err(error);
-            }
-            let Err(error) = tx.commit().await else {
-                return Ok(());
-            };
-            let commit_error = ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "commit inference provider attempt admission",
-                error,
-            );
-            match load_provider_attempt_fact(db, attempt).await {
-                Ok(Some(persisted)) => validate_ambiguous_provider_attempt_admission(
-                    &persisted,
-                    attempt,
-                    provider_wire_bytes,
-                ),
-                Ok(None) => Err(commit_error),
-                Err(read_error) => {
-                    tracing::warn!(
-                        attempt_id = %attempt.attempt_id,
-                        %read_error,
-                        "provider attempt admission commit is unresolved after authoritative re-read failed"
-                    );
-                    Err(commit_error)
-                }
-            }
+    if let Err(error) =
+        insert_inference_provider_attempt_admission(&mut tx, attempt, provider_wire_bytes).await
+    {
+        rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
+        if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+            validate_persisted_provider_attempt_identity(&persisted, attempt, provider_wire_bytes)?;
+            return Err(ServiceError::conflict(format!(
+                "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
+                attempt.attempt_id, persisted.status
+            )));
         }
-        Ok(_) => Err(ServiceError::conflict(format!(
-            "inference invocation {} is not admitted for provider attempt {}",
-            attempt.invocation_id, attempt.attempt_id
-        ))),
-        Err(error) => {
-            rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-            if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
-                validate_persisted_provider_attempt_identity(
-                    &persisted,
-                    attempt,
-                    provider_wire_bytes,
-                )?;
-                Err(ServiceError::conflict(format!(
-                    "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
-                    attempt.attempt_id, persisted.status
-                )))
-            } else {
-                Err(ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "insert inference provider attempt",
-                    error,
-                ))
-            }
+        return Err(error);
+    }
+    let Err(error) = tx.commit().await else {
+        return Ok(());
+    };
+    let commit_error = ServiceError::with_source(
+        ServiceErrorKind::Persistence,
+        "commit inference provider attempt admission",
+        error,
+    );
+    match load_provider_attempt_fact(db, attempt).await {
+        Ok(Some(persisted)) => {
+            validate_ambiguous_provider_attempt_admission(&persisted, attempt, provider_wire_bytes)
+        }
+        Ok(None) => Err(commit_error),
+        Err(read_error) => {
+            tracing::warn!(
+                attempt_id = %attempt.attempt_id,
+                %read_error,
+                "provider attempt admission commit is unresolved after authoritative re-read failed"
+            );
+            Err(commit_error)
         }
     }
 }

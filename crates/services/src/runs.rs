@@ -3070,6 +3070,8 @@ pub enum DatabaseRunStateStoreError {
         rows: usize,
         bytes: usize,
     },
+    #[error("run event batch too large: run_id={run_id}, rows={rows}")]
+    RunEventBatchTooLarge { run_id: String, rows: usize },
     #[error("JSON serialization failed: operation={operation}, entity={entity}, source={source}")]
     Json {
         operation: &'static str,
@@ -4173,6 +4175,66 @@ fn run_owner_lease_renewal_interval(lease_ttl: Duration) -> Duration {
 }
 
 impl DatabaseRunStateStore {
+    async fn insert_initial_run_events_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+        record: &DurableRunRecord,
+        events: &[serde_json::Value],
+    ) -> DbStoreResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let event_count = i64::try_from(events.len()).map_err(|_| {
+            DatabaseRunStateStoreError::RunEventBatchTooLarge {
+                run_id: record.run_id.clone(),
+                rows: events.len(),
+            }
+        })?;
+        let mut rows = Vec::with_capacity(events.len());
+        for (event_idx, event) in (0_i64..event_count).zip(events) {
+            rows.push(build_run_event_insert_row(
+                &record.user_id,
+                &record.run_id,
+                &record.session_id,
+                record.agent_id.as_deref(),
+                event_idx,
+                &self.owner_pod_id,
+                event,
+            )?);
+        }
+        let mut builder = sqlx::QueryBuilder::<sqlx::MySql>::new(
+            "INSERT INTO agent_run_events \
+             (id, run_id, event_idx, user_id, session_id, event_type, event_id, agent_id, \
+              subject_run_id, interaction_request_id, idempotency_key, event_hash, producer_pod_id, payload_json, created_at) ",
+        );
+        builder.push_values(rows.iter(), |mut row, event| {
+            row.push_bind(&event.id)
+                .push_bind(&event.run_id)
+                .push_bind(event.event_idx)
+                .push_bind(&event.user_id)
+                .push_bind(&event.session_id)
+                .push_bind(&event.event_type)
+                .push_bind(&event.event_id)
+                .push_bind(&event.agent_id)
+                .push_bind(&event.subject_run_id)
+                .push_bind(&event.interaction_request_id)
+                .push_bind(&event.idempotency_key)
+                .push_bind(&event.event_hash)
+                .push_bind(&event.producer_pod_id)
+                .push_bind(&event.payload_json)
+                .push("NOW(6)");
+        });
+        builder.push(matrixone_null_shape_comment(
+            rows.iter().flat_map(RunEventInsertRow::nullable_shape),
+        ));
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|source| db_error("insert_initial_run_events", &record.run_id, source))?;
+        Ok(())
+    }
+
     async fn existing_run_start_claim(
         &self,
         user_id: &str,
@@ -4235,10 +4297,21 @@ impl DatabaseRunStateStore {
             + chrono::Duration::from_std(self.lease_ttl)
                 .unwrap_or_else(|_| chrono::Duration::seconds(45));
         let events = std::mem::take(&mut record.events);
+        let holds_session_slot = run_requires_session_execution_slot(&record)
+            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref());
+        let atomic_initial_events = holds_session_slot && !events.is_empty();
 
-        // New run: last_event_idx must be -1 (no events written yet) so the
-        // first batch append allocates indices starting at 0.
-        if !events.is_empty() {
+        // A blocking run and its initial events are inserted in one transaction.
+        // Other run shapes retain the general append allocator below.
+        if atomic_initial_events {
+            record.last_event_idx = i64::try_from(events.len()).map_err(|_| {
+                DatabaseRunStateStoreError::RunEventBatchTooLarge {
+                    run_id: record.run_id.clone(),
+                    rows: events.len(),
+                }
+                .to_string()
+            })? - 1;
+        } else if !events.is_empty() {
             record.last_event_idx = -1;
         }
 
@@ -4261,9 +4334,7 @@ impl DatabaseRunStateStore {
             record.provider_request_fingerprint.is_some(),
         ];
 
-        let insert_result = if run_requires_session_execution_slot(&record)
-            && durable_run_status_blocks_session(&record.status, record.waiting_for.as_deref())
-        {
+        let (insert_result, initial_events_committed) = if holds_session_slot {
             let mut tx = self.pool.get().begin().await.map_err(|source| {
                 db_error("insert_run_begin", &record.run_id, source).to_string()
             })?;
@@ -4357,10 +4428,25 @@ impl DatabaseRunStateStore {
                 })?;
                 return Err("session already has an active run".to_string());
             }
+            if atomic_initial_events
+                && let Err(source) = self
+                    .insert_initial_run_events_tx(&mut tx, &record, &events)
+                    .await
+            {
+                tx.rollback().await.map_err(|rollback_error| {
+                    db_error(
+                        "insert_run_rollback_initial_events",
+                        &record.run_id,
+                        rollback_error,
+                    )
+                    .to_string()
+                })?;
+                return Err(source.to_string());
+            }
             tx.commit().await.map_err(|source| {
                 db_error("insert_run_commit", &record.run_id, source).to_string()
             })?;
-            result
+            (result, atomic_initial_events)
         } else {
             let insert_sql = if claim_existing {
                 "INSERT INTO agent_runs
@@ -4422,7 +4508,7 @@ impl DatabaseRunStateStore {
                 .bind(&record.provider_request_fingerprint)
                 .execute(self.pool.get())
                 .await;
-            match result {
+            let result = match result {
                 Ok(result) => result,
                 Err(source) if claim_existing && astra_core::is_duplicate_key_error(&source) => {
                     return self
@@ -4436,25 +4522,28 @@ impl DatabaseRunStateStore {
                 Err(source) => {
                     return Err(db_error("insert_run", &record.run_id, source).to_string());
                 }
-            }
+            };
+            (result, false)
         };
         if insert_result.rows_affected() == 0 {
             return Err("session already has an active run".to_string());
         }
 
-        if !events.is_empty() {
+        if initial_events_committed {
+            let projection =
+                build_run_display_projection(&record, events.last().map(extract_event_type), None);
+            self.upsert_run_projection(&projection)
+                .await
+                .map_err(|error| error.to_string())?;
+        } else if !events.is_empty() {
             self.append_events_batch_for_user(&record.user_id, &record.run_id, &events)
                 .await
                 .map_err(|e| e.to_string())?;
+        } else {
+            self.sync_projection_for_user(&record.user_id, &record.run_id, None, None)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        self.sync_projection_for_user(
-            &record.user_id,
-            &record.run_id,
-            record.events.last().map(extract_event_type).as_deref(),
-            None,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
         Ok(DurableRunStartClaim::Started)
     }
 }
@@ -8333,6 +8422,10 @@ mod tests {
                 let mut record = durable_run_record(&run_id);
                 record.user_id = user_id;
                 record.session_id = session_id.clone();
+                record.events = vec![json!({
+                    "event_type": "run_started",
+                    "event_id": format!("event-{run_id}"),
+                })];
                 store.claim_run_start(record, Some(&session_id)).await
             }
         };
@@ -8358,6 +8451,26 @@ mod tests {
                 .count(),
             1
         );
+
+        let durable_counts = sqlx::query(
+            "SELECT run.last_event_idx,
+                    (SELECT COUNT(*) FROM agent_run_events AS event
+                     WHERE event.user_id = run.user_id AND event.run_id = run.run_id
+                       AND event.event_idx = 0) AS event_count,
+                    (SELECT COUNT(*) FROM run_display_projections AS projection
+                     WHERE projection.user_id = run.user_id AND projection.run_id = run.run_id
+                       AND projection.projection_event_idx = 0) AS projection_count
+             FROM agent_runs AS run
+             WHERE run.user_id = ? AND run.run_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&run_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("load atomic run-start facts");
+        assert_eq!(durable_counts.get::<i64, _>("last_event_idx"), 0);
+        assert_eq!(durable_counts.get::<i64, _>("event_count"), 1);
+        assert_eq!(durable_counts.get::<i64, _>("projection_count"), 1);
 
         sqlx::query(
             "DELETE FROM agent_session_execution_slots WHERE user_id = ? AND session_id = ?",
