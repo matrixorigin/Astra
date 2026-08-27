@@ -2051,12 +2051,14 @@ impl RuntimeToolExecutor {
         name: &str,
     ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
         let context = self.runtime_file_transfer.clone()?;
-        if matches!(name, "materialize_attachment" | "publish_artifact")
-            || (name == "bash"
-                && matches!(
-                    &context.layout,
-                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
-                ))
+        if crate::server::tool_binding_projection::request_scoped_file_transfer_tool_ready(
+            name,
+            Some(context.as_ref()),
+        ) || (name == "bash"
+            && matches!(
+                &context.layout,
+                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
+            ))
         {
             return Some(context);
         }
@@ -2103,6 +2105,29 @@ impl RuntimeToolExecutor {
         // This avoids TOCTOU between admission time and execution time.
         if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
             return Some(offer);
+        }
+        if crate::server::tool_binding_projection::request_scoped_file_transfer_tool_ready(
+            &request.tool_name,
+            self.runtime_file_transfer.as_deref(),
+        ) {
+            let mut admission_context = self.tool_admission_context();
+            admission_context.request_scoped_file_transfer_provider_ready = true;
+            let decision = crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
+                &request.tool_name,
+                &[],
+                &request.workspace,
+                &request.executor,
+                request.runtime.as_ref(),
+                &astra_runtime_env::ToolRegistry::builtins(),
+                admission_context,
+            );
+            return decision.selected_offer.map(|offer| {
+                SelectedToolOfferSnapshot::new_with_route(
+                    offer.tool_name,
+                    offer.provider_id,
+                    offer.route,
+                )
+            });
         }
         // Fallback for request-scoped MCP tools: these are dynamically discovered
         // and may not have been available during surface assembly.
@@ -4256,6 +4281,70 @@ mod tests {
         assert!(bash.runtime_file_transfer.is_some());
         assert!(bash.runtime_file_transfer_required);
         assert!(bash.runtime_filesystem_boundary.is_none());
+    }
+
+    #[test]
+    fn ephemeral_publish_uses_request_scoped_edge_offer_and_surface() {
+        let (mut exec, _dir) = test_executor();
+        exec.set_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MOI ephemeral sandbox",
+                "/sandbox/.moi",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "eph-sandbox-1",
+                "MOI ephemeral sandbox",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+        );
+        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
+            endpoint_url: "https://moi.example/runtime-files".to_string(),
+            authorization: "Bearer request-scoped".to_string(),
+            workspace_root: "/sandbox/.moi".to_string(),
+            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
+                work_dir: "/sandbox/.moi".to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        });
+        let exec = exec.with_runtime_file_transfer(Some(context));
+
+        let request = exec.tool_execution_request(
+            "publish_artifact",
+            &json!({
+                "path": "/sandbox/.moi/report.pptx"
+            }),
+        );
+
+        let offer = request
+            .selected_offer
+            .as_ref()
+            .expect("request-scoped publish offer");
+        assert_eq!(offer.provider_id, "eph-sandbox-1");
+        assert_eq!(
+            offer.route,
+            crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound
+        );
+        assert!(
+            request
+                .runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins())
+                .tool_surface
+                .contains("publish_artifact"),
+            "execution authorization must preserve the request-scoped publish provider"
+        );
+        assert!(
+            !request
+                .runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins())
+                .tool_surface
+                .contains("materialize_attachment"),
+            "ephemeral execution must not restore the retired attachment tool"
+        );
+
+        let materialize =
+            exec.tool_execution_request("materialize_attachment", &json!({"file_id": "file-1"}));
+        assert!(materialize.selected_offer.is_none());
     }
 
     #[test]

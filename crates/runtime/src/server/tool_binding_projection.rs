@@ -284,10 +284,55 @@ fn extend_tool_schema_pool_prefer_extra_for_duplicates(pool: &mut Vec<Value>, ex
 }
 
 impl ToolExecutionRequest {
+    pub(crate) fn request_admission_context(
+        &self,
+        mut context: ToolAdmissionContext,
+    ) -> ToolAdmissionContext {
+        context.request_scoped_file_transfer_provider_ready =
+            request_scoped_file_transfer_tool_ready(
+                &self.tool_name,
+                self.runtime_file_transfer.as_deref(),
+            );
+        context
+    }
+
     pub fn runtime_environment_binding(
         &self,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> astra_runtime_env::RunBinding {
+        let admission_context = self.request_admission_context(ToolAdmissionContext::default());
+        if admission_context.request_scoped_file_transfer_provider_ready {
+            let mut providers = active_provider_declarations_for_binding(
+                &[],
+                &self.workspace,
+                &self.executor,
+                self.runtime.as_ref(),
+                registry,
+                &admission_context,
+            );
+            let runtime_provider_id =
+                super::tool_execution_binding::runtime_execution_provider_id_for_executor(
+                    &self.executor,
+                );
+            if let Some(provider) = providers
+                .iter_mut()
+                .find(|provider| provider.provider_id == runtime_provider_id)
+            {
+                provider.tool_names.retain(|name| name == &self.tool_name);
+                provider
+                    .tool_schema_digests
+                    .retain(|name, _| name == &self.tool_name);
+            }
+            return runtime_environment_binding_for_parts_with_provider_declarations(
+                &self.tool_name,
+                &self.workspace,
+                &self.executor,
+                self.runtime.clone(),
+                &self.policy,
+                registry,
+                &providers,
+            );
+        }
         runtime_environment_binding_for_parts(
             &self.tool_name,
             &self.workspace,
@@ -296,6 +341,21 @@ impl ToolExecutionRequest {
             &self.policy,
             registry,
         )
+    }
+}
+
+pub(crate) fn request_scoped_file_transfer_tool_ready(
+    tool_name: &str,
+    transfer: Option<&astra_services::runs::RuntimeFileTransferContext>,
+) -> bool {
+    match transfer.map(|transfer| &transfer.layout) {
+        Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
+            tool_name == "publish_artifact"
+        }
+        Some(astra_services::runs::RuntimeFileTransferLayout::Legacy { .. }) => {
+            astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES.contains(&tool_name)
+        }
+        None => false,
     }
 }
 

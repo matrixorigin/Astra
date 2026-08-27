@@ -686,6 +686,11 @@ impl ToolExecutionService {
                 self.provider_allowed_tools.read().await.clone(),
             )
         };
+        let admission_context = transport_request.request_admission_context(ToolAdmissionContext {
+            disabled_tool_offers: disabled_offer_ids.clone(),
+            provider_allowed_tools: provider_allowed_tools.clone(),
+            ..ToolAdmissionContext::default()
+        });
         let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
             &[],
@@ -693,11 +698,7 @@ impl ToolExecutionService {
             &transport_request.executor,
             transport_request.runtime.as_ref(),
             &self.tool_registry,
-            ToolAdmissionContext {
-                disabled_tool_offers: disabled_offer_ids.clone(),
-                provider_allowed_tools: provider_allowed_tools.clone(),
-                ..ToolAdmissionContext::default()
-            },
+            admission_context,
         );
         if let Some(offer_id) =
             disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
@@ -1384,6 +1385,77 @@ mod tests {
                 HashSet::from(["web.fetch".to_string()]),
             )]))
             .build();
+    }
+
+    #[test]
+    fn request_scoped_publish_authorization_requires_transfer_context() {
+        let service = ToolExecutionService::new_for_test();
+        let mut request = ToolExecutionRequest {
+            user_id: "user-1".to_string(),
+            run_id: "run-1".to_string(),
+            turn_chain_id: "turn-1".to_string(),
+            session_id: "session-1".to_string(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "publish_artifact".to_string(),
+            args: serde_json::json!({"path": "/sandbox/.moi/report.pptx"}),
+            workspace: WorkspaceBinding::edge_workspace(
+                "MOI ephemeral sandbox",
+                "/sandbox/.moi",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            workspace_record: None,
+            executor: ExecutorBinding::edge_agent(
+                "eph-sandbox-1",
+                "MOI ephemeral sandbox",
+                ToolTransportKind::EdgeWs,
+                ExecutorStatus::Online,
+            ),
+            runtime: None,
+            selected_offer: Some(
+                super::super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                    "publish_artifact",
+                    "eph-sandbox-1",
+                    ToolExecutionRouteKind::EdgeBound,
+                ),
+            ),
+            policy: Default::default(),
+            runtime_file_transfer: None,
+            runtime_file_transfer_required: true,
+            runtime_filesystem_boundary: None,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
+        };
+
+        assert!(
+            service.authorize_tool_request(&request).is_err(),
+            "generic Edge capacity must not authorize managed artifact publication"
+        );
+
+        request.runtime_file_transfer =
+            Some(Arc::new(astra_services::runs::RuntimeFileTransferContext {
+                endpoint_url: "https://moi.example/runtime-files".to_string(),
+                authorization: "Bearer request-scoped".to_string(),
+                workspace_root: "/sandbox/.moi".to_string(),
+                layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
+                    work_dir: "/sandbox/.moi".to_string(),
+                },
+                max_file_bytes: 1024,
+                attachments: Vec::new(),
+            }));
+
+        let mut materialize_request = request.clone();
+        materialize_request.tool_name = "materialize_attachment".to_string();
+        assert!(
+            service
+                .authorize_tool_request(&materialize_request)
+                .is_err(),
+            "ephemeral transfer must not restore materialize_attachment"
+        );
+
+        let binding = service
+            .authorize_tool_request(&request)
+            .expect("validated request-scoped transfer must authorize publish_artifact");
+        assert!(binding.tool_surface.contains("publish_artifact"));
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};
