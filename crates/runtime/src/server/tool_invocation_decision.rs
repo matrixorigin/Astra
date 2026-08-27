@@ -719,17 +719,13 @@ mod tests {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let mut request = request();
         request.policy.allowed_tools = vec!["write_file".into(), "read_file".into()];
-        let mut original = ToolInvocationDecisionSnapshot::resolve(
+        let original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
             &registry,
         )
         .unwrap();
         assert!(original.runtime_filesystem_boundary.is_none());
-        // Simulate a durable decision written by an older server. The field
-        // must remain decodable and hash-stable, but replay must not restore it
-        // onto the live execution request.
-        original.runtime_filesystem_boundary = request.runtime_filesystem_boundary.clone();
 
         request.policy.allowed_tools.reverse();
         request.workspace.display_name = "Renamed workspace".to_string();
@@ -840,12 +836,17 @@ mod tests {
             },
         ));
         request.runtime_edge_dispatch_authorization_required = true;
-        let original = ToolInvocationDecisionSnapshot::resolve(
+        let mut original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
             &registry,
         )
         .unwrap();
+        // Simulate a hash-valid durable decision written by an older server.
+        // The compatibility field must survive decoding, but replay must not
+        // restore it onto the live execution request.
+        original.runtime_filesystem_boundary = request.runtime_filesystem_boundary.clone();
+        assert!(original.runtime_filesystem_boundary.is_some());
         let durable = original.durable().unwrap();
         let durable_json = durable.snapshot.to_string();
         assert!(!durable_json.contains("transfer-secret-must-not-persist"));
@@ -862,6 +863,7 @@ mod tests {
         request.runtime_edge_dispatch_authorization_required = false;
         request.policy.admission_snapshot = Some(Default::default());
         let restored = ToolInvocationDecisionSnapshot::from_durable(&durable).unwrap();
+        assert!(restored.runtime_filesystem_boundary.is_some());
         restored.apply_to_request(&mut request);
 
         assert_eq!(request.workspace.cwd.as_deref(), Some("/original"));
