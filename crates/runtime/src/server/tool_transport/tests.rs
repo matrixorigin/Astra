@@ -1640,6 +1640,42 @@ fn validated_transfer_context_authorizes_edge_interceptor_support() {
 }
 
 #[test]
+fn ordinary_managed_edge_tools_do_not_require_transfer_protocol_capability() {
+    let request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "Managed sandbox",
+            "/sandbox",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-old",
+            "Managed sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    let mut agent = edge_agent_record("edge-old");
+    agent.capabilities = agent.capabilities.map(|mut value| {
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_capabilities");
+        value
+    });
+
+    let selected = super::super::tool_edge_selection::select_capable_edge_agent(
+        std::slice::from_ref(&agent),
+        Some("edge-old"),
+        &request,
+        &astra_runtime_env::ToolRegistry::builtins(),
+    )
+    .expect("ordinary managed Edge tools must not depend on file-transfer negotiation");
+
+    assert!(selected.is_some());
+}
+
+#[test]
 fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
     let mut request = request(
         "materialize_attachment",

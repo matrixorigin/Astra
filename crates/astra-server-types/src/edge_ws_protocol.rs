@@ -321,9 +321,9 @@ pub enum EdgeServerMessage {
         delivery_generation: u64,
         tool: String,
         args: Value,
-        /// Host-owned transfer credentials and path contract. This field is
-        /// never part of model-visible tool arguments or the invocation
-        /// journal; its Debug implementation redacts authorization.
+        /// Request-scoped transfer credentials and local path contract. This
+        /// field is never part of model-visible tool arguments or the
+        /// invocation journal; its Debug implementation redacts authorization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_file_transfer: Option<Box<RuntimeFileTransferContext>>,
         /// V2 managed file-transfer contract. It is separately negotiated so
@@ -331,8 +331,9 @@ pub enum EdgeServerMessage {
         /// eph Edge requires this explicit layout-aware contract.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_file_transfer_v2: Option<Box<RuntimeFileTransferContextV2>>,
-        /// Non-secret mount boundary for host-owned lanes within the writable
-        /// workspace. Unlike transfer credentials this field is durable.
+        /// Compatibility-only filesystem guard accepted from older servers
+        /// during rolling upgrades. New managed transfer requests treat local
+        /// Edge paths as executor-owned and omit this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_filesystem_boundary: Option<Box<RuntimeFilesystemBoundaryContext>>,
         /// Maximum execution time in seconds.

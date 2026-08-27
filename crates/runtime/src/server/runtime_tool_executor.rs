@@ -2015,7 +2015,6 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
-        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -2038,7 +2037,6 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
-        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -2061,26 +2059,6 @@ impl RuntimeToolExecutor {
             return Some(context);
         }
         None
-    }
-
-    fn runtime_filesystem_boundary(
-        &self,
-    ) -> Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>> {
-        let context = self.runtime_file_transfer.as_ref()?;
-        let astra_services::runs::RuntimeFileTransferLayout::Legacy {
-            root, session_dir, ..
-        } = &context.layout
-        else {
-            // eph-* owns its complete /sandbox/.moi work directory; there are
-            // no host-owned lanes to mount read-only inside that workspace.
-            return None;
-        };
-        Some(Arc::new(
-            astra_services::runs::RuntimeFilesystemBoundaryContext {
-                workspace_root: context.workspace_root.clone(),
-                read_only_paths: vec![root.clone(), session_dir.clone()],
-            },
-        ))
     }
 
     fn runtime_edge_dispatch_authorization_for_request(
@@ -4199,7 +4177,7 @@ mod tests {
     }
 
     #[test]
-    fn transfer_credentials_are_attached_only_to_transfer_tools() {
+    fn legacy_transfer_context_is_attached_only_to_transfer_tools() {
         let (exec, _dir) = test_executor();
         let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
@@ -4220,17 +4198,17 @@ mod tests {
         let materialize = exec.tool_execution_request("materialize_attachment", &Value::Null);
         assert!(materialize.runtime_file_transfer.is_some());
         assert!(materialize.runtime_file_transfer_required);
-        assert!(materialize.runtime_filesystem_boundary.is_some());
+        assert!(materialize.runtime_filesystem_boundary.is_none());
 
         let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
         assert!(publish.runtime_file_transfer.is_some());
         assert!(publish.runtime_file_transfer_required);
-        assert!(publish.runtime_filesystem_boundary.is_some());
+        assert!(publish.runtime_filesystem_boundary.is_none());
 
         let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
         assert!(bash.runtime_file_transfer.is_none());
         assert!(!bash.runtime_file_transfer_required);
-        assert!(bash.runtime_filesystem_boundary.is_some());
+        assert!(bash.runtime_filesystem_boundary.is_none());
     }
 
     #[test]

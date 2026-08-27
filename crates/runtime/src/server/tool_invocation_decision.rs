@@ -39,6 +39,9 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
     pub runtime_file_transfer_required: bool,
+    /// Legacy field retained so durable decisions created by older servers can
+    /// still be decoded and hashed. New decisions leave it empty, and replay
+    /// deliberately does not restore it onto an execution request.
     pub runtime_filesystem_boundary:
         Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
     pub runtime_edge_dispatch_authorization_required: bool,
@@ -216,7 +219,7 @@ impl ToolInvocationDecisionSnapshot {
             }),
             admission,
             runtime_file_transfer_required: request.runtime_file_transfer_required,
-            runtime_filesystem_boundary: request.runtime_filesystem_boundary.clone(),
+            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
         })
@@ -352,7 +355,12 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
         request.runtime_file_transfer_required = self.runtime_file_transfer_required;
-        request.runtime_filesystem_boundary = self.runtime_filesystem_boundary.clone();
+        // Legacy boundaries depended on nested mount namespaces that are not
+        // available inside managed OpenShell executors. The protected Catalog
+        // originals now remain behind request-scoped transfer authorization,
+        // while local Runner paths are executor-owned, so old durable values
+        // must not be re-applied during replay.
+        request.runtime_filesystem_boundary = None;
         request.runtime_edge_dispatch_authorization_required =
             self.runtime_edge_dispatch_authorization_required;
     }
@@ -711,12 +719,17 @@ mod tests {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         let mut request = request();
         request.policy.allowed_tools = vec!["write_file".into(), "read_file".into()];
-        let original = ToolInvocationDecisionSnapshot::resolve(
+        let mut original = ToolInvocationDecisionSnapshot::resolve(
             &request,
             ToolExecutionRouteKind::ServerLocal,
             &registry,
         )
         .unwrap();
+        assert!(original.runtime_filesystem_boundary.is_none());
+        // Simulate a durable decision written by an older server. The field
+        // must remain decodable and hash-stable, but replay must not restore it
+        // onto the live execution request.
+        original.runtime_filesystem_boundary = request.runtime_filesystem_boundary.clone();
 
         request.policy.allowed_tools.reverse();
         request.workspace.display_name = "Renamed workspace".to_string();
@@ -860,13 +873,7 @@ mod tests {
         assert_eq!(request.policy.max_output_bytes, Some(4096));
         assert!(request.runtime_file_transfer.is_none());
         assert!(request.runtime_file_transfer_required);
-        assert_eq!(
-            request
-                .runtime_filesystem_boundary
-                .as_ref()
-                .map(|boundary| boundary.read_only_paths.as_slice()),
-            Some(["/workspace/.moi/runtime/task-1".to_string()].as_slice())
-        );
+        assert!(request.runtime_filesystem_boundary.is_none());
         assert!(request.runtime_edge_dispatch_authorization.is_none());
         assert!(request.runtime_edge_dispatch_authorization_required);
         assert_eq!(restored.route, ToolExecutionRouteKind::ServerLocal);
