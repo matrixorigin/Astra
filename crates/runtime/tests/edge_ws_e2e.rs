@@ -583,15 +583,8 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         delivery_generation: 1,
         tool: "bash".to_string(),
         args: json!({"command": "sleep 30"}),
-        runtime_file_transfer: None,
-        runtime_file_transfer_v2: None,
         runtime_process_authorization: None,
-        runtime_filesystem_boundary: Some(Box::new(
-            astra_server_types::edge_ws_protocol::RuntimeFilesystemBoundaryContext {
-                workspace_root: "/sandbox".to_string(),
-                read_only_paths: vec!["/sandbox/.moi/runtime/task-1".to_string()],
-            },
-        )),
+        runtime_process_authorization_required: false,
         timeout_secs: 30,
     };
     dispatch
@@ -613,10 +606,6 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
     assert_eq!(req_json["type"], "edge_tool_request");
     assert_eq!(req_json["request_id"], request_id);
     assert_eq!(req_json["tool"], "bash");
-    assert!(
-        req_json.get("runtime_filesystem_boundary").is_none(),
-        "relay must strip a retired boundary from a pre-upgrade pending row"
-    );
 
     drop(ws);
 
@@ -654,10 +643,8 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         delivery_generation: 9,
         tool: "bash".to_string(),
         args: json!({"command": "effect"}),
-        runtime_file_transfer: None,
-        runtime_file_transfer_v2: None,
         runtime_process_authorization: None,
-        runtime_filesystem_boundary: None,
+        runtime_process_authorization_required: false,
         timeout_secs: 30,
     };
     dispatch

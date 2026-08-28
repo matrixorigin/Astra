@@ -911,7 +911,7 @@ fn edge_runtime_environment_advertisement(edge_agent_id: &str) -> Value {
     )
     .expect("serialize edge runtime environment advertisement");
     advertisement["protocol_capabilities"] = serde_json::json!({
-        "managed_file_transfer_v1": true,
+        "runtime_process_authorization_v1": true,
     });
     advertisement
 }
@@ -933,11 +933,8 @@ fn request(
         workspace_record: None,
         executor,
         runtime: None,
-        runtime_file_transfer: None,
-        runtime_file_transfer_required: false,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         selected_offer: None,
@@ -1553,49 +1550,6 @@ fn edge_bound_execution_plan_builds_dispatch_payload_and_delivery_metadata() {
 }
 
 #[test]
-fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
-    let mut request = request(
-        "materialize_attachment",
-        WorkspaceBinding::edge_workspace(
-            "Managed sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-1",
-            "Managed sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    request.runtime_file_transfer = Some(std::sync::Arc::new(
-        astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer durable-secret-must-not-appear".to_string(),
-            workspace_root: "/sandbox".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: "/sandbox/.moi/runtime/task-1".to_string(),
-                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        },
-    ));
-    request.runtime_file_transfer_required = true;
-
-    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
-    let payload = plan.dispatch_payload_json().expect("dispatch payload");
-    let parsed: Value = serde_json::from_str(&payload).expect("payload json");
-
-    assert!(!payload.contains("durable-secret-must-not-appear"));
-    assert_eq!(parsed["runtime_file_transfer"], Value::Null);
-    assert!(plan.runtime_file_transfer().is_some());
-}
-
-#[test]
 fn durable_edge_payload_never_contains_runtime_process_authorization() {
     let mut request = request(
         "bash",
@@ -1624,192 +1578,8 @@ fn durable_edge_payload_never_contains_runtime_process_authorization() {
 
     assert!(!payload.contains("durable-secret-must-not-appear"));
     assert_eq!(parsed["runtime_process_authorization"], Value::Null);
+    assert_eq!(parsed["runtime_process_authorization_required"], true);
     assert!(plan.runtime_process_authorization().is_some());
-}
-
-#[test]
-fn validated_transfer_context_authorizes_edge_interceptor_support() {
-    let mut request = request(
-        "materialize_attachment",
-        WorkspaceBinding::edge_workspace(
-            "Managed sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-selected",
-            "Managed sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    request.runtime_file_transfer = Some(std::sync::Arc::new(
-        astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: "/sandbox/.moi/runtime/task-1".to_string(),
-                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        },
-    ));
-    request.runtime_file_transfer_required = true;
-    let agent = edge_agent_record("edge-selected");
-
-    let selected = super::super::tool_edge_selection::select_capable_edge_agent(
-        std::slice::from_ref(&agent),
-        Some("edge-selected"),
-        &request,
-        &astra_runtime_env::ToolRegistry::builtins(),
-    )
-    .expect("validated transfer context must authorize the edge interceptor");
-
-    assert!(selected.is_some());
-}
-
-#[test]
-fn ordinary_managed_edge_tools_do_not_require_transfer_protocol_capability() {
-    let request = request(
-        "bash",
-        WorkspaceBinding::edge_workspace(
-            "Managed sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-old",
-            "Managed sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    let mut agent = edge_agent_record("edge-old");
-    agent.capabilities = agent.capabilities.map(|mut value| {
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("protocol_capabilities");
-        value
-    });
-
-    let selected = super::super::tool_edge_selection::select_capable_edge_agent(
-        std::slice::from_ref(&agent),
-        Some("edge-old"),
-        &request,
-        &astra_runtime_env::ToolRegistry::builtins(),
-    )
-    .expect("ordinary managed Edge tools must not depend on file-transfer negotiation");
-
-    assert!(selected.is_some());
-}
-
-#[test]
-fn transfer_context_does_not_substitute_for_edge_protocol_capability() {
-    let mut request = request(
-        "materialize_attachment",
-        WorkspaceBinding::edge_workspace(
-            "Managed sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-old",
-            "Managed sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    request.runtime_file_transfer = Some(std::sync::Arc::new(
-        astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: "/sandbox/.moi/runtime/task-1".to_string(),
-                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        },
-    ));
-    request.runtime_file_transfer_required = true;
-    let mut agent = edge_agent_record("edge-old");
-    agent.capabilities = agent.capabilities.map(|mut value| {
-        value
-            .as_object_mut()
-            .unwrap()
-            .remove("protocol_capabilities");
-        value
-    });
-
-    let denial = super::super::tool_edge_selection::select_capable_edge_agent(
-        std::slice::from_ref(&agent),
-        Some("edge-old"),
-        &request,
-        &astra_runtime_env::ToolRegistry::builtins(),
-    )
-    .expect_err("an older edge must not receive managed transfer requests");
-
-    assert!(matches!(
-        denial.1,
-        astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(ref reason)
-            if reason == "managed_file_transfer_v1_not_advertised"
-    ));
-}
-
-#[test]
-fn ephemeral_transfer_requires_v2_edge_protocol_capability() {
-    let mut request = request(
-        "bash",
-        WorkspaceBinding::edge_workspace(
-            "Ephemeral sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        ),
-        ExecutorBinding::edge_agent(
-            "edge-v1-only",
-            "Ephemeral sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    request.runtime_file_transfer = Some(std::sync::Arc::new(
-        astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                work_dir: "/sandbox/.moi".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        },
-    ));
-    request.runtime_file_transfer_required = true;
-    let agent = edge_agent_record("edge-v1-only");
-
-    let denial = super::super::tool_edge_selection::select_capable_edge_agent(
-        std::slice::from_ref(&agent),
-        Some("edge-v1-only"),
-        &request,
-        &astra_runtime_env::ToolRegistry::builtins(),
-    )
-    .expect_err("an eph transfer must not be sent through the V1 wire protocol");
-
-    assert!(matches!(
-        denial.1,
-        astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(ref reason)
-            if reason == "managed_file_transfer_v2_not_advertised"
-    ));
 }
 
 #[test]
@@ -3583,83 +3353,6 @@ async fn replayed_authorized_provider_executor_without_context_fails_before_disp
 }
 
 #[tokio::test]
-async fn replayed_managed_transfer_without_context_fails_before_dispatch() {
-    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<astra_server_types::EdgeServerMessage>(1);
-    pool.register_with_capabilities(
-        "user-1",
-        "runner-selected",
-        Some("Runner".to_string()),
-        Some("/workspace".to_string()),
-        Some(edge_runtime_environment_advertisement("runner-selected")),
-        None,
-        tx,
-    );
-    let dispatch = Arc::new(StaticEdgeDispatch::default());
-    let service = ToolExecutionService::builder()
-        .edge_connection_pool(pool)
-        .edge_dispatch_service(dispatch.clone())
-        .build();
-    let local = CountingLocalTransport::new();
-    let mut original = request(
-        "materialize_attachment",
-        WorkspaceBinding::edge_workspace("Runner", "/workspace", WorkspaceAuthority::ReadWrite),
-        ExecutorBinding::edge_agent(
-            "runner-selected",
-            "Runner",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        ),
-    );
-    original.runtime_file_transfer =
-        Some(Arc::new(astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer transfer-secret-must-not-appear".to_string(),
-            workspace_root: "/workspace".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: "/workspace/.moi/runtime/task-1".to_string(),
-                catalog_dir: "/workspace/.moi/runtime/task-1/catalog".to_string(),
-                session_dir: "/workspace/.moi/sessions/session-1".to_string(),
-                scratch_dir: "/workspace/.moi/runtime/task-1/scratch".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        }));
-    original.runtime_file_transfer_required = true;
-
-    let snapshot = serde_json::to_value(&original).expect("serialize tool snapshot");
-    assert!(snapshot.get("runtime_file_transfer").is_none());
-    assert_eq!(snapshot["runtime_file_transfer_required"], true);
-    assert!(
-        !snapshot
-            .to_string()
-            .contains("transfer-secret-must-not-appear")
-    );
-    let replayed: ToolExecutionRequest =
-        serde_json::from_value(snapshot).expect("deserialize tool snapshot");
-    assert!(replayed.runtime_file_transfer.is_none());
-    assert!(replayed.runtime_file_transfer_required);
-
-    let result = service.execute(replayed, &local).await;
-
-    assert!(result.is_error, "{result:?}");
-    assert_eq!(local.calls(), 0);
-    assert!(rx.try_recv().is_err(), "replay must not reach the Edge");
-    assert!(
-        dispatch
-            .inserted_edge_agent_ids
-            .lock()
-            .expect("inserted edge agent ids lock")
-            .is_empty(),
-        "replay without transfer context must not create a durable dispatch row"
-    );
-    let metadata = result.metadata.expect("file-transfer rejection metadata");
-    assert_eq!(metadata["execution_started"], false);
-    assert_eq!(metadata["side_effects_maybe"], false);
-}
-
-#[tokio::test]
 async fn terminal_durable_dispatch_replays_without_socket_redispatch() {
     let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
     let dispatch = Arc::new(StaticEdgeDispatch::terminal_admission("durable-result"));
@@ -5298,11 +4991,8 @@ fn edge_executor_id_returns_none_for_empty_id() {
         },
         workspace_record: None,
         runtime: None,
-        runtime_file_transfer: None,
-        runtime_file_transfer_required: false,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),
@@ -5341,11 +5031,8 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         },
         workspace_record: None,
         runtime: None,
-        runtime_file_transfer: None,
-        runtime_file_transfer_required: false,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),
@@ -5384,11 +5071,8 @@ fn edge_executor_id_returns_some_for_valid_id() {
         },
         workspace_record: None,
         runtime: None,
-        runtime_file_transfer: None,
-        runtime_file_transfer_required: false,
         runtime_process_authorization: None,
         runtime_process_authorization_required: false,
-        runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
         tool_name: "bash".to_string(),

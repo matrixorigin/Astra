@@ -1244,7 +1244,6 @@ pub struct ServerAgenticLoopHost {
     executor_binding: ExecutorBinding,
     runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
     request_scoped_mcp_provider_ready: bool,
-    request_scoped_file_transfer_tool_names: HashSet<String>,
     /// Request-scoped terminal control metadata supplied by the runtime
     /// provider. Kept outside the provider-facing tool schemas.
     runtime_control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
@@ -1908,7 +1907,6 @@ impl ServerAgenticLoopHostBuilder {
             executor_binding: schema_executor.clone(),
             runtime_binding: schema_runtime.clone(),
             request_scoped_mcp_provider_ready: false,
-            request_scoped_file_transfer_tool_names: HashSet::new(),
             runtime_control_tools: Default::default(),
             runtime_stop_after_success_tools: Default::default(),
             terminal_handoff_window: Default::default(),
@@ -2426,34 +2424,6 @@ impl ServerAgenticLoopHost {
         }
         self.request_scoped_mcp_provider_ready |= installed_request_scoped_mcp_schema;
         self.tool_schemas.extend(schemas);
-    }
-
-    /// Install tools backed by a validated, request-scoped managed file
-    /// transfer descriptor. These schemas are intentionally absent from every
-    /// generic provider catalog and become admissible only for this run.
-    pub(crate) fn install_managed_file_transfer_tool_schemas(
-        &mut self,
-        transfer: &astra_services::runs::RuntimeFileTransferContext,
-    ) {
-        self.request_scoped_file_transfer_tool_names =
-            crate::server::tool_admission::request_scoped_file_transfer_tool_names(Some(transfer));
-        for schema in astra_tools::schemas::all_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                tool_schema_name(schema)
-                    .is_some_and(|name| self.request_scoped_file_transfer_tool_names.contains(name))
-            })
-        {
-            append_tool_schemas_unique(&mut self.admission_tool_schemas, vec![schema.clone()]);
-            let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
-                continue;
-            };
-            self.valid_tools.insert(name.clone());
-            if !self.admissible_extras.iter().any(|extra| extra == &name) {
-                self.admissible_extras.push(name);
-            }
-            append_tool_schemas_unique(&mut self.tool_schemas, vec![schema]);
-        }
     }
 
     pub(crate) fn install_runtime_stop_after_success_tools(
@@ -4379,11 +4349,8 @@ impl ServerAgenticLoopHost {
                 runtime: self.runtime_binding.clone(),
                 selected_offer: None,
                 policy: ToolPolicySnapshot::default(),
-                runtime_file_transfer: None,
-                runtime_file_transfer_required: false,
                 runtime_process_authorization: None,
                 runtime_process_authorization_required: false,
-                runtime_filesystem_boundary: None,
                 runtime_edge_dispatch_authorization: None,
                 runtime_edge_dispatch_authorization_required: false,
             };
@@ -4480,9 +4447,6 @@ impl ServerAgenticLoopHost {
             server_service_provider_ready: self.server_service_provider_catalog_enabled,
             control_plane_provider_ready: self.control_plane_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
-            request_scoped_file_transfer_tool_names: self
-                .request_scoped_file_transfer_tool_names
-                .clone(),
             selected_runtime_platform: self
                 .runtime_binding
                 .as_ref()
@@ -8059,88 +8023,6 @@ mod tests {
     }
 
     #[test]
-    fn managed_file_transfer_surface_and_selected_offers_follow_layout() {
-        for (name, transfer, expected) in [
-            ("none", None, HashSet::new()),
-            (
-                "ephemeral",
-                Some(runtime_file_transfer_context(
-                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                        work_dir: "/Users/test/project".to_string(),
-                    },
-                )),
-                HashSet::from(["publish_artifact"]),
-            ),
-            (
-                "legacy",
-                Some(runtime_file_transfer_context(
-                    astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                        task_id: "task-1".to_string(),
-                        root: "/Users/test/project/runtime/task-1".to_string(),
-                        catalog_dir: "/Users/test/project/runtime/task-1/catalog".to_string(),
-                        session_dir: "/Users/test/project/sessions/session-1".to_string(),
-                        scratch_dir: "/Users/test/project/runtime/task-1/scratch".to_string(),
-                    },
-                )),
-                HashSet::from(["materialize_attachment", "publish_artifact"]),
-            ),
-        ] {
-            let mut host = ServerAgenticLoopHostBuilder::new(
-                mock_matrixone(),
-                mock_encryptor(),
-                format!("u-transfer-{name}"),
-                format!("s-transfer-{name}"),
-            )
-            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-                false, false,
-            ))
-            .with_server_service_tool_catalog_enabled(false)
-            .with_static_tool_catalog_admissible(false)
-            .with_edge_tools(sample_edge_tools())
-            .with_execution_binding_snapshot(edge_runtime_snapshot())
-            .build();
-            if let Some(transfer) = transfer.as_deref() {
-                host.install_managed_file_transfer_tool_schemas(transfer);
-            }
-
-            let dir = tempfile::TempDir::new().unwrap();
-            let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
-            runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
-            let runtime_executor =
-                Arc::new(runtime_executor.with_runtime_file_transfer(transfer.clone()));
-            let mut state = create_test_state();
-            state.runtime_tool_executor = Some(Arc::clone(&runtime_executor));
-
-            let visible = host.visible_turn_tools(&mut state);
-            let visible_names = schema_names(&visible);
-            for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
-                let should_be_visible = expected.contains(tool_name);
-                assert_eq!(
-                    visible_names.contains(*tool_name),
-                    should_be_visible,
-                    "{name} visible schema mismatch for {tool_name}"
-                );
-                assert_eq!(
-                    host.valid_tool_names().contains(*tool_name),
-                    should_be_visible,
-                    "{name} valid tool mismatch for {tool_name}"
-                );
-                let request = runtime_executor.tool_execution_request(tool_name, &Value::Null);
-                assert_eq!(
-                    request.selected_offer.is_some(),
-                    should_be_visible,
-                    "{name} selected offer mismatch for {tool_name}"
-                );
-                assert_eq!(
-                    request.runtime_file_transfer.is_some(),
-                    should_be_visible,
-                    "{name} transfer attachment mismatch for {tool_name}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn runtime_mcp_install_exposes_request_scoped_mcp_offer_to_admission() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -8702,19 +8584,6 @@ mod tests {
             ),
             astra_runtime_env::RuntimeBinding::host_process("edge-host"),
         )
-    }
-
-    fn runtime_file_transfer_context(
-        layout: astra_services::runs::RuntimeFileTransferLayout,
-    ) -> Arc<astra_services::runs::RuntimeFileTransferContext> {
-        Arc::new(astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/Users/test/project".to_string(),
-            layout,
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        })
     }
 
     fn runtime_tool_executor_with_agent_context(

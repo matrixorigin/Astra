@@ -534,9 +534,6 @@ pub struct RuntimeToolExecutor {
     auxiliary_event_writer: Option<Arc<dyn crate::TurnAuxiliaryEventWriter>>,
     /// Tool names explicitly admitted for edge dispatch (bypass capability check).
     edge_admitted_tools: HashSet<String>,
-    /// Hidden RuntimeGrant-backed byte-transfer context for managed Edge
-    /// tools. It is attached after model admission and never merged into args.
-    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     /// Provider authorization injected only into Edge bash subprocesses.
     runtime_process_authorization:
         Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
@@ -627,7 +624,6 @@ impl RuntimeToolExecutor {
             invocation_ledger: None,
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
-            runtime_file_transfer: None,
             runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
         }
@@ -659,14 +655,6 @@ impl RuntimeToolExecutor {
     /// so that multiple executors share the same disabled tool-offer set.
     pub fn with_tool_execution_service(mut self, service: ToolExecutionService) -> Self {
         self.tool_execution_service = service;
-        self
-    }
-
-    pub fn with_runtime_file_transfer(
-        mut self,
-        context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
-    ) -> Self {
-        self.runtime_file_transfer = context;
         self
     }
 
@@ -1380,10 +1368,6 @@ impl RuntimeToolExecutor {
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
-        context.request_scoped_file_transfer_tool_names =
-            crate::server::tool_admission::request_scoped_file_transfer_tool_names(
-                self.runtime_file_transfer.as_deref(),
-            );
         context
     }
 
@@ -2028,8 +2012,6 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
-        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_process_authorization = (name == "bash")
             .then(|| self.runtime_process_authorization.clone())
             .flatten();
@@ -2055,8 +2037,6 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
-        request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
         request.runtime_process_authorization = (name == "bash")
             .then(|| self.runtime_process_authorization.clone())
             .flatten();
@@ -2067,27 +2047,6 @@ impl RuntimeToolExecutor {
         request.runtime_edge_dispatch_authorization_required =
             request.runtime_edge_dispatch_authorization.is_some();
         request
-    }
-
-    fn runtime_file_transfer_for_tool(
-        &self,
-        name: &str,
-    ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
-        let context = self.runtime_file_transfer.clone()?;
-        let transfer_tool_names =
-            crate::server::tool_admission::request_scoped_file_transfer_tool_names(Some(
-                context.as_ref(),
-            ));
-        if transfer_tool_names.contains(name)
-            || (name == "bash"
-                && matches!(
-                    &context.layout,
-                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
-                ))
-        {
-            return Some(context);
-        }
-        None
     }
 
     fn runtime_edge_dispatch_authorization_for_request(
@@ -2110,28 +2069,6 @@ impl RuntimeToolExecutor {
         // This avoids TOCTOU between admission time and execution time.
         if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
             return Some(offer);
-        }
-        let admission_context = self.tool_admission_context();
-        if admission_context
-            .request_scoped_file_transfer_tool_names
-            .contains(&request.tool_name)
-        {
-            let decision = crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
-                &request.tool_name,
-                &[],
-                &request.workspace,
-                &request.executor,
-                request.runtime.as_ref(),
-                &astra_runtime_env::ToolRegistry::builtins(),
-                admission_context,
-            );
-            return decision.selected_offer.map(|offer| {
-                SelectedToolOfferSnapshot::new_with_route(
-                    offer.tool_name,
-                    offer.provider_id,
-                    offer.route,
-                )
-            });
         }
         // Fallback for request-scoped MCP tools: these are dynamically discovered
         // and may not have been available during surface assembly.
@@ -4228,41 +4165,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_transfer_context_is_attached_only_to_transfer_tools() {
-        let (exec, _dir) = test_executor();
-        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                task_id: "task-1".to_string(),
-                root: "/sandbox/.moi/runtime/task-1".to_string(),
-                catalog_dir: "/sandbox/.moi/runtime/task-1/catalog".to_string(),
-                session_dir: "/sandbox/.moi/sessions/session-1".to_string(),
-                scratch_dir: "/sandbox/.moi/runtime/task-1/scratch".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        });
-        let exec = exec.with_runtime_file_transfer(Some(context));
-
-        let materialize = exec.tool_execution_request("materialize_attachment", &Value::Null);
-        assert!(materialize.runtime_file_transfer.is_some());
-        assert!(materialize.runtime_file_transfer_required);
-        assert!(materialize.runtime_filesystem_boundary.is_none());
-
-        let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
-        assert!(publish.runtime_file_transfer.is_some());
-        assert!(publish.runtime_file_transfer_required);
-        assert!(publish.runtime_filesystem_boundary.is_none());
-
-        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
-        assert!(bash.runtime_file_transfer.is_none());
-        assert!(!bash.runtime_file_transfer_required);
-        assert!(bash.runtime_filesystem_boundary.is_none());
-    }
-
-    #[test]
     fn process_authorization_is_attached_only_to_bash() {
         let (exec, _dir) = test_executor();
         let context = Arc::new(astra_services::runs::RuntimeProcessAuthorizationContext {
@@ -4277,91 +4179,6 @@ mod tests {
         let read = exec.tool_execution_request("read_file", &json!({"path": "report.txt"}));
         assert!(read.runtime_process_authorization.is_none());
         assert!(!read.runtime_process_authorization_required);
-    }
-
-    #[test]
-    fn ephemeral_transfer_does_not_protect_its_owned_work_dir() {
-        let (exec, _dir) = test_executor();
-        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox/.moi".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                work_dir: "/sandbox/.moi".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        });
-        let exec = exec.with_runtime_file_transfer(Some(context));
-
-        let publish = exec.tool_execution_request("publish_artifact", &Value::Null);
-        assert!(publish.runtime_file_transfer.is_some());
-        assert!(publish.runtime_filesystem_boundary.is_none());
-
-        let bash = exec.tool_execution_request("bash", &json!({"command": "pwd"}));
-        assert!(bash.runtime_file_transfer.is_some());
-        assert!(bash.runtime_file_transfer_required);
-        assert!(bash.runtime_filesystem_boundary.is_none());
-    }
-
-    #[test]
-    fn ephemeral_publish_uses_request_scoped_edge_offer_and_surface() {
-        let (mut exec, _dir) = test_executor();
-        exec.set_execution_bindings(
-            WorkspaceBinding::edge_workspace(
-                "MOI ephemeral sandbox",
-                "/sandbox/.moi",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            ExecutorBinding::edge_agent(
-                "eph-sandbox-1",
-                "MOI ephemeral sandbox",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-        );
-        let context = Arc::new(astra_services::runs::RuntimeFileTransferContext {
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            authorization: "Bearer request-scoped".to_string(),
-            workspace_root: "/sandbox/.moi".to_string(),
-            layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                work_dir: "/sandbox/.moi".to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        });
-        let exec = exec.with_runtime_file_transfer(Some(context));
-
-        let request = exec.tool_execution_request(
-            "publish_artifact",
-            &json!({
-                "path": "/sandbox/.moi/report.pptx"
-            }),
-        );
-
-        let offer = request
-            .selected_offer
-            .as_ref()
-            .expect("request-scoped publish offer");
-        assert_eq!(offer.provider_id, "eph-sandbox-1");
-        assert_eq!(
-            offer.route,
-            crate::server::tool_route_selection::ToolExecutionRouteKind::EdgeBound
-        );
-        assert!(
-            request
-                .runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins())
-                .tool_surface
-                .contains("publish_artifact"),
-            "execution authorization must preserve the request-scoped publish provider"
-        );
-        assert!(
-            !request
-                .runtime_environment_binding(&astra_runtime_env::ToolRegistry::builtins())
-                .tool_surface
-                .contains("materialize_attachment"),
-            "ephemeral execution must not restore the retired attachment tool"
-        );
     }
 
     #[test]
@@ -5921,34 +5738,6 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("missing 'snapshot_id'")
-        );
-    }
-
-    #[tokio::test]
-    async fn publish_artifact_executes_from_tool_engine_registry() {
-        let (exec, _dir) = test_executor();
-        assert!(
-            exec.tool_engine.contains("publish_artifact"),
-            "publish_artifact should be registered in ToolEngine for server-local execution"
-        );
-
-        let result = exec
-            .execute_with_metadata("publish_artifact", &json!({"path": "report.md"}))
-            .await;
-
-        assert!(result.is_error, "{result:?}");
-        assert!(
-            result
-                .output
-                .contains("requires a configured MatrixOne artifact store"),
-            "{result:?}"
-        );
-        assert!(
-            result
-                .metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.contains_key("runtime_environment")),
-            "ToolEngine publish_artifact errors should still receive execution metadata"
         );
     }
 

@@ -229,13 +229,6 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("apply_patch", MU, A.union(FI)),
     tool("create_file", MU, A.union(FI)),
     tool("delete_file", MU, A.union(FI)),
-    tool_idem(
-        "materialize_attachment",
-        MU,
-        A.union(FI),
-        ToolIdempotency::IdempotentWrite,
-    ),
-    tool("publish_artifact", MU, A.union(FI)),
     tool("notebook_edit", MU, OR),
     // ── Mutating — rollback ──────────────────────────────────────────
     tool("rollback_file_edits", MU, A.union(OR)),
@@ -2572,19 +2565,5 @@ mod tests {
                  either the table or display_category() logic is wrong"
             );
         }
-    }
-}
-
-#[cfg(test)]
-mod artifact_effect_invariants {
-    use super::*;
-
-    #[test]
-    fn publish_artifact_is_a_mutating_external_effect() {
-        let classified = classify("publish_artifact", None);
-
-        assert!(classified.category.is_mutating());
-        assert!(!classified.category.is_read_only());
-        assert_eq!(classified.category, ToolCategory::Mutating);
     }
 }

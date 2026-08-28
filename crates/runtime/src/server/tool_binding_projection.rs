@@ -8,7 +8,6 @@ use serde_json::Value;
 use crate::server::tool_admission::{
     ToolAdmissionContext, ToolAdmissionDecision, ToolHiddenReason,
     active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
-    request_scoped_file_transfer_tool_names,
 };
 use crate::server::tool_route_selection::ToolExecutionRouteKind;
 
@@ -287,10 +286,8 @@ fn extend_tool_schema_pool_prefer_extra_for_duplicates(pool: &mut Vec<Value>, ex
 impl ToolExecutionRequest {
     pub(crate) fn request_admission_context(
         &self,
-        mut context: ToolAdmissionContext,
+        context: ToolAdmissionContext,
     ) -> ToolAdmissionContext {
-        context.request_scoped_file_transfer_tool_names =
-            request_scoped_file_transfer_tool_names(self.runtime_file_transfer.as_deref());
         context
     }
 
@@ -298,48 +295,6 @@ impl ToolExecutionRequest {
         &self,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> astra_runtime_env::RunBinding {
-        let transfer_tool_names =
-            request_scoped_file_transfer_tool_names(self.runtime_file_transfer.as_deref());
-        if transfer_tool_names.contains(&self.tool_name)
-            && matches!(self.executor.kind, ExecutorBindingKind::EdgeAgent)
-        {
-            let runtime = self
-                .runtime
-                .clone()
-                .unwrap_or_else(|| runtime_env_runtime_binding(&self.workspace, &self.executor));
-            let provider_type =
-                super::tool_execution_binding::capacity_provider_type_for_workspace_executor(
-                    self.workspace.kind,
-                    self.executor.kind,
-                );
-            let mut provider = astra_runtime_env::runtime_workspace_provider(
-                provider_type,
-                super::tool_execution_binding::runtime_execution_provider_id_for_executor(
-                    &self.executor,
-                ),
-                registry,
-                runtime.platform,
-            );
-            for tool_name in transfer_tool_names {
-                let Some(spec) = registry.get(&tool_name) else {
-                    continue;
-                };
-                provider.tool_names.insert(tool_name.clone());
-                provider.tool_schema_digests.insert(
-                    tool_name,
-                    astra_runtime_env::canonical_tool_spec_digest(spec),
-                );
-            }
-            return runtime_environment_binding_for_parts_with_provider_declarations(
-                &self.tool_name,
-                &self.workspace,
-                &self.executor,
-                Some(runtime),
-                &self.policy,
-                registry,
-                &[provider],
-            );
-        }
         runtime_environment_binding_for_parts(
             &self.tool_name,
             &self.workspace,

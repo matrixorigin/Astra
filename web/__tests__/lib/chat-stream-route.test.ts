@@ -1386,7 +1386,7 @@ describe("chat stream route proxy cancellation", () => {
   });
 });
 
-describe("chat stream route artifact fetch optimization", () => {
+describe("chat stream route startup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRequireRuntimeUser.mockResolvedValue({
@@ -1412,182 +1412,6 @@ describe("chat stream route artifact fetch optimization", () => {
       },
       sessionId: "chat-1",
     });
-  });
-
-  it("skips fetchSessionArtifacts for new chats (no prior messages)", async () => {
-    mockGetChat.mockReturnValue({
-      chat: {
-        id: "chat-1",
-        title: "Chat",
-        projectId: null,
-        createdAt: "2026-06-07T00:00:00.000Z",
-        updatedAt: "2026-06-07T00:00:00.000Z",
-        archivedAt: null,
-        model: "sonnet-4.6-adaptive",
-      },
-      messages: [], // New chat — no messages
-    });
-
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
-    const runtime = {
-      sdk: {
-        getRuntimeSession: vi.fn().mockResolvedValue({}),
-        listSessionArtifacts,
-      },
-      fetchResponse: vi.fn().mockResolvedValue({
-        ok: true,
-        body: backend.body,
-      }),
-    };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(listSessionArtifacts).not.toHaveBeenCalled();
-  });
-
-  it("skips fetchSessionArtifacts for new chats with only a pending first user message", async () => {
-    mockGetChat.mockReturnValue({
-      chat: {
-        id: "chat-1",
-        title: "Chat",
-        projectId: null,
-        createdAt: "2026-06-07T00:00:00.000Z",
-        updatedAt: "2026-06-07T00:00:00.000Z",
-        archivedAt: null,
-        model: "sonnet-4.6-adaptive",
-      },
-      messages: [
-        {
-          id: "pending-user-1",
-          role: "user" as const,
-          content: "hello",
-          createdAt: "2026-06-07T00:00:00.000Z",
-          status: "complete" as const,
-        },
-      ],
-      pendingTurn: {
-        messageId: "pending-user-1",
-        content: "hello",
-        options: {
-          model: "sonnet-4.6-adaptive",
-          webSearch: false,
-          thinking: true,
-          activeSkills: [],
-        },
-      },
-    });
-
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
-    const runtime = {
-      sdk: {
-        getRuntimeSession: vi.fn().mockResolvedValue({}),
-        listSessionArtifacts,
-      },
-      fetchResponse: vi.fn().mockResolvedValue({
-        ok: true,
-        body: backend.body,
-      }),
-    };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          pendingMessageId: "pending-user-1",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    expect(listSessionArtifacts).not.toHaveBeenCalled();
-  });
-
-  it("fetches artifacts for chats with prior messages", async () => {
-    mockGetChat.mockReturnValue({
-      chat: {
-        id: "chat-1",
-        title: "Chat",
-        projectId: null,
-        createdAt: "2026-06-07T00:00:00.000Z",
-        updatedAt: "2026-06-07T00:00:00.000Z",
-        archivedAt: null,
-        model: "sonnet-4.6-adaptive",
-      },
-      messages: [
-        {
-          id: "msg-1",
-          role: "user" as const,
-          content: "previous message",
-          createdAt: "2026-06-06T00:00:00.000Z",
-          status: "complete" as const,
-        },
-      ],
-    });
-
-    const { POST } = await import("@/app/api/chats/[chatId]/stream/route");
-    const backend = makeBackendStream();
-    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
-    const runtime = {
-      sdk: {
-        getRuntimeSession: vi.fn().mockResolvedValue({}),
-        listSessionArtifacts,
-      },
-      fetchResponse: vi.fn().mockResolvedValue({
-        ok: true,
-        body: backend.body,
-      }),
-    };
-    mockRequireRuntimeClient.mockResolvedValue(runtime as never);
-
-    const response = await POST(
-      new Request("http://web.test/api/chats/chat-1/stream", {
-        method: "POST",
-        body: JSON.stringify({
-          content: "hello",
-          options: {
-            model: "sonnet-4.6-adaptive",
-            webSearch: false,
-            thinking: true,
-            activeSkills: [],
-          },
-        }),
-      }) as never,
-      { params: Promise.resolve({ chatId: "chat-1" }) },
-    );
-
-    const reader = response.body?.getReader();
-    await reader?.read();
-    await waitForStreamWork();
-    await reader?.cancel();
-
-    expect(listSessionArtifacts).toHaveBeenCalledTimes(1);
   });
 
   it("creates the backend session and resolves the model in parallel", async () => {
@@ -1725,11 +1549,8 @@ describe("chat existing run stream route", () => {
       'data: {"type":"text_delta","content":"reply"}\n\n',
       'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
     ]);
-    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     mockRequireRuntimeClient.mockResolvedValue({
-      sdk: {
-        listSessionArtifacts,
-      },
+      sdk: {},
       fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         body: backend.body,
@@ -1759,9 +1580,6 @@ describe("chat existing run stream route", () => {
       }
     }
 
-    expect(listSessionArtifacts).toHaveBeenCalledWith("runtime-session-1", {
-      limit: 50,
-    });
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
       "user-a",
       "web-chat-1",

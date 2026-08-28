@@ -592,23 +592,6 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
-        if transport_request.runtime_file_transfer_required
-            && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
-                || transport_request.runtime_file_transfer.is_none())
-        {
-            let binding = transport_request.runtime_environment_binding(&self.tool_registry);
-            let reason = if transport_request.runtime_file_transfer.is_none() {
-                "managed runtime file-transfer context is unavailable"
-            } else {
-                "managed runtime file transfer requires an edge-bound execution route"
-            };
-            return edge_admission_rejected_result(
-                &transport_request,
-                &binding,
-                "file-transfer",
-                reason,
-            );
-        }
         if transport_request.runtime_process_authorization_required
             && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
                 || transport_request.runtime_process_authorization.is_none())
@@ -1344,11 +1327,8 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
-            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: Some(
@@ -1406,81 +1386,6 @@ mod tests {
             .build();
     }
 
-    #[test]
-    fn request_scoped_publish_authorization_requires_transfer_context() {
-        let service = ToolExecutionService::new_for_test();
-        let mut request = ToolExecutionRequest {
-            user_id: "user-1".to_string(),
-            run_id: "run-1".to_string(),
-            turn_chain_id: "turn-1".to_string(),
-            session_id: "session-1".to_string(),
-            tool_call_id: "call-1".to_string(),
-            tool_name: "publish_artifact".to_string(),
-            args: serde_json::json!({"path": "/sandbox/.moi/report.pptx"}),
-            workspace: WorkspaceBinding::edge_workspace(
-                "MOI ephemeral sandbox",
-                "/sandbox/.moi",
-                WorkspaceAuthority::ReadWrite,
-            ),
-            workspace_record: None,
-            executor: ExecutorBinding::edge_agent(
-                "eph-sandbox-1",
-                "MOI ephemeral sandbox",
-                ToolTransportKind::EdgeWs,
-                ExecutorStatus::Online,
-            ),
-            runtime: None,
-            selected_offer: None,
-            policy: Default::default(),
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
-            runtime_process_authorization: None,
-            runtime_process_authorization_required: false,
-            runtime_filesystem_boundary: None,
-            runtime_edge_dispatch_authorization: None,
-            runtime_edge_dispatch_authorization_required: false,
-        };
-
-        assert!(
-            service.authorize_tool_request(&request).is_err(),
-            "generic Edge capacity must not authorize managed artifact publication"
-        );
-
-        request.selected_offer = Some(
-            super::super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
-                "publish_artifact",
-                "eph-sandbox-1",
-                ToolExecutionRouteKind::EdgeBound,
-            ),
-        );
-        request.runtime_file_transfer =
-            Some(Arc::new(astra_services::runs::RuntimeFileTransferContext {
-                endpoint_url: "https://moi.example/runtime-files".to_string(),
-                authorization: "Bearer request-scoped".to_string(),
-                workspace_root: "/sandbox/.moi".to_string(),
-                layout: astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                    work_dir: "/sandbox/.moi".to_string(),
-                },
-                max_file_bytes: 1024,
-                attachments: Vec::new(),
-            }));
-        request.runtime_file_transfer_required = true;
-
-        let mut materialize_request = request.clone();
-        materialize_request.tool_name = "materialize_attachment".to_string();
-        assert!(
-            service
-                .authorize_tool_request(&materialize_request)
-                .is_err(),
-            "ephemeral transfer must not restore materialize_attachment"
-        );
-
-        let binding = service
-            .authorize_tool_request(&request)
-            .expect("validated request-scoped transfer must authorize publish_artifact");
-        assert!(binding.tool_surface.contains("publish_artifact"));
-    }
-
     use std::sync::atomic::{AtomicBool, Ordering};
 
     struct RecordingLocalTransport {
@@ -1519,11 +1424,8 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: Some(runtime),
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
-            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,

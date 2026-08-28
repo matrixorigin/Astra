@@ -76,56 +76,10 @@ use sqlx::Row;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RuntimeFileTransferMetadataV1 {
-    contract_version: u32,
-    task_id: String,
-    root: String,
-    catalog_dir: String,
-    session_dir: String,
-    scratch_dir: String,
-    max_file_bytes: u64,
-    attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RuntimeFileTransferMetadataV2 {
-    contract_version: u32,
-    work_dir: String,
-    max_file_bytes: u64,
-    attachments: Vec<astra_services::runs::RuntimeFileTransferAttachment>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RuntimeFileTransferMetadata {
-    Legacy(RuntimeFileTransferMetadataV1),
-    Ephemeral(RuntimeFileTransferMetadataV2),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RuntimeEdgeDispatchAuthorizationMetadata {
     contract_version: u32,
     task_id: String,
     executor_id: String,
-}
-
-const MAX_RUNTIME_ATTACHMENT_NAME_BYTES: usize = 240;
-
-fn valid_runtime_attachment_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_RUNTIME_ATTACHMENT_NAME_BYTES
-        && name.trim() == name
-        && !name.contains('\0')
-        && Path::new(name).file_name().and_then(|part| part.to_str()) == Some(name)
-}
-
-fn valid_lowercase_md5(md5: &str) -> bool {
-    md5.len() == 32
-        && md5
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_runtime_http_endpoint(endpoint: &str) -> bool {
@@ -2361,7 +2315,6 @@ fn build_server_skill_executor(
     edge_profile: &Map<String, Value>,
     execution_bindings: Option<&ExecutionBindingSnapshot>,
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
-    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     runtime_process_authorization: Option<
         Arc<astra_services::runs::RuntimeProcessAuthorizationContext>,
     >,
@@ -2400,7 +2353,6 @@ fn build_server_skill_executor(
     .with_edge_tools(edge_tools.to_vec())
     .with_edge_profile(edge_profile.clone())
     .with_workspace_record(workspace_record)
-    .with_runtime_file_transfer(runtime_file_transfer)
     .with_runtime_process_authorization(runtime_process_authorization)
     .with_runtime_edge_dispatch_authorization(runtime_edge_dispatch_authorization)
     .with_forward_headers(forward_headers.clone())
@@ -5187,13 +5139,6 @@ impl AgenticRunLifecycleService {
         Self::validate_resolved_model_selection(request)?;
         self.validate_runtime_profile_shape(request)?;
         Self::validate_runtime_auth_shape(request)?;
-        Self::runtime_file_transfer_context(request).map_err(|detail| {
-            error_response_coded(
-                StatusCode::BAD_REQUEST,
-                detail,
-                "runtime_file_transfer_invalid",
-            )
-        })?;
         Self::runtime_process_authorization_context(request).map_err(|detail| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -5266,152 +5211,14 @@ impl AgenticRunLifecycleService {
         Ok(request_constraints)
     }
 
-    fn runtime_file_transfer_context(
-        request: &ChatRequestData,
-    ) -> Result<Option<Arc<astra_services::runs::RuntimeFileTransferContext>>, String> {
-        let Some(descriptor) = request
-            .capability_descriptors
-            .as_ref()
-            .and_then(|descriptors| descriptors.file_transfer.as_ref())
-        else {
-            return Ok(None);
-        };
-        if !request.provider_runtime_authorized {
-            return Err("file_transfer requires provider-authorized runtime context".to_string());
-        }
-        let edge_workspace = request.workspace_binding.as_ref().filter(|binding| {
-            matches!(
-                binding.kind,
-                astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
-            )
-        });
-        let edge_executor = request.executor_binding.as_ref().is_some_and(|binding| {
-            matches!(
-                binding.kind,
-                astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
-            ) && matches!(
-                binding.transport,
-                Some(
-                    astra_services::runs::ToolTransportKindRequest::EdgeWs
-                        | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
-                )
-            )
-        });
-        if edge_workspace.is_none() || !edge_executor {
-            return Err(
-                "file_transfer requires an edge_workspace and Edge WebSocket executor".to_string(),
-            );
-        }
-        if descriptor.id != "moi-runtime-files"
-            || descriptor.descriptor_type != "file_transfer"
-            || descriptor.transport != "http"
-            || descriptor.protocol != "moi_runtime_files_v1"
-            || !valid_runtime_http_endpoint(&descriptor.endpoint_url)
-        {
-            return Err("file_transfer descriptor contract is invalid".to_string());
-        }
-        let auth = request
-            .runtime_auth
-            .as_ref()
-            .ok_or_else(|| "file_transfer requires runtime_auth".to_string())?;
-        let metadata: RuntimeFileTransferMetadata =
-            serde_json::from_value(Value::Object(descriptor.metadata.clone()))
-                .map_err(|error| format!("file_transfer metadata is invalid: {error}"))?;
-        let workspace_root = edge_workspace
-            .and_then(|binding| binding.root.as_deref())
-            .ok_or_else(|| "file_transfer requires an explicit edge workspace root".to_string())?;
-        let workspace_root = Path::new(workspace_root);
-        let (layout, max_file_bytes, attachments) = match metadata {
-            RuntimeFileTransferMetadata::Legacy(metadata) => {
-                if metadata.contract_version != 1
-                    || metadata.task_id.trim().is_empty()
-                    || Path::new(&metadata.task_id)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        != Some(metadata.task_id.as_str())
-                    || metadata.max_file_bytes == 0
-                    || metadata.max_file_bytes > 32 * 1024 * 1024
-                    || workspace_root != Path::new("/sandbox")
-                {
-                    return Err("file_transfer metadata contract is unsupported".to_string());
-                }
-                let root = Path::new(&metadata.root);
-                let expected_root = workspace_root.join(".moi/runtime").join(&metadata.task_id);
-                let expected_sessions_root = workspace_root.join(".moi/sessions");
-                let session = Path::new(&metadata.session_dir);
-                if root != expected_root
-                    || Path::new(&metadata.catalog_dir) != root.join("catalog")
-                    || Path::new(&metadata.scratch_dir) != root.join("scratch")
-                    || session.parent() != Some(expected_sessions_root.as_path())
-                    || session.file_name().is_none()
-                {
-                    return Err("file_transfer directory scope is invalid".to_string());
-                }
-                (
-                    astra_services::runs::RuntimeFileTransferLayout::Legacy {
-                        task_id: metadata.task_id,
-                        root: metadata.root,
-                        catalog_dir: metadata.catalog_dir,
-                        session_dir: metadata.session_dir,
-                        scratch_dir: metadata.scratch_dir,
-                    },
-                    metadata.max_file_bytes,
-                    metadata.attachments,
-                )
-            }
-            RuntimeFileTransferMetadata::Ephemeral(metadata) => {
-                if metadata.contract_version != 2
-                    || metadata.max_file_bytes == 0
-                    || metadata.max_file_bytes > 32 * 1024 * 1024
-                    || workspace_root != Path::new("/sandbox/.moi")
-                    || Path::new(&metadata.work_dir) != workspace_root
-                {
-                    return Err("file_transfer metadata contract is unsupported".to_string());
-                }
-                (
-                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                        work_dir: metadata.work_dir,
-                    },
-                    metadata.max_file_bytes,
-                    metadata.attachments,
-                )
-            }
-        };
-        let mut file_ids = HashSet::new();
-        let mut destination_names = HashSet::new();
-        for (index, attachment) in attachments.iter().enumerate() {
-            let destination_name =
-                astra_server_types::edge_ws_protocol::runtime_attachment_destination_name(
-                    index,
-                    &attachment.name,
-                );
-            if attachment.file_id.trim().is_empty()
-                || !valid_runtime_attachment_name(&attachment.name)
-                || attachment.size < 0
-                || attachment.size as u64 > max_file_bytes
-                || !valid_lowercase_md5(&attachment.md5)
-                || !file_ids.insert(attachment.file_id.clone())
-                || !destination_name.is_some_and(|name| destination_names.insert(name))
-            {
-                return Err("file_transfer attachment inventory is invalid".to_string());
-            }
-        }
-        Ok(Some(Arc::new(
-            astra_services::runs::RuntimeFileTransferContext {
-                endpoint_url: descriptor.endpoint_url.clone(),
-                authorization: auth.authorization.clone(),
-                workspace_root: workspace_root.display().to_string(),
-                layout,
-                max_file_bytes,
-                attachments,
-            },
-        )))
-    }
-
     fn runtime_process_authorization_context(
         request: &ChatRequestData,
     ) -> Result<Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>, String> {
-        let Some(auth) = request.runtime_auth.as_ref() else {
+        let Some(capability) = request
+            .capability_descriptors
+            .as_ref()
+            .and_then(|descriptors| descriptors.runtime_process_authorization.as_ref())
+        else {
             return Ok(None);
         };
         if !request.provider_runtime_authorized {
@@ -5424,25 +5231,49 @@ impl AgenticRunLifecycleService {
             matches!(
                 binding.kind,
                 astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+            ) && binding
+                .root
+                .as_deref()
+                .is_some_and(|root| !root.trim().is_empty())
+        });
+        let Some(executor) = request.executor_binding.as_ref() else {
+            return Err("runtime process authorization requires executor_binding".to_string());
+        };
+        let managed_edge_executor = matches!(
+            executor.kind,
+            astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+        ) && matches!(
+            executor.transport,
+            Some(
+                astra_services::runs::ToolTransportKindRequest::EdgeWs
+                    | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
             )
-        });
-        let managed_edge_executor = request.executor_binding.as_ref().is_some_and(|binding| {
-            matches!(
-                binding.kind,
-                astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
-            ) && matches!(
-                binding.transport,
-                Some(
-                    astra_services::runs::ToolTransportKindRequest::EdgeWs
-                        | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
-                )
-            ) && binding.executor_id.as_deref().is_some_and(|executor_id| {
-                executor_id.starts_with("eph-") || executor_id.starts_with("sbx-")
-            })
-        });
+        );
         if !edge_workspace || !managed_edge_executor {
-            return Ok(None);
+            return Err(
+                "runtime process authorization requires an edge_workspace and Edge WebSocket executor"
+                    .to_string(),
+            );
         }
+        let executor_id = executor
+            .executor_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "runtime process authorization requires executor_id".to_string())?;
+        if capability.contract_version
+            != astra_services::runs::RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION
+            || capability.task_id.trim().is_empty()
+            || capability.task_id.contains('/')
+            || capability.task_id.contains('\\')
+            || capability.executor_id != executor_id
+        {
+            return Err("runtime process authorization capability contract is invalid".to_string());
+        }
+        let auth = request
+            .runtime_auth
+            .as_ref()
+            .ok_or_else(|| "runtime process authorization requires runtime_auth".to_string())?;
         Ok(Some(Arc::new(
             astra_services::runs::RuntimeProcessAuthorizationContext {
                 authorization: auth.authorization.clone(),
@@ -7612,8 +7443,6 @@ impl AgenticRunLifecycleService {
             &edge_profile,
             execution_bindings,
             provider_effective_workspace_record(None, request.provider_run_owner.as_ref()),
-            Self::runtime_file_transfer_context(request)
-                .expect("runtime file transfer was validated before state construction"),
             Self::runtime_process_authorization_context(request)
                 .expect("runtime process authorization was validated before state construction"),
             Self::runtime_edge_dispatch_authorization_context(request)
@@ -9119,11 +8948,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &snapshot.executor,
             )));
         }
-        if let Some(transfer) = Self::runtime_file_transfer_context(&request)
-            .expect("runtime file transfer was validated before host construction")
-        {
-            host.install_managed_file_transfer_tool_schemas(transfer.as_ref());
-        }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
             host.install_runtime_stop_after_success_tools(bundle.stop_after_success_tools.clone());
@@ -9346,10 +9170,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            )
-            .with_runtime_file_transfer(
-                Self::runtime_file_transfer_context(&request)
-                    .expect("runtime file transfer was validated before run start"),
             )
             .with_runtime_process_authorization(
                 Self::runtime_process_authorization_context(&request)
@@ -10855,12 +10675,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
 
-        if let Some(transfer) = Self::runtime_file_transfer_context(&request)
-            .expect("runtime file transfer was validated before streaming host construction")
-        {
-            host.install_managed_file_transfer_tool_schemas(transfer.as_ref());
-        }
-
         // ── MCP: inject request-scoped schemas into host tool surface ─
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
@@ -11058,10 +10872,6 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 session_id.clone(),
                 memoria_base,
                 None,
-            )
-            .with_runtime_file_transfer(
-                Self::runtime_file_transfer_context(&request)
-                    .expect("runtime file transfer was validated before streaming run start"),
             )
             .with_runtime_process_authorization(
                 Self::runtime_process_authorization_context(&request).expect(

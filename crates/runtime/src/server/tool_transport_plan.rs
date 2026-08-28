@@ -29,13 +29,9 @@ pub(crate) struct EdgeBoundExecutionPlan {
     timeout_secs: u64,
     workspace: WorkspaceBinding,
     executor: ExecutorBinding,
-    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
-    runtime_file_transfer_required: bool,
     runtime_process_authorization:
         Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
     runtime_process_authorization_required: bool,
-    runtime_filesystem_boundary:
-        Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
     runtime_edge_dispatch_authorization_required: bool,
@@ -74,11 +70,8 @@ impl EdgeBoundExecutionPlan {
             timeout_secs: Self::DEFAULT_TIMEOUT_SECS,
             workspace: request.workspace.clone(),
             executor: request.executor.clone(),
-            runtime_file_transfer: request.runtime_file_transfer.clone(),
-            runtime_file_transfer_required: request.runtime_file_transfer_required,
             runtime_process_authorization: request.runtime_process_authorization.clone(),
             runtime_process_authorization_required: request.runtime_process_authorization_required,
-            runtime_filesystem_boundary: request.runtime_filesystem_boundary.clone(),
             runtime_edge_dispatch_authorization: request
                 .runtime_edge_dispatch_authorization
                 .clone(),
@@ -104,16 +97,6 @@ impl EdgeBoundExecutionPlan {
         &self.identity
     }
 
-    pub(crate) fn runtime_file_transfer(
-        &self,
-    ) -> Option<&astra_services::runs::RuntimeFileTransferContext> {
-        self.runtime_file_transfer.as_deref()
-    }
-
-    pub(crate) fn runtime_file_transfer_required(&self) -> bool {
-        self.runtime_file_transfer_required
-    }
-
     pub(crate) fn runtime_process_authorization(
         &self,
     ) -> Option<&astra_services::runs::RuntimeProcessAuthorizationContext> {
@@ -122,12 +105,6 @@ impl EdgeBoundExecutionPlan {
 
     pub(crate) fn runtime_process_authorization_required(&self) -> bool {
         self.runtime_process_authorization_required
-    }
-
-    pub(crate) fn runtime_filesystem_boundary(
-        &self,
-    ) -> Option<&astra_services::runs::RuntimeFilesystemBoundaryContext> {
-        self.runtime_filesystem_boundary.as_deref()
     }
 
     pub(crate) fn runtime_edge_dispatch_authorization(
@@ -151,13 +128,8 @@ impl EdgeBoundExecutionPlan {
             delivery_generation: 1,
             tool: self.tool_name.clone(),
             args: self.args.clone(),
-            runtime_file_transfer: None,
-            runtime_file_transfer_v2: None,
             runtime_process_authorization: None,
-            runtime_filesystem_boundary: self
-                .runtime_filesystem_boundary
-                .as_deref()
-                .map(|context| Box::new(context.into())),
+            runtime_process_authorization_required: self.runtime_process_authorization_required,
             timeout_secs: self.timeout_secs,
         }
     }

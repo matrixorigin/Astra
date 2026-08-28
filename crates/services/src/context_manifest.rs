@@ -131,7 +131,6 @@ pub const BASELINE_PREVIEW_TEMPLATES: &[(&str, u32, &str)] = &[
     ("csv_head", 1200, "csv_v1"),
     ("json_preview", 1200, "json_v1"),
     ("markdown_preview", 1200, "markdown_v1"),
-    ("publish_artifact", 1200, "artifact_file_v1"),
 ];
 
 pub fn preview_template_fts_field_weights(normalize_version: &str) -> &'static str {

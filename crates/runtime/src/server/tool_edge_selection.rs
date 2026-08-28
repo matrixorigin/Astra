@@ -117,35 +117,6 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
-    // Managed transfer tools require their matching Edge wire contract. The
-    // legacy Runner layout is V1; eph's single work directory is V2. Filesystem
-    // boundaries from old durable decisions are discarded before selection.
-    if request.runtime_file_transfer.is_some() {
-        let required_capability = match request
-            .runtime_file_transfer
-            .as_deref()
-            .map(|context| &context.layout)
-        {
-            Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
-                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY
-            }
-            _ => astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY,
-        };
-        if capabilities
-            .get("protocol_capabilities")
-            .and_then(|value| value.get(required_capability))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            return Ok(());
-        }
-        return Err(Box::new((
-            advert.binding,
-            astra_runtime_env::ToolUnavailableReason::ExecutorUnavailable(format!(
-                "{required_capability}_not_advertised"
-            )),
-        )));
-    }
     astra_runtime_env::CapabilityResolver
         .check_tool_call_for_surface(
             registry,

@@ -109,34 +109,12 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     Ok(persisted == replayed)
 }
 
-/// Canonicalize the durable identity of an Edge dispatch payload.
-///
-/// `runtime_filesystem_boundary` was retired from `edge_tool_request` during
-/// the managed Runner rollout. Older servers may already have persisted that
-/// field, so it cannot distinguish the same dispatch across a rolling upgrade.
-/// Every other message type and field remains part of the exact JSON identity.
-pub fn canonicalize_edge_dispatch_payload(
-    payload_json: &str,
-) -> Result<serde_json::Value, serde_json::Error> {
-    let mut payload = serde_json::from_str::<serde_json::Value>(payload_json)?;
-    if payload.get("type").and_then(serde_json::Value::as_str) == Some("edge_tool_request")
-        && let Some(object) = payload.as_object_mut()
-    {
-        object.remove("runtime_filesystem_boundary");
-    }
-    Ok(payload)
-}
-
 fn canonical_edge_dispatch_payload_json(payload_json: &str) -> Result<String, serde_json::Error> {
-    serde_json::to_string(&canonicalize_edge_dispatch_payload(payload_json)?)
+    serde_json::to_string(&serde_json::from_str::<serde_json::Value>(payload_json)?)
 }
 
 fn edge_dispatch_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> {
-    let persisted = canonicalize_edge_dispatch_payload(persisted)
-        .map_err(|error| format!("persisted durable payload is invalid JSON: {error}"))?;
-    let replayed = canonicalize_edge_dispatch_payload(replayed)
-        .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
-    Ok(persisted == replayed)
+    json_payloads_match(persisted, replayed)
 }
 
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
@@ -1911,46 +1889,6 @@ mod tests {
     }
 
     #[test]
-    fn edge_tool_request_payload_comparison_retires_only_the_legacy_boundary() {
-        let boundary_free = serde_json::json!({
-            "type": "edge_tool_request",
-            "request_id": "request-1",
-            "tool": "bash",
-            "args": {"command": "pwd"},
-            "timeout_secs": 30
-        });
-        let mut legacy = boundary_free.clone();
-        legacy["runtime_filesystem_boundary"] = serde_json::json!({
-            "workspace_root": "/sandbox",
-            "read_only_paths": ["/sandbox/.moi/runtime/task-1"]
-        });
-
-        let legacy = legacy.to_string();
-        let boundary_free = boundary_free.to_string();
-        assert!(
-            !json_payloads_match(&legacy, &boundary_free).unwrap(),
-            "generic durable JSON equality must remain strict"
-        );
-        assert!(edge_dispatch_payloads_match(&legacy, &boundary_free).unwrap());
-
-        let changed_tool = boundary_free.replace("\"bash\"", "\"write_file\"");
-        assert!(!edge_dispatch_payloads_match(&legacy, &changed_tool).unwrap());
-
-        let unrelated_with_boundary = serde_json::json!({
-            "type": "edge_other_message",
-            "runtime_filesystem_boundary": {"workspace_root": "/sandbox"}
-        })
-        .to_string();
-        let unrelated_without_boundary =
-            serde_json::json!({"type": "edge_other_message"}).to_string();
-        assert!(
-            !edge_dispatch_payloads_match(&unrelated_with_boundary, &unrelated_without_boundary)
-                .unwrap(),
-            "the compatibility exception must not affect unrelated message types"
-        );
-    }
-
-    #[test]
     fn claimed_dispatch_update_count_must_match_selected_rows() {
         validate_claimed_dispatch_update_count(2, 2).expect("matching counts are valid");
 
@@ -1979,8 +1917,7 @@ mod tests {
             format!("request-{unique}"),
         );
         cleanup_edge_dispatch_fixture(&pool, &identity).await;
-        let payload = json!({"request_id": identity.request_id, "tool": "materialize_attachment"})
-            .to_string();
+        let payload = json!({"request_id": identity.request_id, "tool": "bash"}).to_string();
 
         let admission = direct
             .admit_and_claim_direct_dispatch(&identity, &edge_agent_id, &payload)

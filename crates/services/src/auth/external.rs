@@ -21,7 +21,8 @@ use crate::models::ModelListItem;
 use crate::runs::{
     ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
     RuntimeCapabilityDescriptorsRequest, RuntimeMcpBindingRequest,
-    RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
+    RuntimeProcessAuthorizationCapabilityRequest, RuntimeSemanticReadCapabilityRequest,
+    RuntimeSkillBindingRequest,
 };
 use astra_turn_types::ModelSelection;
 
@@ -404,7 +405,7 @@ pub struct ExternalRuntimeCapabilityDescriptors {
     #[serde(default)]
     pub edge_agent: Option<ExternalRuntimeCapabilityDescriptor>,
     #[serde(default)]
-    pub file_transfer: Option<ExternalRuntimeCapabilityDescriptor>,
+    pub runtime_process_authorization: Option<RuntimeProcessAuthorizationCapabilityRequest>,
 }
 
 impl ExternalRuntimeCapabilityDescriptors {
@@ -426,10 +427,7 @@ impl ExternalRuntimeCapabilityDescriptors {
                 .edge_agent
                 .as_ref()
                 .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
-            file_transfer: self
-                .file_transfer
-                .as_ref()
-                .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
+            runtime_process_authorization: self.runtime_process_authorization.clone(),
         }
     }
 }
@@ -1098,9 +1096,6 @@ pub fn validate_provider_runtime_context(
     if let Some(edge_agent) = context.capability_descriptors.edge_agent.as_ref() {
         validate_capability_descriptor(provider, edge_agent, "edge_agent")?;
     }
-    if let Some(file_transfer) = context.capability_descriptors.file_transfer.as_ref() {
-        validate_capability_descriptor(provider, file_transfer, "file_transfer")?;
-    }
     Ok(())
 }
 
@@ -1610,33 +1605,25 @@ mod tests {
     }
 
     #[test]
-    fn external_file_transfer_descriptor_is_preserved_for_runtime_admission() {
-        let descriptor = ExternalRuntimeCapabilityDescriptor {
-            id: "moi-runtime-files".to_string(),
-            descriptor_type: "file_transfer".to_string(),
-            transport: "http".to_string(),
-            endpoint_url: "https://moi.example/runtime-files".to_string(),
-            protocol: "moi_runtime_files_v1".to_string(),
-            semantic_read: None,
-            metadata: serde_json::Map::from_iter([("contract_version".to_string(), json!(1))]),
-        };
+    fn external_process_authorization_capability_is_preserved_for_runtime_admission() {
         let descriptors = ExternalRuntimeCapabilityDescriptors {
-            file_transfer: Some(descriptor),
+            runtime_process_authorization: Some(RuntimeProcessAuthorizationCapabilityRequest {
+                contract_version: crate::runs::RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION
+                    .to_string(),
+                task_id: "task-1".to_string(),
+                executor_id: "eph-1".to_string(),
+            }),
             ..Default::default()
         };
 
         let request = descriptors.to_request_descriptors();
 
         assert_eq!(
-            request.file_transfer.as_ref().map(|item| item.id.as_str()),
-            Some("moi-runtime-files")
-        );
-        assert_eq!(
             request
-                .file_transfer
+                .runtime_process_authorization
                 .as_ref()
-                .map(|item| item.protocol.as_str()),
-            Some("moi_runtime_files_v1")
+                .map(|item| item.executor_id.as_str()),
+            Some("eph-1")
         );
     }
 

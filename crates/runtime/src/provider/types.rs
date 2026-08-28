@@ -76,8 +76,7 @@ impl ToolCategory {
             | "rollback_file_edits"
             | "list_dir"
             | "grep"
-            | "glob"
-            | "publish_artifact" => Some(Self::FileSystem),
+            | "glob" => Some(Self::FileSystem),
             "git" | "git_clone" => Some(Self::VersionControl),
             "web_search" | "web_fetch" | "github" | "tool_search" => Some(Self::ExternalApi),
             "ask_user"

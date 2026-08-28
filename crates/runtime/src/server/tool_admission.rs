@@ -78,9 +78,6 @@ pub(crate) struct ToolAdmissionContext {
     pub server_service_provider_ready: bool,
     pub control_plane_provider_ready: bool,
     pub request_scoped_mcp_provider_ready: bool,
-    /// Exact tools authorized by the validated request-scoped file-transfer
-    /// layout. These remain absent from every generic runtime catalog.
-    pub request_scoped_file_transfer_tool_names: HashSet<String>,
     pub selected_runtime_platform: astra_runtime_env::RuntimePlatform,
     pub runtime_declared_tool_names: Option<HashSet<String>>,
     pub provider_capabilities: HashMap<String, HashSet<String>>,
@@ -94,30 +91,12 @@ impl Default for ToolAdmissionContext {
             server_service_provider_ready: true,
             control_plane_provider_ready: true,
             request_scoped_mcp_provider_ready: false,
-            request_scoped_file_transfer_tool_names: HashSet::new(),
             selected_runtime_platform: astra_runtime_env::RuntimePlatform::Unknown,
             runtime_declared_tool_names: None,
             provider_capabilities: HashMap::new(),
             disabled_tool_offers: HashSet::new(),
             provider_allowed_tools: HashMap::new(),
         }
-    }
-}
-
-pub(crate) fn request_scoped_file_transfer_tool_names(
-    transfer: Option<&astra_services::runs::RuntimeFileTransferContext>,
-) -> HashSet<String> {
-    match transfer.map(|transfer| &transfer.layout) {
-        Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
-            HashSet::from(["publish_artifact".to_string()])
-        }
-        Some(astra_services::runs::RuntimeFileTransferLayout::Legacy { .. }) => {
-            astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect()
-        }
-        None => HashSet::new(),
     }
 }
 
@@ -450,18 +429,6 @@ pub(crate) fn active_provider_declarations_for_binding(
             runtime_provider
                 .tool_schema_digests
                 .retain(|name, _| runtime_declared_tool_names.contains(name));
-        }
-        if matches!(executor.kind, ExecutorBindingKind::EdgeAgent) {
-            for tool_name in &context.request_scoped_file_transfer_tool_names {
-                let Some(spec) = registry.get(tool_name) else {
-                    continue;
-                };
-                runtime_provider.tool_names.insert(tool_name.clone());
-                runtime_provider.tool_schema_digests.insert(
-                    tool_name.clone(),
-                    astra_runtime_env::canonical_tool_spec_digest(spec),
-                );
-            }
         }
         providers.push(runtime_provider);
     }
@@ -996,103 +963,6 @@ mod tests {
             server_candidate.reason,
             ToolOfferCandidateReason::CurrentProviderPreferred
         );
-    }
-
-    #[test]
-    fn managed_file_transfer_requires_validated_request_provider() {
-        let workspace = WorkspaceBinding::edge_workspace(
-            "Managed sandbox",
-            "/sandbox",
-            WorkspaceAuthority::ReadWrite,
-        );
-        let executor = ExecutorBinding::edge_agent(
-            "edge-managed",
-            "Managed sandbox",
-            ToolTransportKind::EdgeWs,
-            ExecutorStatus::Online,
-        );
-
-        let unavailable = resolve_tool_admission_for_binding_with_context(
-            "materialize_attachment",
-            &[],
-            &workspace,
-            &executor,
-            None,
-            &registry(),
-            ToolAdmissionContext::default(),
-        );
-        assert!(!unavailable.visible);
-        assert_eq!(
-            unavailable.hidden_reason,
-            Some(ToolHiddenReason::NoProvider)
-        );
-
-        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
-            let available = resolve_tool_admission_for_binding_with_context(
-                tool_name,
-                &[],
-                &workspace,
-                &executor,
-                None,
-                &registry(),
-                ToolAdmissionContext {
-                    request_scoped_file_transfer_tool_names: HashSet::from([
-                        "materialize_attachment".to_string(),
-                        "publish_artifact".to_string(),
-                    ]),
-                    runtime_declared_tool_names: Some(HashSet::from([
-                        "bash".to_string(),
-                        "publish_artifact".to_string(),
-                    ])),
-                    ..ToolAdmissionContext::default()
-                },
-            );
-            assert!(available.visible, "{tool_name} must be request-scoped");
-            assert_eq!(available.route, ToolExecutionRouteKind::EdgeBound);
-            let expected_offer_id = format!("{tool_name}@edge-managed");
-            assert_eq!(
-                available.selected_offer_id(),
-                Some(expected_offer_id.as_str())
-            );
-        }
-
-        let providers = active_provider_declarations_for_binding(
-            &[],
-            &workspace,
-            &executor,
-            None,
-            &registry(),
-            &ToolAdmissionContext {
-                request_scoped_file_transfer_tool_names: HashSet::from([
-                    "materialize_attachment".to_string(),
-                    "publish_artifact".to_string(),
-                ]),
-                runtime_declared_tool_names: Some(HashSet::from([
-                    "bash".to_string(),
-                    "publish_artifact".to_string(),
-                ])),
-                ..ToolAdmissionContext::default()
-            },
-        );
-        let edge_providers = providers
-            .iter()
-            .filter(|provider| provider.provider_id == "edge-managed")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            edge_providers.len(),
-            1,
-            "runtime provider ID must be unique"
-        );
-        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
-            assert!(edge_providers[0].declares_tool(tool_name));
-            assert_eq!(
-                edge_providers[0].schema_digest_for_tool(tool_name),
-                registry()
-                    .get(tool_name)
-                    .map(astra_runtime_env::canonical_tool_spec_digest)
-                    .as_deref()
-            );
-        }
     }
 
     #[test]

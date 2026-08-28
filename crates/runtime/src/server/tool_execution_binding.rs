@@ -269,15 +269,6 @@ pub struct ToolExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_offer: Option<SelectedToolOfferSnapshot>,
     pub policy: ToolPolicySnapshot,
-    /// Request-scoped managed Edge transfer material. Skipped by generic
-    /// serialization so credentials cannot enter durable tool snapshots.
-    #[serde(skip)]
-    pub runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
-    /// Non-secret durable marker. If a snapshot is replayed without the
-    /// skipped transfer context, routing must fail closed rather than degrade
-    /// to ordinary Edge dispatch.
-    #[serde(default)]
-    pub runtime_file_transfer_required: bool,
     /// Provider authorization injected only into a selected managed Sandbox bash
     /// subprocess. The credential is never serialized into durable snapshots.
     #[serde(skip)]
@@ -286,12 +277,6 @@ pub struct ToolExecutionRequest {
     /// Replay fence for the skipped process authorization.
     #[serde(default)]
     pub runtime_process_authorization_required: bool,
-    /// Compatibility-only filesystem guard retained in the request shape for
-    /// older senders. Current runtime requests treat local Edge paths as
-    /// executor-owned and never populate or replay this field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_filesystem_boundary:
-        Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
     /// Request-scoped dispatch authorization callback. Like file transfer
     /// credentials, this is never serialized into durable tool snapshots.
     #[serde(skip)]
@@ -521,11 +506,8 @@ impl ExecutionBindingState {
             runtime: self.runtime.clone(),
             selected_offer: None,
             policy: ToolPolicySnapshot::default(),
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
             runtime_process_authorization: None,
             runtime_process_authorization_required: false,
-            runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
         }
