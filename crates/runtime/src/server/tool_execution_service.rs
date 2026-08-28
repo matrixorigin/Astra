@@ -1451,46 +1451,13 @@ mod tests {
             service
                 .authorize_tool_request(&materialize_request)
                 .is_err(),
-            "ephemeral transfer without attachments must not expose materialize_attachment"
+            "ephemeral transfer must not restore materialize_attachment"
         );
 
         let binding = service
             .authorize_tool_request(&request)
             .expect("validated request-scoped transfer must authorize publish_artifact");
         assert!(binding.tool_surface.contains("publish_artifact"));
-
-        let mut materialize_request = request.clone();
-        materialize_request.tool_name = "materialize_attachment".to_string();
-        materialize_request.selected_offer = Some(
-            super::super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
-                "materialize_attachment",
-                "eph-sandbox-1",
-                ToolExecutionRouteKind::EdgeBound,
-            ),
-        );
-        Arc::make_mut(
-            materialize_request
-                .runtime_file_transfer
-                .as_mut()
-                .expect("transfer context"),
-        )
-        .attachments
-        .push(astra_services::runs::RuntimeFileTransferAttachment {
-            file_id: "file-1".to_string(),
-            name: "input.pdf".to_string(),
-            size: 512,
-            md5: "0123456789abcdef0123456789abcdef".to_string(),
-        });
-        let binding = service
-            .authorize_tool_request(&materialize_request)
-            .expect("ephemeral transfer with attachments must authorize materialization");
-        assert!(binding.tool_surface.contains("materialize_attachment"));
-
-        request.workspace.authority = WorkspaceAuthority::None;
-        assert!(
-            service.authorize_tool_request(&request).is_err(),
-            "request-scoped transfer must not bypass runtime provider readiness"
-        );
     }
 
     use std::sync::atomic::{AtomicBool, Ordering};

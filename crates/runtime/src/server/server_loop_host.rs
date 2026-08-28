@@ -8061,24 +8061,13 @@ mod tests {
         for (name, transfer, expected) in [
             ("none", None, HashSet::new()),
             (
-                "ephemeral-without-attachments",
+                "ephemeral",
                 Some(runtime_file_transfer_context(
                     astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
                         work_dir: "/Users/test/project".to_string(),
                     },
-                    false,
                 )),
                 HashSet::from(["publish_artifact"]),
-            ),
-            (
-                "ephemeral-with-attachments",
-                Some(runtime_file_transfer_context(
-                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral {
-                        work_dir: "/Users/test/project".to_string(),
-                    },
-                    true,
-                )),
-                HashSet::from(["materialize_attachment", "publish_artifact"]),
             ),
             (
                 "legacy",
@@ -8090,7 +8079,6 @@ mod tests {
                         session_dir: "/Users/test/project/sessions/session-1".to_string(),
                         scratch_dir: "/Users/test/project/runtime/task-1/scratch".to_string(),
                     },
-                    false,
                 )),
                 HashSet::from(["materialize_attachment", "publish_artifact"]),
             ),
@@ -8716,7 +8704,6 @@ mod tests {
 
     fn runtime_file_transfer_context(
         layout: astra_services::runs::RuntimeFileTransferLayout,
-        with_attachment: bool,
     ) -> Arc<astra_services::runs::RuntimeFileTransferContext> {
         Arc::new(astra_services::runs::RuntimeFileTransferContext {
             endpoint_url: "https://moi.example/runtime-files".to_string(),
@@ -8724,15 +8711,7 @@ mod tests {
             workspace_root: "/Users/test/project".to_string(),
             layout,
             max_file_bytes: 1024,
-            attachments: with_attachment
-                .then(|| astra_services::runs::RuntimeFileTransferAttachment {
-                    file_id: "file-1".to_string(),
-                    name: "input.pdf".to_string(),
-                    size: 512,
-                    md5: "0123456789abcdef0123456789abcdef".to_string(),
-                })
-                .into_iter()
-                .collect(),
+            attachments: Vec::new(),
         })
     }
 
