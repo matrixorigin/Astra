@@ -107,18 +107,21 @@ impl Default for ToolAdmissionContext {
 pub(crate) fn request_scoped_file_transfer_tool_names(
     transfer: Option<&astra_services::runs::RuntimeFileTransferContext>,
 ) -> HashSet<String> {
-    match transfer.map(|transfer| &transfer.layout) {
-        Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
-            HashSet::from(["publish_artifact".to_string()])
-        }
-        Some(astra_services::runs::RuntimeFileTransferLayout::Legacy { .. }) => {
-            astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect()
-        }
-        None => HashSet::new(),
+    let Some(transfer) = transfer else {
+        return HashSet::new();
+    };
+    let mut tool_names = astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<HashSet<_>>();
+    if matches!(
+        transfer.layout,
+        astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
+    ) && transfer.attachments.is_empty()
+    {
+        tool_names.remove(astra_tools::schemas::MATERIALIZE_ATTACHMENT_TOOL_NAME);
     }
+    tool_names
 }
 
 impl ToolAdmissionDecision {

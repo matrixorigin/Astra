@@ -12,8 +12,10 @@ use serde_json::{Map, Value, json};
 pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
 pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
 pub const PER_ACTION_ALLOWED_KEY: &str = "x-astra-per-action-allowed";
+pub const MATERIALIZE_ATTACHMENT_TOOL_NAME: &str = "materialize_attachment";
+pub const PUBLISH_ARTIFACT_TOOL_NAME: &str = "publish_artifact";
 pub const MANAGED_FILE_TRANSFER_TOOL_NAMES: &[&str] =
-    &["materialize_attachment", "publish_artifact"];
+    &[MATERIALIZE_ATTACHMENT_TOOL_NAME, PUBLISH_ARTIFACT_TOOL_NAME];
 
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.

@@ -302,6 +302,11 @@ impl ToolExecutionRequest {
             request_scoped_file_transfer_tool_names(self.runtime_file_transfer.as_deref());
         if transfer_tool_names.contains(&self.tool_name)
             && matches!(self.executor.kind, ExecutorBindingKind::EdgeAgent)
+            && has_explicit_runtime_executor_provider(
+                &self.workspace,
+                &self.executor,
+                self.runtime.as_ref(),
+            )
         {
             let runtime = self
                 .runtime
