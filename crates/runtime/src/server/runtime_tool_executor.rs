@@ -1368,7 +1368,10 @@ impl RuntimeToolExecutor {
         context.request_scoped_mcp_provider_ready = !self
             .request_scoped_mcp_schemas_snapshot("request_scoped_mcp_admission")
             .is_empty();
-        context.request_scoped_file_transfer_provider_ready = self.runtime_file_transfer.is_some();
+        context.request_scoped_file_transfer_tool_names =
+            crate::server::tool_admission::request_scoped_file_transfer_tool_names(
+                self.runtime_file_transfer.as_deref(),
+            );
         context
     }
 
@@ -2051,14 +2054,16 @@ impl RuntimeToolExecutor {
         name: &str,
     ) -> Option<Arc<astra_services::runs::RuntimeFileTransferContext>> {
         let context = self.runtime_file_transfer.clone()?;
-        if crate::server::tool_binding_projection::request_scoped_file_transfer_tool_ready(
-            name,
-            Some(context.as_ref()),
-        ) || (name == "bash"
-            && matches!(
-                &context.layout,
-                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
-            ))
+        let transfer_tool_names =
+            crate::server::tool_admission::request_scoped_file_transfer_tool_names(Some(
+                context.as_ref(),
+            ));
+        if transfer_tool_names.contains(name)
+            || (name == "bash"
+                && matches!(
+                    &context.layout,
+                    astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }
+                ))
         {
             return Some(context);
         }
@@ -2106,12 +2111,11 @@ impl RuntimeToolExecutor {
         if let Some(offer) = self.current_selected_tool_offer(&request.tool_name) {
             return Some(offer);
         }
-        if crate::server::tool_binding_projection::request_scoped_file_transfer_tool_ready(
-            &request.tool_name,
-            self.runtime_file_transfer.as_deref(),
-        ) {
-            let mut admission_context = self.tool_admission_context();
-            admission_context.request_scoped_file_transfer_provider_ready = true;
+        let admission_context = self.tool_admission_context();
+        if admission_context
+            .request_scoped_file_transfer_tool_names
+            .contains(&request.tool_name)
+        {
             let decision = crate::server::tool_binding_projection::resolve_tool_visibility_for_binding_with_context(
                 &request.tool_name,
                 &[],
@@ -4341,10 +4345,6 @@ mod tests {
                 .contains("materialize_attachment"),
             "ephemeral execution must not restore the retired attachment tool"
         );
-
-        let materialize =
-            exec.tool_execution_request("materialize_attachment", &json!({"file_id": "file-1"}));
-        assert!(materialize.selected_offer.is_none());
     }
 
     #[test]

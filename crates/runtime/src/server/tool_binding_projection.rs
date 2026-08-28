@@ -8,6 +8,7 @@ use serde_json::Value;
 use crate::server::tool_admission::{
     ToolAdmissionContext, ToolAdmissionDecision, ToolHiddenReason,
     active_provider_declarations_for_binding, has_explicit_runtime_executor_provider,
+    request_scoped_file_transfer_tool_names,
 };
 use crate::server::tool_route_selection::ToolExecutionRouteKind;
 
@@ -288,11 +289,8 @@ impl ToolExecutionRequest {
         &self,
         mut context: ToolAdmissionContext,
     ) -> ToolAdmissionContext {
-        context.request_scoped_file_transfer_provider_ready =
-            request_scoped_file_transfer_tool_ready(
-                &self.tool_name,
-                self.runtime_file_transfer.as_deref(),
-            );
+        context.request_scoped_file_transfer_tool_names =
+            request_scoped_file_transfer_tool_names(self.runtime_file_transfer.as_deref());
         context
     }
 
@@ -300,37 +298,46 @@ impl ToolExecutionRequest {
         &self,
         registry: &astra_runtime_env::ToolRegistry,
     ) -> astra_runtime_env::RunBinding {
-        let admission_context = self.request_admission_context(ToolAdmissionContext::default());
-        if admission_context.request_scoped_file_transfer_provider_ready {
-            let mut providers = active_provider_declarations_for_binding(
-                &[],
-                &self.workspace,
-                &self.executor,
-                self.runtime.as_ref(),
-                registry,
-                &admission_context,
-            );
-            let runtime_provider_id =
+        let transfer_tool_names =
+            request_scoped_file_transfer_tool_names(self.runtime_file_transfer.as_deref());
+        if transfer_tool_names.contains(&self.tool_name)
+            && matches!(self.executor.kind, ExecutorBindingKind::EdgeAgent)
+        {
+            let runtime = self
+                .runtime
+                .clone()
+                .unwrap_or_else(|| runtime_env_runtime_binding(&self.workspace, &self.executor));
+            let provider_type =
+                super::tool_execution_binding::capacity_provider_type_for_workspace_executor(
+                    self.workspace.kind,
+                    self.executor.kind,
+                );
+            let mut provider = astra_runtime_env::runtime_workspace_provider(
+                provider_type,
                 super::tool_execution_binding::runtime_execution_provider_id_for_executor(
                     &self.executor,
+                ),
+                registry,
+                runtime.platform,
+            );
+            for tool_name in transfer_tool_names {
+                let Some(spec) = registry.get(&tool_name) else {
+                    continue;
+                };
+                provider.tool_names.insert(tool_name.clone());
+                provider.tool_schema_digests.insert(
+                    tool_name,
+                    astra_runtime_env::canonical_tool_spec_digest(spec),
                 );
-            if let Some(provider) = providers
-                .iter_mut()
-                .find(|provider| provider.provider_id == runtime_provider_id)
-            {
-                provider.tool_names.retain(|name| name == &self.tool_name);
-                provider
-                    .tool_schema_digests
-                    .retain(|name, _| name == &self.tool_name);
             }
             return runtime_environment_binding_for_parts_with_provider_declarations(
                 &self.tool_name,
                 &self.workspace,
                 &self.executor,
-                self.runtime.clone(),
+                Some(runtime),
                 &self.policy,
                 registry,
-                &providers,
+                &[provider],
             );
         }
         runtime_environment_binding_for_parts(
@@ -341,21 +348,6 @@ impl ToolExecutionRequest {
             &self.policy,
             registry,
         )
-    }
-}
-
-pub(crate) fn request_scoped_file_transfer_tool_ready(
-    tool_name: &str,
-    transfer: Option<&astra_services::runs::RuntimeFileTransferContext>,
-) -> bool {
-    match transfer.map(|transfer| &transfer.layout) {
-        Some(astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. }) => {
-            tool_name == "publish_artifact"
-        }
-        Some(astra_services::runs::RuntimeFileTransferLayout::Legacy { .. }) => {
-            astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES.contains(&tool_name)
-        }
-        None => false,
     }
 }
 

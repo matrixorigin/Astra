@@ -1411,16 +1411,10 @@ mod tests {
                 ExecutorStatus::Online,
             ),
             runtime: None,
-            selected_offer: Some(
-                super::super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
-                    "publish_artifact",
-                    "eph-sandbox-1",
-                    ToolExecutionRouteKind::EdgeBound,
-                ),
-            ),
+            selected_offer: None,
             policy: Default::default(),
             runtime_file_transfer: None,
-            runtime_file_transfer_required: true,
+            runtime_file_transfer_required: false,
             runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
@@ -1431,6 +1425,13 @@ mod tests {
             "generic Edge capacity must not authorize managed artifact publication"
         );
 
+        request.selected_offer = Some(
+            super::super::tool_execution_binding::SelectedToolOfferSnapshot::new_with_route(
+                "publish_artifact",
+                "eph-sandbox-1",
+                ToolExecutionRouteKind::EdgeBound,
+            ),
+        );
         request.runtime_file_transfer =
             Some(Arc::new(astra_services::runs::RuntimeFileTransferContext {
                 endpoint_url: "https://moi.example/runtime-files".to_string(),
@@ -1442,6 +1443,7 @@ mod tests {
                 max_file_bytes: 1024,
                 attachments: Vec::new(),
             }));
+        request.runtime_file_transfer_required = true;
 
         let mut materialize_request = request.clone();
         materialize_request.tool_name = "materialize_attachment".to_string();

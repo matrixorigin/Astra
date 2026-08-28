@@ -425,8 +425,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         }
 
         let mut host = builder.build();
-        if self.runtime_file_transfer.is_some() {
-            host.install_managed_file_transfer_tool_schemas();
+        if let Some(transfer) = self.runtime_file_transfer.as_deref() {
+            host.install_managed_file_transfer_tool_schemas(transfer);
         }
         if let Some(sink) = &self.interaction_sink {
             host.set_interaction_sink(Arc::clone(sink));

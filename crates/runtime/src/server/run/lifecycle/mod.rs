@@ -9064,11 +9064,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 &snapshot.executor,
             )));
         }
-        if Self::runtime_file_transfer_context(&request)
+        if let Some(transfer) = Self::runtime_file_transfer_context(&request)
             .expect("runtime file transfer was validated before host construction")
-            .is_some()
         {
-            host.install_managed_file_transfer_tool_schemas();
+            host.install_managed_file_transfer_tool_schemas(transfer.as_ref());
         }
         if let Some(ref bundle) = runtime_capabilities.mcp_bundle {
             host.install_runtime_tool_schemas(bundle.schemas.clone(), bundle.control_tools.clone());
@@ -10797,11 +10796,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             )));
         }
 
-        if Self::runtime_file_transfer_context(&request)
+        if let Some(transfer) = Self::runtime_file_transfer_context(&request)
             .expect("runtime file transfer was validated before streaming host construction")
-            .is_some()
         {
-            host.install_managed_file_transfer_tool_schemas();
+            host.install_managed_file_transfer_tool_schemas(transfer.as_ref());
         }
 
         // ── MCP: inject request-scoped schemas into host tool surface ─
