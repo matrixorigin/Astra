@@ -269,8 +269,8 @@ pub struct ToolExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_offer: Option<SelectedToolOfferSnapshot>,
     pub policy: ToolPolicySnapshot,
-    /// Provider authorization injected only into a selected managed Sandbox bash
-    /// subprocess. The credential is never serialized into durable snapshots.
+    /// Provider authorization injected only into bash on the provider-selected
+    /// Edge executor. The credential is never serialized into durable snapshots.
     #[serde(skip)]
     pub runtime_process_authorization:
         Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,

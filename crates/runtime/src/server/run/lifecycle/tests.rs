@@ -5942,42 +5942,17 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
             mcp: None,
             skills: None,
             edge_agent: Some(descriptor),
-            runtime_process_authorization: None,
         });
     request
 }
 
 #[test]
-fn runtime_process_authorization_requires_explicit_provider_capability() {
-    let runner_request = authorized_edge_dispatch_request();
-    assert!(
-        AgenticRunLifecycleService::runtime_process_authorization_context(&runner_request)
-            .unwrap()
-            .is_none(),
-        "a user Runner must not receive the managed Sandbox RuntimeGrant"
-    );
-
-    let mut request = runner_request;
-    request
-        .executor_binding
-        .as_mut()
-        .expect("executor binding")
-        .executor_id = Some("sbx-managed".to_string());
-    request
-        .capability_descriptors
-        .as_mut()
-        .expect("capability descriptors")
-        .runtime_process_authorization = Some(
-        astra_services::runs::RuntimeProcessAuthorizationCapabilityRequest {
-            contract_version: astra_services::runs::RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION
-                .to_string(),
-            task_id: "task-1".to_string(),
-            executor_id: "sbx-managed".to_string(),
-        },
-    );
+fn provider_edge_bash_uses_runtime_auth_without_an_extra_capability() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
     let context = AgenticRunLifecycleService::runtime_process_authorization_context(&request)
         .expect("valid provider runtime context")
-        .expect("explicit process authorization");
+        .expect("edge process authorization");
     assert_eq!(context.authorization, "Bearer runtime-grant");
 
     let mut ordinary_edge_ws = request.clone();
@@ -5990,7 +5965,7 @@ fn runtime_process_authorization_requires_explicit_provider_capability() {
         AgenticRunLifecycleService::runtime_process_authorization_context(&ordinary_edge_ws)
             .unwrap()
             .is_some(),
-        "EPH edge execution uses the same process-only authorization contract"
+        "ordinary edge WebSocket execution uses the same runtime authorization"
     );
 
     let mut server_workspace = request.clone();
@@ -6009,8 +5984,10 @@ fn runtime_process_authorization_requires_explicit_provider_capability() {
     let mut untrusted = request;
     untrusted.provider_runtime_authorized = false;
     assert!(
-        AgenticRunLifecycleService::runtime_process_authorization_context(&untrusted).is_err(),
-        "an untrusted request must not inject process authorization"
+        AgenticRunLifecycleService::runtime_process_authorization_context(&untrusted)
+            .unwrap()
+            .is_none(),
+        "an untrusted request has no provider runtime authorization to inject"
     );
 }
 
@@ -6085,7 +6062,6 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
-            runtime_process_authorization: None,
         });
 
     let prepared = service
@@ -6129,7 +6105,6 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
-            runtime_process_authorization: None,
         });
 
     let err = service
@@ -10536,7 +10511,6 @@ async fn agent_binding_runtime_discovers_descriptor_capabilities_concurrently() 
                 &format!("http://{addr}/skills"),
             )),
             edge_agent: None,
-            runtime_process_authorization: None,
         });
 
     let capabilities = tokio::time::timeout(

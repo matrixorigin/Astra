@@ -5140,11 +5140,7 @@ impl AgenticRunLifecycleService {
         self.validate_runtime_profile_shape(request)?;
         Self::validate_runtime_auth_shape(request)?;
         Self::runtime_process_authorization_context(request).map_err(|detail| {
-            error_response_coded(
-                StatusCode::BAD_REQUEST,
-                detail,
-                "runtime_process_authorization_invalid",
-            )
+            error_response_coded(StatusCode::BAD_REQUEST, detail, "edge_runtime_auth_invalid")
         })?;
         Self::runtime_edge_dispatch_authorization_context(request).map_err(|detail| {
             error_response_coded(
@@ -5214,62 +5210,43 @@ impl AgenticRunLifecycleService {
     fn runtime_process_authorization_context(
         request: &ChatRequestData,
     ) -> Result<Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>, String> {
-        let Some(capability) = request
-            .capability_descriptors
-            .as_ref()
-            .and_then(|descriptors| descriptors.runtime_process_authorization.as_ref())
-        else {
+        if !request.provider_runtime_authorized {
+            return Ok(None);
+        }
+        let Some(executor) = request.executor_binding.as_ref() else {
             return Ok(None);
         };
-        if !request.provider_runtime_authorized {
-            return Err(
-                "runtime process authorization requires provider-authorized runtime context"
-                    .to_string(),
-            );
+        if !matches!(
+            executor.kind,
+            astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+        ) {
+            return Ok(None);
         }
         let edge_workspace = request.workspace_binding.as_ref().is_some_and(|binding| {
             matches!(
                 binding.kind,
                 astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
-            ) && binding
-                .root
-                .as_deref()
-                .is_some_and(|root| !root.trim().is_empty())
+            )
         });
-        let Some(executor) = request.executor_binding.as_ref() else {
-            return Err("runtime process authorization requires executor_binding".to_string());
-        };
-        let managed_edge_executor = matches!(
-            executor.kind,
-            astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
-        ) && matches!(
+        let edge_transport = matches!(
             executor.transport,
             Some(
                 astra_services::runs::ToolTransportKindRequest::EdgeWs
                     | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
             )
         );
-        if !edge_workspace || !managed_edge_executor {
+        if !edge_workspace || !edge_transport {
             return Err(
                 "runtime process authorization requires an edge_workspace and Edge WebSocket executor"
                     .to_string(),
             );
         }
-        let executor_id = executor
+        executor
             .executor_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| "runtime process authorization requires executor_id".to_string())?;
-        if capability.contract_version
-            != astra_services::runs::RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION
-            || capability.task_id.trim().is_empty()
-            || capability.task_id.contains('/')
-            || capability.task_id.contains('\\')
-            || capability.executor_id != executor_id
-        {
-            return Err("runtime process authorization capability contract is invalid".to_string());
-        }
         let auth = request
             .runtime_auth
             .as_ref()

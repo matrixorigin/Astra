@@ -487,23 +487,11 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_process_authorization: Option<RuntimeProcessAuthorizationCapabilityRequest>,
 }
 
-pub const RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION: &str =
-    "moi_runtime_process_authorization_v1";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeProcessAuthorizationCapabilityRequest {
-    pub contract_version: String,
-    pub task_id: String,
-    pub executor_id: String,
-}
-
-/// Request-scoped provider authorization exposed only to one managed Sandbox Edge bash
-/// subprocess. It is never persisted, logged, or merged into tool arguments.
+/// Request-scoped provider authorization exposed to each bash subprocess on
+/// the provider-selected Edge executor. It is never persisted, logged, or
+/// merged into tool arguments.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RuntimeProcessAuthorizationContext {
     pub authorization: String,

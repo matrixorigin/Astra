@@ -21,8 +21,7 @@ use crate::models::ModelListItem;
 use crate::runs::{
     ResolvedModelSelection, RuntimeAuthRequest, RuntimeCapabilityDescriptorRequest,
     RuntimeCapabilityDescriptorsRequest, RuntimeMcpBindingRequest,
-    RuntimeProcessAuthorizationCapabilityRequest, RuntimeSemanticReadCapabilityRequest,
-    RuntimeSkillBindingRequest,
+    RuntimeSemanticReadCapabilityRequest, RuntimeSkillBindingRequest,
 };
 use astra_turn_types::ModelSelection;
 
@@ -404,8 +403,6 @@ pub struct ExternalRuntimeCapabilityDescriptors {
     pub skills: Option<ExternalRuntimeCapabilityDescriptor>,
     #[serde(default)]
     pub edge_agent: Option<ExternalRuntimeCapabilityDescriptor>,
-    #[serde(default)]
-    pub runtime_process_authorization: Option<RuntimeProcessAuthorizationCapabilityRequest>,
 }
 
 impl ExternalRuntimeCapabilityDescriptors {
@@ -427,7 +424,6 @@ impl ExternalRuntimeCapabilityDescriptors {
                 .edge_agent
                 .as_ref()
                 .map(ExternalRuntimeCapabilityDescriptor::to_request_descriptor),
-            runtime_process_authorization: self.runtime_process_authorization.clone(),
         }
     }
 }
@@ -1601,29 +1597,6 @@ mod tests {
         assert_eq!(
             err.1.error_code.as_deref(),
             Some("external_provider_runtime_context_invalid")
-        );
-    }
-
-    #[test]
-    fn external_process_authorization_capability_is_preserved_for_runtime_admission() {
-        let descriptors = ExternalRuntimeCapabilityDescriptors {
-            runtime_process_authorization: Some(RuntimeProcessAuthorizationCapabilityRequest {
-                contract_version: crate::runs::RUNTIME_PROCESS_AUTHORIZATION_CONTRACT_VERSION
-                    .to_string(),
-                task_id: "task-1".to_string(),
-                executor_id: "eph-1".to_string(),
-            }),
-            ..Default::default()
-        };
-
-        let request = descriptors.to_request_descriptors();
-
-        assert_eq!(
-            request
-                .runtime_process_authorization
-                .as_ref()
-                .map(|item| item.executor_id.as_str()),
-            Some("eph-1")
         );
     }
 
