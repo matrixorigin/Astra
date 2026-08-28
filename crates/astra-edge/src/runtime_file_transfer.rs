@@ -1237,6 +1237,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_local_transfer_paths_are_executor_owned_without_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("sandbox");
+        let transfer_root = workspace.join(".moi/runtime/task-1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let context = RuntimeFileTransferContext {
+            endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
+            authorization: "Bearer task-scoped-grant".to_string(),
+            workspace_root: workspace.display().to_string(),
+            layout: RuntimeFileTransferLayout::Legacy {
+                task_id: "task-1".to_string(),
+                root: transfer_root.display().to_string(),
+                catalog_dir: transfer_root.join("catalog").display().to_string(),
+                session_dir: workspace
+                    .join(".moi/sessions/session-1")
+                    .display()
+                    .to_string(),
+                scratch_dir: transfer_root.join("scratch").display().to_string(),
+            },
+            max_file_bytes: 1024,
+            attachments: Vec::new(),
+        };
+        prepare_scope_dirs(&context).await.unwrap();
+        let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
+            &workspace,
+            "user-1",
+            "session-1",
+            "astra-edge/test",
+            Duration::from_secs(30),
+        );
+
+        let result = execute_default_tool(
+            &executor,
+            "write_file",
+            &json!({
+                "path": ".moi/runtime/task-1/catalog/input.txt",
+                "content": "agent-owned"
+            }),
+            Some(&context),
+            None,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(transfer_root.join("catalog/input.txt")).unwrap(),
+            "agent-owned\n"
+        );
+    }
+
+    #[tokio::test]
     async fn materialize_rejects_file_outside_current_attachment_inventory() {
         let temp = tempfile::tempdir().unwrap();
         let result = materialize(&json!({"file_id": "other"}), Some(&context(temp.path()))).await;

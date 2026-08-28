@@ -688,8 +688,7 @@ async fn handle_edge_connection(
                 Ok(rows) if !rows.is_empty() => {
                     let mut stop_dispatch = false;
                     for (idx, row) in rows.iter().enumerate() {
-                        let msg = match serde_json::from_str::<EdgeServerMessage>(&row.payload_json)
-                        {
+                        let msg = match decode_relay_edge_dispatch_payload(&row.payload_json) {
                             Ok(msg) => msg,
                             Err(error) => {
                                 tracing::warn!(
@@ -1196,6 +1195,13 @@ async fn edge_socket_appears_closed(
             None => return false,
         }
     }
+}
+
+fn decode_relay_edge_dispatch_payload(
+    payload_json: &str,
+) -> Result<EdgeServerMessage, serde_json::Error> {
+    astra_services::multi_agent::canonicalize_edge_dispatch_payload(payload_json)
+        .and_then(serde_json::from_value)
 }
 
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.

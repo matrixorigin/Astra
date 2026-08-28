@@ -109,6 +109,36 @@ fn json_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> 
     Ok(persisted == replayed)
 }
 
+/// Canonicalize the durable identity of an Edge dispatch payload.
+///
+/// `runtime_filesystem_boundary` was retired from `edge_tool_request` during
+/// the managed Runner rollout. Older servers may already have persisted that
+/// field, so it cannot distinguish the same dispatch across a rolling upgrade.
+/// Every other message type and field remains part of the exact JSON identity.
+pub fn canonicalize_edge_dispatch_payload(
+    payload_json: &str,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut payload = serde_json::from_str::<serde_json::Value>(payload_json)?;
+    if payload.get("type").and_then(serde_json::Value::as_str) == Some("edge_tool_request")
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.remove("runtime_filesystem_boundary");
+    }
+    Ok(payload)
+}
+
+fn canonical_edge_dispatch_payload_json(payload_json: &str) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&canonicalize_edge_dispatch_payload(payload_json)?)
+}
+
+fn edge_dispatch_payloads_match(persisted: &str, replayed: &str) -> Result<bool, String> {
+    let persisted = canonicalize_edge_dispatch_payload(persisted)
+        .map_err(|error| format!("persisted durable payload is invalid JSON: {error}"))?;
+    let replayed = canonicalize_edge_dispatch_payload(replayed)
+        .map_err(|error| format!("replayed durable payload is invalid JSON: {error}"))?;
+    Ok(persisted == replayed)
+}
+
 async fn rollback_edge_dispatch_tx(tx: sqlx::Transaction<'_, MySql>, context: &'static str) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(context, %error, "edge_dispatch rollback failed");
@@ -816,6 +846,8 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         if !identity.is_complete() {
             return Err("edge_dispatch insert: incomplete dispatch identity".to_string());
         }
+        let payload_json = canonical_edge_dispatch_payload_json(payload_json)
+            .map_err(|error| format!("edge_dispatch insert payload is invalid JSON: {error}"))?;
         // Idempotent insert inside a full turn boundary: duplicate calls for
         // the same dispatched tool are harmless retries, while same request_id
         // values in other runs/chains remain isolated.
@@ -830,7 +862,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .bind(&identity.turn_chain_id)
         .bind(edge_agent_id)
         .bind(&identity.request_id)
-        .bind(payload_json)
+        .bind(&payload_json)
         .execute(&self.pool)
         .await
         {
@@ -865,12 +897,12 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 "edge_dispatch admit: edge_agent_id is required".to_string(),
             ));
         }
-        serde_json::from_str::<serde_json::Value>(payload_json).map_err(|error| {
+        let payload_json = canonical_edge_dispatch_payload_json(payload_json).map_err(|error| {
             EdgeDispatchAdmissionError::Rejected(format!(
                 "edge_dispatch admit: payload is invalid JSON: {error}"
             ))
         })?;
-        self.insert_dispatch(identity, edge_agent_id, payload_json)
+        self.insert_dispatch(identity, edge_agent_id, &payload_json)
             .await
             .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?;
         let row = sqlx::query(
@@ -908,7 +940,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             ))
         })?;
         if persisted_edge != edge_agent_id
-            || !json_payloads_match(&persisted_payload, payload_json)
+            || !edge_dispatch_payloads_match(&persisted_payload, &payload_json)
                 .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
         {
             return Err(EdgeDispatchAdmissionError::Rejected(format!(
@@ -960,7 +992,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
                 "edge_dispatch direct admit: edge_agent_id is required".to_string(),
             ));
         }
-        serde_json::from_str::<serde_json::Value>(payload_json).map_err(|error| {
+        let payload_json = canonical_edge_dispatch_payload_json(payload_json).map_err(|error| {
             EdgeDispatchAdmissionError::Rejected(format!(
                 "edge_dispatch direct admit: payload is invalid JSON: {error}"
             ))
@@ -983,7 +1015,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
         .bind(&identity.turn_chain_id)
         .bind(edge_agent_id)
         .bind(&identity.request_id)
-        .bind(payload_json)
+        .bind(&payload_json)
         .execute(&mut *tx)
         .await
         {
@@ -1035,7 +1067,7 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             ))
         })?;
         if persisted_edge != edge_agent_id
-            || !json_payloads_match(&persisted_payload, payload_json)
+            || !edge_dispatch_payloads_match(&persisted_payload, &payload_json)
                 .map_err(EdgeDispatchAdmissionError::OutcomeUnknown)?
         {
             rollback_edge_dispatch_tx(tx, "direct admit conflict").await;
@@ -1875,6 +1907,46 @@ mod tests {
             json_payloads_match("not-json", reordered_replay)
                 .unwrap_err()
                 .contains("persisted durable payload is invalid JSON")
+        );
+    }
+
+    #[test]
+    fn edge_tool_request_payload_comparison_retires_only_the_legacy_boundary() {
+        let boundary_free = serde_json::json!({
+            "type": "edge_tool_request",
+            "request_id": "request-1",
+            "tool": "bash",
+            "args": {"command": "pwd"},
+            "timeout_secs": 30
+        });
+        let mut legacy = boundary_free.clone();
+        legacy["runtime_filesystem_boundary"] = serde_json::json!({
+            "workspace_root": "/sandbox",
+            "read_only_paths": ["/sandbox/.moi/runtime/task-1"]
+        });
+
+        let legacy = legacy.to_string();
+        let boundary_free = boundary_free.to_string();
+        assert!(
+            !json_payloads_match(&legacy, &boundary_free).unwrap(),
+            "generic durable JSON equality must remain strict"
+        );
+        assert!(edge_dispatch_payloads_match(&legacy, &boundary_free).unwrap());
+
+        let changed_tool = boundary_free.replace("\"bash\"", "\"write_file\"");
+        assert!(!edge_dispatch_payloads_match(&legacy, &changed_tool).unwrap());
+
+        let unrelated_with_boundary = serde_json::json!({
+            "type": "edge_other_message",
+            "runtime_filesystem_boundary": {"workspace_root": "/sandbox"}
+        })
+        .to_string();
+        let unrelated_without_boundary =
+            serde_json::json!({"type": "edge_other_message"}).to_string();
+        assert!(
+            !edge_dispatch_payloads_match(&unrelated_with_boundary, &unrelated_without_boundary)
+                .unwrap(),
+            "the compatibility exception must not affect unrelated message types"
         );
     }
 

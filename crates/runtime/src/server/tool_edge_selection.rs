@@ -117,11 +117,10 @@ fn edge_advertised_tool_check(
             ),
         ))
     })?;
-    // Managed transfer tools and their filesystem boundary require a matching
-    // Edge wire contract. The legacy Runner layout is V1; eph's single work
-    // directory requires V2 and must never be projected into fabricated V1
-    // mount paths.
-    if request.runtime_filesystem_boundary.is_some() || request.runtime_file_transfer.is_some() {
+    // Managed transfer tools require their matching Edge wire contract. The
+    // legacy Runner layout is V1; eph's single work directory is V2. Filesystem
+    // boundaries from old durable decisions are discarded before selection.
+    if request.runtime_file_transfer.is_some() {
         let required_capability = match request
             .runtime_file_transfer
             .as_deref()

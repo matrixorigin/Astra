@@ -9,8 +9,9 @@ mod common;
 use std::sync::Arc;
 
 use astra_services::multi_agent::{
-    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchAdmission,
-    EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService, EdgeRegistryService,
+    DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDirectDispatchAdmission,
+    EdgeDispatchAdmission, EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchService,
+    EdgeRegistryService,
 };
 use sqlx::Row;
 use uuid::Uuid;
@@ -158,6 +159,80 @@ async fn edge_dispatch_admission_replays_terminal_and_rejects_identity_conflicts
         serde_json::from_str::<serde_json::Value>(result_json)
             .expect("fixture terminal result must be valid JSON"),
         "durable replay preserves JSON meaning independently of object-key storage order"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn edge_dispatch_boundary_free_replay_accepts_legacy_terminal_row() {
+    require_env();
+    let pool = common::setup_pool().await;
+    let svc = DatabaseEdgeDispatchService::new(pool.get().clone());
+    let user_id = format!("ed-legacy-usr-{}", unique_suffix());
+    let agent_id = format!("ed-legacy-agent-{}", unique_suffix());
+    let identity = dispatch_identity(&user_id, &Uuid::new_v4().to_string());
+    let boundary_free = serde_json::json!({
+        "type": "edge_tool_request",
+        "request_id": identity.request_id.clone(),
+        "identity": {
+            "user_id": identity.user_id.clone(),
+            "session_id": identity.session_id.clone(),
+            "run_id": identity.run_id.clone(),
+            "turn_chain_id": identity.turn_chain_id.clone(),
+            "invocation_id": "call-1"
+        },
+        "delivery_generation": 1,
+        "tool": "bash",
+        "args": {"command": "pwd"},
+        "timeout_secs": 30
+    });
+    let mut legacy = boundary_free.clone();
+    legacy["runtime_filesystem_boundary"] = serde_json::json!({
+        "workspace_root": "/sandbox",
+        "read_only_paths": ["/sandbox/.moi/runtime/task-1"]
+    });
+    let result_json = r#"{"status":"completed","output":"/sandbox"}"#;
+
+    sqlx::query(
+        "INSERT INTO edge_pending_dispatch \
+         (user_id, session_id, run_id, turn_chain_id, edge_agent_id, request_id, \
+          payload_json, status, result_json) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'completed', ?)",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .bind(&identity.run_id)
+    .bind(&identity.turn_chain_id)
+    .bind(&agent_id)
+    .bind(&identity.request_id)
+    .bind(legacy.to_string())
+    .bind(result_json)
+    .execute(pool.get())
+    .await
+    .expect("seed boundary-bearing terminal dispatch written by an older server");
+
+    let EdgeDispatchAdmission::Terminal(replayed) = svc
+        .admit_dispatch(&identity, &agent_id, &boundary_free.to_string())
+        .await
+        .expect("boundary-free replay must match the legacy durable identity")
+    else {
+        panic!("legacy terminal dispatch must replay its durable result");
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&replayed).unwrap(),
+        serde_json::from_str::<serde_json::Value>(result_json).unwrap()
+    );
+
+    let EdgeDirectDispatchAdmission::Terminal(direct_replayed) = svc
+        .admit_and_claim_direct_dispatch(&identity, &agent_id, &boundary_free.to_string())
+        .await
+        .expect("direct boundary-free replay must match the legacy durable identity")
+    else {
+        panic!("legacy terminal dispatch must also replay through direct admission");
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&direct_replayed).unwrap(),
+        serde_json::from_str::<serde_json::Value>(result_json).unwrap()
     );
 }
 

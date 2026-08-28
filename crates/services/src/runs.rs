@@ -530,9 +530,9 @@ pub enum RuntimeFileTransferLayout {
     Ephemeral { work_dir: String },
 }
 
-/// Non-secret filesystem boundary for a provider-managed Edge workspace.
-/// Unlike transfer credentials this contract is safe to persist in durable
-/// dispatch state and must accompany every tool that can mutate the workspace.
+/// Retired filesystem boundary retained only to decode legacy durable and wire
+/// payloads during rolling upgrades. New managed Edge requests omit it because
+/// their local workspace paths are executor-owned; replay must not restore it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeFilesystemBoundaryContext {

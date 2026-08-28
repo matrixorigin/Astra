@@ -278,8 +278,9 @@ pub struct ToolExecutionRequest {
     /// to ordinary Edge dispatch.
     #[serde(default)]
     pub runtime_file_transfer_required: bool,
-    /// Non-secret, durable mount boundary for host-owned paths inside a
-    /// managed Edge workspace.
+    /// Compatibility-only filesystem guard retained in the request shape for
+    /// older senders. Current runtime requests treat local Edge paths as
+    /// executor-owned and never populate or replay this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_filesystem_boundary:
         Option<Arc<astra_services::runs::RuntimeFilesystemBoundaryContext>>,
