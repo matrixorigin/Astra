@@ -34,6 +34,23 @@ pub const MANAGED_FILE_TRANSFER_V1_CAPABILITY: &str = "managed_file_transfer_v1"
 /// the eph work-directory layout; V1 remains frozen for managed Runner
 /// connections during a rolling upgrade.
 pub const MANAGED_FILE_TRANSFER_V2_CAPABILITY: &str = "managed_file_transfer_v2";
+/// Edge can inject request-scoped provider authorization into one bash
+/// subprocess without receiving file-transfer metadata or bytes.
+pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeProcessAuthorizationContext {
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeProcessAuthorizationContext")
+            .field("authorization_present", &!self.authorization.is_empty())
+            .finish()
+    }
+}
 
 /// Produce the deterministic, collision-free catalog filename used for one
 /// attachment inventory entry. Every entry is namespaced by its stable
@@ -331,6 +348,9 @@ pub enum EdgeServerMessage {
         /// eph Edge requires this explicit layout-aware contract.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         runtime_file_transfer_v2: Option<Box<RuntimeFileTransferContextV2>>,
+        /// Opaque provider authorization injected only for this bash call.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime_process_authorization: Option<Box<RuntimeProcessAuthorizationContext>>,
         /// Compatibility-only filesystem guard accepted from older servers
         /// during rolling upgrades. New managed transfer requests treat local
         /// Edge paths as executor-owned and omit this field.
@@ -459,6 +479,7 @@ mod tests {
             args: json!({"command": "echo hello"}),
             runtime_file_transfer: None,
             runtime_file_transfer_v2: None,
+            runtime_process_authorization: None,
             runtime_filesystem_boundary: None,
             timeout_secs: 120,
         };
@@ -466,6 +487,37 @@ mod tests {
         assert_eq!(v["type"], "edge_tool_request");
         assert_eq!(v["tool"], "bash");
         assert_eq!(v["timeout_secs"], 120);
+    }
+
+    #[test]
+    fn edge_tool_request_round_trips_hidden_process_authorization() {
+        let msg = EdgeServerMessage::ToolRequest {
+            request_id: "req-process-auth".into(),
+            identity: Box::new(identity()),
+            delivery_generation: 1,
+            tool: "bash".into(),
+            args: json!({"command": "moi-cli file upload --publish-artifact --file report.pdf"}),
+            runtime_file_transfer: None,
+            runtime_file_transfer_v2: None,
+            runtime_process_authorization: Some(Box::new(RuntimeProcessAuthorizationContext {
+                authorization: "Bearer runtime-grant".into(),
+            })),
+            runtime_filesystem_boundary: None,
+            timeout_secs: 120,
+        };
+
+        assert!(!format!("{msg:?}").contains("runtime-grant"));
+        let encoded = serde_json::to_string(&msg).unwrap();
+        let decoded: EdgeServerMessage = serde_json::from_str(&encoded).unwrap();
+        match decoded {
+            EdgeServerMessage::ToolRequest {
+                runtime_process_authorization: Some(context),
+                runtime_file_transfer: None,
+                runtime_file_transfer_v2: None,
+                ..
+            } => assert_eq!(context.authorization, "Bearer runtime-grant"),
+            other => panic!("expected tool request with process authorization, got {other:?}"),
+        }
     }
 
     #[test]
@@ -494,6 +546,7 @@ mod tests {
                 }],
             })),
             runtime_file_transfer_v2: None,
+            runtime_process_authorization: None,
             runtime_filesystem_boundary: Some(Box::new(RuntimeFilesystemBoundaryContext {
                 workspace_root: "/sandbox".into(),
                 read_only_paths: vec![
@@ -550,6 +603,7 @@ mod tests {
                 max_file_bytes: 1024,
                 attachments: Vec::new(),
             })),
+            runtime_process_authorization: None,
             runtime_filesystem_boundary: None,
             timeout_secs: 120,
         };

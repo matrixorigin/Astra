@@ -2362,6 +2362,9 @@ fn build_server_skill_executor(
     execution_bindings: Option<&ExecutionBindingSnapshot>,
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_process_authorization: Option<
+        Arc<astra_services::runs::RuntimeProcessAuthorizationContext>,
+    >,
     runtime_edge_dispatch_authorization: Option<
         Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>,
     >,
@@ -2398,6 +2401,7 @@ fn build_server_skill_executor(
     .with_edge_profile(edge_profile.clone())
     .with_workspace_record(workspace_record)
     .with_runtime_file_transfer(runtime_file_transfer)
+    .with_runtime_process_authorization(runtime_process_authorization)
     .with_runtime_edge_dispatch_authorization(runtime_edge_dispatch_authorization)
     .with_forward_headers(forward_headers.clone())
     .with_request_constraints(request_constraints)
@@ -5190,6 +5194,13 @@ impl AgenticRunLifecycleService {
                 "runtime_file_transfer_invalid",
             )
         })?;
+        Self::runtime_process_authorization_context(request).map_err(|detail| {
+            error_response_coded(
+                StatusCode::BAD_REQUEST,
+                detail,
+                "runtime_process_authorization_invalid",
+            )
+        })?;
         Self::runtime_edge_dispatch_authorization_context(request).map_err(|detail| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -5393,6 +5404,48 @@ impl AgenticRunLifecycleService {
                 layout,
                 max_file_bytes,
                 attachments,
+            },
+        )))
+    }
+
+    fn runtime_process_authorization_context(
+        request: &ChatRequestData,
+    ) -> Result<Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>, String> {
+        let Some(auth) = request.runtime_auth.as_ref() else {
+            return Ok(None);
+        };
+        if !request.provider_runtime_authorized {
+            return Err(
+                "runtime process authorization requires provider-authorized runtime context"
+                    .to_string(),
+            );
+        }
+        let edge_workspace = request.workspace_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.kind,
+                astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace
+            )
+        });
+        let managed_edge_executor = request.executor_binding.as_ref().is_some_and(|binding| {
+            matches!(
+                binding.kind,
+                astra_services::runs::ExecutorBindingRequestKind::EdgeAgent
+            ) && matches!(
+                binding.transport,
+                Some(
+                    astra_services::runs::ToolTransportKindRequest::EdgeWs
+                        | astra_services::runs::ToolTransportKindRequest::EdgeWsAuthorized
+                )
+            ) && binding.executor_id.as_deref().is_some_and(|executor_id| {
+                executor_id.starts_with("eph-") || executor_id.starts_with("sbx-")
+            })
+        });
+        if !edge_workspace || !managed_edge_executor {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(
+            astra_services::runs::RuntimeProcessAuthorizationContext {
+                authorization: auth.authorization.clone(),
             },
         )))
     }
@@ -7561,6 +7614,8 @@ impl AgenticRunLifecycleService {
             provider_effective_workspace_record(None, request.provider_run_owner.as_ref()),
             Self::runtime_file_transfer_context(request)
                 .expect("runtime file transfer was validated before state construction"),
+            Self::runtime_process_authorization_context(request)
+                .expect("runtime process authorization was validated before state construction"),
             Self::runtime_edge_dispatch_authorization_context(request)
                 .expect("runtime executor authorization was validated before state construction"),
             &request.forward_headers,
@@ -9296,6 +9351,10 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 Self::runtime_file_transfer_context(&request)
                     .expect("runtime file transfer was validated before run start"),
             )
+            .with_runtime_process_authorization(
+                Self::runtime_process_authorization_context(&request)
+                    .expect("runtime process authorization was validated before run start"),
+            )
             .with_runtime_edge_dispatch_authorization(
                 Self::runtime_edge_dispatch_authorization_context(&request)
                     .expect("runtime executor authorization was validated before run start"),
@@ -11003,6 +11062,11 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             .with_runtime_file_transfer(
                 Self::runtime_file_transfer_context(&request)
                     .expect("runtime file transfer was validated before streaming run start"),
+            )
+            .with_runtime_process_authorization(
+                Self::runtime_process_authorization_context(&request).expect(
+                    "runtime process authorization was validated before streaming run start",
+                ),
             )
             .with_runtime_edge_dispatch_authorization(
                 Self::runtime_edge_dispatch_authorization_context(&request).expect(

@@ -6147,6 +6147,62 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
 }
 
 #[test]
+fn runtime_process_authorization_is_derived_only_for_provider_authorized_edge_execution() {
+    let runner_request = authorized_edge_dispatch_request();
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&runner_request)
+            .unwrap()
+            .is_none(),
+        "a user Runner must not receive the managed Sandbox RuntimeGrant"
+    );
+
+    let mut request = runner_request;
+    request
+        .executor_binding
+        .as_mut()
+        .expect("executor binding")
+        .executor_id = Some("sbx-managed".to_string());
+    let context = AgenticRunLifecycleService::runtime_process_authorization_context(&request)
+        .expect("valid provider runtime context")
+        .expect("managed Sandbox process authorization");
+    assert_eq!(context.authorization, "Bearer runtime-grant");
+
+    let mut ordinary_edge_ws = request.clone();
+    ordinary_edge_ws
+        .executor_binding
+        .as_mut()
+        .expect("executor binding")
+        .transport = Some(astra_services::runs::ToolTransportKindRequest::EdgeWs);
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&ordinary_edge_ws)
+            .unwrap()
+            .is_some(),
+        "EPH edge execution uses the same process-only authorization contract"
+    );
+
+    let mut server_workspace = request.clone();
+    server_workspace.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+        display_name: Some("Server sandbox".to_string()),
+        root: None,
+        source: None,
+        authority: None,
+    });
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&server_workspace)
+            .unwrap()
+            .is_none()
+    );
+
+    let mut untrusted = request;
+    untrusted.provider_runtime_authorized = false;
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&untrusted).is_err(),
+        "an untrusted request must not inject process authorization"
+    );
+}
+
+#[test]
 fn runtime_executor_authorization_requires_versioned_transport_and_matching_scope() {
     let request = authorized_edge_dispatch_request();
     let context = AgenticRunLifecycleService::runtime_edge_dispatch_authorization_context(&request)

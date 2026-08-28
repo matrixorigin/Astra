@@ -1384,6 +1384,14 @@ fn validate_edge_capabilities(
         })
         .and_then(serde_json::Value::as_bool)
         == Some(true);
+    let runtime_process_authorization_v1 = protocol_capabilities
+        .and_then(|value| {
+            value.get(
+                astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY,
+            )
+        })
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
 
     let mut advert = match serde_json::from_value::<
         astra_runtime_env::RuntimeEnvironmentAdvertisement,
@@ -1470,7 +1478,7 @@ fn validate_edge_capabilities(
     }
 
     let mut sanitized = serde_json::to_value(&advert).ok()?;
-    if managed_file_transfer_v1 || managed_file_transfer_v2 {
+    if managed_file_transfer_v1 || managed_file_transfer_v2 || runtime_process_authorization_v1 {
         let mut accepted = serde_json::Map::new();
         if managed_file_transfer_v1 {
             accepted.insert(
@@ -1482,6 +1490,13 @@ fn validate_edge_capabilities(
         if managed_file_transfer_v2 {
             accepted.insert(
                 astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY
+                    .to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
+        if runtime_process_authorization_v1 {
+            accepted.insert(
+                astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY
                     .to_string(),
                 serde_json::Value::Bool(true),
             );

@@ -39,6 +39,8 @@ pub(crate) struct ToolInvocationDecisionSnapshot {
     pub permission_grant: Option<InvocationPermissionGrantSnapshot>,
     pub admission: ToolExecutionAdmissionSnapshot,
     pub runtime_file_transfer_required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runtime_process_authorization_required: bool,
     /// Legacy field retained so durable decisions created by older servers can
     /// still be decoded and hashed. New decisions leave it empty, and replay
     /// deliberately does not restore it onto an execution request.
@@ -219,6 +221,7 @@ impl ToolInvocationDecisionSnapshot {
             }),
             admission,
             runtime_file_transfer_required: request.runtime_file_transfer_required,
+            runtime_process_authorization_required: request.runtime_process_authorization_required,
             runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
@@ -355,6 +358,8 @@ impl ToolInvocationDecisionSnapshot {
         request.policy.semantic_read_freshness = None;
         request.policy.semantic_read_condition = None;
         request.runtime_file_transfer_required = self.runtime_file_transfer_required;
+        request.runtime_process_authorization_required =
+            self.runtime_process_authorization_required;
         // Legacy boundaries depended on nested mount namespaces that are not
         // available inside managed OpenShell executors. The protected Catalog
         // originals now remain behind request-scoped transfer authorization,
@@ -364,6 +369,10 @@ impl ToolInvocationDecisionSnapshot {
         request.runtime_edge_dispatch_authorization_required =
             self.runtime_edge_dispatch_authorization_required;
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn resolve_semantic_read_cache_decision(
@@ -821,6 +830,12 @@ mod tests {
             },
         ));
         request.runtime_file_transfer_required = true;
+        request.runtime_process_authorization = Some(std::sync::Arc::new(
+            astra_services::runs::RuntimeProcessAuthorizationContext {
+                authorization: "Bearer request-scoped".to_string(),
+            },
+        ));
+        request.runtime_process_authorization_required = true;
         request.runtime_filesystem_boundary = Some(std::sync::Arc::new(
             astra_services::runs::RuntimeFilesystemBoundaryContext {
                 workspace_root: "/workspace".to_string(),
@@ -858,6 +873,8 @@ mod tests {
         request.policy.max_output_bytes = Some(1);
         request.runtime_file_transfer = None;
         request.runtime_file_transfer_required = false;
+        request.runtime_process_authorization = None;
+        request.runtime_process_authorization_required = false;
         request.runtime_filesystem_boundary = None;
         request.runtime_edge_dispatch_authorization = None;
         request.runtime_edge_dispatch_authorization_required = false;
@@ -875,6 +892,8 @@ mod tests {
         assert_eq!(request.policy.max_output_bytes, Some(4096));
         assert!(request.runtime_file_transfer.is_none());
         assert!(request.runtime_file_transfer_required);
+        assert!(request.runtime_process_authorization.is_none());
+        assert!(request.runtime_process_authorization_required);
         assert!(request.runtime_filesystem_boundary.is_none());
         assert!(request.runtime_edge_dispatch_authorization.is_none());
         assert!(request.runtime_edge_dispatch_authorization_required);

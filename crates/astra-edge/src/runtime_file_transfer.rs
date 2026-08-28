@@ -20,7 +20,6 @@ use tokio_util::io::ReaderStream;
 
 const RUNTIME_FILE_TRANSFER_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_FILE_TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-const MOI_RUNTIME_AUTHORIZATION_ENV: &str = "MOI_RUNTIME_AUTHORIZATION";
 
 /// Ensure a server-supplied managed transfer context belongs to this Edge.
 ///
@@ -67,24 +66,6 @@ pub(crate) async fn execute_default_tool(
     boundary: Option<&astra_server_types::edge_ws_protocol::RuntimeFilesystemBoundaryContext>,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> ToolResult {
-    if tool == "bash"
-        && let Some(context) = context
-        && matches!(&context.layout, RuntimeFileTransferLayout::Ephemeral { .. })
-    {
-        if context.authorization.is_empty() {
-            return ToolResult::error("Ephemeral runtime authorization is unavailable".to_string());
-        }
-        let environment = vec![(
-            MOI_RUNTIME_AUTHORIZATION_ENV.to_string(),
-            context.authorization.clone(),
-        )];
-        return astra_tools::shell_ops::execute_bash_with_environment(
-            executor.context(),
-            args,
-            &environment,
-        )
-        .await;
-    }
     let Some(boundary) = boundary else {
         return astra_tools::ToolExecutor::execute_with_cancel(executor, tool, args, Some(cancel))
             .await;
@@ -1197,43 +1178,6 @@ mod tests {
         let (allowed_roots, staging_root) = publish_scope(&context);
         assert_eq!(allowed_roots, vec![work_dir.clone()]);
         assert_eq!(staging_root, work_dir);
-    }
-
-    #[tokio::test]
-    async fn ephemeral_bash_receives_call_scoped_runtime_authorization() {
-        let temp = tempfile::tempdir().unwrap();
-        let work_dir = temp.path().join(".moi");
-        std::fs::create_dir_all(&work_dir).unwrap();
-        let context = RuntimeFileTransferContext {
-            endpoint_url: "http://127.0.0.1:1/api/v1/runtime-files".to_string(),
-            authorization: "Bearer task-scoped-grant".to_string(),
-            workspace_root: work_dir.display().to_string(),
-            layout: RuntimeFileTransferLayout::Ephemeral {
-                work_dir: work_dir.display().to_string(),
-            },
-            max_file_bytes: 1024,
-            attachments: Vec::new(),
-        };
-        let executor = astra_tools::executor::DefaultToolExecutor::for_workspace(
-            &work_dir,
-            "user-1",
-            "session-1",
-            "astra-edge/test",
-            Duration::from_secs(30),
-        );
-
-        let result = execute_default_tool(
-            &executor,
-            "bash",
-            &json!({"command": "printf %s \"$MOI_RUNTIME_AUTHORIZATION\""}),
-            Some(&context),
-            None,
-            &tokio_util::sync::CancellationToken::new(),
-        )
-        .await;
-
-        assert!(!result.is_error, "{result:?}");
-        assert_eq!(result.output, "Bearer task-scoped-grant");
     }
 
     #[tokio::test]

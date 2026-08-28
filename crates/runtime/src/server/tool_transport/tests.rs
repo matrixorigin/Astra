@@ -935,6 +935,8 @@ fn request(
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
         runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
@@ -1591,6 +1593,38 @@ fn durable_edge_payload_never_contains_runtime_transfer_credentials() {
     assert!(!payload.contains("durable-secret-must-not-appear"));
     assert_eq!(parsed["runtime_file_transfer"], Value::Null);
     assert!(plan.runtime_file_transfer().is_some());
+}
+
+#[test]
+fn durable_edge_payload_never_contains_runtime_process_authorization() {
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "Ephemeral sandbox",
+            "/sandbox/.moi",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "Ephemeral sandbox",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+    request.runtime_process_authorization = Some(std::sync::Arc::new(
+        astra_services::runs::RuntimeProcessAuthorizationContext {
+            authorization: "Bearer durable-secret-must-not-appear".to_string(),
+        },
+    ));
+    request.runtime_process_authorization_required = true;
+
+    let plan = EdgeBoundExecutionPlan::try_from_request(&request).unwrap();
+    let payload = plan.dispatch_payload_json().expect("dispatch payload");
+    let parsed: Value = serde_json::from_str(&payload).expect("payload json");
+
+    assert!(!payload.contains("durable-secret-must-not-appear"));
+    assert_eq!(parsed["runtime_process_authorization"], Value::Null);
+    assert!(plan.runtime_process_authorization().is_some());
 }
 
 #[test]
@@ -5266,6 +5300,8 @@ fn edge_executor_id_returns_none_for_empty_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
         runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
@@ -5307,6 +5343,8 @@ fn edge_executor_id_rejects_whitespace_only_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
         runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,
@@ -5348,6 +5386,8 @@ fn edge_executor_id_returns_some_for_valid_id() {
         runtime: None,
         runtime_file_transfer: None,
         runtime_file_transfer_required: false,
+        runtime_process_authorization: None,
+        runtime_process_authorization_required: false,
         runtime_filesystem_boundary: None,
         runtime_edge_dispatch_authorization: None,
         runtime_edge_dispatch_authorization_required: false,

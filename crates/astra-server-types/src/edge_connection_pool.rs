@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::edge_ws_protocol::{
     EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeFileTransferContext,
-    RuntimeFileTransferContextV2, ToolInvocationIdentity,
+    RuntimeFileTransferContextV2, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -51,6 +51,8 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub tool: &'a str,
     pub args: &'a serde_json::Value,
     pub runtime_file_transfer: Option<&'a astra_services::runs::RuntimeFileTransferContext>,
+    pub runtime_process_authorization:
+        Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
     pub runtime_filesystem_boundary:
         Option<&'a astra_services::runs::RuntimeFilesystemBoundaryContext>,
     pub cancel_token: Option<&'a CancellationToken>,
@@ -599,6 +601,7 @@ impl EdgeConnectionPool {
                 tool,
                 args,
                 runtime_file_transfer: None,
+                runtime_process_authorization: None,
                 runtime_filesystem_boundary: None,
                 cancel_token,
             },
@@ -624,6 +627,7 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_file_transfer,
+            runtime_process_authorization,
             runtime_filesystem_boundary,
             cancel_token,
         } = invocation;
@@ -692,6 +696,11 @@ impl EdgeConnectionPool {
             args: args.clone(),
             runtime_file_transfer,
             runtime_file_transfer_v2,
+            runtime_process_authorization: runtime_process_authorization.map(|context| {
+                Box::new(RuntimeProcessAuthorizationContext {
+                    authorization: context.authorization.clone(),
+                })
+            }),
             runtime_filesystem_boundary: runtime_filesystem_boundary
                 .map(|context| Box::new(context.into())),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,

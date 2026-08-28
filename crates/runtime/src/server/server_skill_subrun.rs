@@ -67,6 +67,8 @@ pub struct ServerSkillSubRunExecutor {
     /// the workspace user running this skill.
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_process_authorization:
+        Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
     /// Skill resolver inherited from parent — enables nested inline skills.
@@ -131,6 +133,7 @@ impl ServerSkillSubRunExecutor {
             execution_binding_snapshot: None,
             workspace_record: None,
             runtime_file_transfer: None,
+            runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
             skill_resolver: None,
             cancel_token: None,
@@ -222,6 +225,14 @@ impl ServerSkillSubRunExecutor {
         context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     ) -> Self {
         self.runtime_file_transfer = context;
+        self
+    }
+
+    pub fn with_runtime_process_authorization(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
+    ) -> Self {
+        self.runtime_process_authorization = context;
         self
     }
 
@@ -674,6 +685,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             ))
             .with_cancel_token(self.cancel_token.clone())
             .with_runtime_file_transfer(self.runtime_file_transfer.clone())
+            .with_runtime_process_authorization(self.runtime_process_authorization.clone())
             .with_runtime_edge_dispatch_authorization(
                 self.runtime_edge_dispatch_authorization.clone(),
             )

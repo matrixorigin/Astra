@@ -278,6 +278,14 @@ pub struct ToolExecutionRequest {
     /// to ordinary Edge dispatch.
     #[serde(default)]
     pub runtime_file_transfer_required: bool,
+    /// Provider authorization injected only into a selected managed Sandbox bash
+    /// subprocess. The credential is never serialized into durable snapshots.
+    #[serde(skip)]
+    pub runtime_process_authorization:
+        Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
+    /// Replay fence for the skipped process authorization.
+    #[serde(default)]
+    pub runtime_process_authorization_required: bool,
     /// Compatibility-only filesystem guard retained in the request shape for
     /// older senders. Current runtime requests treat local Edge paths as
     /// executor-owned and never populate or replay this field.
@@ -515,6 +523,8 @@ impl ExecutionBindingState {
             policy: ToolPolicySnapshot::default(),
             runtime_file_transfer: None,
             runtime_file_transfer_required: false,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
             runtime_filesystem_boundary: None,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,

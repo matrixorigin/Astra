@@ -552,6 +552,21 @@ impl std::fmt::Debug for RuntimeFileTransferContext {
     }
 }
 
+/// Request-scoped provider authorization exposed only to one managed Sandbox Edge bash
+/// subprocess. It is never persisted, logged, or merged into tool arguments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeProcessAuthorizationContext {
+    pub authorization: String,
+}
+
+impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeProcessAuthorizationContext")
+            .field("authorization_present", &!self.authorization.is_empty())
+            .finish()
+    }
+}
+
 /// Request-scoped provider callback used to reauthorize a selected Edge
 /// executor immediately before dispatch. The bearer is deliberately skipped
 /// by durable tool snapshots and redacted from Debug output.

@@ -537,6 +537,9 @@ pub struct RuntimeToolExecutor {
     /// Hidden RuntimeGrant-backed byte-transfer context for managed Edge
     /// tools. It is attached after model admission and never merged into args.
     runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    /// Provider authorization injected only into Edge bash subprocesses.
+    runtime_process_authorization:
+        Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
     /// Provider-owned live authorization callback for the selected Edge.
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
@@ -625,6 +628,7 @@ impl RuntimeToolExecutor {
             semantic_read_observation_store: None,
             edge_admitted_tools: HashSet::new(),
             runtime_file_transfer: None,
+            runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
         }
     }
@@ -663,6 +667,14 @@ impl RuntimeToolExecutor {
         context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
     ) -> Self {
         self.runtime_file_transfer = context;
+        self
+    }
+
+    pub fn with_runtime_process_authorization(
+        mut self,
+        context: Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
+    ) -> Self {
+        self.runtime_process_authorization = context;
         self
     }
 
@@ -2018,6 +2030,11 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_process_authorization = (name == "bash")
+            .then(|| self.runtime_process_authorization.clone())
+            .flatten();
+        request.runtime_process_authorization_required =
+            request.runtime_process_authorization.is_some();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -2040,6 +2057,11 @@ impl RuntimeToolExecutor {
         }
         request.runtime_file_transfer = self.runtime_file_transfer_for_tool(name);
         request.runtime_file_transfer_required = request.runtime_file_transfer.is_some();
+        request.runtime_process_authorization = (name == "bash")
+            .then(|| self.runtime_process_authorization.clone())
+            .flatten();
+        request.runtime_process_authorization_required =
+            request.runtime_process_authorization.is_some();
         request.runtime_edge_dispatch_authorization =
             self.runtime_edge_dispatch_authorization_for_request(&request);
         request.runtime_edge_dispatch_authorization_required =
@@ -4238,6 +4260,23 @@ mod tests {
         assert!(bash.runtime_file_transfer.is_none());
         assert!(!bash.runtime_file_transfer_required);
         assert!(bash.runtime_filesystem_boundary.is_none());
+    }
+
+    #[test]
+    fn process_authorization_is_attached_only_to_bash() {
+        let (exec, _dir) = test_executor();
+        let context = Arc::new(astra_services::runs::RuntimeProcessAuthorizationContext {
+            authorization: "Bearer request-scoped".to_string(),
+        });
+        let exec = exec.with_runtime_process_authorization(Some(context));
+
+        let bash = exec.tool_execution_request("bash", &json!({"command": "moi-cli file list"}));
+        assert!(bash.runtime_process_authorization.is_some());
+        assert!(bash.runtime_process_authorization_required);
+
+        let read = exec.tool_execution_request("read_file", &json!({"path": "report.txt"}));
+        assert!(read.runtime_process_authorization.is_none());
+        assert!(!read.runtime_process_authorization_required);
     }
 
     #[test]

@@ -585,6 +585,7 @@ async fn edge_ws_relay_strips_legacy_boundary_and_preserves_inflight_dispatch() 
         args: json!({"command": "sleep 30"}),
         runtime_file_transfer: None,
         runtime_file_transfer_v2: None,
+        runtime_process_authorization: None,
         runtime_filesystem_boundary: Some(Box::new(
             astra_server_types::edge_ws_protocol::RuntimeFilesystemBoundaryContext {
                 workspace_root: "/sandbox".to_string(),
@@ -655,6 +656,7 @@ async fn edge_ws_replayed_result_after_reconnect_is_durably_accepted_and_acked()
         args: json!({"command": "effect"}),
         runtime_file_transfer: None,
         runtime_file_transfer_v2: None,
+        runtime_process_authorization: None,
         runtime_filesystem_boundary: None,
         timeout_secs: 30,
     };

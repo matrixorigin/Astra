@@ -11,6 +11,7 @@
 
 mod invocation_journal;
 mod runtime_file_transfer;
+mod runtime_process_authorization;
 mod token_manager;
 mod token_renewal;
 
@@ -498,6 +499,9 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
     let mut advertisement = serde_json::to_value(RuntimeEnvironmentAdvertisement::new(binding))
         .expect("runtime environment advertisement serializes");
     advertisement["protocol_capabilities"] = serde_json::json!({});
+    advertisement["protocol_capabilities"]
+        [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
+        Value::Bool(true);
     #[cfg(unix)]
     if managed_file_transfer_supported {
         advertisement["protocol_capabilities"]
@@ -1078,6 +1082,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                 args: tool_args,
                                 runtime_file_transfer,
                                 runtime_file_transfer_v2,
+                                runtime_process_authorization,
                                 runtime_filesystem_boundary,
                                 timeout_secs,
                             }) => {
@@ -1110,6 +1115,22 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         *identity,
                                         delivery_generation,
                                         message,
+                                    );
+                                    write
+                                        .send(Message::Text(
+                                            serde_json::to_string(&message)?.into(),
+                                        ))
+                                        .await?;
+                                    continue;
+                                }
+                                if runtime_process_authorization.as_ref().is_some_and(|context| {
+                                    tool != "bash" || context.authorization.trim().is_empty()
+                                }) {
+                                    let message = rejected_tool_message(
+                                        request_id,
+                                        *identity,
+                                        delivery_generation,
+                                        "Runtime process authorization is invalid",
                                     );
                                     write
                                         .send(Message::Text(
@@ -1220,6 +1241,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         .await
                                         {
                                             result
+                                        } else if let Some(process_authorization) =
+                                            runtime_process_authorization.as_deref()
+                                        {
+                                            runtime_process_authorization::execute_bash(
+                                                executor.as_ref(),
+                                                &tool_args,
+                                                process_authorization,
+                                            )
+                                            .await
                                         } else {
                                             runtime_file_transfer::execute_default_tool(
                                                 executor.as_ref(),
@@ -1637,6 +1667,7 @@ mod tests {
                             args,
                             runtime_file_transfer: None,
                             runtime_file_transfer_v2: Some(Box::new(mismatched_context.clone())),
+                            runtime_process_authorization: None,
                             runtime_filesystem_boundary: None,
                             timeout_secs: 10,
                         })
@@ -1872,6 +1903,7 @@ mod tests {
                 args: json!({"file_id": "file-1"}),
                 runtime_file_transfer: Some(Box::new(transfer_context.clone())),
                 runtime_file_transfer_v2: None,
+                runtime_process_authorization: None,
                 runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                 timeout_secs: 10,
             };
@@ -1937,6 +1969,7 @@ mod tests {
                         args: json!({"path": "report.txt", "content": "protocol report"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
                         runtime_file_transfer_v2: None,
+                        runtime_process_authorization: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -1981,6 +2014,7 @@ mod tests {
                         args: json!({"path": "report.txt"}),
                         runtime_file_transfer: Some(Box::new(transfer_context.clone())),
                         runtime_file_transfer_v2: None,
+                        runtime_process_authorization: None,
                         runtime_filesystem_boundary: Some(Box::new(filesystem_boundary.clone())),
                         timeout_secs: 10,
                     })
@@ -2043,6 +2077,7 @@ mod tests {
                         args: json!({"file_id": "file-1"}),
                         runtime_file_transfer: None,
                         runtime_file_transfer_v2: None,
+                        runtime_process_authorization: None,
                         runtime_filesystem_boundary: None,
                         timeout_secs: 10,
                     })
@@ -2156,6 +2191,11 @@ mod tests {
             value["protocol_capabilities"]
                 .get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
                 .is_none()
+        );
+        assert_eq!(
+            value["protocol_capabilities"]
+                [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY],
+            true
         );
         assert!(
             value["binding"]["tool_surface"]["tool_names"]
