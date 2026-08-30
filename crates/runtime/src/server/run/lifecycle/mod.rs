@@ -5873,20 +5873,6 @@ impl AgenticRunLifecycleService {
         ))
     }
 
-    fn validate_provider_task_ref_session(
-        requested_session_id: Option<&str>,
-        bound_session_id: &str,
-    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-        if requested_session_id.is_some_and(|session_id| session_id != bound_session_id) {
-            return Err(error_response_coded(
-                StatusCode::CONFLICT,
-                "provider task_ref is already bound to a different session",
-                "provider_task_ref_session_mismatch",
-            ));
-        }
-        Ok(())
-    }
-
     async fn resolve_agent_binding_runtime(
         &self,
         request: &AgentBindingRuntimeRequest,
@@ -5915,6 +5901,20 @@ impl AgenticRunLifecycleService {
         }
 
         Ok(ResolvedAgentBindingRuntime { binding })
+    }
+
+    fn validate_provider_task_ref_session(
+        requested_session_id: Option<&str>,
+        bound_session_id: &str,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        if requested_session_id.is_some_and(|session_id| session_id != bound_session_id) {
+            return Err(error_response_coded(
+                StatusCode::CONFLICT,
+                "provider task_ref is already bound to a different session",
+                "provider_task_ref_session_mismatch",
+            ));
+        }
+        Ok(())
     }
 
     fn requested_agent_bindings(
@@ -9876,24 +9876,34 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         request: ChatRequestData,
     ) -> Result<ChatStreamRecord, (StatusCode, Json<ErrorResponse>)> {
         let provider_identity = self.provider_idempotency_identity(&user_id, &request)?;
-        if let Some(identity) = provider_identity.as_ref()
-            && let Some(durable) = self
-                .load_durable_run_for_user(&identity.run_id, &user_id)
-                .await?
-        {
-            Self::validate_provider_task_ref_session(
-                request.session_id.as_deref(),
-                &durable.session_id,
-            )?;
-            Self::validate_provider_request_fingerprint(
-                &identity.request_fingerprint,
-                durable.provider_request_fingerprint.as_deref(),
-            )?;
-            return self
-                .stream_run_live(identity.run_id.clone(), user_id, 0)
-                .await;
-        }
-        let request = self.prepare_chat_request(request).await?;
+        let request = if let Some(identity) = provider_identity.as_ref() {
+            // Provider retries must be replayable even when they omit trusted
+            // runtime context that was required only to start the original
+            // execution. The durable lookup therefore remains authoritative,
+            // but it can run alongside the read-only request preparation for
+            // the new-run path instead of extending the critical path.
+            let requested_session_id = request.session_id.clone();
+            let (durable, prepared) = tokio::join!(
+                self.load_durable_run_for_user(&identity.run_id, &user_id),
+                self.prepare_chat_request(request),
+            );
+            if let Some(durable) = durable? {
+                Self::validate_provider_task_ref_session(
+                    requested_session_id.as_deref(),
+                    &durable.session_id,
+                )?;
+                Self::validate_provider_request_fingerprint(
+                    &identity.request_fingerprint,
+                    durable.provider_request_fingerprint.as_deref(),
+                )?;
+                return self
+                    .stream_run_live(identity.run_id.clone(), user_id, 0)
+                    .await;
+            }
+            prepared?
+        } else {
+            self.prepare_chat_request(request).await?
+        };
         let request_constraints = self
             .validate_request_constraints(&user_id, &request)
             .await?;
@@ -10772,8 +10782,18 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                 }
             }
         }
-        if let Some(pool) = &self.shared_pool {
-            let trace = server_trace_context(&user_id, &session_id, &run_id, state.session_turn);
+        self.configure_loop_state_runtime_controls(
+            &mut state,
+            &cancel_flag,
+            &pause_flag,
+            (*llm_cancel_token).clone(),
+        );
+        let transcript_turn = state.session_turn;
+        let persist_user_transcript = async {
+            let Some(pool) = &self.shared_pool else {
+                return;
+            };
+            let trace = server_trace_context(&user_id, &session_id, &run_id, transcript_turn);
             let user_transcript = TranscriptPersistItem {
                 run_id: Some(run_id.clone()),
                 role: "user",
@@ -10791,22 +10811,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     "user intent transcript item was not committed"
                 );
             }
-        }
-
-        self.configure_loop_state_runtime_controls(
-            &mut state,
-            &cancel_flag,
-            &pause_flag,
-            (*llm_cancel_token).clone(),
-        );
-        configure_runtime_controllers(
+        };
+        let configure_controllers = configure_runtime_controllers(
             &self.matrixone,
             self.shared_pool.as_ref(),
             &mut state,
             &user_id,
             &session_id,
-        )
-        .await;
+        );
+        tokio::join!(persist_user_transcript, configure_controllers);
 
         // Wire the server-side runtime tool owner whenever the host exposes the
         // server tool catalog. For edge-bound runs this uses an internal

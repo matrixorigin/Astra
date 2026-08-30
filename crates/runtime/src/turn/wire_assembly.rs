@@ -100,6 +100,8 @@ pub(crate) fn observe_context_compaction(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WireBudgetStatus {
     pub estimated_input_tokens: usize,
+    pub estimated_tool_schema_tokens: usize,
+    pub admission_estimated_input_tokens: usize,
     pub requested_output_tokens: usize,
     pub reserved_protocol_tokens: usize,
     pub effective_input_limit: usize,
@@ -167,6 +169,39 @@ pub(crate) fn wire_budget_status_with_metadata(
         .sum();
     let estimated_input_tokens =
         crate::prompts::estimate_tokens_cache_aware_split(&[], messages, tool_tokens).total_tokens;
+    // Preserve the historical provider-admission estimate exactly while
+    // reusing the message measurement above. Tool schema accounting used a
+    // whole-list serialization, whereas the wire budget intentionally walks
+    // individual JSON values.
+    let serialized_tools = serde_json::to_string(tools);
+    let estimated_tool_schema_tokens = match serialized_tools {
+        Ok(value) => {
+            let site =
+                astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization;
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    value.len().try_into().unwrap_or(u64::MAX),
+                    tools.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                );
+            }
+            usize::try_from(astra_turn_core::section_types::estimate_text_tokens(&value))
+                .unwrap_or(usize::MAX)
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(
+                astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization,
+                &error,
+            );
+            0
+        }
+    };
+    let admission_estimated_input_tokens = estimated_input_tokens
+        .saturating_sub(tool_tokens)
+        .saturating_add(estimated_tool_schema_tokens)
+        .saturating_add(crate::prompts::DEFAULT_SYSTEM_PROMPT_TOKENS)
+        .saturating_add(crate::prompts::MODEL_FRAMING_TOKENS);
     let budget = crate::prompts::budget_for_model_with_metadata(
         Some(model_name),
         context_window,
@@ -175,6 +210,8 @@ pub(crate) fn wire_budget_status_with_metadata(
     let policy = budget.window_policy();
     WireBudgetStatus {
         estimated_input_tokens,
+        estimated_tool_schema_tokens,
+        admission_estimated_input_tokens,
         requested_output_tokens,
         reserved_protocol_tokens: policy.reserved_protocol_tokens,
         effective_input_limit: budget.effective_input_limit(),
@@ -1217,6 +1254,29 @@ mod tests {
             trace["wire"]["budget"]["enforcement"],
             "observational_estimate_provider_authoritative"
         );
+    }
+
+    #[test]
+    fn wire_budget_reuses_measurement_without_changing_provider_admission_estimate() {
+        let messages = vec![
+            json!({"role": "system", "content": "stable instructions"}),
+            json!({"role": "user", "content": "你好"}),
+        ];
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Lookup a record",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+
+        let status =
+            wire_budget_status_with_metadata(&messages, &tools, "model", Some(32_000), None, 1_000);
+        let historical =
+            crate::prompts::estimate_tokens(&messages, status.estimated_tool_schema_tokens, 0);
+
+        assert_eq!(status.admission_estimated_input_tokens, historical);
     }
 
     #[tokio::test]

@@ -357,15 +357,18 @@ pub(super) async fn chat_stream_handler(
     let requested_session_id_for_diagnostics = requested_session_id
         .as_deref()
         .filter(|session_id| astra_services::validate_persisted_session_id(session_id).is_ok());
-    let resolved = match resolve_or_create_chat_session(
-        &state,
-        &user,
-        chat_data.session_id.take(),
-        chat_data.agent_id.clone(),
-        false,
-    )
-    .await
-    {
+    let requested_agent_id = chat_data.agent_id.clone();
+    let (resolved, runtime_context) = tokio::join!(
+        resolve_or_create_chat_session(
+            &state,
+            &user,
+            requested_session_id.clone(),
+            requested_agent_id,
+            false,
+        ),
+        inject_effective_runtime_context(&state, &principal, &mut chat_data),
+    );
+    let resolved = match resolved {
         Ok(resolved) => resolved,
         Err((status, error)) => {
             return sse_error_response_from_error_with_context(
@@ -399,9 +402,7 @@ pub(super) async fn chat_stream_handler(
             },
         );
     }
-    if let Err((status, error)) =
-        inject_effective_runtime_context(&state, &principal, &mut chat_data).await
-    {
+    if let Err((status, error)) = runtime_context {
         return sse_error_response_from_error_with_context(
             status,
             error.0,
@@ -412,11 +413,11 @@ pub(super) async fn chat_stream_handler(
             },
         );
     }
-
+    let error_session_id = chat_data.session_id.clone();
     match state
         .execution
         .run_lifecycle_service
-        .stream_chat(user.user_id.clone(), chat_data.clone())
+        .stream_chat(user.user_id.clone(), chat_data)
         .await
     {
         Ok(mut stream) => {
@@ -444,7 +445,7 @@ pub(super) async fn chat_stream_handler(
             error.0,
             SseErrorContext {
                 request_id: request_id.as_deref(),
-                session_id: chat_data.session_id.as_deref(),
+                session_id: error_session_id.as_deref(),
                 ..SseErrorContext::default()
             },
         ),

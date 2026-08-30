@@ -20,7 +20,9 @@ pub use context::{
     capped_output_tokens, estimate_json_value_tokens, estimate_str_tokens, estimate_tokens,
     estimate_tokens_cache_aware, estimate_tokens_cache_aware_split,
 };
-pub(crate) use context::{PER_MESSAGE_OVERHEAD, estimate_single_message_tokens};
+pub(crate) use context::{
+    MODEL_FRAMING_TOKENS, PER_MESSAGE_OVERHEAD, estimate_single_message_tokens,
+};
 pub use system::{
     CacheScope, DeferredToolsPromptBlock, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
     PromptSection, PromptTokenBucket, STALL_NUDGE, SYSTEM_PROMPT_BASE,
