@@ -176,6 +176,7 @@ pub(super) async fn completions_handler(
                 purpose,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
                 max_output_tokens: Some(request.max_tokens as usize),
                 temperature: Some(request.temperature),

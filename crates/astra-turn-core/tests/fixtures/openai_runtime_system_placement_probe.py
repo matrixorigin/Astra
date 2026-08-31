@@ -167,9 +167,26 @@ def tool_loop_case(placement: str) -> tuple[bool, float, int, int, float]:
     )
     assistant = first.get("choices", [{}])[0].get("message", {})
     calls = assistant.get("tool_calls") or []
-    if not calls:
+    if len(calls) != 1:
         return False, 0.0, 0, 0, 0.0
-    tool_call_id = calls[0].get("id")
+    tool_call = calls[0]
+    if tool_call.get("type") != "function":
+        return False, 0.0, 0, 0, 0.0
+    function = tool_call.get("function") or {}
+    if function.get("name") != "cache_probe":
+        return False, 0.0, 0, 0, 0.0
+    raw_arguments = function.get("arguments")
+    try:
+        arguments = (
+            json.loads(raw_arguments)
+            if isinstance(raw_arguments, str)
+            else raw_arguments
+        )
+    except (TypeError, json.JSONDecodeError):
+        return False, 0.0, 0, 0, 0.0
+    if arguments != {"value": "warm"}:
+        return False, 0.0, 0, 0, 0.0
+    tool_call_id = tool_call.get("id")
     if not tool_call_id:
         return False, 0.0, 0, 0, 0.0
     # Reassemble round 2 from canonical conversation data with a changed

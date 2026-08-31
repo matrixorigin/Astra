@@ -82,6 +82,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             purpose,
             messages,
             tools: &[],
+            cache_capability: None,
             route: self.route.borrowed(),
             max_output_tokens: Some(self.max_output_tokens),
             temperature: None,

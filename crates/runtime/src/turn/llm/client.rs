@@ -39,6 +39,7 @@ use astra_text_utils::output_style::current_output_style;
 use astra_turn_core::bridge_rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
+use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
@@ -607,6 +608,9 @@ pub(crate) struct LlmCall<'a> {
     pub purpose: astra_turn_types::InferencePurpose,
     pub messages: &'a [Value],
     pub tools: &'a [Value],
+    /// Cache placement resolved from model metadata by the owning runtime path.
+    /// `None` preserves heuristic classification for standalone inference calls.
+    pub cache_capability: Option<CacheCapability>,
     pub route: LlmExecutionRoute<'a>,
     pub max_output_tokens: Option<usize>,
     pub temperature: Option<f64>,
@@ -2537,16 +2541,19 @@ pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
     model_name: &str,
+    explicit_cache_capability: Option<CacheCapability>,
 ) -> Vec<Value> {
     let protocol = llm_provider_protocol(provider);
-    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
-        provider, model_name,
+    let cache_cap = CacheCapability::from_explicit_or_provider_model(
+        explicit_cache_capability,
+        provider,
+        model_name,
     );
     let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
         || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
             && !matches!(
                 cache_cap.volatile_placement,
-                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+                VolatilePlacement::CurrentUserOnly
             ));
     consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
 }
@@ -3212,6 +3219,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
         purpose,
         messages,
         tools,
+        cache_capability,
         route,
         max_output_tokens,
         temperature,
@@ -3242,7 +3250,8 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     // Consolidate system messages: merge all system-role messages into the first
     // one, converting extras to a single leading system message. Some providers
     // (e.g. MiniMax) reject system messages after the first position.
-    let messages = consolidate_system_messages_for_provider(messages, provider, model_name);
+    let messages =
+        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
@@ -4577,6 +4586,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
         purpose,
         messages,
         tools,
+        cache_capability,
         route,
         max_output_tokens,
         temperature,
@@ -4597,7 +4607,8 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let started = Instant::now();
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let messages = consolidate_system_messages_for_provider(messages, provider, model_name);
+    let messages =
+        consolidate_system_messages_for_provider(messages, provider, model_name, cache_capability);
 
     let body = build_provider_request_body_with_overrides(
         &messages,
@@ -5343,6 +5354,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"x"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -5426,6 +5438,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -5496,6 +5509,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -7856,6 +7870,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -7915,6 +7930,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -7960,6 +7976,7 @@ mod tests {
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
+                    cache_capability: None,
                     route: LlmExecutionRoute {
                         model_name: "m",
                         wire_model_name: None,
@@ -8002,6 +8019,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8041,6 +8059,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8083,6 +8102,7 @@ mod tests {
                     purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                     messages: &messages,
                     tools: &[],
+                    cache_capability: None,
                     route: LlmExecutionRoute {
                         model_name: "m",
                         wire_model_name: None,
@@ -8155,6 +8175,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8184,6 +8205,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8234,6 +8256,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8298,6 +8321,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8344,6 +8368,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8394,6 +8419,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8438,6 +8464,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8481,6 +8508,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "m",
                     wire_model_name: None,
@@ -8662,7 +8690,7 @@ mod tests {
             "turn_chain_id": "chain-current"
         });
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o");
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o", None);
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -8697,7 +8725,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -8728,7 +8756,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7", None);
 
         assert_eq!(out.len(), 4);
         assert_eq!(out[0]["role"], "system");
@@ -8737,6 +8765,43 @@ mod tests {
             out.iter()
                 .skip(1)
                 .all(|message| { message.get("role").and_then(Value::as_str) != Some("system") })
+        );
+        assert_eq!(out[3]["content"], "hi");
+    }
+
+    #[test]
+    fn explicit_current_user_only_capability_overrides_provider_model_heuristic() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            runtime,
+            json!({"role": "user", "content": "hi"}),
+        ];
+        let explicit = CacheCapability {
+            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+            volatile_placement: VolatilePlacement::CurrentUserOnly,
+            reuse_scope: None,
+        };
+
+        let out = consolidate_system_messages_for_provider(
+            &msgs,
+            "openai",
+            "metadata-defined-alias",
+            Some(explicit),
+        );
+
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            out.iter()
+                .skip(1)
+                .all(|message| message.get("role").and_then(Value::as_str) != Some("system"))
         );
         assert_eq!(out[3]["content"], "hi");
     }
@@ -8755,7 +8820,8 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4");
+        let out =
+            consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4", None);
 
         assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
@@ -10522,8 +10588,12 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages =
-            consolidate_system_messages_for_provider(&messages, "anthropic", "claude-sonnet-4");
+        let messages = consolidate_system_messages_for_provider(
+            &messages,
+            "anthropic",
+            "claude-sonnet-4",
+            None,
+        );
         let body = build_provider_request_body(
             &messages,
             &[],

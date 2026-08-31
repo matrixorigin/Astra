@@ -348,6 +348,7 @@ async fn bedrock_stream_with_retry(
         purpose,
         messages,
         tools,
+        cache_capability: _,
         route,
         max_output_tokens,
         temperature,
@@ -578,6 +579,7 @@ async fn anthropic_stream_with_retry(
         purpose,
         messages,
         tools,
+        cache_capability: _,
         route,
         max_output_tokens,
         temperature,
@@ -1202,6 +1204,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
         purpose,
         messages,
         tools,
+        cache_capability,
         route,
         max_output_tokens,
         temperature,
@@ -1242,7 +1245,10 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
     })?;
 
     let messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
-        messages, provider, model_name,
+        messages,
+        provider,
+        model_name,
+        cache_capability,
     );
     if provider_uses_bedrock_converse(provider) {
         return bedrock_stream_with_retry(
@@ -1251,6 +1257,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                 purpose,
                 messages: &messages,
                 tools,
+                cache_capability,
                 route: LlmExecutionRoute {
                     model_name,
                     wire_model_name,
@@ -1279,6 +1286,7 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
                 purpose,
                 messages: &messages,
                 tools,
+                cache_capability,
                 route: LlmExecutionRoute {
                     model_name,
                     wire_model_name,
@@ -2066,6 +2074,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "deepseek-v4-pro-anthropic",
                     wire_model_name: Some("deepseek-v4-pro"),
@@ -2145,6 +2154,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -2204,6 +2214,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -2333,6 +2344,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "claude-test",
                     wire_model_name: None,
@@ -2547,6 +2559,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role": "user", "content": "hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "claude-test",
                     wire_model_name: None,
@@ -2664,6 +2677,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -2851,6 +2865,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -2933,6 +2948,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "claude-test",
                     wire_model_name: None,
@@ -3011,6 +3027,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &[json!({"role":"user","content":"hi"})],
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "gpt-5-mini",
                     wire_model_name: None,
@@ -3315,6 +3332,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "anthropic.claude-sonnet-4-test",
                     wire_model_name: None,
@@ -3509,6 +3527,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "anthropic.claude-sonnet-4-test",
                     wire_model_name: None,
@@ -3562,6 +3581,7 @@ mod tests {
                 purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
                 messages: &messages,
                 tools: &[],
+                cache_capability: None,
                 route: LlmExecutionRoute {
                     model_name: "anthropic.claude-sonnet-4-test",
                     wire_model_name: None,

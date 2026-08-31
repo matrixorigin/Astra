@@ -3839,6 +3839,7 @@ impl InProcessChatTurnBridge {
                                 purpose: inference_purpose,
                                 messages: &llm_messages,
                                 tools: &pruned_tools,
+                                cache_capability,
                                 route: LlmExecutionRoute {
                                     model_name: &model_name,
                                     wire_model_name: wire_model_name.as_deref(),
@@ -4147,6 +4148,7 @@ impl InProcessChatTurnBridge {
                                     purpose: inference_purpose,
                                     messages: &llm_messages,
                                     tools: &pruned_tools,
+                                    cache_capability,
                                     route: LlmExecutionRoute {
                                         model_name: &model_name,
                                         wire_model_name: wire_model_name.as_deref(),

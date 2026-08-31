@@ -6081,6 +6081,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         purpose: state.inference_purpose,
                         messages: &llm_messages,
                         tools: &final_tools,
+                        cache_capability: llm_cfg.cache_capability,
                         route: LlmExecutionRoute {
                             model_name: &llm_cfg.model_name,
                             wire_model_name: llm_cfg.wire_model_name.as_deref(),

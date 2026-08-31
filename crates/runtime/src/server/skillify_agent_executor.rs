@@ -91,6 +91,7 @@ impl RuntimeSkillifyAgentExecutor {
                     purpose: astra_turn_types::InferencePurpose::SkillSynthesis,
                     messages: &messages,
                     tools: &[],
+                    cache_capability: None,
                     route: LlmExecutionRoute::from_admitted(&execution.admitted),
                     max_output_tokens: Some(max_output_tokens),
                     temperature: None,
