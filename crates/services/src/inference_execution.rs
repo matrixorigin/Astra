@@ -2024,6 +2024,31 @@ async fn record_inference_settlement_debt(
             )));
         }
     }
+    if terminal.status == InferenceTerminalStatus::Succeeded.as_str()
+        && matching_successful_provider_attempt(
+            &mut *tx,
+            user_id,
+            invocation_id,
+            terminal.terminal_fingerprint.as_deref().ok_or_else(|| {
+                ServiceError::invalid(
+                    "successful inference settlement requires a terminal fingerprint",
+                )
+            })?,
+        )
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "verify successful inference provider attempt under lifecycle lock",
+                error,
+            )
+        })?
+        .is_none()
+    {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} cannot succeed without a matching succeeded provider attempt"
+        )));
+    }
     write_inference_settlement_debt(&mut tx, user_id, invocation_id, terminal).await?;
     tx.commit().await.map_err(|error| {
         ServiceError::with_source(
@@ -2118,12 +2143,15 @@ async fn apply_inference_terminal_if_quiescent(
     .map(|result| result.rows_affected())
 }
 
-async fn matching_successful_provider_attempt(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn matching_successful_provider_attempt<'e, E>(
+    executor: E,
     user_id: &str,
     invocation_id: &str,
     fingerprint: &str,
-) -> Result<Option<DurableInferenceTerminal>, sqlx::Error> {
+) -> Result<Option<DurableInferenceTerminal>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     sqlx::query(
         "SELECT status, terminal_fingerprint, input_tokens, output_tokens, cache_read_tokens,
                 cache_creation_tokens, provider_response_id, error_kind, error_message
@@ -2151,7 +2179,7 @@ async fn matching_successful_provider_attempt(
     .bind(user_id)
     .bind(invocation_id)
     .bind(fingerprint)
-    .fetch_optional(db)
+    .fetch_optional(executor)
     .await?
     .map(|row| DurableInferenceTerminal::decode(&row))
     .transpose()
@@ -2452,34 +2480,6 @@ pub async fn finish_inference_invocation(
             )))
         };
     }
-    if terminal.status == InferenceTerminalStatus::Succeeded {
-        let has_succeeded_attempt = sqlx::query(
-            "SELECT 1 FROM inference_provider_attempts
-             WHERE user_id = ? AND invocation_id = ? AND status = 'succeeded'
-               AND terminal_fingerprint = ?
-             LIMIT 1",
-        )
-        .bind(&plan.input.user_id)
-        .bind(&plan.invocation_id)
-        .bind(&fingerprint)
-        .fetch_optional(db)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "verify successful inference provider attempt",
-                error,
-            )
-        })?
-        .is_some();
-        if !has_succeeded_attempt {
-            return Err(ServiceError::conflict(format!(
-                "inference invocation {} cannot succeed without a matching succeeded provider attempt",
-                plan.invocation_id
-            )));
-        }
-    }
-
     // The finalization owner explicitly records the logical outcome before it
     // tries to mirror it to `inference_invocations`. Unlike a provider attempt
     // failure, this is a durable declaration that retry policy has finished.
