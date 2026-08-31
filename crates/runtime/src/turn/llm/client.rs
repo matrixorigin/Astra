@@ -2200,10 +2200,10 @@ pub(crate) fn build_provider_request_body_with_overrides(
     let sanitized_overrides =
         sanitize_request_body_overrides_for_thinking(thinking, request_body_overrides);
     let marker_stripped_messages;
-    let messages = if messages
-        .iter()
-        .any(crate::turn::wire_assembly::is_required_runtime_preamble)
-    {
+    let messages = if messages.iter().any(|message| {
+        crate::turn::wire_assembly::is_required_runtime_preamble(message)
+            || crate::turn::wire_assembly::is_runtime_system_context(message)
+    }) {
         marker_stripped_messages = {
             astra_core::history_work::record_serialized_value(
                 astra_core::history_work::HistoryWorkSite::ProviderWireAssembly,
@@ -2536,11 +2536,18 @@ pub(crate) fn consolidate_system_messages(messages: &[Value]) -> Vec<Value> {
 pub(crate) fn consolidate_system_messages_for_provider(
     messages: &[Value],
     provider: &str,
+    model_name: &str,
 ) -> Vec<Value> {
-    let preserve_runtime_system_tail = matches!(
-        llm_provider_protocol(provider),
-        LlmProviderProtocol::AnthropicMessages | LlmProviderProtocol::OpenAiCompatible
+    let protocol = llm_provider_protocol(provider);
+    let cache_cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
+        provider, model_name,
     );
+    let preserve_runtime_system_tail = matches!(protocol, LlmProviderProtocol::AnthropicMessages)
+        || (matches!(protocol, LlmProviderProtocol::OpenAiCompatible)
+            && !matches!(
+                cache_cap.volatile_placement,
+                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
+            ));
     consolidate_system_messages_inner(messages, preserve_runtime_system_tail)
 }
 
@@ -2578,7 +2585,7 @@ fn consolidate_system_messages_inner(
         let is_system = msg.get("role").and_then(|r| r.as_str()) == Some("system");
         let preserve_runtime_control = preserve_runtime_system_tail
             && is_system
-            && crate::turn::wire_assembly::is_required_runtime_preamble(msg);
+            && crate::turn::wire_assembly::is_runtime_system_context(msg);
         if is_system && !preserve_runtime_control {
             match msg.get("content") {
                 Some(Value::String(text)) => {
@@ -3235,7 +3242,7 @@ pub(crate) async fn call_llm_and_collect_with_stream_callback(
     // Consolidate system messages: merge all system-role messages into the first
     // one, converting extras to a single leading system message. Some providers
     // (e.g. MiniMax) reject system messages after the first position.
-    let messages = consolidate_system_messages_for_provider(messages, provider);
+    let messages = consolidate_system_messages_for_provider(messages, provider, model_name);
 
     // All providers stream — including Bedrock (via converse-stream +
     // AWS vnd.amazon.eventstream). The body builder and URL builder flip
@@ -4590,7 +4597,7 @@ pub(crate) async fn call_llm_nonstream_with_attempt_observer(
     let started = Instant::now();
     let upstream_name = wire_model_name.unwrap_or(model_name);
 
-    let messages = consolidate_system_messages_for_provider(messages, provider);
+    let messages = consolidate_system_messages_for_provider(messages, provider, model_name);
 
     let body = build_provider_request_body_with_overrides(
         &messages,
@@ -8655,7 +8662,7 @@ mod tests {
             "turn_chain_id": "chain-current"
         });
 
-        let out = consolidate_system_messages_for_provider(&[runtime], "openai");
+        let out = consolidate_system_messages_for_provider(&[runtime], "openai", "gpt-4o");
 
         assert_eq!(out[0]["content"], "model-visible required context");
         assert!(
@@ -8677,55 +8684,85 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_for_openai_preserves_runtime_control_system_tail() {
+    fn consolidate_for_openai_preserves_runtime_system_at_current_turn_boundary() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
         .expect("runtime message");
         let msgs = vec![
             json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "hi"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
             runtime,
+            json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "openai");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "gpt-4o");
 
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "stable");
         assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[1]["content"], "hi");
-        assert_eq!(out[2]["role"], "system");
-        assert_eq!(out[2]["content"], "required resume context");
+        assert_eq!(out[3]["role"], "system");
+        assert_eq!(out[3]["content"], "required resume context");
+        assert_eq!(out[4]["content"], "hi");
         assert!(
-            out[2]
+            out.iter().all(|message| message
                 .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
-                .is_none(),
+                .is_none()),
             "internal marker must not reach provider request messages"
         );
     }
 
     #[test]
-    fn consolidate_for_anthropic_preserves_runtime_control_system_tail() {
+    fn consolidate_for_strict_history_openai_moves_required_runtime_to_initial_system() {
         let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
             "required resume context",
         )
         .expect("runtime message");
         let msgs = vec![
             json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "hi"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
             runtime,
+            json!({"role": "user", "content": "hi"}),
         ];
 
-        let out = consolidate_system_messages_for_provider(&msgs, "anthropic");
+        let out = consolidate_system_messages_for_provider(&msgs, "openai", "MiniMax-M2.7");
 
-        assert_eq!(out.len(), 3);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0]["role"], "system");
+        assert_eq!(out[0]["content"], "stable\n\nrequired resume context");
+        assert!(
+            out.iter()
+                .skip(1)
+                .all(|message| { message.get("role").and_then(Value::as_str) != Some("system") })
+        );
+        assert_eq!(out[3]["content"], "hi");
+    }
+
+    #[test]
+    fn consolidate_for_anthropic_preserves_runtime_system_boundary_for_body_builder() {
+        let runtime = crate::turn::wire_assembly::required_runtime_preamble_message(
+            "required resume context",
+        )
+        .expect("runtime message");
+        let msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "old question"}),
+            json!({"role": "assistant", "content": "old answer"}),
+            runtime,
+            json!({"role": "user", "content": "hi"}),
+        ];
+
+        let out = consolidate_system_messages_for_provider(&msgs, "anthropic", "claude-sonnet-4");
+
+        assert_eq!(out.len(), 5);
         assert_eq!(out[0]["role"], "system");
         assert_eq!(out[0]["content"], "stable");
-        assert_eq!(out[1]["role"], "user");
-        assert_eq!(out[1]["content"], "hi");
-        assert_eq!(out[2]["role"], "system");
-        assert_eq!(out[2]["content"], "required resume context");
+        assert_eq!(out[3]["role"], "system");
+        assert_eq!(out[3]["content"], "required resume context");
+        assert_eq!(out[4]["content"], "hi");
         assert!(
             out.iter().all(|message| message
                 .get(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER)
@@ -10485,7 +10522,8 @@ mod tests {
             json!({"role": "user", "content": "hello"}),
             runtime,
         ];
-        let messages = consolidate_system_messages_for_provider(&messages, "anthropic");
+        let messages =
+            consolidate_system_messages_for_provider(&messages, "anthropic", "claude-sonnet-4");
         let body = build_provider_request_body(
             &messages,
             &[],
@@ -10524,6 +10562,32 @@ mod tests {
                 .to_string()
                 .contains(crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER),
             "internal runtime marker must never reach the provider request body: {body:#?}"
+        );
+    }
+
+    #[test]
+    fn build_openai_body_strips_optional_runtime_system_marker() {
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "optional runtime evidence",
+            false,
+        )
+        .expect("runtime message");
+        let body = build_provider_request_body(
+            &[runtime, json!({"role": "user", "content": "hello"})],
+            &[],
+            "gpt-4o",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+
+        let rendered = body.to_string();
+        assert!(rendered.contains("optional runtime evidence"));
+        assert!(
+            !rendered.contains(crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER),
+            "optional runtime marker must never reach the provider request body: {body:#?}"
         );
     }
 

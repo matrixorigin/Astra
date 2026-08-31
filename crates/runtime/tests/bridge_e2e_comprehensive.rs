@@ -8468,8 +8468,8 @@ async fn a4_skill_tool_name_in_edge_tools_treated_as_regular_tool() {
 
 #[tokio::test]
 async fn a4_active_skills_in_edge_profile() {
-    // active_skills in edge_profile should influence system prompt construction.
-    // Verify the bridge accepts active_skills without errors.
+    // active_skills is runtime metadata, not model-visible prompt text.
+    // Verify the bridge accepts it without changing the request contract.
     init_env();
     let cap = AllCaptures::default();
     let app = build_test_app(cap.clone());

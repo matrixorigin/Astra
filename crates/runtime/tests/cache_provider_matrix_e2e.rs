@@ -12,11 +12,10 @@
 //! The matrix is `{provider, model} × {scenario}` where:
 //!
 //!   * providers: Anthropic, Bedrock-claude, DeepSeek-/anthropic,
-//!     OpenAI-gpt, MiniMax-M2.7.
+//!     OpenAI-gpt, Qwen, DeepSeek-v4, MiniMax-M2.7.
 //!   * scenarios: fresh-turn, multi-round with assistant-only turns,
 //!     tool-loop with appended (assistant_tc, tool) pairs, runtime
-//!     injections mid-history (tool_health warnings, working-set block,
-//!     already-fetched block, coaching ping).
+//!     runtime-system injections at the current-turn boundary.
 //!
 //! # What it asserts
 //!
@@ -26,16 +25,14 @@
 //!      system, history-before-this-round), the SHA-256 of the cacheable
 //!      prefix must be identical across rounds. This is what DeepSeek's
 //!      2-round warm-up actually measures.
-//!   2. **Volatile slot placement**: for marker-isolated providers
-//!      (Anthropic/Bedrock), CacheScope::None sections do NOT leak into
-//!      the system content array (b551c04f). For tail-suffix providers
-//!      (e.g. OpenAI-gpt), volatile rides the tail of the last user
-//!      message, not the primary system message. For strict-history
-//!      providers (e.g. MiniMax), volatile is suppressed entirely.
-//!   3. **No volatile-cc-marker on trailing system msgs**: if runtime
-//!      pushes `role=system [working-set:v1]` at history tail, the cache
-//!      breakpoint MUST land on the last non-system message; the
-//!      trailing system must not carry cache_control (5c0b9693).
+//!   2. **Runtime-system placement**: user/tool messages remain byte-for-byte
+//!      conversational data. Marker-isolated providers keep runtime context
+//!      after the explicit message cache boundary; OpenAI-compatible
+//!      providers place it before the current user turn; strict-history
+//!      providers suppress optional runtime context.
+//!   3. **No runtime-cc-marker on trailing system msgs**: the cache
+//!      breakpoint MUST land on the last non-system message before runtime
+//!      context; the runtime system message must not carry cache_control.
 //!
 //! # Why mock, not real API
 //!
@@ -114,6 +111,29 @@ fn tool_cache_control_count(request: &CapturedLlmRequest) -> usize {
         .count()
 }
 
+fn flatten_content(message: &Value) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.get("content").and_then(Value::as_str))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn messages_with_role<'a>(messages: &'a [Value], role: &str) -> Vec<&'a Value> {
+    messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
+        .collect()
+}
+
 /// A (provider, model) pair and whether we expect the Anthropic-native
 /// marker contract to apply. Bundled so each matrix scenario is a short,
 /// self-describing data row instead of a soup of string literals.
@@ -155,6 +175,18 @@ const PROVIDER_MATRIX: &[ProviderCase] = &[
         label: "openai-gpt",
         provider: "openai",
         model: "gpt-4o",
+        is_marker_isolated: false,
+    },
+    ProviderCase {
+        label: "qwen-openai-compatible",
+        provider: "openai",
+        model: "qwen-max",
+        is_marker_isolated: false,
+    },
+    ProviderCase {
+        label: "deepseek-v4-openai-compatible",
+        provider: "openai",
+        model: "deepseek-v4-pro",
         is_marker_isolated: false,
     },
     ProviderCase {
@@ -206,10 +238,12 @@ async fn run_user_turn(
         .push(json!({ "role": "assistant", "content": reply_text }));
 }
 
-/// Assert that the captured LLM request payload satisfies the constraints
-/// every marker-isolated (Anthropic-dialect) provider imposes:
-///   1. `role=system` appears only at `msg[0]` (if at all).
-///   2. No two consecutive messages both have role in {user, tool} — in the
+/// Assert that the captured internal wire payload satisfies conversation
+/// constraints before the provider adapter projects runtime system messages
+/// into the endpoint-specific body:
+///   1. Runtime system messages are ignored for conversation alternation.
+///   2. No two consecutive conversational messages both have role in
+///      {user, tool} — in the
 ///      Anthropic dialect a `role=tool` is collapsed to `role=user` on the
 ///      wire, so adjacent `user+user`, `user+tool`, or `tool+tool` pairs
 ///      all trigger HTTP 400 "expected role to alternate between 'user'
@@ -219,26 +253,22 @@ async fn run_user_turn(
 ///      ("This model does not support assistant message prefill. The
 ///      conversation must end with a user message.", session 6f167b47).
 ///
-/// Prefix-only providers (OpenAI / MiniMax) are more lenient but failing
+/// OpenAI-compatible providers are more lenient but failing
 /// 2 and 3 is still a code smell, so we enforce the same rules across the
 /// whole matrix. Call this right after `run_one_mock_turn_for_test` in
 /// every new matrix test, threaded via the label so a failure names the
 /// offending provider row directly.
 fn assert_protocol_valid(label: &str, turn: usize, messages: &[Value]) {
-    // 1: role=system only at msg[0].
-    for (i, m) in messages.iter().enumerate().skip(1) {
-        let role = m.get("role").and_then(Value::as_str);
-        assert_ne!(
-            role,
-            Some("system"),
-            "[{label} t{turn}] msg[{i}] has role=system (only msg[0] may be system)"
-        );
-    }
-
-    // 2: no two adjacent user/tool pairs. In Anthropic dialect tool_result
-    // is a user-role block, so tool counts as user for alternation.
-    let roles: Vec<&str> = messages
+    // Runtime-owned system messages are not conversation turns. The provider
+    // adapter either preserves their OpenAI-compatible placement or projects
+    // them into Anthropic's top-level system blocks.
+    let conversation = messages
         .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"));
+
+    // No two adjacent user/tool pairs. In Anthropic dialect tool_result
+    // is a user-role block, so tool counts as user for alternation.
+    let roles: Vec<&str> = conversation
         .filter_map(|m| m.get("role").and_then(Value::as_str))
         .collect();
     for (i, window) in roles.windows(2).enumerate() {
@@ -258,6 +288,7 @@ fn assert_protocol_valid(label: &str, turn: usize, messages: &[Value]) {
     let last_role = messages
         .iter()
         .rev()
+        .filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
         .find_map(|m| m.get("role").and_then(Value::as_str));
     assert!(
         matches!(last_role, Some("user") | Some("tool")),
@@ -477,20 +508,13 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
     }
 }
 
-// ── Invariant 4: tool-loop growth preserves historical byte stability ────
+// ── Invariant 4: tool-loop growth preserves conversation bytes ─────────────
 //
-// Session d0640d3d regression: agentic tool loops append (assistant_tc,
-// tool_result) pairs within the same user-turn. Under reference-agent semantics
-// the sole message marker advances behind the previous round. The current
-// tool-result tail is intentionally outside that marker: provider-valid
-// runtime context must be merged into the user-like tool result rather than
-// emitted as an adjacent synthetic user message. Therefore only the history
-// strictly before the prior dynamic tail is byte-stable across the next round.
-//
-// Here we simulate a two-round tool loop by mocking two turns where the
-// second turn has one extra (assistant_tc, tool) pair appended and
-// assert the matching msg[i].sha256 for all messages before the newly-
-// appended pair.
+// Runtime context is a separate system message. It must never be appended to
+// the current user or tool result. OpenAI-compatible providers place it before
+// the current user-turn boundary; marker-isolated providers keep it after the
+// last conversation message so the explicit cache breakpoint stays on real
+// history. Strict-history providers suppress optional runtime context.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
@@ -507,6 +531,10 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         );
         let mut state = make_test_loop_state();
         state.max_turn_input_tokens = 200_000;
+        state.push_volatile(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            "runtime advisory round 1",
+        );
 
         // Round 1 wire snapshot: [user q, assistant(tc), tool_result]
         state
@@ -529,6 +557,10 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
 
         // Round 2: append (assistant_tc, tool_result) and rerun.
+        state.push_volatile(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            "runtime advisory round 2",
+        );
         state.messages.push(json!({
             "role": "assistant",
             "content": null,
@@ -548,62 +580,76 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         let guard = capture.lock().unwrap();
         let r1 = &guard[0];
         let r2 = &guard[1];
-        // Round 1's dynamic suffix is merged into seeded msg[2], because a
-        // separate user message after a tool result would violate Anthropic
-        // role alternation. The cacheable history strictly before that suffix
-        // (msg[0..2]) must remain byte-identical when the suffix moves to the
-        // newly appended tool result in round 2.
-        assert!(
-            r1.message_sha256.len() >= 3 && r2.message_sha256.len() >= 3,
-            "tool-loop rounds must preserve at least the seeded 3-message history"
+        let r1_users = messages_with_role(&r1.messages, "user");
+        let r2_users = messages_with_role(&r2.messages, "user");
+        assert_eq!(r1_users.len(), 1, "[{}] round 1 user count", case.label);
+        assert_eq!(r2_users.len(), 1, "[{}] round 2 user count", case.label);
+        assert_eq!(flatten_content(r1_users[0]), "look it up");
+        assert_eq!(flatten_content(r2_users[0]), "look it up");
+
+        let r1_tools = messages_with_role(&r1.messages, "tool");
+        let r2_tools = messages_with_role(&r2.messages, "tool");
+        assert_eq!(r1_tools.len(), 1, "[{}] round 1 tool count", case.label);
+        assert_eq!(r2_tools.len(), 2, "[{}] round 2 tool count", case.label);
+        assert_eq!(flatten_content(r1_tools[0]), "result 1");
+        assert_eq!(flatten_content(r2_tools[0]), "result 1");
+        assert_eq!(flatten_content(r2_tools[1]), "result 2");
+        for message in r1_users
+            .iter()
+            .chain(r2_users.iter())
+            .chain(r1_tools.iter())
+            .chain(r2_tools.iter())
+        {
+            let text = flatten_content(message);
+            assert!(!text.contains("runtime advisory"));
+            assert!(!text.contains("<runtime-context-after-tool>"));
+        }
+
+        let suppresses_volatile = matches!(
+            cache_capability_for(case).volatile_placement,
+            VolatilePlacement::CurrentUserOnly
         );
-        for i in 0..2 {
-            assert_eq!(
-                r1.message_sha256[i],
-                r2.message_sha256[i],
-                "[{label}] msg[{i}] must be byte-identical across rounds after \
-                 tool-loop growth (d0640d3d regression). r1 hashes={:?} \
-                 r2 hashes={:?}",
-                r1.message_sha256,
-                r2.message_sha256,
-                label = case.label,
+        let r1_runtime_systems = messages_with_role(&r1.messages, "system");
+        let r2_runtime_systems = messages_with_role(&r2.messages, "system");
+        if suppresses_volatile {
+            assert!(
+                r1_runtime_systems
+                    .iter()
+                    .all(|message| !flatten_content(message).contains("runtime advisory round"))
+            );
+            assert!(
+                r2_runtime_systems
+                    .iter()
+                    .all(|message| !flatten_content(message).contains("runtime advisory round"))
+            );
+        } else {
+            assert!(
+                r1_runtime_systems
+                    .iter()
+                    .any(|message| flatten_content(message).contains("runtime advisory round 1"))
+            );
+            assert!(
+                r2_runtime_systems
+                    .iter()
+                    .any(|message| flatten_content(message).contains("runtime advisory round 2"))
             );
         }
-        let r1_old_tail = serde_json::to_string(&r1.messages[2]).unwrap();
-        let r2_old_tail = serde_json::to_string(&r2.messages[2]).unwrap();
-        let r2_current_tail = serde_json::to_string(r2.messages.last().unwrap()).unwrap();
-        assert!(
-            r1_old_tail.contains("<runtime-context-after-tool>"),
-            "[{label}] round 1 runtime context must ride the provider-valid current tool tail",
-            label = case.label,
-        );
-        assert!(
-            !r2_old_tail.contains("<runtime-context-after-tool>"),
-            "[{label}] runtime context must not persist on a historical tool result",
-            label = case.label,
-        );
-        assert!(
-            r2_current_tail.contains("<runtime-context-after-tool>"),
-            "[{label}] round 2 runtime context must move to the new current tool tail",
-            label = case.label,
-        );
         if case.is_marker_isolated {
             assert_eq!(
                 r1.message_cache_control_indices,
-                vec![0],
-                "[{label}] round 1 must mark the last stable message before the \
-                 dynamic tool tail",
+                vec![2],
+                "[{label}] round 1 must mark the last conversation message before runtime system",
                 label = case.label,
             );
             assert_eq!(
                 r2.message_cache_control_indices,
-                vec![2],
-                "[{label}] round 2 must advance the marker through the prior \
-                 stable tool result while excluding the new dynamic tail",
+                vec![4],
+                "[{label}] round 2 must advance through the new tool result while excluding runtime system",
                 label = case.label,
             );
         }
-        // Also: r1's full prefix hash equals r2's (system+tools unchanged).
+        // Primary system + tools remain the same even when runtime context and
+        // conversation tail grow.
         assert_eq!(
             r1.cacheable_prefix_sha256,
             r2.cacheable_prefix_sha256,
@@ -616,8 +662,8 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
 
 // ── Invariant 5: trailing role=system messages don't claim the cache marker
 //
-// 5c0b9693 regression: when the runtime appends `[working-set:v1]` (or
-// `## Already Fetched`) as a trailing `role=system` message, the cache
+// 5c0b9693 regression: when the runtime appends a trailing `role=system`
+// message, the cache
 // breakpoint must fall on the last non-system message before it, not on
 // the trailing system msg itself. Otherwise the cache boundary lands on
 // content that changes every round, and everything past the system
@@ -650,7 +696,7 @@ async fn matrix_trailing_system_msg_does_not_capture_cache_marker() {
         state
             .messages
             .push(json!({"role": "user", "content": "q2"}));
-        // Runtime-injected trailing system msg (working-set / inventory style).
+        // Runtime-injected trailing system message.
         state.messages.push(json!({
             "role": "system",
             "content": "[working-set:v1]\ngoal: test\nrecent_tools: []"
@@ -686,11 +732,9 @@ async fn matrix_trailing_system_msg_does_not_capture_cache_marker() {
 
 // ── Invariant 6.5: structured volatile lane keeps messages[] clean ─────────
 //
-// Post-Task #45 architectural invariant: when runtime code fires a
-// volatile injection via `state.push_volatile(Kind, content)`, the
-// content rides `volatile_pending` and NEVER lands in
-// `state.messages[]`. The wire layer drains the lane into the
-// preamble for each LLM call.
+// Runtime code sends volatile injections through `volatile_pending`, never
+// `state.messages[]`. The wire layer drains the lane into a runtime-owned
+// system message; it must not prefix or suffix the real user utterance.
 //
 // This test is stricter than Invariant 6 (which allowed legacy
 // callers to still push into messages[]): it mocks a single turn and
@@ -712,15 +756,7 @@ async fn matrix_volatile_lane_keeps_history_clean() {
         let mut state = make_test_loop_state();
         state.max_turn_input_tokens = 200_000;
 
-        // Simulate a turn where multiple runtime components fire volatile
-        // injections into the lane (already-fetched, a stall nudge, a coaching
-        // ping). After the turn runs, none of these
-        // should appear as standalone msgs in `state.messages` — they
-        // should all be in the captured LAST user message's prefix.
-        state.push_volatile(
-            VolatileKind::AlreadyFetched,
-            "## Already Fetched\nsrc/foo.rs",
-        );
+        // Simulate multiple advisory producers in one prepare cycle.
         state.push_volatile(
             VolatileKind::StallNudge,
             "⚠ REFLECTION: same read_file called 3 times in a row",
@@ -729,16 +765,15 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             VolatileKind::ToolBatchCoaching,
             "✓ 2 tools executed in parallel — excellent. Keep batching independent operations.",
         );
+        state.push_volatile(VolatileKind::BehaviorAdvisory, "runtime behavior evidence");
         state
             .messages
             .push(json!({"role": "user", "content": "real question"}));
 
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
 
-        // After the turn: the lane was drained (take_volatile_pending),
-        // so `state.volatile_pending` is empty and the captured wire
-        // payload should have the injections folded into the last user
-        // message.
+        // After the turn the lane is drained, while canonical history keeps
+        // only the real conversation.
         assert!(
             state.volatile_pending.is_empty(),
             "[{label}] volatile lane must be drained after assemble; got {n} entries",
@@ -749,113 +784,50 @@ async fn matrix_volatile_lane_keeps_history_clean() {
         let guard = capture.lock().unwrap();
         let cap = &guard[0];
 
-        // Flatten a message's content whether it's a string or a
-        // block-array (Anthropic shape). Needed because marker-isolated
-        // providers render content as `[{type:"text", text:"…"}, …]`.
-        fn flatten_content(m: &Value) -> String {
-            match m.get("content") {
-                Some(Value::String(s)) => s.clone(),
-                Some(Value::Array(parts)) => {
-                    let mut out = String::new();
-                    for p in parts {
-                        if let Some(t) = p.get("text").and_then(Value::as_str) {
-                            if !out.is_empty() {
-                                out.push('\n');
-                            }
-                            out.push_str(t);
-                        }
-                    }
-                    out
-                }
-                _ => String::new(),
-            }
-        }
-
-        // No standalone message in `messages[]` should be pure volatile
-        // content — real history stays clean.
-        for (i, m) in cap.messages.iter().enumerate() {
-            let c = flatten_content(m);
-            if c.is_empty() {
-                continue;
-            }
-            // Tail-suffix / marker-isolated providers legitimately fold the
-            // volatile lane into the last user message. Strict-history
-            // providers must suppress volatile entirely, so the last message
-            // must stay clean too.
-            if !suppresses_volatile && i == cap.messages.len() - 1 {
-                continue;
-            }
-            assert!(
-                !c.starts_with("[working-set:v1]"),
-                "[{label}] msg[{i}] leaked working-set into history: {c}",
-                label = case.label,
-            );
-            assert!(
-                !c.starts_with("## Already Fetched"),
-                "[{label}] msg[{i}] leaked already-fetched into history: {c}",
-                label = case.label,
-            );
-            assert!(
-                !c.starts_with("⚠ REFLECTION"),
-                "[{label}] msg[{i}] leaked stall-nudge into history: {c}",
-                label = case.label,
-            );
-            assert!(
-                !c.starts_with("✓ ") || c.contains("real question"),
-                "[{label}] msg[{i}] leaked coaching-ping into history: {c}",
-                label = case.label,
-            );
-        }
-
-        let last_text = cap.messages.last().map(flatten_content).unwrap_or_default();
-        assert!(
-            last_text.contains("real question"),
-            "[{label}] last user msg must preserve real question; got {last_text:?}",
-            label = case.label,
+        let users = messages_with_role(&cap.messages, "user");
+        assert_eq!(
+            users.len(),
+            1,
+            "[{}] exactly one real user turn",
+            case.label
         );
+        assert_eq!(flatten_content(users[0]), "real question");
+        let runtime_text = cap
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .map(flatten_content)
+            .collect::<Vec<_>>()
+            .join("\n");
         if suppresses_volatile {
             assert!(
-                !last_text.contains("[working-set:v1]")
-                    && !last_text.contains("## Already Fetched")
-                    && !last_text.contains("⚠ REFLECTION")
-                    && !last_text.contains("✓ 2 tools executed"),
-                "[{label}] strict-history providers must suppress volatile injections entirely; got {last_text:?}",
+                !runtime_text.contains("⚠ REFLECTION")
+                    && !runtime_text.contains("✓ 2 tools executed")
+                    && !runtime_text.contains("runtime behavior evidence"),
+                "[{label}] strict-history providers must suppress optional runtime context while retaining required context; got {runtime_text:?}",
                 label = case.label,
             );
         } else {
-            // And at least one of the lane contents should appear in the
-            // final user message's prefix.
             assert!(
-                last_text.contains("[working-set:v1]")
-                    || last_text.contains("## Already Fetched")
-                    || last_text.contains("⚠ REFLECTION")
-                    || last_text.contains("✓ 2 tools executed"),
-                "[{label}] last user msg must carry the lane's folded preamble; got {last_text:?}",
+                runtime_text.contains("⚠ REFLECTION")
+                    && runtime_text.contains("✓ 2 tools executed")
+                    && runtime_text.contains("runtime behavior evidence"),
+                "[{label}] runtime evidence must use system messages; got {runtime_text:?}",
                 label = case.label,
             );
         }
     }
 }
 
-// ── Invariant 6: mid-history runtime injections get consolidated ──────────
+// ── Invariant 6: runtime injections do not rewrite history ─────────────────
 //
-// 5d48887e regression: session 05e63cac t5 had 12 consecutive
-// `⚠ The following tools have failed 3 or more times consecutively…`
-// user msgs scattered mid-history. Before the fix every round rewrote
-// those bytes and DeepSeek stopped caching. After the fix, the
-// wire-layer consolidation in `assemble_llm_messages` extracts them into
-// the volatile preamble.
-//
-// We can't observe `volatile_preamble` through `CapturedLlmRequest`
-// directly (it's internal), but we CAN observe:
-//   - fewer messages in the captured `messages` than the original state
-//     had (the consolidator stripped duplicates).
-//   - no mid-history msg starts with the `⚠ The following tools have failed`
-//     prefix — they were moved.
+// Runtime data enters through the typed volatile lane. Prior history and the
+// current user message remain exact conversation bytes; optional evidence is
+// either carried by a system message or suppressed for strict-history models.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
-async fn matrix_mid_history_runtime_injections_consolidated() {
+async fn matrix_runtime_injections_do_not_rewrite_history() {
     for case in PROVIDER_MATRIX.iter().copied() {
         let suppresses_volatile = matches!(
             cache_capability_for(case).volatile_placement,
@@ -879,68 +851,41 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
             .messages
             .push(json!({"role": "user", "content": "latest question"}));
         state.push_volatile(
-            astra_runtime::turn::agentic_loop::host::VolatileKind::AlreadyFetched,
-            "## Already Fetched\nfoo.rs",
+            astra_runtime::turn::agentic_loop::host::VolatileKind::BehaviorAdvisory,
+            "runtime evidence: duplicate read",
         );
 
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
 
         let guard = capture.lock().unwrap();
         let cap = &guard[0];
-        let content_text = |message: &Value| -> String {
-            match message.get("content") {
-                Some(Value::String(text)) => text.clone(),
-                Some(Value::Array(blocks)) => blocks
-                    .iter()
-                    .filter_map(|block| {
-                        block
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .or_else(|| block.get("content").and_then(Value::as_str))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(""),
-                _ => String::new(),
-            }
-        };
+        let users = messages_with_role(&cap.messages, "user")
+            .into_iter()
+            .map(flatten_content)
+            .collect::<Vec<_>>();
+        let assistants = messages_with_role(&cap.messages, "assistant")
+            .into_iter()
+            .map(flatten_content)
+            .collect::<Vec<_>>();
+        assert_eq!(users, vec!["q1", "latest question"], "[{}]", case.label);
+        assert_eq!(assistants, vec!["a1"], "[{}]", case.label);
+        assert!(users.iter().all(|text| !text.contains("runtime evidence")));
 
-        // Typed volatile injections may be folded into the last wire user
-        // message, but they must never become persisted mid-history turns.
-        let last_idx = cap.messages.len().saturating_sub(1);
-        let mid_history_with_runtime_text = cap
-            .messages
-            .iter()
-            .enumerate()
-            .filter(|(i, message)| {
-                *i != last_idx && content_text(message).contains("## Already Fetched")
-            })
-            .count();
-        assert_eq!(
-            mid_history_with_runtime_text,
-            0,
-            "[{label}] typed runtime data must not enter mid-history; captured messages={:#?}",
-            cap.messages,
-            label = case.label,
-        );
-        let last_text = cap.messages.last().map(content_text).unwrap_or_default();
-        assert!(
-            last_text.contains("latest question"),
-            "[{label}] last user msg must end with the real question; got {:?}",
-            last_text,
-            label = case.label,
-        );
+        let runtime_text = messages_with_role(&cap.messages, "system")
+            .into_iter()
+            .map(flatten_content)
+            .collect::<Vec<_>>()
+            .join("\n");
         if suppresses_volatile {
             assert!(
-                !last_text.contains("## Already Fetched"),
-                "[{label}] strict-history providers must suppress ordinary volatile injections; got {:?}",
-                last_text,
+                !runtime_text.contains("runtime evidence: duplicate read"),
+                "[{label}] strict-history providers must suppress optional runtime evidence while retaining required context; got {runtime_text:?}",
                 label = case.label,
             );
         } else {
             assert!(
-                last_text.contains("## Already Fetched"),
-                "[{label}] volatile runtime evidence must be delivered at the current tail; got {:?}",
-                last_text,
+                runtime_text.contains("runtime evidence: duplicate read"),
+                "[{label}] runtime evidence must be delivered with system authority; got {runtime_text:?}",
                 label = case.label,
             );
         }
@@ -958,8 +903,8 @@ async fn matrix_mid_history_runtime_injections_consolidated() {
 // provider protocol.
 //
 // This invariant closes that gap: for every provider in the matrix the
-// assembled wire payload must satisfy the rules in `assert_protocol_valid`
-// (system only at msg[0], no consecutive user/tool, last msg is user/tool).
+// assembled internal wire payload must satisfy conversation alternation even
+// when a runtime system message occupies an endpoint-specific boundary.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
@@ -1090,18 +1035,15 @@ fn assert_protocol_valid_catches_consecutive_user_tool() {
 }
 
 #[test]
-fn assert_protocol_valid_catches_mid_history_system() {
-    let bad = vec![
+fn assert_protocol_valid_accepts_runtime_system_boundary() {
+    let good = vec![
         json!({"role": "system", "content": "sys"}),
-        json!({"role": "user", "content": "q"}),
-        json!({"role": "system", "content": "[working-set:v1]"}),
-        json!({"role": "user", "content": "r"}),
+        json!({"role": "user", "content": "q1"}),
+        json!({"role": "assistant", "content": "a1"}),
+        json!({"role": "system", "content": "runtime context"}),
+        json!({"role": "user", "content": "q2"}),
     ];
-    let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
-    assert!(
-        caught.is_err(),
-        "assert_protocol_valid must reject mid-history role=system messages"
-    );
+    assert_protocol_valid("self-test", 0, &good);
 }
 
 #[test]

@@ -1892,20 +1892,6 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     maybe_pre_route_skill(host, state).await;
 
     if turn_index > 0 {
-        // Inventory snapshots go through the structured volatile lane so
-        // they stay out of `state.messages[]` — the wire layer drains
-        // them into volatile_preamble for each LLM call.
-        const INVENTORY_HEADER: &str = "## Already Fetched";
-        let inventory = state.semantic_dedup.context_inventory();
-        if !inventory.is_empty() {
-            state.push_volatile(
-                super::host::VolatileKind::AlreadyFetched,
-                format!("{INVENTORY_HEADER} (do NOT re-read/re-grep these)\n{inventory}"),
-            );
-        }
-    }
-
-    if turn_index > 0 {
         // ── Stall correction: inject a nudge if stall was detected ────
         // Stall events are recorded during the tool phase of the *previous*
         // turn.  If any new events appeared, build a reflection and inject it

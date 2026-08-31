@@ -1241,8 +1241,9 @@ pub(crate) async fn call_llm_stream_with_attempt_observer(
         )
     })?;
 
-    let messages =
-        crate::turn::llm::client::consolidate_system_messages_for_provider(messages, provider);
+    let messages = crate::turn::llm::client::consolidate_system_messages_for_provider(
+        messages, provider, model_name,
+    );
     if provider_uses_bedrock_converse(provider) {
         return bedrock_stream_with_retry(
             &client,

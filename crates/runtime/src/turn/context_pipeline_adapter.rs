@@ -100,17 +100,6 @@ pub(crate) fn build_external_sources(
     // and returns (stable_sections, dynamic_sections). No channel can be
     // "forgotten" — the compiler guarantees every provider is iterated.
 
-    let active_skill_names: Vec<String> = edge_profile
-        .get("active_skills")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
     let cwd_str = edge_profile
         .get("cwd")
         .and_then(Value::as_str)
@@ -181,36 +170,6 @@ pub(crate) fn build_external_sources(
     if !runtime_advisory_evidence.is_empty() {
         providers.push(Box::new(RuntimeAdvisoryEvidenceProvider {
             injections: runtime_advisory_evidence,
-        }));
-    }
-
-    // Active skills visibility hint
-    if !active_skill_names.is_empty() {
-        providers.push(Box::new(ActiveSkillNamesProvider {
-            names: active_skill_names.clone(),
-        }));
-    }
-
-    // Turn budget hint (tiered urgency)
-    if state.max_turns > 0 && state.remaining_turns > 0 {
-        providers.push(Box::new(TurnBudgetProvider {
-            remaining_turns: state.remaining_turns as u32,
-            max_turns: state.max_turns as u32,
-        }));
-    }
-
-    // Capabilities (tool count + skill count + context window)
-    {
-        let skill_count = active_skill_names.len();
-        providers.push(Box::new(CapabilitiesProvider {
-            tool_count: tool_names.len(),
-            skill_count,
-            max_turn_input_tokens: state.max_turn_input_tokens,
-            capacity_provider_coverage: state
-                .runtime_tool_executor
-                .as_deref()
-                .map(|executor| executor.capacity_provider_coverage())
-                .unwrap_or_default(),
         }));
     }
 
@@ -475,115 +434,6 @@ impl astra_turn_core::context_sources::ContextChannelProvider for RuntimeVolatil
             .collect::<Vec<_>>()
             .join("\n\n");
         (!text.is_empty()).then(|| PromptSection::dynamic(text, PromptTokenBucket::Environment))
-    }
-}
-
-/// Active skill names: visibility hint for currently loaded skills.
-/// Dynamic scope (skill set can change mid-session).
-struct ActiveSkillNamesProvider {
-    names: Vec<String>,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for ActiveSkillNamesProvider {
-    fn channel_id(&self) -> &'static str {
-        "active_skill_names"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::None
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::Environment
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        if self.names.is_empty() {
-            return None;
-        }
-        Some(PromptSection::dynamic(
-            format!(
-                "\n\n## Active Skills\nThe following skills are currently active: {}. Use `discover_skills` to see their full descriptions.",
-                self.names.join(", ")
-            ),
-            PromptTokenBucket::Environment,
-        ))
-    }
-}
-
-/// Turn budget: tiered urgency hint based on remaining turns.
-/// Dynamic scope (remaining_turns changes every turn).
-struct TurnBudgetProvider {
-    remaining_turns: u32,
-    max_turns: u32,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for TurnBudgetProvider {
-    fn channel_id(&self) -> &'static str {
-        "turn_budget"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::None
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::Environment
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        let budget_pct = (self.remaining_turns as f64 / self.max_turns as f64) * 100.0;
-        let urgency = if budget_pct >= 80.0 {
-            ""
-        } else if budget_pct >= 50.0 {
-            " Use turns efficiently."
-        } else {
-            " Do not consume turns needlessly."
-        };
-        Some(PromptSection::dynamic(
-            format!(
-                "\n\n## Turn Budget\n{}/{} turns remaining ({:.0}%).{urgency}",
-                self.remaining_turns, self.max_turns, budget_pct
-            ),
-            PromptTokenBucket::Environment,
-        ))
-    }
-}
-
-/// Capabilities: tool count + skill count + context window info.
-/// Dynamic scope (tool_names and active_skill_names are per-turn clipped).
-struct CapabilitiesProvider {
-    tool_count: usize,
-    skill_count: usize,
-    max_turn_input_tokens: u64,
-    capacity_provider_coverage: Vec<astra_turn_core::introspect::CapacityProviderCoverageEntry>,
-}
-
-impl astra_turn_core::context_sources::ContextChannelProvider for CapabilitiesProvider {
-    fn channel_id(&self) -> &'static str {
-        "capabilities"
-    }
-    fn cache_scope(&self) -> CacheScope {
-        CacheScope::None
-    }
-    fn token_bucket(&self) -> PromptTokenBucket {
-        PromptTokenBucket::Environment
-    }
-    fn provide(&self, _turn_index: u32) -> Option<PromptSection> {
-        let mut cap = format!(
-            "\n\n## Capabilities\n{} tools available. {} active skills.",
-            self.tool_count, self.skill_count
-        );
-        if self.max_turn_input_tokens > 0 {
-            cap.push_str(&format!(
-                " Context window: {} tokens per turn.",
-                self.max_turn_input_tokens
-            ));
-        }
-        if !self.capacity_provider_coverage.is_empty() {
-            cap.push_str(" Provider coverage: ");
-            cap.push_str(
-                &astra_turn_core::introspect::capacity_provider_coverage_summary(
-                    &self.capacity_provider_coverage,
-                ),
-            );
-            cap.push('.');
-        }
-        Some(PromptSection::dynamic(cap, PromptTokenBucket::Environment))
     }
 }
 
@@ -1738,166 +1588,6 @@ mod tests {
         assert_eq!(p.cache_scope(), CacheScope::None);
     }
 
-    // ── ActiveSkillNamesProvider ──
-
-    #[test]
-    fn active_skill_names_provider_emits_skill_list() {
-        let p = super::ActiveSkillNamesProvider {
-            names: vec!["review".into(), "test".into()],
-        };
-        let section = p.provide(0).expect("should emit for non-empty names");
-        assert!(section.text.contains("Active Skills"));
-        assert!(section.text.contains("review"));
-        assert!(section.text.contains("test"));
-    }
-
-    #[test]
-    fn active_skill_names_provider_returns_none_when_empty() {
-        let p = super::ActiveSkillNamesProvider { names: vec![] };
-        assert!(p.provide(0).is_none(), "empty names → None");
-    }
-
-    #[test]
-    fn active_skill_names_provider_cache_scope_is_none() {
-        let p = super::ActiveSkillNamesProvider {
-            names: vec!["a".into()],
-        };
-        assert_eq!(p.cache_scope(), CacheScope::None);
-    }
-
-    // ── TurnBudgetProvider ──
-
-    #[test]
-    fn turn_budget_provider_emits_high_budget_no_urgency() {
-        let p = super::TurnBudgetProvider {
-            remaining_turns: 90,
-            max_turns: 100,
-        };
-        let section = p.provide(0).expect("should always emit when constructed");
-        assert!(section.text.contains("Turn Budget"));
-        assert!(section.text.contains("90/100"));
-        assert!(!section.text.contains("efficiently"));
-        assert!(!section.text.contains("needlessly"));
-    }
-
-    #[test]
-    fn turn_budget_provider_emits_medium_budget_efficiency_nudge() {
-        let p = super::TurnBudgetProvider {
-            remaining_turns: 60,
-            max_turns: 100,
-        };
-        let section = p.provide(0).expect("should emit");
-        assert!(section.text.contains("efficiently"));
-    }
-
-    #[test]
-    fn turn_budget_provider_emits_low_budget_needlessly_warning() {
-        let p = super::TurnBudgetProvider {
-            remaining_turns: 10,
-            max_turns: 100,
-        };
-        let section = p.provide(0).expect("should emit");
-        assert!(section.text.contains("needlessly"));
-    }
-
-    #[test]
-    fn turn_budget_provider_at_exact_80_pct_is_high() {
-        let p = super::TurnBudgetProvider {
-            remaining_turns: 80,
-            max_turns: 100,
-        };
-        let section = p.provide(0).expect("should emit");
-        assert!(
-            !section.text.contains("efficiently"),
-            "80%+ should be high budget, no urgency"
-        );
-    }
-
-    #[test]
-    fn turn_budget_provider_cache_scope_is_none() {
-        let p = super::TurnBudgetProvider {
-            remaining_turns: 5,
-            max_turns: 10,
-        };
-        assert_eq!(p.cache_scope(), CacheScope::None);
-    }
-
-    // ── CapabilitiesProvider ──
-
-    #[test]
-    fn capabilities_provider_emits_tool_and_skill_counts() {
-        let p = super::CapabilitiesProvider {
-            tool_count: 5,
-            skill_count: 2,
-            max_turn_input_tokens: 100_000,
-            capacity_provider_coverage: Vec::new(),
-        };
-        let section = p.provide(0).expect("should always emit");
-        assert!(section.text.contains("Capabilities"));
-        assert!(section.text.contains("5 tools"));
-        assert!(section.text.contains("2 active skills"));
-        assert!(section.text.contains("100000 tokens per turn"));
-    }
-
-    #[test]
-    fn capabilities_provider_omits_context_window_when_zero() {
-        let p = super::CapabilitiesProvider {
-            tool_count: 1,
-            skill_count: 0,
-            max_turn_input_tokens: 0,
-            capacity_provider_coverage: Vec::new(),
-        };
-        let section = p.provide(0).expect("should emit");
-        assert!(
-            !section.text.contains("tokens per turn"),
-            "zero max_turn_input_tokens → omitted"
-        );
-    }
-
-    #[test]
-    fn capabilities_provider_cache_scope_is_none() {
-        let p = super::CapabilitiesProvider {
-            tool_count: 1,
-            skill_count: 0,
-            max_turn_input_tokens: 0,
-            capacity_provider_coverage: Vec::new(),
-        };
-        assert_eq!(p.cache_scope(), CacheScope::None);
-    }
-
-    #[test]
-    fn capabilities_provider_emits_capacity_provider_coverage() {
-        let p = super::CapabilitiesProvider {
-            tool_count: 4,
-            skill_count: 0,
-            max_turn_input_tokens: 0,
-            capacity_provider_coverage: vec![
-                astra_runtime_env::CapacityProviderCoverageEntry::ready(
-                    astra_runtime_env::CapacityProviderType::ServerService,
-                    "server-builtin",
-                    vec!["web_fetch".into()],
-                ),
-                astra_runtime_env::CapacityProviderCoverageEntry::unavailable(
-                    astra_runtime_env::CapacityProviderType::Sandbox,
-                    "workspace-executor",
-                    astra_runtime_env::CapacityProviderStatus::Unbound,
-                    "no_workspace_provider_bound",
-                ),
-            ],
-        };
-
-        let section = p.provide(0).expect("should emit");
-        assert!(section.text.contains("Provider coverage"));
-        assert!(section.text.contains("server_service:ready"));
-        assert!(
-            section
-                .text
-                .contains("sandbox:unbound (workspace executor not bound)")
-        );
-        assert!(!section.text.contains("no_workspace_provider_bound"));
-        assert!(!section.text.contains("chat-only"));
-    }
-
     // ── SkillListingProvider ──
 
     #[test]
@@ -2060,22 +1750,14 @@ mod tests {
                 content: "skills".into(),
             }), // Session
             Box::new(super::CacheStrategyProvider), // Session
-            Box::new(super::TurnBudgetProvider {
-                remaining_turns: 5,
-                max_turns: 10,
-            }), // None
-            Box::new(super::ActiveSkillNamesProvider {
-                names: vec!["a".into()],
+            Box::new(super::EnvVolatileProvider {
+                text: "git: dirty".into(),
             }), // None
         ];
         let assembler = ChannelAssembler::new(providers, ContextChannelPolicy::default());
         let (stable, dynamic) = assembler.assemble(0);
         assert_eq!(stable.len(), 2, "skill_listing + cache_strategy → 2 stable");
-        assert_eq!(
-            dynamic.len(),
-            2,
-            "turn_budget + active_skill_names → 2 dynamic"
-        );
+        assert_eq!(dynamic.len(), 1, "environment_volatile → 1 dynamic");
     }
 
     #[test]
@@ -2142,38 +1824,32 @@ mod tests {
         );
 
         assert!(
-            dynamic_texts.iter().any(|t| t.contains("Turn Budget")),
-            "turn_budget in dynamic"
+            dynamic_texts
+                .iter()
+                .all(|text| !text.contains("Turn Budget") && !text.contains("Capabilities")),
+            "runtime telemetry must not be projected into model-visible context"
         );
         assert!(
-            dynamic_texts.iter().any(|t| t.contains("Capabilities")),
-            "capabilities in dynamic"
-        );
-        assert!(
-            dynamic_texts.iter().any(|t| t.contains("Active Skills")),
-            "active_skills in dynamic"
+            dynamic_texts
+                .iter()
+                .all(|text| !text.contains("Active Skills")),
+            "active skill names are redundant with invoked-skill attachments"
         );
     }
 
     #[test]
-    fn external_sources_empty_edge_profile_produces_only_always_emit_sections() {
+    fn external_sources_empty_edge_profile_produces_no_sections_without_tools() {
         let ep = serde_json::Map::new();
         let state = make_state();
         let sources = build_external_sources(&ep, &state, &[], None, None);
 
-        // With no tools, no env, no skills: only CapabilitiesProvider (always emits)
-        // and no self_model/tool_conditional (gated on non-empty tool_names)
-        assert!(
-            sources
-                .extra_dynamic_sections
-                .iter()
-                .any(|s| s.text.contains("Capabilities")),
-            "Capabilities always emits"
-        );
-        // No stable sections should be emitted
         assert!(
             sources.extra_stable_sections.is_empty(),
             "empty edge_profile → no stable sections"
+        );
+        assert!(
+            sources.extra_dynamic_sections.is_empty(),
+            "empty edge_profile → no dynamic sections"
         );
     }
 
@@ -2559,10 +2235,10 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_turn_budget_not_present_when_max_turns_zero() {
+    fn external_sources_never_projects_turn_budget_telemetry() {
         let ep = serde_json::Map::new();
         let mut state = make_state();
-        state.max_turns = 0;
+        state.max_turns = 60;
         state.remaining_turns = 5;
 
         let sources = build_external_sources(&ep, &state, &[], None, None);
@@ -2571,7 +2247,7 @@ mod tests {
                 .extra_dynamic_sections
                 .iter()
                 .any(|s| s.text.contains("Turn Budget")),
-            "turn_budget provider not constructed when max_turns=0"
+            "turn budget remains structured runtime state instead of prompt text"
         );
     }
 

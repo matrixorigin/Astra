@@ -979,20 +979,20 @@ fn always_load_tool_names_for_bridge(
         .unwrap_or_else(crate::turn::prompt_cache::runtime_always_load_tool_names)
 }
 
-/// Strip volatile `dynamic_sections` when the provider can't tolerate
-/// per-round byte churn in the request prefix.
+/// Suppress advisory `dynamic_sections` when the provider cannot tolerate
+/// per-round byte churn before conversation history.
 ///
 /// Strict-history providers (MiniMax-style, classified as
 /// `VolatilePlacement::CurrentUserOnly`) invalidate the whole cache
-/// entry on ANY mid-history byte change. Re-injecting volatile content
+/// entry on ANY request-history byte change. Re-injecting dynamic system content
 /// (Self-Awareness, session anchor, memoria insights, feedback rules)
 /// on every round collapses their cache. `CacheCapability::should_inject_volatile_on_round`
 /// returns `false` for them on every round — including round 0 — and
 /// we must respond by dropping all volatile sections.
 ///
-/// Round-0-only injection was tried and rejected: round 0's msg[1]
-/// would include `preamble + user_q` while round 1+'s msg[1] would be
-/// `user_q` only, so the byte-stable-history invariant still breaks.
+/// Round-0-only injection was tried and rejected: a runtime system block on
+/// round 0 but not on later rounds still changes the request prefix and breaks
+/// the byte-stable-history invariant.
 /// See `cache_placement::VolatilePlacement::CurrentUserOnly` docs and
 /// the session 986a553e regression for the full rationale.
 ///
@@ -1010,22 +1010,6 @@ fn effective_volatile_sections_for_round(
     } else {
         Vec::new()
     }
-}
-
-fn self_awareness_volatile_section(text: &str) -> Option<prompts::PromptSection> {
-    (!text.is_empty()).then(|| {
-        prompts::PromptSection::dynamic(text.to_string(), prompts::PromptTokenBucket::Environment)
-            .with_trace_signals(
-                astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                    context_signals:
-                        astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            self_awareness: true,
-                            ..Default::default()
-                        },
-                    ..Default::default()
-                },
-            )
-    })
 }
 
 #[derive(Clone)]
@@ -2849,30 +2833,6 @@ impl InProcessChatTurnBridge {
                     .collect();
                 memoria_prefetch_entries = filtered_entries;
             }
-            // Read active skill hints from edge_profile (injected by CLI)
-            let active_skill_names: Vec<&str> = edge_profile
-                .get("active_skills")
-                .and_then(Value::as_array)
-                .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
-            let skill_hint = if active_skill_names.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "\n\n## Active Output Skills\n\
-                     The user has enabled these output constraints: {}. \
-                     Follow their formatting rules strictly.",
-                    active_skill_names.join(", ")
-                )
-            };
-            // ── Self-awareness section (injected by CLI via edge_profile) ──
-            let self_awareness_hint = edge_profile
-                .get("self_awareness_text")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(|text| format!("\n\n{text}"))
-                .unwrap_or_default();
-
             // ── Recent tool-call arg hints (injected by CLI via edge_profile) ──
             let recent_arg_hints_hint = edge_profile
                 .get("recent_arg_hints_text")
@@ -2908,8 +2868,6 @@ impl InProcessChatTurnBridge {
             //
             // VOLATILE (change each turn by design):
             //   environment_volatile (git branch dirty/diff/recent commits),
-            //   skill_hint (active skill/tool surface),
-            //   self_awareness_hint (turn/token/outcome signals),
             //   typed memory_entries (per-turn retrieval, routed through the
             //     Memory section),
             //   recent_arg_hints_hint (per-turn tool args),
@@ -2930,24 +2888,6 @@ impl InProcessChatTurnBridge {
             }
             // Stable-lane memory (index + session_memory) goes behind
             // the cache marker — byte-stable across the session.
-            if !skill_hint.is_empty() {
-                dynamic_sections.push(
-                    prompts::PromptSection::dynamic(
-                        skill_hint.clone(),
-                        prompts::PromptTokenBucket::UserPreferences,
-                    )
-                    .with_trace_signals(astra_turn_core::context_assembly_trace::PromptTraceSignals {
-                        context_signals: astra_turn_core::context_assembly_trace::PromptContextSignals {
-                            active_output_skills: true,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-            if let Some(section) = self_awareness_volatile_section(&self_awareness_hint) {
-                dynamic_sections.push(section);
-            }
             if !recent_arg_hints_hint.is_empty() {
                 dynamic_sections.push(
                     prompts::PromptSection::dynamic(
@@ -3128,20 +3068,16 @@ impl InProcessChatTurnBridge {
             llm_messages.push(system_msg);
             let mut bridge_volatile_text: Option<String> = None;
             if let Some(ref dyn_msg) = dynamic_msg {
-                // Volatile per-turn content (Self-Awareness counter, session
-                // anchor, etc.) — ALL protocols now route it to the
-                // last user message prefix so the system + tools prefix stays
-                // byte-stable across rounds. Earlier the Anthropic/Bedrock
-                // paths embedded volatile in the system content array past
-                // the cache_control marker. Providers that cache an exact
-                // request prefix treat that byte change as a fresh payload,
-                // while marker-isolated providers are unaffected.
+                // Keep per-turn content separate from the stable system value
+                // until final wire assembly. It is then inserted as runtime
+                // system context after the stable cache boundary and before
+                // conversation history.
                 let dyn_text = dyn_msg
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                // Stash for prepending to last user message after history is added
+                // Stash until history compaction has completed.
                 bridge_volatile_text = Some(dyn_text);
             }
 
@@ -3442,32 +3378,9 @@ impl InProcessChatTurnBridge {
                 };
 
                 // Emit system prompt breakdown so CLI can record precise per-component trace.
-                let skill_injections: Vec<astra_turn_core::context_assembly_trace::SkillInjection> =
-                    edge_profile
-                        .get("active_skills")
-                        .and_then(Value::as_array)
-                        .map(|arr| {
-                            let names: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-                            if names.is_empty() {
-                                vec![]
-                            } else {
-                                // Total tokens for the skill hint section, split evenly.
-                                let hint_tokens = prompts::estimate_str_tokens(&skill_hint) as u32;
-                                let per = hint_tokens / names.len().max(1) as u32;
-                                names
-                                    .iter()
-                                    .map(|name| {
-                                        astra_turn_core::context_assembly_trace::SkillInjection {
-                                            skill_name: name.to_string(),
-                                            skill_version: None,
-                                            tokens: per,
-                                            selection_reason: "active_output_skill".into(),
-                                        }
-                                    })
-                                    .collect()
-                            }
-                        })
-                        .unwrap_or_default();
+                // `active_skills` is runtime diagnostic state, not a prompt
+                // injection, so it must not be reported as model-visible tokens.
+                let skill_injections = Vec::new();
                 let memory_injections =
                     crate::turn::llm::context::prompt_memory_injections(
                         &memoria_prefetch_entries,
@@ -3764,7 +3677,11 @@ impl InProcessChatTurnBridge {
                         // authoritative fingerprints win. Bytes here
                         // reflect the bridge-side view of the same
                         // strings in edge_profile.
-                        bridge_channel("self_awareness", &self_awareness_hint),
+                        // Keep the channel in the event schema, but report an
+                        // empty model-visible fingerprint: self-awareness is
+                        // runtime diagnostic state and is intentionally not
+                        // projected into the prompt.
+                        bridge_channel("self_awareness", ""),
                         bridge_channel("recent_arg_hints", &recent_arg_hints_hint),
                         bridge_channel(
                             "skill_listing",
@@ -4104,6 +4021,7 @@ impl InProcessChatTurnBridge {
                                         previous_messages: &llm_messages,
                                         compacted_messages: compact_result.messages,
                                         boundary_present: compact_result.boundary.is_some(),
+                                        volatile_runtime_text: bridge_volatile_text.clone(),
                                         required_runtime_text: required_runtime_text.clone(),
                                         provider: &provider,
                                         model_name: &model_name,
@@ -7528,9 +7446,9 @@ mod tests {
     }
 
     #[test]
-    fn bridge_does_not_cache_dynamic_tool_tail_without_a_cacheable_conversation_prefix() {
+    fn bridge_marks_last_conversation_message_before_dynamic_runtime_system() {
         let mut llm_messages = vec![
-            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "system", "content": "stable"}),
             json!({"role": "assistant", "content": ""}),
             json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
         ];
@@ -7557,18 +7475,23 @@ mod tests {
             "sess",
         );
 
-        assert_eq!(bridge_synthetic_tail_prefix_end, Some(2));
+        assert_eq!(bridge_synthetic_tail_prefix_end, Some(3));
         assert!(
-            llm_messages.iter().all(|message| {
-                !astra_turn_core::context_serializer::message_has_cache_control(message)
-            }),
-            "an empty assistant is not a cacheable conversation prefix, and the dynamic tool tail must remain unmarked",
+            astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[2]),
+            "last conversation message must receive the explicit cache boundary",
         );
         assert!(
-            llm_messages[2].to_string().contains("volatile"),
-            "runtime context should be appended to the existing tool tail",
+            !astra_turn_core::context_serializer::message_has_cache_control(&llm_messages[3]),
+            "dynamic runtime system context must remain outside the conversation cache prefix",
         );
-        assert_eq!(llm_messages.len(), 3, "bridge must not invent a user turn");
+        assert_eq!(llm_messages[3]["role"], "system");
+        assert_eq!(llm_messages[3]["content"], "volatile");
+        assert!(
+            llm_messages[2]["content"]
+                .to_string()
+                .contains("tool output")
+        );
+        assert_eq!(llm_messages.len(), 4, "bridge must not invent a user turn");
     }
 
     #[test]
@@ -7739,22 +7662,7 @@ mod tests {
     }
 
     #[test]
-    fn self_awareness_section_is_post_cache_volatile() {
-        let section = self_awareness_volatile_section(
-            "\n\n## Self-Awareness\nTurn: 37 | Tokens: 26899/80000",
-        )
-        .expect("section");
-
-        assert_eq!(
-            section.scope,
-            prompts::CacheScope::None,
-            "self-awareness contains per-turn counters and must not enter the cached prefix"
-        );
-        assert!(section.trace_signals.context_signals.self_awareness);
-    }
-
-    #[test]
-    fn pipeline_assembly_records_bridge_context_signals() {
+    fn pipeline_trace_records_explicit_context_signals() {
         let active_skill_names = vec!["concise"];
         // memory_signal_hint removed — LLM-driven via system prompt rules
         let self_awareness_hint =
@@ -9265,7 +9173,11 @@ mod tests {
         );
 
         let last = msgs.last().unwrap();
-        assert_eq!(last["role"], "user");
+        assert_eq!(last["role"], "system");
+        assert!(crate::turn::wire_assembly::is_runtime_system_context(last));
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            last
+        ));
         let note = last["content"].as_str().unwrap();
         assert!(note.contains("Context was compacted"));
         assert!(note.contains("not a new user request"));

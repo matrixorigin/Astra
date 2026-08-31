@@ -32,8 +32,8 @@
 //! | Scope | Meaning | Serialised positions |
 //! |---|---|---|
 //! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
-//! | `Session` | Stable within a session (version, cwd, date, user, branch, strict-history model identity) | Middle, before the breakpoint |
-//! | `None` | Per-turn/non-cacheable runtime facts (model identity for marker/auto-prefix providers, skills, turn budget) | After the breakpoint |
+//! | `Session` | Stable within a session (version, cwd, date, user, branch, model identity) | Middle, before the breakpoint |
+//! | `None` | Per-turn/non-cacheable runtime facts (memory, retrieval, runtime policy) | After the breakpoint |
 //!
 //! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
 //! byte ordering regardless of insertion order.
@@ -119,30 +119,15 @@ pub struct PromptCacheConfig {
     pub is_anthropic: bool,
 }
 
-pub(crate) fn model_identity_prompt_text(model_id: &str, provider: &str) -> String {
-    format!("Model: {model_id} (via {provider})")
+pub(crate) fn model_identity_prompt_text(model_id: &str) -> String {
+    format!("Model: {model_id}")
 }
 
-pub(crate) fn model_identity_prompt_section_for_cache_capability(
-    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    provider: &str,
-    model_id: &str,
-) -> prompts::PromptSection {
-    let cache_cap =
-        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
-            cache_capability,
-            provider,
-            model_id,
-        );
-    let text = model_identity_prompt_text(model_id, provider);
-    if matches!(
-        cache_cap.volatile_placement,
-        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
-    ) {
-        prompts::PromptSection::stable(text, prompts::CacheScope::Session)
-    } else {
-        prompts::PromptSection::dynamic(text, prompts::PromptTokenBucket::Environment)
-    }
+pub(crate) fn model_identity_prompt_section(model_id: &str) -> prompts::PromptSection {
+    prompts::PromptSection::stable(
+        model_identity_prompt_text(model_id),
+        prompts::CacheScope::Session,
+    )
 }
 
 fn saturating_usize_to_u32(value: usize) -> u32 {
@@ -460,15 +445,9 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     };
     // ASTRA_OUTPUT_STYLE is a user preference — stable within a session
     // (user doesn't toggle styles mid-session). Route to stable lane.
-    let model_identity_section =
-        model_identity_prompt_section_for_cache_capability(cache_capability, provider, model_id);
     let mut stable = extra_stable_sections.to_vec();
     let mut volatile = extra_volatile_sections.to_vec();
-    if matches!(model_identity_section.scope, prompts::CacheScope::None) {
-        volatile.push(model_identity_section);
-    } else {
-        stable.push(model_identity_section);
-    }
+    stable.push(model_identity_prompt_section(model_id));
     if let Some(style) = astra_text_utils::output_style::current_output_style()
         && !style.prompt.is_empty()
     {
@@ -1701,9 +1680,10 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            primary_text.contains("Model: deepseek-v4-pro (via openai)"),
-            "strict-history model identity must remain visible in stable prompt: {primary_text}"
+            primary_text.contains("Model: deepseek-v4-pro"),
+            "stable model identity must remain visible without provider routing: {primary_text}"
         );
+        assert!(!primary_text.contains("via openai"));
         assert!(
             !primary_text.contains("must be suppressed"),
             "volatile sections must not leak into strict-history stable prompt: {primary_text}"
@@ -1714,7 +1694,7 @@ mod tests {
         );
         assert!(
             !dynamic_text.contains("Model:"),
-            "model identity must not be duplicated into volatile dynamic lane: {dynamic_text}"
+            "model identity must not be duplicated into the dynamic prompt lane: {dynamic_text}"
         );
     }
 
@@ -1753,21 +1733,19 @@ mod tests {
             "surface-derived guidance should be in the reusable prefix: {primary_text}"
         );
         assert!(
-            !primary_text.contains("Model: claude-sonnet-4-6"),
-            "anthropic cacheable prefix must not churn on model id changes: {primary_text}"
+            primary_text.contains("Model: claude-sonnet-4-6"),
+            "stable model identity must remain in the cacheable system prompt: {primary_text}"
         );
-        let dtext = dynamic
-            .as_ref()
-            .and_then(|msg| msg.get("content"))
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        assert!(!primary_text.contains("via bedrock"));
         assert!(
-            dtext.contains("Model: claude-sonnet-4-6 (via bedrock)"),
-            "anthropic model identity should remain visible outside the cacheable prefix: {dtext}"
-        );
-        assert!(
-            !dtext.contains("Tool Availability Protocol"),
-            "surface-derived guidance must not be paid again in the volatile tail: {dtext}"
+            dynamic.as_ref().is_none_or(|message| {
+                !message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .contains("Model:")
+            }),
+            "model identity must not be duplicated into dynamic system context"
         );
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),
@@ -1807,17 +1785,18 @@ mod tests {
             "primary system message must be non-empty"
         );
         assert!(
-            !primary_text.contains("Model: gpt-4o"),
-            "openai auto-prefix primary must not churn on model identity: {primary_text}"
+            primary_text.contains("Model: gpt-4o"),
+            "stable model identity must remain in the reusable prefix: {primary_text}"
         );
+        assert!(!primary_text.contains("via openai"));
         // Dynamic may or may not be present depending on whether any None-scoped
-        // section was emitted — assert at least the split is structurally sound.
+        // section was emitted. Model identity must remain stable either way.
         if let Some(d) = dynamic {
             let dtext = d.get("content").and_then(Value::as_str).unwrap_or_default();
             assert!(!dtext.is_empty(), "if dynamic present, must be non-empty");
             assert!(
-                dtext.contains("Model: gpt-4o (via openai)"),
-                "model identity should be visible in the non-cacheable lane: {dtext}"
+                !dtext.contains("Model:"),
+                "model identity must not enter the dynamic prompt lane: {dtext}"
             );
         }
     }

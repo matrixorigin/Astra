@@ -245,8 +245,6 @@ impl<'a> ToolSurfacePlan<'a> {
 pub(crate) struct RuntimeSignals<'a> {
     pub edge_profile: &'a Map<String, Value>,
     pub plan_resume_hint: Option<String>,
-    pub extra_stable_sections: &'a [crate::prompts::PromptSection],
-    pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
     pub memory_provider_source: Option<&'a str>,
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
@@ -260,22 +258,10 @@ impl<'a> RuntimeSignals<'a> {
         Self {
             edge_profile,
             plan_resume_hint,
-            extra_stable_sections: &[],
-            extra_volatile_sections: &[],
             memory_entries: &[],
             memory_provider_source: None,
             session_memory_entry: None,
         }
-    }
-
-    pub(crate) fn with_extra_sections(
-        mut self,
-        stable: &'a [crate::prompts::PromptSection],
-        volatile: &'a [crate::prompts::PromptSection],
-    ) -> Self {
-        self.extra_stable_sections = stable;
-        self.extra_volatile_sections = volatile;
-        self
     }
 
     pub(crate) fn with_session_memory_entry(
@@ -1335,16 +1321,6 @@ pub(crate) fn assemble_context_pipeline(
     external
         .memory_entries
         .extend(input.runtime_signals.memory_entries.iter().cloned());
-    external
-        .extra_stable_sections
-        .extend(input.runtime_signals.extra_stable_sections.iter().cloned());
-    external.extra_dynamic_sections.extend(
-        input
-            .runtime_signals
-            .extra_volatile_sections
-            .iter()
-            .cloned(),
-    );
     if tool_names.contains(&"memory")
         && let Some(selection) =
             astra_tools::memoria::MemoriaToolGateway::latest_selection_context(input.session_id)
@@ -1356,20 +1332,11 @@ pub(crate) fn assemble_context_pipeline(
                 crate::prompts::PromptTokenBucket::Environment,
             ));
     }
-    let model_identity_section =
-        crate::turn::prompt_cache::model_identity_prompt_section_for_cache_capability(
-            input.cache_capability,
-            input.provider,
+    external
+        .extra_stable_sections
+        .push(crate::turn::prompt_cache::model_identity_prompt_section(
             input.model_name,
-        );
-    if matches!(
-        model_identity_section.scope,
-        astra_turn_core::section_types::CacheScope::None
-    ) {
-        external.extra_dynamic_sections.push(model_identity_section);
-    } else {
-        external.extra_stable_sections.push(model_identity_section);
-    }
+        ));
     external.session_memory_entry = input.runtime_signals.session_memory_entry.clone();
     let turn_state = build_turn_state(state, input.user_content);
     // `AgenticLoopState::max_turn_input_tokens` is an input-budget/wind-down
@@ -1506,7 +1473,7 @@ pub(crate) fn assemble_context_pipeline(
                 .map(|block| block.text.as_str())
                 .collect();
             let system = vec![json!({"role": "system", "content": stable_content})];
-            let preamble = volatile_preamble_from_text(volatile_text, inject_volatile);
+            let preamble = runtime_system_messages_from_text(volatile_text, inject_volatile);
             (system, preamble)
         }
         VolatilePlacement::TailSuffix
@@ -1522,7 +1489,7 @@ pub(crate) fn assemble_context_pipeline(
                 }
             }
             let system = vec![json!({"role": "system", "content": stable_text})];
-            let preamble = volatile_preamble_from_text(volatile_text, inject_volatile);
+            let preamble = runtime_system_messages_from_text(volatile_text, inject_volatile);
             (system, preamble)
         }
     };
@@ -1588,18 +1555,13 @@ pub(crate) fn assemble_context_pipeline(
     })
 }
 
-fn volatile_preamble_from_text(text: String, inject: bool) -> Vec<Value> {
+fn runtime_system_messages_from_text(text: String, inject: bool) -> Vec<Value> {
     if !inject || text.is_empty() {
         return Vec::new();
     }
-    vec![json!({
-        "role": "user",
-        "content": ensure_system_reminder_wrapper(&text),
-    })]
-}
-
-fn ensure_system_reminder_wrapper(text: &str) -> String {
-    crate::turn::wire_assembly::system_reminder_wrapped_text(text)
+    crate::turn::wire_assembly::runtime_system_context_message(&text, false)
+        .into_iter()
+        .collect()
 }
 
 fn record_pipeline_abort(
@@ -1871,6 +1833,7 @@ pub(crate) struct BridgeRetryWireRebuildInput<'a> {
     pub previous_messages: &'a [Value],
     pub compacted_messages: Vec<Value>,
     pub boundary_present: bool,
+    pub volatile_runtime_text: Option<String>,
     pub required_runtime_text: Option<String>,
     pub provider: &'a str,
     pub model_name: &'a str,
@@ -1883,7 +1846,7 @@ pub(crate) struct BridgeRetryWireRebuildInput<'a> {
 pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> {
     let compactable_history = messages
         .iter()
-        .filter(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message))
+        .filter(|message| !crate::turn::wire_assembly::is_runtime_system_context(message))
         .cloned()
         .map(|mut message| {
             crate::turn::wire_assembly::strip_runtime_context_from_tool_message(&mut message);
@@ -1905,12 +1868,16 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         .iter()
         .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
         .count();
-    let retained_system_prefix = &input.previous_messages[..system_prefix_count];
+    let retained_system_prefix = input.previous_messages[..system_prefix_count]
+        .iter()
+        .filter(|message| !crate::turn::wire_assembly::is_runtime_system_context(message))
+        .cloned()
+        .collect::<Vec<_>>();
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-        retained_system_prefix,
+        &retained_system_prefix,
     );
-    let mut messages = retained_system_prefix.to_vec();
+    let mut messages = retained_system_prefix;
     let mut compacted_messages = input.compacted_messages;
     crate::turn::wire_assembly::maybe_append_continuation_prompt(
         &mut compacted_messages,
@@ -1919,7 +1886,7 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
     messages.extend(compacted_messages);
     let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
         &mut messages,
-        None,
+        input.volatile_runtime_text,
         input.required_runtime_text,
         input.provider,
         input.model_name,
@@ -1944,9 +1911,10 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
 /// release have run.
 ///
 /// The bridge currently compacts and mutates its message vector inline. This
-/// helper centralizes the cache-sensitive tail rule shared with
-/// [`assemble_wire_messages`]: runtime control text must stay out of
-/// post-prefix system messages and ride the provider-valid tail suffix.
+/// helper centralizes the runtime-authority rule shared with
+/// [`assemble_wire_messages`]: model-visible runtime context keeps `system`
+/// authority and is inserted immediately before the current user-turn
+/// boundary. Canonical user/tool history is never rewritten.
 pub(crate) fn finalize_bridge_wire_messages(
     llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
@@ -1955,7 +1923,7 @@ pub(crate) fn finalize_bridge_wire_messages(
     model_name: &str,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    cache_cfg: &PromptCacheConfig,
+    _cache_cfg: &PromptCacheConfig,
 ) -> Option<usize> {
     let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
         llm_messages,
@@ -1973,55 +1941,48 @@ pub(crate) fn finalize_bridge_wire_messages(
             provider,
             model_name,
         );
-    let mut synthetic_tail_prefix_end = None;
     let suppress_volatile = matches!(
         cache_cap.volatile_placement,
         astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
     );
-    let mut runtime_parts = Vec::new();
+    let carried_runtime =
+        crate::turn::wire_assembly::take_runtime_system_context_messages(llm_messages);
+    let mut runtime_messages = Vec::new();
+    for message in carried_runtime {
+        let is_required = crate::turn::wire_assembly::is_required_runtime_preamble(&message);
+        if suppress_volatile && !is_required {
+            continue;
+        }
+        runtime_messages.push(message);
+    }
     if let Some(text) = required_runtime_text
         && !text.trim().is_empty()
+        && let Some(message) =
+            crate::turn::wire_assembly::runtime_system_context_message(&text, true)
     {
-        runtime_parts.push(text);
+        runtime_messages.push(message);
     }
     if !suppress_volatile
         && let Some(text) = volatile_text
         && !text.trim().is_empty()
+        && let Some(message) =
+            crate::turn::wire_assembly::runtime_system_context_message(&text, false)
     {
-        runtime_parts.push(text);
+        runtime_messages.push(message);
     }
-    let text = runtime_parts.join("\n\n");
-    if !text.is_empty() {
-        let tail_role = llm_messages
-            .last()
-            .and_then(|m| m.get("role").and_then(Value::as_str));
-        if tail_role == Some("user") {
-            let tail_index = llm_messages.len().saturating_sub(1);
-            if let Some(tail) = llm_messages.last_mut() {
-                crate::turn::wire_assembly::append_volatile_to_tail_user_message(
-                    tail,
-                    &text,
-                    cache_cfg.should_annotate(),
-                );
-            }
-            synthetic_tail_prefix_end = Some(tail_index);
-        } else if tail_role == Some("tool") {
-            let tail_index = llm_messages.len().saturating_sub(1);
-            if let Some(tail) = llm_messages.last_mut() {
-                crate::turn::wire_assembly::append_runtime_context_to_tail_tool_message(
-                    tail, &text,
-                );
-            }
-            synthetic_tail_prefix_end = Some(tail_index);
-        } else {
-            synthetic_tail_prefix_end = Some(llm_messages.len());
-            llm_messages.push(serde_json::json!({
-                "role": "user",
-                "content": text,
-            }));
-        }
+    if runtime_messages.is_empty() {
+        return None;
     }
-    synthetic_tail_prefix_end
+    if matches!(
+        cache_cap.volatile_placement,
+        astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated
+    ) {
+        let index = llm_messages.len();
+        llm_messages.extend(runtime_messages);
+        Some(index)
+    } else {
+        crate::turn::wire_assembly::insert_runtime_system_context(llm_messages, runtime_messages)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2455,7 +2416,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn assemble_context_pipeline_keeps_strict_history_model_visible_without_volatile_preamble() {
+    fn assemble_context_pipeline_keeps_required_runtime_system_context_for_strict_history() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state
             .messages
@@ -2469,12 +2430,13 @@ mod context_cache_contract_tests {
                 .to_string(),
             json!([runtime_policy]),
         );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS
+                .to_string(),
+            json!(["## Volatile\nmust be suppressed"]),
+        );
         let visible_tools = vec![tool("bash")];
         let restricted_tools = HashSet::new();
-        let volatile = vec![crate::prompts::PromptSection::dynamic(
-            "## Volatile\nmust be suppressed".to_string(),
-            crate::prompts::PromptTokenBucket::Environment,
-        )];
         let cache_cfg = PromptCacheConfig {
             cache_enabled: false,
             is_anthropic: false,
@@ -2490,8 +2452,7 @@ mod context_cache_contract_tests {
             state: &mut state,
             session_id: "sid-deepseek",
             tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
-            runtime_signals: RuntimeSignals::new(&edge_profile, None)
-                .with_extra_sections(&[], &volatile),
+            runtime_signals: RuntimeSignals::new(&edge_profile, None),
             cache_cfg: &cache_cfg,
             provider: "openai",
             model_name: "deepseek-v4-pro-official(thinking:high)",
@@ -2510,9 +2471,10 @@ mod context_cache_contract_tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            primary_text.contains("Model: deepseek-v4-pro-official(thinking:high) (via openai)"),
-            "strict-history model identity must survive volatile suppression: {primary_text}"
+            primary_text.contains("Model: deepseek-v4-pro-official(thinking:high)"),
+            "stable model identity must remain visible without provider routing: {primary_text}"
         );
+        assert!(!primary_text.contains("via openai"));
         assert!(
             !primary_text.contains("must be suppressed"),
             "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"
@@ -2546,7 +2508,12 @@ mod context_cache_contract_tests {
                 .iter()
                 .map(estimate_json_tokens)
                 .fold(0_u32, u32::saturating_add),
-            "system prompt telemetry must report estimated tokens, not section count"
+            "stable system prompt telemetry must not absorb volatile runtime bytes"
+        );
+        assert_eq!(output.manifest_trace.volatile_preamble_count, 1);
+        assert_eq!(
+            output.manifest_trace.system_prompt_tokens,
+            output.breakdown.total_tokens
         );
         assert!(state.messages.iter().all(|message| {
             !message
@@ -2578,6 +2545,15 @@ mod context_cache_contract_tests {
                     .is_some_and(|content| content.contains(runtime_policy))
             }),
             "required control policy must reach the strict-history provider wire: {wire:#?}"
+        );
+        assert_eq!(
+            wire.last(),
+            Some(&json!({"role": "user", "content": "which model are you?"}))
+        );
+        assert!(
+            wire[..wire.len() - 1]
+                .iter()
+                .all(|message| { message.get("role").and_then(Value::as_str) == Some("system") })
         );
         assert_eq!(
             state.messages, history_before,
@@ -2667,35 +2643,16 @@ mod context_cache_contract_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(user_text.contains("相关的测试够硬核吗"));
-        assert_eq!(messages[3]["role"], "user");
-        let tail_user = message_text(&messages[3]);
-        assert!(
-            tail_user.starts_with("相关的测试够硬核吗？"),
-            "real user content must remain first: {tail_user}"
+        assert_eq!(
+            messages[4],
+            json!({"role": "user", "content": "相关的测试够硬核吗？"})
         );
-        assert!(
-            tail_user.contains("<runtime-required-context>"),
-            "runtime goal frame must be visible in the protocol-valid tail suffix"
-        );
-        assert!(tail_user.contains("\"turn_id\":7"));
-        assert!(tail_user.contains("\"round_id\":3"));
-        assert!(
-            messages
-                .iter()
-                .skip(1)
-                .all(|message| message.get("role").and_then(Value::as_str) != Some("system")),
-            "wire messages must not introduce post-prefix system messages: {messages:#?}"
-        );
-        let system_text = messages
-            .iter()
-            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-            .map(message_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !system_text.contains("<runtime-required-context>"),
-            "active-turn runtime context must not mutate the stable system lane"
-        );
+        assert_eq!(messages[3]["role"], "system");
+        let runtime_system_text = message_text(&messages[3]);
+        assert!(runtime_system_text.contains("<runtime-required-context>"));
+        assert!(runtime_system_text.contains("\"turn_id\":7"));
+        assert!(runtime_system_text.contains("\"round_id\":3"));
+        assert!(!message_text(&messages[0]).contains("<runtime-required-context>"));
         assert!(
             state.volatile_pending.is_empty(),
             "active frame must be one-shot per LLM request"
@@ -3646,7 +3603,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_keeps_historical_user_stable_when_tail_is_tool() {
+    fn finalize_bridge_wire_messages_places_runtime_system_before_tool_history() {
         let mut messages = vec![
             json!({"role": "user", "content": "original user"}),
             json!({"role": "assistant", "content": ""}),
@@ -3664,21 +3621,18 @@ mod context_cache_contract_tests {
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
-        assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[2]["role"], "tool");
-        assert!(message_text(&messages[2]).starts_with("tool output"));
-        assert!(message_text(&messages[2]).contains("volatile"));
-        assert_eq!(
-            messages.len(),
-            3,
-            "runtime framing must not invent any conversation turn"
-        );
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "volatile");
+        assert_eq!(messages[1]["content"], "original user");
+        assert_eq!(messages[3]["role"], "tool");
+        assert!(messages[3]["content"].to_string().contains("tool output"));
     }
 
     #[test]
-    fn bridge_cache_annotation_handles_live_tool_loop_shape() {
+    fn bridge_cache_annotation_marks_conversation_before_runtime_system() {
         let mut messages = vec![
-            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "system", "content": "stable"}),
             json!({"role": "user", "content": "Analyze the journal"}),
             json!({"role": "assistant", "content": Value::Null}),
             json!({
@@ -3710,20 +3664,22 @@ mod context_cache_contract_tests {
             "sess",
         );
 
-        assert_eq!(synthetic_tail_prefix_end, Some(3));
+        assert_eq!(synthetic_tail_prefix_end, Some(4));
         assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
-            "live tool-loop shape must walk past an empty assistant and mark the stable user message",
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
+            "the last conversation message must receive the cache boundary",
         );
         assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
-            "dynamic tool/runtime tail must remain unannotated",
+            !astra_turn_core::context_serializer::message_has_cache_control(&messages[4]),
+            "dynamic runtime system context must remain after the cache boundary",
         );
-        assert!(message_text(&messages[3]).contains("volatile"));
+        assert_eq!(messages[4]["role"], "system");
+        assert_eq!(message_text(&messages[4]), "volatile");
+        assert!(messages[3]["content"].to_string().contains("tool output"));
     }
 
     #[test]
-    fn bridge_retry_compaction_history_excludes_required_runtime_tail() {
+    fn bridge_retry_compaction_history_excludes_runtime_system_context() {
         let required_tail =
             crate::turn::wire_assembly::required_runtime_preamble_message("required runtime")
                 .expect("required runtime tail");
@@ -3747,15 +3703,15 @@ mod context_cache_contract_tests {
         assert!(
             history
                 .iter()
-                .all(|message| !crate::turn::wire_assembly::is_required_runtime_preamble(message)),
-            "retry compaction input must not preserve the prior synthetic runtime tail"
+                .all(|message| !crate::turn::wire_assembly::is_runtime_system_context(message)),
+            "retry compaction input must not preserve prior runtime system context"
         );
     }
 
     #[test]
-    fn rebuild_bridge_retry_wire_messages_reapplies_runtime_tail_and_cache_metadata() {
+    fn rebuild_bridge_retry_wire_messages_reapplies_runtime_system_and_cache_metadata() {
         let previous_messages = vec![
-            json!({"role": "system", "content": [{"type": "text", "text": "stable"}]}),
+            json!({"role": "system", "content": "stable"}),
             json!({"role": "user", "content": "oversized history"}),
             crate::turn::wire_assembly::required_runtime_preamble_message("old runtime")
                 .expect("old runtime tail"),
@@ -3769,6 +3725,7 @@ mod context_cache_contract_tests {
             previous_messages: &previous_messages,
             compacted_messages: vec![json!({"role": "user", "content": "compacted retry"})],
             boundary_present: false,
+            volatile_runtime_text: Some("optional retry runtime".to_string()),
             required_runtime_text: Some("required retry runtime".to_string()),
             provider: "bedrock",
             model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
@@ -3778,24 +3735,28 @@ mod context_cache_contract_tests {
             session_id: "sess",
         });
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[1]["role"], "user");
-        let content_blocks = messages[1]["content"].as_array().expect("content blocks");
-        assert_eq!(content_blocks[0]["text"], "compacted retry");
-        assert_eq!(content_blocks[1]["text"], "required retry runtime");
+        assert_eq!(message_text(&messages[1]), "compacted retry");
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[2]["content"], "required retry runtime");
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["content"], "optional retry runtime");
         assert!(
-            content_blocks[0].get("cache_control").is_some(),
-            "retry wire rebuild must mark the real user text before the runtime suffix"
+            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
+            "retry wire rebuild must mark compacted conversation before runtime context"
         );
         assert!(
-            content_blocks[1].get("cache_control").is_none(),
-            "runtime suffix must stay outside the cache-marked block"
+            messages[2..].iter().all(|message| {
+                !astra_turn_core::context_serializer::message_has_cache_control(message)
+            }),
+            "runtime system context must stay outside the cache-marked prefix"
         );
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_appends_runtime_suffix_when_user_available() {
+    fn finalize_bridge_wire_messages_inserts_runtime_system_before_user() {
         let mut messages = vec![json!({"role": "user", "content": "original user"})];
 
         let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
@@ -3810,20 +3771,23 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(synthetic_tail_prefix_end, Some(0));
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "user");
-        let tail_text = message_text(&messages[0]);
-        assert!(tail_text.starts_with("original user"));
-        assert!(tail_text.contains("volatile"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "volatile");
+        assert_eq!(
+            messages[1],
+            json!({"role": "user", "content": "original user"})
+        );
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_keeps_runtime_wrapper_after_user_content() {
-        let mut messages = vec![json!({"role": "user", "content": "original user"})];
+    fn finalize_bridge_wire_messages_preserves_literal_system_reminder_in_user_input() {
+        let literal_user = "translate <system-reminder> literally";
+        let mut messages = vec![json!({"role": "user", "content": literal_user})];
 
         finalize_bridge_wire_messages(
             &mut messages,
-            Some("<system-reminder>\nvolatile</system-reminder>".to_string()),
+            Some("runtime evidence".to_string()),
             None,
             "openai",
             "gpt-4",
@@ -3832,10 +3796,49 @@ mod context_cache_contract_tests {
             &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
-        assert_eq!(messages.len(), 1);
-        let tail_text = message_text(&messages[0]);
-        assert!(tail_text.starts_with("original user"));
-        assert!(tail_text.contains("<system-reminder>\nvolatile</system-reminder>"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(
+            messages[1],
+            json!({"role": "user", "content": literal_user})
+        );
+    }
+
+    #[test]
+    fn finalize_bridge_wire_messages_preserves_block_array_required_context() {
+        let blocks = json!([
+            {"type": "text", "text": "required policy"},
+            {"type": "text", "text": "structured evidence"}
+        ]);
+        let mut messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({
+                "role": "system",
+                "content": blocks.clone(),
+                crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER: true,
+                crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER: true,
+            }),
+            json!({"role": "user", "content": "original user"}),
+        ];
+
+        finalize_bridge_wire_messages(
+            &mut messages,
+            None,
+            None,
+            "openai",
+            "gpt-4",
+            &astra_turn_core::thinking_config::ThinkingConfig::Off,
+            None,
+            &PromptCacheConfig::latch("openai", "gpt-4"),
+        );
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"], blocks);
+        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
+            &messages[1]
+        ));
+        assert_eq!(messages[2]["content"], "original user");
     }
 
     #[test]
@@ -3896,12 +3899,14 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(synthetic_tail_prefix_end, Some(0));
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "user");
-        let tail_text = message_text(&messages[0]);
-        assert!(tail_text.starts_with("original user"));
-        assert!(tail_text.contains("required resume context"));
-        assert!(!tail_text.contains("best effort volatile"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "required resume context");
+        assert_eq!(
+            messages[1],
+            json!({"role": "user", "content": "original user"})
+        );
+        assert!(!message_text(&messages[0]).contains("best effort volatile"));
     }
 
     #[test]

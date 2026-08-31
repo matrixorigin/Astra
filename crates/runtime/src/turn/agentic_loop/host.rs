@@ -1770,8 +1770,6 @@ pub enum VolatileKind {
     StallNudge,
     /// Execution-pattern evidence for mutating-task read-only churn.
     ExecutionEscalation,
-    /// `## Already Fetched` inventory block.
-    AlreadyFetched,
     /// Observation that a tool batch executed in parallel.
     ToolBatchCoaching,
     /// Authoritative budget/turn/round context. Actual budget enforcement is
@@ -1851,8 +1849,7 @@ impl VolatileKind {
     pub fn is_singleton(self) -> bool {
         matches!(
             self,
-            Self::AlreadyFetched
-                | Self::ContextPressure
+            Self::ContextPressure
                 | Self::Mailbox
                 | Self::CompactResume
                 | Self::CircuitBreaker
@@ -1870,9 +1867,8 @@ impl VolatileKind {
         )
     }
 
-    /// Prompt-delivery semantics for this signal. This is deliberately
-    /// independent of chat roles: runtime context is attached at the wire tail
-    /// and never becomes a synthetic prompt-facing history turn.
+    /// Prompt-delivery semantics for this signal. Runtime context is projected
+    /// through the runtime system lane and never becomes a synthetic user turn.
     #[must_use]
     pub fn delivery_class(self) -> astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass {
         use astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass;
@@ -1891,7 +1887,6 @@ impl VolatileKind {
             Self::SelfStatus => VolatileDeliveryClass::TelemetryOnly,
             Self::StallNudge
             | Self::ExecutionEscalation
-            | Self::AlreadyFetched
             | Self::ToolBatchCoaching
             | Self::PolicyAdvisory
             | Self::CircuitBreaker
@@ -1984,8 +1979,8 @@ pub struct AgenticLoopState {
     /// this explicit append lane rather than inferring new history by comparing
     /// serialized message text. Root/server loops leave it disabled.
     pub run_transcript_capture: Option<Arc<Mutex<Vec<Value>>>>,
-    /// Runtime-produced volatile content scheduled to ride the next
-    /// LLM call's volatile_preamble. See [`VolatileInjection`]. The
+    /// Runtime-produced volatile content scheduled for the next LLM call's
+    /// runtime system context. See [`VolatileInjection`]. The
     /// wire layer (`wire_assembly::assemble_llm_messages`) drains this
     /// field on every call, so producers just append and move on.
     pub volatile_pending: Vec<VolatileInjection>,
@@ -2645,7 +2640,7 @@ impl AgenticLoopState {
     /// rounds.
     ///
     /// **Singleton kinds auto-dedup**: snapshot-style signals such as
-    /// `AlreadyFetched` keep only their most recent value. If one is already pending when a new one
+    /// Snapshot-style signals keep only their most recent value. If one is already pending when a new one
     /// is pushed, the old entry is replaced in place (preserving order
     /// for other kinds).
     ///

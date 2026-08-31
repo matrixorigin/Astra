@@ -6114,15 +6114,13 @@ async fn context_meta_exposes_builder_supplied_context_signals() {
     );
 }
 
-/// Regression: `model` override must NOT strip `active_skills` from the system prompt.
+/// Regression: `model` override must not break requests carrying `active_skills`.
 ///
 /// The bridge marks `routing_meta.status = "skipped"` with reason `model_override`
-/// whenever the caller pins a model (`bridge_prep.rs:350`). That metadata is
-/// trace-only — it must not gate skill injection, which runs unconditionally from
-/// `edge_profile.active_skills` (`bridge_inprocess.rs:1141`, `1739`). This test
-/// asserts both the hint section (`active_output_skills` signal) and the
-/// `skills_injected` breakdown survive the override path, so users reporting
-/// "skill lost when MiniMax-M2.7 set as model_override" get a durable guardrail.
+/// whenever the caller pins a model. `active_skills` names remain accepted as
+/// runtime metadata, but #629 deliberately keeps that diagnostic summary out of
+/// the model prompt; actual skill instructions are delivered only after a skill
+/// invocation. This test guards the request/event flow from model-override drift.
 #[tokio::test]
 async fn context_meta_active_skills_survive_model_override() {
     // Guard against hangs from deadlocked channels or unresponsive mock paths:
@@ -6168,14 +6166,10 @@ async fn context_meta_active_skills_survive_model_override() {
     .expect("context_meta_active_skills_survive_model_override exceeded 30s timeout — likely a hang regression");
 }
 
-/// Observability: unknown skill names in `active_skills` must still surface in
-/// `skills_injected` so operators can detect typos / missing registrations.
+/// Unknown skill names in runtime metadata must not crash the turn.
 ///
-/// Per CLAUDE.md rule 1 (no silent failures): even if a caller references a
-/// skill the resolver cannot dispatch, the trace must faithfully show *what
-/// was requested* — downstream systems can cross-reference with the resolver
-/// registry to alert on mismatches. This guards against future drift where
-/// we might silently drop unknown names from the breakdown.
+/// They are not projected into the model prompt or reported as injected skill
+/// tokens; actual skill resolution remains owned by the skill invocation path.
 #[tokio::test]
 async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
     // Guard against hangs from deadlocked channels or unresponsive mock paths:
@@ -6229,15 +6223,13 @@ async fn context_meta_surfaces_unknown_active_skills_for_debugging() {
 ///
 /// What this scenario exercises in one turn:
 ///   1. `model` override is set (routing metadata will be marked "skipped")
-///   2. Two `active_skills` are pre-injected into the system prompt
+///   2. Two `active_skills` names are carried as runtime metadata only
 ///   3. Model calls the `skill` tool to load a different skill mid-turn
 ///   4. Resolved skill instructions flow back as a tool_result
 ///   5. Model continues and produces final answer
 ///
 /// Asserts:
-///   * `active_output_skills` signal fires AND the `skills_injected` breakdown
-///     carries both names (regression from the real bug I fixed in
-///     `server_loop_host.rs:1652`).
+///   * `context_meta` remains available with model override and runtime metadata.
 ///   * Skill tool call does NOT escape as an edge `tool_request`.
 ///   * The intercepted skill instructions appear in the observer's
 ///     follow-up round so the model can actually act on them.
@@ -6355,7 +6347,7 @@ async fn complex_scenario_model_override_plus_active_skills_plus_skill_invocatio
 /// Multi-turn variant of the complex scenario: same `session_id` across two
 /// user messages, both under `model_override` with `active_skills` pinned.
 /// Catches drift in cross-turn invariants that the single-turn test can't:
-///   * Does the skill hint consistently appear in BOTH turns' system prompts?
+///   * Does runtime skill metadata remain accepted in BOTH turns?
 ///   * Does `state.skills.invoked` persist across the turn boundary so the
 ///     model doesn't need to re-load the same skill?
 ///

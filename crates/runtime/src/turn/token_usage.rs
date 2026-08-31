@@ -20,6 +20,9 @@
 //!   subtract `prompt_tokens_details.cached_tokens` so `input_tokens` reflects
 //!   only fresh input. Cache creation is rarely surfaced; when present as
 //!   `prompt_tokens_details.cache_creation_input_tokens` we subtract too.
+//! - **DeepSeek native OpenAI-compatible**: top-level
+//!   `prompt_cache_hit_tokens` and `prompt_cache_miss_tokens` are already the
+//!   cached/fresh partition of inclusive `prompt_tokens`.
 //! - **Bedrock Converse**: `usage.inputTokens` EXCLUDES both
 //!   `cacheReadInputTokens` and `cacheWriteInputTokens`. Use values directly.
 //! - **Anthropic Messages**: `usage.input_tokens` EXCLUDES both
@@ -148,6 +151,36 @@ fn extract_openai(u: &Map<String, Value>) -> Option<TokenUsage> {
             || u.contains_key("cache_creation_input_tokens"))
     {
         return extract_anthropic(u);
+    }
+
+    // DeepSeek's native OpenAI-compatible response uses top-level hit/miss
+    // fields, but unlike Anthropic's top-level cache aliases `prompt_tokens`
+    // remains inclusive. Handle this shape before the generic field-location
+    // heuristic or cached input would be counted twice as fresh input.
+    let deepseek_hit = as_u64(u.get("prompt_cache_hit_tokens"));
+    let deepseek_miss = as_u64(u.get("prompt_cache_miss_tokens"));
+    if deepseek_hit.is_some() || deepseek_miss.is_some() {
+        let prompt_total = as_u64(u.get("prompt_tokens"));
+        let cached = deepseek_hit.unwrap_or(0);
+        let fresh = deepseek_miss
+            .or_else(|| prompt_total.map(|total| total.saturating_sub(cached)))
+            .unwrap_or(0);
+        if let Some(total) = prompt_total
+            && total != fresh.saturating_add(cached)
+        {
+            tracing::warn!(
+                prompt_tokens = total,
+                prompt_cache_hit_tokens = cached,
+                prompt_cache_miss_tokens = fresh,
+                "DeepSeek usage cache partition does not match prompt_tokens"
+            );
+        }
+        return Some(TokenUsage {
+            input_tokens: fresh,
+            cached_input_tokens: cached,
+            cache_creation_tokens: 0,
+            output_tokens: as_u64(u.get("completion_tokens")).unwrap_or(0),
+        });
     }
 
     // Required: prompt_tokens + completion_tokens (either one is enough to
@@ -369,6 +402,21 @@ mod tests {
                 }),
             },
             Case {
+                name: "deepseek native inclusive hit miss partition",
+                dialect: UsageDialect::OpenAi,
+                usage: json!({
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 50,
+                    "prompt_cache_hit_tokens": 800,
+                    "prompt_cache_miss_tokens": 200
+                }),
+                expected: Some(NormalizedPromptCacheUsage {
+                    fresh_input_tokens: 200,
+                    cache_read_tokens: 800,
+                    cache_creation_tokens: 0,
+                }),
+            },
+            Case {
                 name: "anthropic disjoint cache fields",
                 dialect: UsageDialect::AnthropicMessages,
                 usage: json!({
@@ -492,6 +540,35 @@ mod tests {
             t.input_tokens + t.cached_input_tokens + t.cache_creation_tokens,
             1000
         );
+    }
+
+    #[test]
+    fn deepseek_native_hit_miss_fields_do_not_double_count_prompt_total() {
+        let u = obj(json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 800,
+            "prompt_cache_miss_tokens": 200
+        }));
+        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
+        assert_eq!(t.input_tokens, 200);
+        assert_eq!(t.cached_input_tokens, 800);
+        assert_eq!(t.cache_creation_tokens, 0);
+        assert_eq!(t.output_tokens, 50);
+        assert_eq!(t.input_tokens + t.cached_input_tokens, 1000);
+    }
+
+    #[test]
+    fn deepseek_native_missing_miss_derives_fresh_from_prompt_total() {
+        let u = obj(json!({
+            "prompt_tokens": 1000,
+            "completion_tokens": 50,
+            "prompt_cache_hit_tokens": 800
+        }));
+        let t = extract_usage(UsageDialect::OpenAi, &u).unwrap();
+        assert_eq!(t.input_tokens, 200);
+        assert_eq!(t.cached_input_tokens, 800);
+        assert_eq!(t.total_tokens(), 1050);
     }
 
     #[test]

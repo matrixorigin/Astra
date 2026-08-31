@@ -3357,6 +3357,42 @@ mod tests {
     }
 
     #[test]
+    fn canonical_run_transcript_does_not_persist_runtime_configuration_as_speech() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.messages = vec![
+            json!({"role": "user", "content": "翻译下面的内容：你好"}),
+            astra_turn_types::runtime_owned_message(
+                "system",
+                "## Turn Budget\n59/60\n\n## Capabilities\n52 tools",
+                astra_turn_types::RuntimeMessageDelivery::Projection,
+            ),
+        ];
+        state.final_text = "你好".to_string();
+
+        let items = transcript_items_from_server_loop(
+            "user-1",
+            "session-1",
+            "run-1",
+            None,
+            "翻译下面的内容：你好",
+            &state,
+            true,
+        );
+
+        assert_eq!(
+            items.iter().map(|item| item.role).collect::<Vec<_>>(),
+            vec!["user", "assistant"]
+        );
+        assert_eq!(items[0].content, "翻译下面的内容：你好");
+        assert_eq!(items[1].content, "你好");
+        assert!(items.iter().all(|item| {
+            !item.content.contains("Turn Budget")
+                && !item.content.contains("Capabilities")
+                && !item.content.contains("<system-reminder>")
+        }));
+    }
+
+    #[test]
     fn canonical_run_transcript_preserves_rejected_tool_error_evidence() {
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state

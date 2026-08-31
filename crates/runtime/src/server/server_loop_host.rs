@@ -4995,7 +4995,9 @@ impl ServerAgenticLoopHost {
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
-        let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
+        // Keep the turn-start snapshot latched for introspection and diagnostics,
+        // but do not project lifecycle telemetry into the model prompt.
+        let _lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
                 let updated = Self::update_latched_plan_resume_line(existing, plan_hint.as_deref());
                 self.turn_start_lifecycle_summary = Some(updated.clone());
@@ -5010,10 +5012,6 @@ impl ServerAgenticLoopHost {
             self.turn_start_plan_resume_hint = plan_hint.clone();
             summary
         };
-        let lifecycle_sections = vec![crate::prompts::PromptSection::dynamic(
-            lifecycle_summary,
-            crate::prompts::PromptTokenBucket::Environment,
-        )];
         let restricted_snapshot = state.restricted_tools.clone();
         let deferred_tools_block = self.deferred_tools_block_for_wire_surface(
             visible_tools,
@@ -5036,7 +5034,6 @@ impl ServerAgenticLoopHost {
                     &self.edge_profile,
                     plan_hint,
                 )
-                .with_extra_sections(&[], &lifecycle_sections)
                 .with_memory_entries(memory_entries)
                 .with_memory_provider_source(
                     self.memoria_client.is_some().then_some("server_config"),
@@ -10048,7 +10045,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pipeline_includes_turn_start_lifecycle_summary_for_web_agent() {
+    async fn run_turn_pipeline_keeps_lifecycle_summary_out_of_model_prompt() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
             "session_lineage".to_string(),
@@ -10084,38 +10081,43 @@ mod tests {
         let text = pipeline_outcome_text(&outcome);
 
         assert!(
-            text.contains("Turn-start session execution state"),
-            "turn-start lifecycle summary must be injected into prompt context: {text}"
+            !text.contains("Turn-start session execution state"),
+            "lifecycle telemetry must not be injected into model prompt context: {text}"
+        );
+        assert!(!text.contains("Workspace binding:"));
+        assert!(!text.contains("Executor binding:"));
+        assert!(!text.contains("Session lineage:"));
+
+        let summary = host.turn_start_lifecycle_summary(&state);
+        assert!(
+            summary.contains("Runtime surface: mode=server-side · interaction=headless · providers=server_service:ready, control_plane:ready, sandbox:unbound (workspace executor not bound)"),
+            "runtime provider coverage must remain available to diagnostics: {summary}"
         );
         assert!(
-            text.contains("Runtime surface: mode=server-side · interaction=headless · providers=server_service:ready, control_plane:ready, sandbox:unbound (workspace executor not bound)"),
-            "runtime provider coverage must be explicit: {text}"
-        );
-        assert!(
-            text.contains(
+            summary.contains(
                 "Workspace binding: kind=none · authority=none · name=No file environment"
             ),
-            "workspace binding must come from execution binding state, not topology shorthand: {text}"
+            "workspace binding must come from execution binding state, not topology shorthand: {summary}"
         );
         assert!(
-            text.contains("Executor binding: kind=server_local · transport=server_local · status=online · id=server-control-plane · name=Server control plane"),
-            "executor binding must be explicit: {text}"
+            summary.contains("Executor binding: kind=server_local · transport=server_local · status=online · id=server-control-plane · name=Server control plane"),
+            "executor binding must remain available to diagnostics: {summary}"
         );
         assert!(
-            text.contains("Resume context: [plan-resume] goal=\"stabilize\""),
-            "plan resume digest must be visible in lifecycle summary: {text}"
+            summary.contains("Resume context: [plan-resume] goal=\"stabilize\""),
+            "plan resume digest must remain available to diagnostics: {summary}"
         );
         assert!(
-            text.contains("Task board: no open tasks"),
-            "task-board state should be explicit even when empty: {text}"
+            summary.contains("Task board: no open tasks"),
+            "task-board state should remain explicit even when empty: {summary}"
         );
         assert!(
-            text.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
-            "fork lineage must be surfaced when available: {text}"
+            summary.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
+            "fork lineage must remain available to diagnostics: {summary}"
         );
         assert!(
-            text.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
-            "delegation state must be visible: {text}"
+            summary.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
+            "delegation state must remain available to diagnostics: {summary}"
         );
     }
 
@@ -10146,13 +10148,12 @@ mod tests {
             .expect("pipeline should succeed");
         let text = pipeline_outcome_text(&outcome);
 
+        assert!(!text.contains("Task board:"));
+        let summary = host.turn_start_lifecycle_summary(&state);
+        assert!(summary.contains("Task board: open=2 · next=[in_progress] task-1: Ship task UX"));
         assert!(
-            text.contains("Task board: open=2 · next=[in_progress] task-1: Ship task UX"),
-            "task-board digest must be visible in Cloud lifecycle summary: {text}"
-        );
-        assert!(
-            !text.contains("The task tools haven't been used recently."),
-            "Cloud task-board lifecycle context must stay a bounded state hint, not a noisy auto-reminder: {text}"
+            !summary.contains("The task tools haven't been used recently."),
+            "task-board diagnostics must stay a bounded state hint: {summary}"
         );
     }
 
@@ -10195,15 +10196,17 @@ mod tests {
 
         assert!(
             !text.contains("Session lineage:"),
-            "turn-start lifecycle summary must require canonical session_lineage object: {text}"
+            "lifecycle summary must not enter the model prompt: {text}"
+        );
+        assert!(!text.contains("Delegation context:"));
+        let summary = host.turn_start_lifecycle_summary(&state);
+        assert!(
+            !summary.contains("parent-ignored") && !summary.contains("forked_after_turn=11"),
+            "top-level fork aliases must not leak into lifecycle diagnostics: {summary}"
         );
         assert!(
-            !text.contains("parent-ignored") && !text.contains("forked_after_turn=11"),
-            "top-level fork aliases must not leak into lifecycle summary: {text}"
-        );
-        assert!(
-            text.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),
-            "sub-agent delegation context should be visible in lifecycle summary: {text}"
+            summary.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),
+            "sub-agent delegation context should remain available to diagnostics: {summary}"
         );
     }
 
@@ -10272,8 +10275,11 @@ mod tests {
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("round 0 pipeline should succeed");
         let round0_text = pipeline_outcome_text(&round0);
-        assert!(round0_text.contains("Resume context: [plan-resume] goal=\"initial\""));
-        assert!(round0_text.contains("this_turn=0"));
+        assert!(!round0_text.contains("Resume context:"));
+        assert!(!round0_text.contains("this_turn=0"));
+        let round0_summary = host.turn_start_lifecycle_summary(&state);
+        assert!(round0_summary.contains("Resume context: [plan-resume] goal=\"initial\""));
+        assert!(round0_summary.contains("this_turn=0"));
 
         state.current_round_index = 3;
         state.delegations_this_turn = 5;
@@ -10287,13 +10293,15 @@ mod tests {
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("round 3 pipeline should succeed");
         let round3_text = pipeline_outcome_text(&round3);
+        assert!(!round3_text.contains("Resume context:"));
+        let round3_summary = host.turn_start_lifecycle_summary(&state);
         assert!(
-            round3_text.contains("Resume context: [plan-resume] goal=\"mutated\""),
-            "plan line must refresh when the shared plan hint changes: {round3_text}"
+            round3_summary.contains("Resume context: [plan-resume] goal=\"mutated\""),
+            "plan line must refresh when the shared plan hint changes: {round3_summary}"
         );
         assert!(
-            round3_text.contains("this_turn=0"),
-            "delegation counters should remain turn-start snapshot values: {round3_text}"
+            round3_summary.contains("this_turn=0"),
+            "delegation counters should remain turn-start snapshot values: {round3_summary}"
         );
     }
 
@@ -13485,13 +13493,34 @@ mod tests {
             Some("system")
         );
         assert_eq!(
-            llm_events[0]["metadata"]["request_summary"]["message_roles"][1]["role"].as_str(),
+            captured_summary_roles
+                .last()
+                .and_then(|entry| entry["role"].as_str()),
             Some("user")
         );
         assert_eq!(
-            llm_events[0]["metadata"]["request"]["messages"][1]["role"].as_str(),
+            captured_request_messages
+                .last()
+                .and_then(|message| message["role"].as_str()),
             Some("user")
         );
+        assert_eq!(
+            captured_request_messages
+                .last()
+                .and_then(|message| message["content"].as_str()),
+            Some("capture this turn"),
+            "the provider boundary must preserve the current user text byte-for-byte"
+        );
+        for message in captured_request_messages
+            .iter()
+            .filter(|message| message["role"] == "user")
+        {
+            let content = message["content"].as_str().unwrap_or_default();
+            assert!(!content.contains("Turn Budget"));
+            assert!(!content.contains("Capabilities"));
+            assert!(!content.contains("Turn-start session execution state"));
+            assert!(!content.contains("<system-reminder>"));
+        }
         assert_eq!(
             llm_events[1]["metadata"]["response"]["outcome"].as_str(),
             Some("success_stop")
@@ -13503,6 +13532,16 @@ mod tests {
         assert_eq!(
             llm_events[1]["metadata"]["response"]["response"]["full_text"].as_str(),
             Some("journal capture reply")
+        );
+        assert!(
+            [
+                "Turn Budget",
+                "Capabilities",
+                "Turn-start session execution state"
+            ]
+            .iter()
+            .all(|fragment| !state.final_text.contains(fragment)),
+            "final assistant output must not contain runtime configuration fragments"
         );
         assert_eq!(
             llm_events[1]["metadata"]["response"]["response"]["usage"]["output_tokens"].as_i64(),
