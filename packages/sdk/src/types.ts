@@ -236,6 +236,7 @@ export type ToolCallEndEvent = {
   duration_ms?: number;
   error_kind?: string;
   blocked?: boolean;
+  artifacts?: unknown[];
 } & ExecutionBindingFields;
 
 export type UsageEvent = {

@@ -87,6 +87,56 @@ describe("applyStreamEvent", () => {
     );
   });
 
+  it("persists cumulative tool_call_end artifacts on the assistant message", () => {
+    const state = makeState();
+
+    applyStreamEvent(
+      {
+        type: "tool_call_end",
+        call_id: "call-1",
+        artifacts: [
+          {
+            artifact_id: "artifact-1",
+            name: "report.pdf",
+            type: "file",
+            data: {
+              filename: "report.pdf",
+              download_url: "/api/files/file-1",
+            },
+          },
+        ],
+      },
+      ctx,
+      state,
+    );
+    applyStreamEvent(
+      {
+        type: "tool_call_end",
+        call_id: "call-2",
+        artifacts: [
+          { artifact_id: "artifact-2", type: "text", data: {} },
+        ],
+      },
+      ctx,
+      state,
+    );
+
+    expect(mockUpdateStreamingAssistantMessage).toHaveBeenLastCalledWith(
+      "user-a",
+      "chat-1",
+      "assistant-1",
+      {
+        artifacts: [
+          expect.objectContaining({
+            id: "artifact-1",
+            downloadUrl: "/api/files/file-1",
+          }),
+          expect.objectContaining({ id: "artifact-2" }),
+        ],
+      },
+    );
+  });
+
   it("does not mark reasoning complete when a run fails", () => {
     const state = makeState();
 
