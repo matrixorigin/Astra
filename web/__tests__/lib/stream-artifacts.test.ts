@@ -55,6 +55,56 @@ describe("stream artifact projection", () => {
     ]);
   });
 
+  it("drops malformed inline base64 while preserving artifact download metadata", () => {
+    expect(
+      artifactsFromToolCallEnd({
+        type: "tool_call_end",
+        artifacts: [
+          {
+            artifact_id: "artifact-1",
+            type: "file",
+            name: "report.pdf",
+            data: {
+              encoding: "base64",
+              data: "!",
+              download_url: "/api/files/file-1",
+            },
+          },
+        ],
+      }),
+    ).toEqual([
+      expect.objectContaining({
+        id: "artifact-1",
+        filename: "report.pdf",
+        downloadUrl: "/api/files/file-1",
+        content: null,
+      }),
+    ]);
+  });
+
+  it("keeps valid padded and unpadded inline base64", () => {
+    const artifacts = artifactsFromToolCallEnd({
+      type: "tool_call_end",
+      artifacts: [
+        {
+          artifact_id: "padded",
+          type: "file",
+          data: { encoding: "base64", data: "YQ==" },
+        },
+        {
+          artifact_id: "unpadded",
+          type: "file",
+          data: { encoding: "base64", data: "YWI" },
+        },
+      ],
+    });
+
+    expect(artifacts.map((artifact) => artifact.content)).toEqual([
+      { encoding: "base64", data: "YQ==" },
+      { encoding: "base64", data: "YWI" },
+    ]);
+  });
+
   it("accumulates artifacts by identity without duplicating retries", () => {
     expect(
       mergeChatArtifacts(

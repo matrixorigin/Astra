@@ -2,6 +2,9 @@ import type { ChatArtifactRef } from "@/lib/api/types";
 
 type JsonRecord = Record<string, unknown>;
 
+const BASE64_PATTERN =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}(?:==)?|[A-Za-z0-9+/]{3}=?)?$/;
+
 function record(value: unknown): JsonRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as JsonRecord)
@@ -63,6 +66,14 @@ function inlineTextContent(artifact: JsonRecord) {
     : null;
 }
 
+function inlineArtifactContent(data: JsonRecord) {
+  if (data.encoding !== "base64") {
+    return data;
+  }
+  const encoded = stringField(data.data);
+  return encoded && BASE64_PATTERN.test(encoded) ? data : null;
+}
+
 function artifactFromToolResult(value: unknown): ChatArtifactRef | null {
   const artifact = record(value);
   if (!artifact) {
@@ -104,7 +115,9 @@ function artifactFromToolResult(value: unknown): ChatArtifactRef | null {
       filename,
     ),
     downloadUrl: safeArtifactDownloadUrl(data?.download_url, file?.uri),
-    content: data ?? inlineTextContent(artifact),
+    content: data
+      ? inlineArtifactContent(data)
+      : inlineTextContent(artifact),
     createdAt: stringField(artifact.created_at),
   };
 }
