@@ -1,5 +1,6 @@
 import type { Dispatch, SetStateAction } from "react";
 import type { ChatDetail, ChatMessage } from "@/lib/api/types";
+import { mergeChatArtifacts } from "@/lib/api/stream-artifacts";
 
 export function createAssistantPatchController(params: {
   setDetail: Dispatch<SetStateAction<ChatDetail>>;
@@ -13,9 +14,23 @@ export function createAssistantPatchController(params: {
     if (!mounted) return;
     params.setDetail((current) => ({
       ...current,
-      messages: current.messages.map((message) =>
-        message.id === assistantId ? { ...message, ...patch } : message,
-      ),
+      messages: current.messages.map((message) => {
+        if (message.id !== assistantId) {
+          return message;
+        }
+        return {
+          ...message,
+          ...patch,
+          ...(patch.artifacts
+            ? {
+                artifacts: mergeChatArtifacts(
+                  message.artifacts ?? [],
+                  patch.artifacts,
+                ),
+              }
+            : {}),
+        };
+      }),
     }));
   };
 

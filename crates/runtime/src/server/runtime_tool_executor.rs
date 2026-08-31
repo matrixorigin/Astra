@@ -3930,6 +3930,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mcp_provider_conversion_projects_structured_artifacts_on_terminal_event() {
+        let structured_content = json!({
+            "artifacts": [{
+                "artifact_id": "artifact_file_1",
+                "type": "file",
+                "data": {"file_id": "file_1"}
+            }]
+        });
+        let result = tool_result_from_provider_payload(
+            ProviderCallPayload {
+                text: "created file".to_string(),
+                structured_content: Some(structured_content),
+                protocol_metadata: None,
+            },
+            false,
+        );
+        let (exec, _dir) = test_executor();
+        let request = exec
+            .tool_execution_request("mcp__moi__write_file", &json!({"_tool_call_id": "call-1"}));
+
+        let event = crate::server::tool_route_boundary::tool_call_end_event(&request, &result, 7)
+            .expect("tool call end event");
+
+        assert_eq!(event["artifacts"][0]["artifact_id"], "artifact_file_1");
+        assert_eq!(
+            event["structuredContent"]["artifacts"][0]["artifact_id"],
+            "artifact_file_1"
+        );
+    }
+
     #[tokio::test]
     async fn oversized_governed_result_persists_owner_artifact_before_ledger_projection() {
         let (exec, _dir) = test_executor();

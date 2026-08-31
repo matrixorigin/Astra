@@ -1,4 +1,5 @@
 import type { RuntimeConfig } from "@/lib/runtime-config";
+import { mergeChatArtifacts } from "@/lib/api/stream-artifacts";
 import {
   buildQueryString,
   chatRunStreamPath,
@@ -1509,7 +1510,10 @@ export function updateStreamingAssistantMessage(
     message.status = patch.status;
   }
   if (patch.artifacts !== undefined) {
-    message.artifacts = patch.artifacts;
+    message.artifacts = mergeChatArtifacts(
+      message.artifacts ?? [],
+      patch.artifacts,
+    );
   }
   chat.lastMessageAt = nowIso();
   if (chat.projectId) {

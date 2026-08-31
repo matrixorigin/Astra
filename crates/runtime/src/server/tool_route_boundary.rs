@@ -345,12 +345,20 @@ fn copy_result_artifacts_metadata(
     event: &mut Map<String, Value>,
     result: &astra_tools::ToolResult,
 ) {
-    let Some(artifacts) = result
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("artifacts"))
+    let Some(metadata) = result.metadata.as_ref() else {
+        return;
+    };
+    let artifacts = metadata
+        .get("artifacts")
         .filter(|value| value.is_array())
-    else {
+        .or_else(|| {
+            metadata
+                .get("structuredContent")
+                .and_then(Value::as_object)
+                .and_then(|structured| structured.get("artifacts"))
+                .filter(|value| value.is_array())
+        });
+    let Some(artifacts) = artifacts else {
         return;
     };
     event

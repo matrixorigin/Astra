@@ -98,6 +98,30 @@ describe("createAssistantPatchController", () => {
     });
   });
 
+  it("preserves artifacts that arrived before a resumed stream cursor", () => {
+    const harness = makeStateHarness();
+    harness.detail.messages[0]!.artifacts = [
+      { id: "artifact-a", kind: "file", filename: "a.pdf" },
+    ];
+    const controller = createAssistantPatchController({
+      setDetail: harness.setDetail,
+      getAssistantId: () => "assistant-1",
+    });
+
+    controller.patchBatched({
+      artifacts: [
+        { id: "artifact-b", kind: "file", filename: "b.pdf" },
+      ],
+    });
+    const callback = [...rafCallbacks.values()][0];
+    callback(0);
+
+    expect(harness.detail.messages[0]?.artifacts).toEqual([
+      expect.objectContaining({ id: "artifact-a" }),
+      expect.objectContaining({ id: "artifact-b" }),
+    ]);
+  });
+
   it("drops pending and future patches after cancel", () => {
     const harness = makeStateHarness();
     const controller = createAssistantPatchController({

@@ -1013,7 +1013,7 @@ fn route_boundary_builds_events_and_attaches_binding_metadata() {
 }
 
 #[test]
-fn route_boundary_tool_call_end_carries_explicit_artifacts() {
+fn route_boundary_tool_call_end_promotes_structured_artifacts() {
     let service = ToolExecutionService::new_for_test();
     let mut request = request_scoped_mcp_request("mcp__moi__write_file");
     request.args = serde_json::json!({
@@ -1024,26 +1024,16 @@ fn route_boundary_tool_call_end_carries_explicit_artifacts() {
     let boundary = service.route_boundary(request);
 
     let mut result = astra_tools::ToolResult::text("created main.go".to_string());
-    result.metadata = Some(serde_json::Map::from_iter([
-        (
-            "structuredContent".to_string(),
-            serde_json::json!({
-                "artifacts": [{
-                    "artifact_id": "artifact_file_1",
-                    "type": "file",
-                    "data": {"file_id": "file_1"}
-                }]
-            }),
-        ),
-        (
-            "artifacts".to_string(),
-            serde_json::json!([{
+    result.metadata = Some(serde_json::Map::from_iter([(
+        "structuredContent".to_string(),
+        serde_json::json!({
+            "artifacts": [{
                 "artifact_id": "artifact_file_1",
                 "type": "file",
                 "data": {"file_id": "file_1"}
-            }]),
-        ),
-    ]));
+            }]
+        }),
+    )]));
 
     let transport_event = boundary
         .transport_finished_event(&result, 17)

@@ -9,6 +9,7 @@ import {
   listChats,
   sendMessage,
   setChatActiveRun,
+  updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 import { getRuntimeConfig } from "@/lib/runtime-config";
 
@@ -117,6 +118,46 @@ describe("web store user scoping", () => {
         201,
       ),
     );
+  });
+
+  it("preserves persisted artifacts when a resumed stream adds another artifact", () => {
+    getStore("user-a").chats.push({
+      id: "chat-artifacts",
+      title: "Artifacts",
+      projectId: null,
+      createdAt: "2026-06-07T00:00:00.000Z",
+      lastMessageAt: "2026-06-07T00:00:00.000Z",
+      lastMessagePreview: "",
+      model: "sonnet-4.6-adaptive",
+      messages: [
+        {
+          id: "assistant-artifacts",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "streaming",
+          artifacts: [
+            { id: "artifact-a", kind: "file", filename: "a.pdf" },
+          ],
+        },
+      ],
+    });
+
+    updateStreamingAssistantMessage(
+      "user-a",
+      "chat-artifacts",
+      "assistant-artifacts",
+      {
+        artifacts: [
+          { id: "artifact-b", kind: "file", filename: "b.pdf" },
+        ],
+      },
+    );
+
+    expect(getStore("user-a").chats[0]?.messages[0]?.artifacts).toEqual([
+      expect.objectContaining({ id: "artifact-a" }),
+      expect.objectContaining({ id: "artifact-b" }),
+    ]);
   });
 
   it("rejects an invalid model selection without mutating the chat or creating a backend session", async () => {
