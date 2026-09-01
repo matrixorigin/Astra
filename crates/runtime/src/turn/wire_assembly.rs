@@ -298,11 +298,24 @@ fn current_turn_boundary(messages: &[Value]) -> usize {
         .unwrap_or(messages.len())
 }
 
-fn current_tail_boundary(messages: &[Value]) -> usize {
-    messages
+fn tail_suffix_boundary(messages: &[Value]) -> usize {
+    let Some(tail_index) = messages
         .iter()
         .rposition(|message| message.get("role").and_then(Value::as_str) != Some("system"))
-        .unwrap_or(messages.len())
+    else {
+        return messages.len();
+    };
+
+    // An OpenAI tool result must remain contiguous with the assistant message
+    // that declared its tool_call_id. Putting a system message immediately
+    // before a trailing tool result makes the provider repair layer synthesize
+    // a missing result and discard the real one as orphaned. Keep the complete
+    // trailing tool group on the stable side of the runtime suffix.
+    if messages[tail_index].get("role").and_then(Value::as_str) == Some("tool") {
+        tail_index + 1
+    } else {
+        tail_index
+    }
 }
 
 pub(crate) fn insert_runtime_system_context(
@@ -317,7 +330,7 @@ pub(crate) fn insert_runtime_system_context(
         placement,
         astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
     ) {
-        current_tail_boundary(messages)
+        tail_suffix_boundary(messages)
     } else {
         current_turn_boundary(messages)
     };
@@ -761,8 +774,9 @@ pub(crate) fn maybe_append_continuation_prompt(
 /// 1. `system_messages` (from the context pipeline).
 /// 2. `compacted_messages` (conversation history from Memoria), unchanged.
 /// 3. Model-visible runtime context is inserted according to the provider's
-///    volatile placement. Auto-prefix providers place it immediately before
-///    the current tail message so later tool rounds can reuse the accumulated
+///    volatile placement. Auto-prefix providers place it before a current
+///    user/assistant tail or after a complete trailing assistant/tool group,
+///    so tool pairing stays valid and later rounds can reuse the accumulated
 ///    current-turn prefix. Other non-marker providers keep the current-user
 ///    boundary. Real user/tool messages remain byte-for-byte unchanged.
 /// 4. `strip_stale_reasoning` is applied in place.
@@ -2212,7 +2226,7 @@ mod tests {
     }
 
     #[test]
-    fn tail_suffix_runtime_precedes_current_tail_and_leaves_history_unchanged() {
+    fn tail_suffix_runtime_follows_complete_tool_group_and_leaves_history_unchanged() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let compacted = vec![
@@ -2233,15 +2247,15 @@ mod tests {
             None,
             &cache_cfg(),
         );
-        assert_eq!(msgs[3]["role"], "system");
-        assert!(message_text(&msgs[3]).contains("volatile"));
+        assert_eq!(msgs[4]["role"], "system");
+        assert!(message_text(&msgs[4]).contains("volatile"));
         assert_eq!(
             msgs[1]["content"], "hi",
             "historical user message must stay unchanged"
         );
         assert_eq!(msgs[2]["role"], "assistant");
-        assert_eq!(msgs[4]["role"], "tool");
-        assert_eq!(message_text(&msgs[4]), "tool output");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(message_text(&msgs[3]), "tool output");
         assert_eq!(msgs.len(), 5);
     }
 

@@ -10662,6 +10662,65 @@ mod tests {
     }
 
     #[test]
+    fn build_openai_body_keeps_real_tool_result_before_tail_runtime_system() {
+        let runtime = crate::turn::wire_assembly::runtime_system_context_message(
+            "round runtime context",
+            false,
+        )
+        .expect("runtime message");
+        let mut messages = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "inspect"}),
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call-real",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call-real",
+                "content": "real tool result"
+            }),
+        ];
+        let boundary = crate::turn::wire_assembly::insert_runtime_system_context(
+            &mut messages,
+            vec![runtime],
+            astra_turn_core::cache_placement::VolatilePlacement::TailSuffix,
+        );
+        assert_eq!(boundary, Some(4));
+
+        let body = build_provider_request_body(
+            &messages,
+            &[],
+            "qwen-plus",
+            "openai",
+            Some(1024),
+            None,
+            false,
+            &ThinkingConfig::Off,
+        );
+        let provider_messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(provider_messages.len(), 5, "{provider_messages:#?}");
+        assert_eq!(provider_messages[2]["role"], "assistant");
+        assert_eq!(provider_messages[3]["role"], "tool");
+        assert_eq!(provider_messages[3]["tool_call_id"], "call-real");
+        assert_eq!(provider_messages[3]["content"], "real tool result");
+        assert_eq!(provider_messages[4]["role"], "system");
+        assert_eq!(provider_messages[4]["content"], "round runtime context");
+        assert!(
+            provider_messages.iter().all(|message| {
+                message.get("content").and_then(Value::as_str)
+                    != Some(SYNTHETIC_TOOL_INTERRUPTED_CONTENT)
+            }),
+            "valid tool result must not be replaced with synthetic repair: {provider_messages:#?}"
+        );
+    }
+
+    #[test]
     fn parse_anthropic_nonstream_response_extracts_text_tool_calls_and_cache_usage() {
         let v = json!({
             "content": [

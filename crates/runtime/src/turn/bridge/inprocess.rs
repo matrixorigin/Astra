@@ -7330,8 +7330,9 @@ mod tests {
 
     #[test]
     fn effective_volatile_openai_keeps_sections_on_every_round() {
-        // OpenAI auto-prefix (TailSuffix): safe to inject every round
-        // since volatile lives at the tail of the last user message.
+        // OpenAI auto-prefix (TailSuffix): safe to inject every round because
+        // volatile stays separate from conversation content and follows a
+        // complete trailing tool group on later rounds.
         let cap = astra_turn_core::cache_placement::CacheCapability::for_provider_and_model(
             "openai", "gpt-4o",
         );

@@ -3605,7 +3605,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_places_tail_suffix_before_current_tool() {
+    fn finalize_bridge_wire_messages_places_tail_suffix_after_complete_tool_group() {
         let mut messages = vec![
             json!({"role": "user", "content": "original user"}),
             json!({"role": "assistant", "content": ""}),
@@ -3625,10 +3625,10 @@ mod context_cache_contract_tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["content"], "original user");
         assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[2]["role"], "system");
-        assert_eq!(messages[2]["content"], "volatile");
-        assert_eq!(messages[3]["role"], "tool");
-        assert!(messages[3]["content"].to_string().contains("tool output"));
+        assert_eq!(messages[2]["role"], "tool");
+        assert!(messages[2]["content"].to_string().contains("tool output"));
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["content"], "volatile");
     }
 
     #[test]

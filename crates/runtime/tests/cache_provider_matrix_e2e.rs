@@ -28,8 +28,9 @@
 //!   2. **Runtime-system placement**: user/tool messages remain byte-for-byte
 //!      conversational data. Marker-isolated providers keep runtime context
 //!      after the explicit message cache boundary; OpenAI-compatible
-//!      providers place it before the current tail message; strict-history
-//!      providers suppress optional runtime context.
+//!      providers place it before a current user tail or after a complete
+//!      trailing assistant/tool group; strict-history providers suppress
+//!      optional runtime context.
 //!   3. **No runtime-cc-marker on trailing system msgs**: the cache
 //!      breakpoint MUST land on the last non-system message before runtime
 //!      context; the runtime system message must not carry cache_control.
@@ -536,11 +537,12 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
 // ── Invariant 4: tool-loop growth preserves conversation bytes ─────────────
 //
 // Runtime context is a separate system message. It must never be appended to
-// the current user or tool result. Auto-prefix providers place it immediately
-// before the current tail message so each later round can reuse the accumulated
-// conversation prefix. Marker-isolated providers keep it after the last
-// conversation message so the explicit cache breakpoint stays on real history.
-// Strict-history providers suppress optional runtime context.
+// the current user or tool result. Auto-prefix providers place it before a
+// current user tail or after a complete trailing assistant/tool group so each
+// later round can reuse the accumulated conversation prefix without breaking
+// tool pairing. Marker-isolated providers keep it after the last conversation
+// message so the explicit cache breakpoint stays on real history. Strict-history
+// providers suppress optional runtime context.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]

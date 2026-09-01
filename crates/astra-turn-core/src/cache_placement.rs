@@ -93,10 +93,11 @@ pub enum VolatilePlacement {
     MarkerIsolated,
     /// Auto-prefix providers (OpenAI chat completions): volatile
     /// content must follow the last stable prefix boundary. Runtime-owned
-    /// content keeps system authority and is inserted immediately before the
-    /// current tail message. On later tool rounds this lets the accumulated
-    /// user/assistant/tool prefix match the preceding request up to the prior
-    /// tail boundary without rewriting any conversation message.
+    /// content keeps system authority and is inserted immediately before a
+    /// current user/assistant tail, or after a complete trailing
+    /// assistant/tool group. This preserves OpenAI tool-call pairing while
+    /// letting later tool rounds reuse the accumulated conversation prefix
+    /// without rewriting any conversation message.
     TailSuffix,
     /// Strict-history providers (MiniMax): any byte change mid-history
     /// destroys the full cache entry. **Volatile content is suppressed

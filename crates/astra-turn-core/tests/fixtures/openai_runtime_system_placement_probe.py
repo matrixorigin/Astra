@@ -15,8 +15,8 @@ It compares three request shapes:
 * ``initial``: dynamic runtime text is merged into the initial system message.
 * ``legacy``: dynamic runtime text is appended to the current tail message.
   This is unsafe for role isolation and is used only as the cache baseline.
-* ``tail``: runtime context keeps ``system`` authority and is inserted
-  immediately before the current tail user/tool message.
+* ``tail``: runtime context keeps ``system`` authority. It is inserted before
+  the current user, and after a complete assistant/tool group on later rounds.
 
 The gate checks API acceptance, instruction isolation, forced tool calling,
 and the second and third tool rounds' provider-reported cache ratios. The
@@ -125,9 +125,14 @@ def messages(
             *conversation,
         ]
     if placement == "tail":
-        return [
+        prefix = [
             {"role": "system", "content": STABLE_SYSTEM},
             *PRIOR_HISTORY,
+        ]
+        if conversation[-1].get("role") == "tool":
+            return [*prefix, *conversation, {"role": "system", "content": runtime_text}]
+        return [
+            *prefix,
             *conversation[:-1],
             {"role": "system", "content": runtime_text},
             conversation[-1],
