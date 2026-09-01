@@ -122,15 +122,30 @@ function artifactFromToolResult(value: unknown): ChatArtifactRef | null {
   };
 }
 
+export function artifactsFromValues(values: unknown): ChatArtifactRef[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values
+    .map(artifactFromToolResult)
+    .filter((artifact): artifact is ChatArtifactRef => Boolean(artifact));
+}
+
 export function artifactsFromToolCallEnd(
   event: Record<string, unknown>,
 ): ChatArtifactRef[] {
-  if (event.type !== "tool_call_end" || !Array.isArray(event.artifacts)) {
+  if (event.type !== "tool_call_end") {
     return [];
   }
-  return event.artifacts
-    .map(artifactFromToolResult)
-    .filter((artifact): artifact is ChatArtifactRef => Boolean(artifact));
+  return artifactsFromValues(event.artifacts);
+}
+
+function definedArtifactFields(artifact: ChatArtifactRef) {
+  return Object.fromEntries(
+    Object.entries(artifact).filter(
+      ([, value]) => value !== null && value !== undefined,
+    ),
+  ) as Partial<ChatArtifactRef>;
 }
 
 export function mergeChatArtifacts(
@@ -148,7 +163,7 @@ export function mergeChatArtifacts(
       indexes.set(artifact.id, merged.length);
       merged.push(artifact);
     } else {
-      merged[index] = { ...merged[index], ...artifact };
+      merged[index] = { ...merged[index], ...definedArtifactFields(artifact) };
     }
   }
   return merged;

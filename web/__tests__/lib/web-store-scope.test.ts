@@ -160,6 +160,65 @@ describe("web store user scoping", () => {
     ]);
   });
 
+  it("hydrates artifacts from the durable transcript after Web process state is lost", async () => {
+    const timestamp = "2026-09-01T00:00:00.000Z";
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeSessionList([
+            runtimeSession("session-artifact-history", "user-a", "Artifacts"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun(
+              "run-artifact-history",
+              "session-artifact-history",
+              "completed",
+            ),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeTranscript([
+            {
+              session_id: "session-artifact-history",
+              item_seq: 1,
+              run_id: "run-artifact-history",
+              role: "assistant",
+              content: "Created the report.",
+              artifacts: [
+                {
+                  artifact_id: "artifact-1",
+                  type: "file",
+                  name: "report.pdf",
+                  data: { download_url: "/api/files/file-1" },
+                },
+              ],
+              created_at: timestamp,
+            },
+          ]),
+        ),
+      );
+
+    const detail = await getChatHydrated(
+      "user-a",
+      "session-artifact-history",
+    );
+
+    expect(detail?.messages[0]?.artifacts).toEqual([
+      expect.objectContaining({
+        id: "artifact-1",
+        filename: "report.pdf",
+        downloadUrl: "/api/files/file-1",
+      }),
+    ]);
+  });
+
   it("rejects an invalid model selection without mutating the chat or creating a backend session", async () => {
     const store = getStore("user-a");
     const chat = {

@@ -2012,7 +2012,10 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_process_authorization = (name == "bash")
+        request.runtime_process_authorization =
+            astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
+                name,
+            )
             .then(|| self.runtime_process_authorization.clone())
             .flatten();
         request.runtime_process_authorization_required =
@@ -2037,7 +2040,10 @@ impl RuntimeToolExecutor {
             request = Self::request_with_selected_offer_route(request, offer.route);
             request = request.with_selected_offer(offer);
         }
-        request.runtime_process_authorization = (name == "bash")
+        request.runtime_process_authorization =
+            astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
+                name,
+            )
             .then(|| self.runtime_process_authorization.clone())
             .flatten();
         request.runtime_process_authorization_required =

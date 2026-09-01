@@ -119,4 +119,36 @@ describe("stream artifact projection", () => {
       { id: "artifact-2", kind: "text" },
     ]);
   });
+
+  it("preserves existing fields when a repeated artifact is sparse", () => {
+    expect(
+      mergeChatArtifacts(
+        [
+          {
+            id: "artifact-1",
+            kind: "file",
+            filename: "report.pdf",
+            downloadUrl: "/api/files/file-1",
+          },
+        ],
+        [
+          {
+            id: "artifact-1",
+            kind: "file",
+            filename: null,
+            downloadUrl: null,
+            title: "Final report",
+          },
+        ],
+      ),
+    ).toEqual([
+      {
+        id: "artifact-1",
+        kind: "file",
+        filename: "report.pdf",
+        downloadUrl: "/api/files/file-1",
+        title: "Final report",
+      },
+    ]);
+  });
 });

@@ -686,11 +686,11 @@ impl ToolExecutionService {
                 self.provider_allowed_tools.read().await.clone(),
             )
         };
-        let admission_context = transport_request.request_admission_context(ToolAdmissionContext {
+        let admission_context = ToolAdmissionContext {
             disabled_tool_offers: disabled_offer_ids.clone(),
             provider_allowed_tools: provider_allowed_tools.clone(),
             ..ToolAdmissionContext::default()
-        });
+        };
         let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
             &[],

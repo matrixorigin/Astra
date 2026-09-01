@@ -31,6 +31,14 @@ pub use astra_turn_types::ToolInvocationIdentity;
 /// subprocess without receiving file-transfer metadata or bytes.
 pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
 
+/// Whether the process-authorization capability applies to this tool.
+///
+/// This is protocol semantics shared by the server and Edge, not a second
+/// independently maintained tool-surface allowlist.
+pub fn runtime_process_authorization_applies_to_tool(tool: &str) -> bool {
+    tool == "bash"
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }

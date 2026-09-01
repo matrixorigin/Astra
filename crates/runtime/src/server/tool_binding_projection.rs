@@ -284,13 +284,6 @@ fn extend_tool_schema_pool_prefer_extra_for_duplicates(pool: &mut Vec<Value>, ex
 }
 
 impl ToolExecutionRequest {
-    pub(crate) fn request_admission_context(
-        &self,
-        context: ToolAdmissionContext,
-    ) -> ToolAdmissionContext {
-        context
-    }
-
     pub fn runtime_environment_binding(
         &self,
         registry: &astra_runtime_env::ToolRegistry,

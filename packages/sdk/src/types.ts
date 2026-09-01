@@ -1087,6 +1087,7 @@ export type RuntimeTranscriptItemResponse = {
   content: string;
   reasoning?: string | null;
   reasoning_status?: string | null;
+  artifacts?: unknown[];
   created_at?: string;
 };
 

@@ -152,7 +152,11 @@ fn valid_runtime_process_authorization(
     context: Option<&astra_server_types::edge_ws_protocol::RuntimeProcessAuthorizationContext>,
 ) -> bool {
     required == context.is_some()
-        && context.is_none_or(|context| tool == "bash" && !context.authorization.trim().is_empty())
+        && context.is_none_or(|context| {
+            astra_server_types::edge_ws_protocol::runtime_process_authorization_applies_to_tool(
+                tool,
+            ) && !context.authorization.trim().is_empty()
+        })
 }
 
 fn decode_edge_server_message(raw: &str) -> Result<EdgeServerMessage, serde_json::Error> {
@@ -1627,7 +1631,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn default_edge_id_is_stable_for_the_same_workspace() {
         let workspace = Path::new("/workspace/app");
