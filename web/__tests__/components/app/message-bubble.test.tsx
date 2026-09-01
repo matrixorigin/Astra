@@ -312,4 +312,37 @@ describe("MessageBubble", () => {
     expect(html).toContain("Thinking");
     expect(html).not.toMatch(/Thinking \d+s/);
   });
+
+  it("downloads a projected tool artifact from its safe URL", () => {
+    let clickedHref = "";
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(function captureHref(this: HTMLAnchorElement) {
+        clickedHref = this.href;
+      });
+    try {
+      render(
+        <MessageBubble
+          message={assistantMessage({
+            status: "complete",
+            reasoningStatus: undefined,
+            artifacts: [
+              {
+                id: "artifact-1",
+                kind: "file",
+                filename: "report.pdf",
+                downloadUrl: "/api/files/file-1",
+              },
+            ],
+          })}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Download" }));
+
+      expect(clickedHref).toBe("http://localhost:3000/api/files/file-1");
+    } finally {
+      click.mockRestore();
+    }
+  });
 });

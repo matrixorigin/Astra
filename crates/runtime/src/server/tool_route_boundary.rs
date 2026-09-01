@@ -345,17 +345,27 @@ fn copy_result_artifacts_metadata(
     event: &mut Map<String, Value>,
     result: &astra_tools::ToolResult,
 ) {
-    let Some(artifacts) = result
-        .metadata
-        .as_ref()
-        .and_then(|metadata| metadata.get("artifacts"))
+    let Some(metadata) = result.metadata.as_ref() else {
+        return;
+    };
+    let artifacts = metadata
+        .get("artifacts")
         .filter(|value| value.is_array())
+        .or_else(|| {
+            metadata
+                .get("structuredContent")
+                .and_then(Value::as_object)
+                .and_then(|structured| structured.get("artifacts"))
+                .filter(|value| value.is_array())
+        });
+    let Some(artifacts) = artifacts else {
+        return;
+    };
+    let Some(artifacts) = astra_services::external_artifacts::project_external_artifacts(artifacts)
     else {
         return;
     };
-    event
-        .entry("artifacts".to_string())
-        .or_insert_with(|| artifacts.clone());
+    event.entry("artifacts".to_string()).or_insert(artifacts);
 }
 
 pub(crate) fn projected_tool_start_event_fields(

@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::edge_ws_protocol::{
-    EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeFileTransferContext,
-    RuntimeFileTransferContextV2, ToolInvocationIdentity,
+    EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeProcessAuthorizationContext,
+    ToolInvocationIdentity,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -50,9 +50,8 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub edge_agent_id: &'a str,
     pub tool: &'a str,
     pub args: &'a serde_json::Value,
-    pub runtime_file_transfer: Option<&'a astra_services::runs::RuntimeFileTransferContext>,
-    pub runtime_filesystem_boundary:
-        Option<&'a astra_services::runs::RuntimeFilesystemBoundaryContext>,
+    pub runtime_process_authorization:
+        Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
     pub cancel_token: Option<&'a CancellationToken>,
 }
 
@@ -598,8 +597,7 @@ impl EdgeConnectionPool {
                 edge_agent_id,
                 tool,
                 args,
-                runtime_file_transfer: None,
-                runtime_filesystem_boundary: None,
+                runtime_process_authorization: None,
                 cancel_token,
             },
         )
@@ -623,8 +621,7 @@ impl EdgeConnectionPool {
             edge_agent_id,
             tool,
             args,
-            runtime_file_transfer,
-            runtime_filesystem_boundary,
+            runtime_process_authorization,
             cancel_token,
         } = invocation;
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
@@ -668,32 +665,18 @@ impl EdgeConnectionPool {
             },
         );
 
-        let (runtime_file_transfer, runtime_file_transfer_v2) = match runtime_file_transfer {
-            Some(context) => match &context.layout {
-                astra_services::runs::RuntimeFileTransferLayout::Legacy { .. } => (
-                    Some(Box::new(
-                        RuntimeFileTransferContext::from_legacy(context)
-                            .expect("legacy runtime file transfer must encode as V1"),
-                    )),
-                    None,
-                ),
-                astra_services::runs::RuntimeFileTransferLayout::Ephemeral { .. } => (
-                    None,
-                    Some(Box::new(RuntimeFileTransferContextV2::from(context))),
-                ),
-            },
-            None => (None, None),
-        };
         let msg = EdgeServerMessage::ToolRequest {
             request_id: request_id.clone(),
             identity: Box::new(identity.clone()),
             delivery_generation,
             tool: tool.to_string(),
             args: args.clone(),
-            runtime_file_transfer,
-            runtime_file_transfer_v2,
-            runtime_filesystem_boundary: runtime_filesystem_boundary
-                .map(|context| Box::new(context.into())),
+            runtime_process_authorization: runtime_process_authorization.map(|context| {
+                Box::new(RuntimeProcessAuthorizationContext {
+                    authorization: context.authorization.clone(),
+                })
+            }),
+            runtime_process_authorization_required: runtime_process_authorization.is_some(),
             timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
         };
 

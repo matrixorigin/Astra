@@ -17,8 +17,7 @@ pub mod task_lease;
 pub use edge_dispatch::{
     DatabaseEdgeDispatchService, EdgeDirectDispatchAdmission, EdgeDispatchAdmission,
     EdgeDispatchAdmissionError, EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService,
-    UnconfiguredEdgeDispatchService, canonicalize_edge_dispatch_payload,
-    refresh_edge_dispatch_backlog_metrics,
+    UnconfiguredEdgeDispatchService, refresh_edge_dispatch_backlog_metrics,
 };
 pub use edge_registry::{
     DatabaseEdgeRegistryService, EdgeAgentRecord, EdgeRegistrationLease, EdgeRegistryService,

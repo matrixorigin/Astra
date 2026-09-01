@@ -297,12 +297,12 @@ async fn edge_registry_reads_json_typed_capabilities_across_all_record_paths() {
     let workspace = format!("it-ws-{}", Uuid::new_v4());
     const LARGE_CAPABILITY_PAYLOAD_BYTES: usize = 72 * 1024;
     let original_capabilities = serde_json::json!({
-        "protocol_capabilities": {"managed_file_transfer_v1": true},
+        "protocol_capabilities": {"runtime_process_authorization_v1": true},
         "tools": ["bash"],
         "descriptor": "x".repeat(LARGE_CAPABILITY_PAYLOAD_BYTES)
     });
     let updated_capabilities = serde_json::json!({
-        "protocol_capabilities": {"managed_file_transfer_v1": true},
+        "protocol_capabilities": {"runtime_process_authorization_v1": true},
         "tools": ["bash", "read_file"],
         "descriptor": "y".repeat(LARGE_CAPABILITY_PAYLOAD_BYTES)
     });

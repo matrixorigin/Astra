@@ -9,6 +9,7 @@ import {
   listChats,
   sendMessage,
   setChatActiveRun,
+  updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
 import { getRuntimeConfig } from "@/lib/runtime-config";
 
@@ -117,6 +118,105 @@ describe("web store user scoping", () => {
         201,
       ),
     );
+  });
+
+  it("preserves persisted artifacts when a resumed stream adds another artifact", () => {
+    getStore("user-a").chats.push({
+      id: "chat-artifacts",
+      title: "Artifacts",
+      projectId: null,
+      createdAt: "2026-06-07T00:00:00.000Z",
+      lastMessageAt: "2026-06-07T00:00:00.000Z",
+      lastMessagePreview: "",
+      model: "sonnet-4.6-adaptive",
+      messages: [
+        {
+          id: "assistant-artifacts",
+          role: "assistant",
+          content: "",
+          createdAt: "2026-06-07T00:00:00.000Z",
+          status: "streaming",
+          artifacts: [
+            { id: "artifact-a", kind: "file", filename: "a.pdf" },
+          ],
+        },
+      ],
+    });
+
+    updateStreamingAssistantMessage(
+      "user-a",
+      "chat-artifacts",
+      "assistant-artifacts",
+      {
+        artifacts: [
+          { id: "artifact-b", kind: "file", filename: "b.pdf" },
+        ],
+      },
+    );
+
+    expect(getStore("user-a").chats[0]?.messages[0]?.artifacts).toEqual([
+      expect.objectContaining({ id: "artifact-a" }),
+      expect.objectContaining({ id: "artifact-b" }),
+    ]);
+  });
+
+  it("hydrates artifacts from the durable transcript after Web process state is lost", async () => {
+    const timestamp = "2026-09-01T00:00:00.000Z";
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    fetchMock
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeSessionList([
+            runtimeSession("session-artifact-history", "user-a", "Artifacts"),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeRunList([
+            runtimeRun(
+              "run-artifact-history",
+              "session-artifact-history",
+              "completed",
+            ),
+          ]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(
+          runtimeTranscript([
+            {
+              session_id: "session-artifact-history",
+              item_seq: 1,
+              run_id: "run-artifact-history",
+              role: "assistant",
+              content: "Created the report.",
+              artifacts: [
+                {
+                  artifact_id: "artifact-1",
+                  type: "file",
+                  name: "report.pdf",
+                  data: { download_url: "/api/files/file-1" },
+                },
+              ],
+              created_at: timestamp,
+            },
+          ]),
+        ),
+      );
+
+    const detail = await getChatHydrated(
+      "user-a",
+      "session-artifact-history",
+    );
+
+    expect(detail?.messages[0]?.artifacts).toEqual([
+      expect.objectContaining({
+        id: "artifact-1",
+        filename: "report.pdf",
+        downloadUrl: "/api/files/file-1",
+      }),
+    ]);
   });
 
   it("rejects an invalid model selection without mutating the chat or creating a backend session", async () => {

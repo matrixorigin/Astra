@@ -487,67 +487,20 @@ pub struct RuntimeCapabilityDescriptorsRequest {
     // the edge agent identified by id via the existing edge WebSocket registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edge_agent: Option<RuntimeCapabilityDescriptorRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file_transfer: Option<RuntimeCapabilityDescriptorRequest>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeFileTransferAttachment {
-    pub file_id: String,
-    pub name: String,
-    pub size: i64,
-    pub md5: String,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeFileTransferContext {
-    pub endpoint_url: String,
+/// Request-scoped provider authorization exposed to each bash subprocess on
+/// the provider-selected Edge executor. It is never persisted, logged, or
+/// merged into tool arguments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RuntimeProcessAuthorizationContext {
     pub authorization: String,
-    /// Canonical workspace root selected by the runtime binding. Relative
-    /// model-visible file paths are resolved from this directory.
-    pub workspace_root: String,
-    pub layout: RuntimeFileTransferLayout,
-    pub max_file_bytes: u64,
-    pub attachments: Vec<RuntimeFileTransferAttachment>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "layout", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RuntimeFileTransferLayout {
-    /// Existing managed Runner layout. It is retained only for sbx-* while
-    /// eph-* moves to the single work-directory contract below.
-    Legacy {
-        task_id: String,
-        root: String,
-        catalog_dir: String,
-        session_dir: String,
-        scratch_dir: String,
-    },
-    /// Ephemeral Sandbox owns its whole local work directory. It has no
-    /// task-scoped subdirectories or durable mounted session/catalog lanes.
-    Ephemeral { work_dir: String },
-}
-
-/// Retired filesystem boundary retained only to decode legacy durable and wire
-/// payloads during rolling upgrades. New managed Edge requests omit it because
-/// their local workspace paths are executor-owned; replay must not restore it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RuntimeFilesystemBoundaryContext {
-    pub workspace_root: String,
-    pub read_only_paths: Vec<String>,
-}
-
-impl std::fmt::Debug for RuntimeFileTransferContext {
+impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeFileTransferContext")
-            .field("endpoint_url", &self.endpoint_url)
+        f.debug_struct("RuntimeProcessAuthorizationContext")
             .field("authorization_present", &!self.authorization.is_empty())
-            .field("workspace_root", &self.workspace_root)
-            .field("layout", &self.layout)
-            .field("attachment_count", &self.attachments.len())
             .finish()
     }
 }
@@ -8189,8 +8142,11 @@ fn copy_explicit_artifacts(
     out: &mut serde_json::Map<String, serde_json::Value>,
     source: &serde_json::Map<String, serde_json::Value>,
 ) {
-    if let Some(artifacts) = source.get("artifacts") {
-        out.insert("artifacts".to_string(), artifacts.clone());
+    if let Some(artifacts) = source
+        .get("artifacts")
+        .and_then(crate::external_artifacts::project_external_artifacts)
+    {
+        out.insert("artifacts".to_string(), artifacts);
     }
 }
 
@@ -11084,7 +11040,7 @@ mod tests {
         let transformed = transform_run_event_for_client(json!({
             "type": "tool_call_end",
             "call_id": "call-artifact",
-            "tool": "publish_artifact",
+            "tool": "bash",
             "result": "Published artifact 'report.pptx'",
             "artifacts": [{
                 "artifact_id": "file-1",
@@ -11106,7 +11062,7 @@ mod tests {
             "tool_result",
             json!({
                 "tool_call_id": "call-artifact",
-                "name": "publish_artifact",
+                "name": "bash",
                 "output": "Published artifact 'report.pptx'",
                 "artifacts": [{
                     "artifact_id": "file-1",

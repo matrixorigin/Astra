@@ -236,6 +236,7 @@ export type ToolCallEndEvent = {
   duration_ms?: number;
   error_kind?: string;
   blocked?: boolean;
+  artifacts?: unknown[];
 } & ExecutionBindingFields;
 
 export type UsageEvent = {
@@ -1086,6 +1087,7 @@ export type RuntimeTranscriptItemResponse = {
   content: string;
   reasoning?: string | null;
   reasoning_status?: string | null;
+  artifacts?: unknown[];
   created_at?: string;
 };
 

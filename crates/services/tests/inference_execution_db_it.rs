@@ -1048,6 +1048,16 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     finish_inference_provider_attempt(&shared_pool, &second_attempt, &success)
         .await
         .expect("finish retry");
+    let successful_settlement_status: String = sqlx::query_scalar(
+        "SELECT terminal_status FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("successful provider terminal must publish its durable settlement handoff");
+    assert_eq!(successful_settlement_status, "succeeded");
     let mismatched_success = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
             output_tokens: 25,
@@ -1062,12 +1072,32 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
             .kind,
         ServiceErrorKind::Conflict
     );
+    let settlement_after_mismatch: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("mismatched logical terminal must preserve the provider settlement handoff");
+    assert_eq!(settlement_after_mismatch, 1);
     let (first_terminal, concurrent_terminal) = tokio::join!(
         finish_inference_invocation(&shared_pool, &plan, &success),
         finish_inference_invocation(&shared_pool, &plan, &success)
     );
     first_terminal.expect("finish logical invocation");
     concurrent_terminal.expect("concurrent exact invocation terminal is idempotent");
+    let settlement_after_success: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("successful logical terminal must consume the provider settlement handoff");
+    assert_eq!(settlement_after_success, 0);
     finish_inference_provider_attempt(&shared_pool, &second_attempt, &success)
         .await
         .expect("an exact provider terminal replay remains idempotent after logical settlement");

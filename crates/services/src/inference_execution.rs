@@ -2000,29 +2000,45 @@ async fn record_inference_settlement_debt(
             )))
         };
     }
-    if mode == SettlementDebtMode::RequireQuiescent {
-        let has_open_attempt = sqlx::query(
-            "SELECT 1 FROM inference_provider_attempts
-             WHERE user_id = ? AND invocation_id = ? AND status = 'started'
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(invocation_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "check open inference provider attempts before settlement",
-                error,
+    let successful_terminal = terminal.status == InferenceTerminalStatus::Succeeded.as_str();
+    let terminal_fingerprint = if successful_terminal {
+        Some(terminal.terminal_fingerprint.as_deref().ok_or_else(|| {
+            ServiceError::invalid("successful inference settlement requires a terminal fingerprint")
+        })?)
+    } else {
+        None
+    };
+    let attempt_state = if mode == SettlementDebtMode::RequireQuiescent || successful_terminal {
+        Some(
+            provider_attempt_settlement_state(
+                &mut *tx,
+                user_id,
+                invocation_id,
+                terminal_fingerprint,
             )
-        })?
-        .is_some();
-        if has_open_attempt {
-            return Err(ServiceError::conflict(format!(
-                "inference invocation {invocation_id} still has an active provider attempt"
-            )));
-        }
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "verify inference provider attempts under lifecycle lock",
+                    error,
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+    if mode == SettlementDebtMode::RequireQuiescent
+        && attempt_state.is_some_and(|state| state.has_open_attempt)
+    {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} still has an active provider attempt"
+        )));
+    }
+    if successful_terminal && !attempt_state.is_some_and(|state| state.successful_attempt_matches) {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} cannot succeed without a matching succeeded provider attempt"
+        )));
     }
     write_inference_settlement_debt(&mut tx, user_id, invocation_id, terminal).await?;
     tx.commit().await.map_err(|error| {
@@ -2118,12 +2134,15 @@ async fn apply_inference_terminal_if_quiescent(
     .map(|result| result.rows_affected())
 }
 
-async fn matching_successful_provider_attempt(
-    db: &sqlx::Pool<sqlx::MySql>,
+async fn matching_successful_provider_attempt<'e, E>(
+    executor: E,
     user_id: &str,
     invocation_id: &str,
     fingerprint: &str,
-) -> Result<Option<DurableInferenceTerminal>, sqlx::Error> {
+) -> Result<Option<DurableInferenceTerminal>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
     sqlx::query(
         "SELECT status, terminal_fingerprint, input_tokens, output_tokens, cache_read_tokens,
                 cache_creation_tokens, provider_response_id, error_kind, error_message
@@ -2151,10 +2170,57 @@ async fn matching_successful_provider_attempt(
     .bind(user_id)
     .bind(invocation_id)
     .bind(fingerprint)
-    .fetch_optional(db)
+    .fetch_optional(executor)
     .await?
     .map(|row| DurableInferenceTerminal::decode(&row))
     .transpose()
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProviderAttemptSettlementState {
+    has_open_attempt: bool,
+    successful_attempt_matches: bool,
+}
+
+async fn provider_attempt_settlement_state<'e, E>(
+    executor: E,
+    user_id: &str,
+    invocation_id: &str,
+    successful_fingerprint: Option<&str>,
+) -> Result<ProviderAttemptSettlementState, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::MySql>,
+{
+    let latest_attempt = sqlx::query(
+        "SELECT attempt.status, attempt.terminal_fingerprint,
+                (SELECT COUNT(*)
+                 FROM inference_provider_attempts AS open_attempt
+                 WHERE open_attempt.user_id = attempt.user_id
+                   AND open_attempt.invocation_id = attempt.invocation_id
+                   AND open_attempt.status = 'started') AS open_attempt_count
+         FROM inference_provider_attempts AS attempt
+         WHERE attempt.user_id = ? AND attempt.invocation_id = ?
+         ORDER BY attempt.attempt_index DESC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(executor)
+    .await?;
+    let Some(latest_attempt) = latest_attempt else {
+        return Ok(ProviderAttemptSettlementState::default());
+    };
+    let has_open_attempt = latest_attempt.try_get::<i64, _>("open_attempt_count")? > 0;
+    let latest_status = latest_attempt.try_get::<String, _>("status")?;
+    let latest_fingerprint = latest_attempt.try_get::<Option<String>, _>("terminal_fingerprint")?;
+    let successful_attempt_matches = successful_fingerprint.is_some()
+        && !has_open_attempt
+        && latest_status == "succeeded"
+        && latest_fingerprint.as_deref() == successful_fingerprint;
+    Ok(ProviderAttemptSettlementState {
+        has_open_attempt,
+        successful_attempt_matches,
+    })
 }
 
 async fn delete_inference_settlement_debt(
@@ -2452,34 +2518,6 @@ pub async fn finish_inference_invocation(
             )))
         };
     }
-    if terminal.status == InferenceTerminalStatus::Succeeded {
-        let has_succeeded_attempt = sqlx::query(
-            "SELECT 1 FROM inference_provider_attempts
-             WHERE user_id = ? AND invocation_id = ? AND status = 'succeeded'
-               AND terminal_fingerprint = ?
-             LIMIT 1",
-        )
-        .bind(&plan.input.user_id)
-        .bind(&plan.invocation_id)
-        .bind(&fingerprint)
-        .fetch_optional(db)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "verify successful inference provider attempt",
-                error,
-            )
-        })?
-        .is_some();
-        if !has_succeeded_attempt {
-            return Err(ServiceError::conflict(format!(
-                "inference invocation {} cannot succeed without a matching succeeded provider attempt",
-                plan.invocation_id
-            )));
-        }
-    }
-
     // The finalization owner explicitly records the logical outcome before it
     // tries to mirror it to `inference_invocations`. Unlike a provider attempt
     // failure, this is a durable declaration that retry policy has finished.

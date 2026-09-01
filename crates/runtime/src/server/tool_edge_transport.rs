@@ -42,12 +42,14 @@ pub(crate) async fn execute_edge_bound(
             ));
         }
     };
-    if plan.runtime_file_transfer_required() && plan.runtime_file_transfer().is_none() {
+    if plan.runtime_process_authorization_required()
+        && plan.runtime_process_authorization().is_none()
+    {
         return edge_admission_rejected_result(
             &request,
             binding,
-            "file-transfer",
-            "managed runtime file-transfer context is unavailable",
+            "process-authorization",
+            "runtime process authorization context is unavailable",
         );
     }
     if plan.runtime_edge_dispatch_authorization_required()
@@ -80,7 +82,7 @@ pub(crate) async fn execute_edge_bound(
     // records intent before socket delivery and can accept a replayed result
     // after either endpoint reconnects. Once it may have dispatched, never
     // fall through to another transport and duplicate an external effect.
-    if plan.runtime_file_transfer().is_none()
+    if plan.runtime_process_authorization().is_none()
         && plan.runtime_edge_dispatch_authorization().is_none()
     {
         match try_edge_dispatch(
@@ -115,14 +117,13 @@ pub(crate) async fn execute_edge_bound(
                     .push("edge-dispatch: durable relay unavailable before dispatch".to_string());
             }
         }
+    } else if plan.runtime_process_authorization().is_some() {
+        diagnostics.push(
+            "edge-dispatch: process authorization requires live websocket delivery".to_string(),
+        );
     } else if plan.runtime_edge_dispatch_authorization().is_some() {
         diagnostics.push(
             "edge-dispatch: provider-authorized executor requires live reauthorization and cannot use durable relay"
-                .to_string(),
-        );
-    } else {
-        diagnostics.push(
-            "edge-dispatch: request-scoped transfer credentials require live websocket delivery"
                 .to_string(),
         );
     }
@@ -359,6 +360,15 @@ async fn try_edge_websocket(
             );
         }
     }
+    if plan.runtime_process_authorization().is_some()
+        && !astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(
+            edge.capabilities.as_ref(),
+        )
+    {
+        return EdgeTransportAttempt::AdmissionRejected(
+            "selected edge does not support runtime process authorization".to_string(),
+        );
+    }
     let dispatch_identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &edge_owner_user_id,
         &request.session_id,
@@ -438,8 +448,7 @@ async fn try_edge_websocket(
                 edge_agent_id: &edge.edge_agent_id,
                 tool: &request.tool_name,
                 args: &request.args,
-                runtime_file_transfer: plan.runtime_file_transfer(),
-                runtime_filesystem_boundary: plan.runtime_filesystem_boundary(),
+                runtime_process_authorization: plan.runtime_process_authorization(),
                 cancel_token,
             },
         )

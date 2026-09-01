@@ -68,14 +68,13 @@ fn is_emoji_like(ch: char) -> bool {
 ///
 /// Calibrated default: the full system prompt (~52 KB) is approximately 14,000 tokens.
 pub const DEFAULT_SYSTEM_PROMPT_TOKENS: usize = 14_000;
+pub(crate) const MODEL_FRAMING_TOKENS: usize = 300;
 
 pub fn estimate_tokens(
     messages: &[serde_json::Value],
     schema_token_total: usize,
     system_prompt_tokens: usize,
 ) -> usize {
-    const MODEL_FRAMING: usize = 300; // JSON wrappers, role tokens, separators
-
     let sys_tokens = if system_prompt_tokens > 0 {
         system_prompt_tokens
     } else {
@@ -86,7 +85,7 @@ pub fn estimate_tokens(
         .iter()
         .map(|m| estimate_single_message_tokens(m) + PER_MESSAGE_OVERHEAD)
         .sum();
-    message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING
+    message_tokens + sys_tokens + schema_token_total + MODEL_FRAMING_TOKENS
 }
 
 pub(crate) const PER_MESSAGE_OVERHEAD: usize = 4;

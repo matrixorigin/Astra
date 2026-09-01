@@ -1200,8 +1200,7 @@ async fn edge_socket_appears_closed(
 fn decode_relay_edge_dispatch_payload(
     payload_json: &str,
 ) -> Result<EdgeServerMessage, serde_json::Error> {
-    astra_services::multi_agent::canonicalize_edge_dispatch_payload(payload_json)
-        .and_then(serde_json::from_value)
+    serde_json::from_str(payload_json)
 }
 
 /// Helper: serialize and send an EdgeServerMessage over the WebSocket.
@@ -1371,19 +1370,10 @@ fn validate_edge_capabilities(
     _user_id: &str,
 ) -> Option<serde_json::Value> {
     let capabilities = capabilities?;
-    let protocol_capabilities = capabilities.get("protocol_capabilities");
-    let managed_file_transfer_v1 = protocol_capabilities
-        .and_then(|value| {
-            value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY)
-        })
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
-    let managed_file_transfer_v2 = protocol_capabilities
-        .and_then(|value| {
-            value.get(astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY)
-        })
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
+    let runtime_process_authorization_v1 =
+        astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
+            &capabilities,
+        ));
 
     let mut advert = match serde_json::from_value::<
         astra_runtime_env::RuntimeEnvironmentAdvertisement,
@@ -1470,22 +1460,13 @@ fn validate_edge_capabilities(
     }
 
     let mut sanitized = serde_json::to_value(&advert).ok()?;
-    if managed_file_transfer_v1 || managed_file_transfer_v2 {
+    if runtime_process_authorization_v1 {
         let mut accepted = serde_json::Map::new();
-        if managed_file_transfer_v1 {
-            accepted.insert(
-                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY
-                    .to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-        if managed_file_transfer_v2 {
-            accepted.insert(
-                astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY
-                    .to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
+        accepted.insert(
+            astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY
+                .to_string(),
+            serde_json::Value::Bool(true),
+        );
         sanitized["protocol_capabilities"] = serde_json::Value::Object(accepted);
     }
     Some(sanitized)
@@ -1739,8 +1720,7 @@ mod tests {
     fn validate_edge_capabilities_preserves_known_protocol_versions_only() {
         let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
         capabilities["protocol_capabilities"] = serde_json::json!({
-            "managed_file_transfer_v1": true,
-            "managed_file_transfer_v2": true,
+            "runtime_process_authorization_v1": true,
             "unrecognized_future_protocol": true,
         });
 
@@ -1749,12 +1729,7 @@ mod tests {
 
         assert_eq!(
             sanitized["protocol_capabilities"]
-                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V1_CAPABILITY],
-            true
-        );
-        assert_eq!(
-            sanitized["protocol_capabilities"]
-                [astra_server_types::edge_ws_protocol::MANAGED_FILE_TRANSFER_V2_CAPABILITY],
+                [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY],
             true
         );
         assert!(

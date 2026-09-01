@@ -66,7 +66,8 @@ pub struct ServerSkillSubRunExecutor {
     /// lookup.  The edge agent may connect as a service account rather than
     /// the workspace user running this skill.
     workspace_record: Option<astra_runtime_env::WorkspaceRecord>,
-    runtime_file_transfer: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+    runtime_process_authorization:
+        Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
     runtime_edge_dispatch_authorization:
         Option<Arc<astra_services::runs::RuntimeEdgeDispatchAuthorizationContext>>,
     /// Skill resolver inherited from parent — enables nested inline skills.
@@ -130,7 +131,7 @@ impl ServerSkillSubRunExecutor {
             edge_profile: Map::new(),
             execution_binding_snapshot: None,
             workspace_record: None,
-            runtime_file_transfer: None,
+            runtime_process_authorization: None,
             runtime_edge_dispatch_authorization: None,
             skill_resolver: None,
             cancel_token: None,
@@ -217,11 +218,11 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
-    pub fn with_runtime_file_transfer(
+    pub fn with_runtime_process_authorization(
         mut self,
-        context: Option<Arc<astra_services::runs::RuntimeFileTransferContext>>,
+        context: Option<Arc<astra_services::runs::RuntimeProcessAuthorizationContext>>,
     ) -> Self {
-        self.runtime_file_transfer = context;
+        self.runtime_process_authorization = context;
         self
     }
 
@@ -425,9 +426,6 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         }
 
         let mut host = builder.build();
-        if self.runtime_file_transfer.is_some() {
-            host.install_managed_file_transfer_tool_schemas();
-        }
         if let Some(sink) = &self.interaction_sink {
             host.set_interaction_sink(Arc::clone(sink));
         }
@@ -673,7 +671,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 self.reflect_service.is_configured(),
             ))
             .with_cancel_token(self.cancel_token.clone())
-            .with_runtime_file_transfer(self.runtime_file_transfer.clone())
+            .with_runtime_process_authorization(self.runtime_process_authorization.clone())
             .with_runtime_edge_dispatch_authorization(
                 self.runtime_edge_dispatch_authorization.clone(),
             )

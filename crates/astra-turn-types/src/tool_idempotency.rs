@@ -35,10 +35,6 @@ impl ToolIdempotency {
 /// action-sensitive tools then return the conservative `NonIdempotent`.
 pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolIdempotency {
     match tool_name {
-        // Materialization is content-addressed by the provider-authorized
-        // attachment inventory and atomically replaces the same destination.
-        "materialize_attachment" => ToolIdempotency::IdempotentWrite,
-
         // ── Consolidated `memory` tool: branch on the `action` field. ──
         //
         // Mutating actions (write state, session-scoped attention, feedback

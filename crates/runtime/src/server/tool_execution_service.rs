@@ -592,20 +592,20 @@ impl ToolExecutionService {
         L: ServerLocalToolTransport + ?Sized,
     {
         let transport_request = request.with_transport_arguments();
-        if transport_request.runtime_file_transfer_required
+        if transport_request.runtime_process_authorization_required
             && (!matches!(route, ToolExecutionRouteKind::EdgeBound)
-                || transport_request.runtime_file_transfer.is_none())
+                || transport_request.runtime_process_authorization.is_none())
         {
             let binding = transport_request.runtime_environment_binding(&self.tool_registry);
-            let reason = if transport_request.runtime_file_transfer.is_none() {
-                "managed runtime file-transfer context is unavailable"
+            let reason = if transport_request.runtime_process_authorization.is_none() {
+                "runtime process authorization context is unavailable"
             } else {
-                "managed runtime file transfer requires an edge-bound execution route"
+                "runtime process authorization requires an edge-bound execution route"
             };
             return edge_admission_rejected_result(
                 &transport_request,
                 &binding,
-                "file-transfer",
+                "process-authorization",
                 reason,
             );
         }
@@ -686,6 +686,11 @@ impl ToolExecutionService {
                 self.provider_allowed_tools.read().await.clone(),
             )
         };
+        let admission_context = ToolAdmissionContext {
+            disabled_tool_offers: disabled_offer_ids.clone(),
+            provider_allowed_tools: provider_allowed_tools.clone(),
+            ..ToolAdmissionContext::default()
+        };
         let admission = resolve_tool_admission_for_binding_with_context(
             &transport_request.tool_name,
             &[],
@@ -693,11 +698,7 @@ impl ToolExecutionService {
             &transport_request.executor,
             transport_request.runtime.as_ref(),
             &self.tool_registry,
-            ToolAdmissionContext {
-                disabled_tool_offers: disabled_offer_ids.clone(),
-                provider_allowed_tools: provider_allowed_tools.clone(),
-                ..ToolAdmissionContext::default()
-            },
+            admission_context,
         );
         if let Some(offer_id) =
             disabled_offer_id_for_request(&transport_request, &admission, &disabled_offer_ids)
@@ -1326,9 +1327,8 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: None,
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
-            runtime_filesystem_boundary: None,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: Some(
@@ -1424,9 +1424,8 @@ mod tests {
             workspace_record: None,
             executor: ExecutorBinding::server_local(),
             runtime: Some(runtime),
-            runtime_file_transfer: None,
-            runtime_file_transfer_required: false,
-            runtime_filesystem_boundary: None,
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
             runtime_edge_dispatch_authorization: None,
             runtime_edge_dispatch_authorization_required: false,
             selected_offer: None,

@@ -1,6 +1,10 @@
 import { requestJson, toQuery } from "@/lib/api/request";
 import { WebApiError } from "@/lib/api/errors";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
+import {
+  artifactsFromToolCallEnd,
+  mergeChatArtifacts,
+} from "@/lib/api/stream-artifacts";
 import { projectRunWaitingState } from "@/lib/run-status-messages";
 import {
   blockedWaitingFor,
@@ -196,6 +200,7 @@ type ChatStreamState = {
   errorCode?: string;
   errorStatus?: number;
   nextEventIndex?: number;
+  artifacts?: NonNullable<ChatMessage["artifacts"]>;
 };
 
 function normalizeEventIndex(value: unknown): number | null {
@@ -403,6 +408,16 @@ function applyStreamEvent(
     return;
   }
 
+  if (type === "tool_call_end") {
+    forwardWorkSurfaceEvent(event, handlers);
+    const artifacts = artifactsFromToolCallEnd(event);
+    if (artifacts.length > 0) {
+      state.artifacts = mergeChatArtifacts(state.artifacts ?? [], artifacts);
+      handlers.onArtifacts?.(state.artifacts);
+    }
+    return;
+  }
+
   if (type === "run_waiting") {
     forwardWorkSurfaceEvent(event, handlers);
     const runId =
@@ -496,9 +511,11 @@ function applyStreamEvent(
   }
 
   if (type === "artifacts" && Array.isArray(event.artifacts)) {
-    handlers.onArtifacts?.(
+    state.artifacts = mergeChatArtifacts(
+      state.artifacts ?? [],
       event.artifacts as NonNullable<ChatMessage["artifacts"]>,
     );
+    handlers.onArtifacts?.(state.artifacts);
     return;
   }
 

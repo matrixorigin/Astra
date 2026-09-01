@@ -18,9 +18,8 @@ use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
-    execute_publish_artifact, execute_rollback_file_edits, execute_server_delete_file,
-    execute_server_multi_edit, execute_server_run_script, execute_server_str_replace,
-    execute_server_write_file,
+    execute_rollback_file_edits, execute_server_delete_file, execute_server_multi_edit,
+    execute_server_run_script, execute_server_str_replace, execute_server_write_file,
 };
 use crate::server::tool_introspect::{current_introspect_snapshot, render_introspect_snapshot};
 use crate::server::tool_local_execution::memory_args_with_context;
@@ -88,7 +87,6 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
         "rollback_database_snapshots",
         RollbackDatabaseSnapshotsToolHandler
     );
-    register_handler_or_log!(engine, "publish_artifact", PublishArtifactToolHandler);
     register_handler_or_log!(engine, "run_script", RunScriptToolHandler);
 
     if let Err(error) = engine.register_prefix_handler_with_validator(
@@ -966,35 +964,6 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
             args,
             context.journal_turn_index.load(Ordering::Relaxed),
         ))
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct PublishArtifactToolHandler;
-
-#[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for PublishArtifactToolHandler {
-    async fn execute(
-        &self,
-        context: &RuntimeToolExecutor,
-        args: &Value,
-        cancel_token: Option<&CancellationToken>,
-    ) -> astra_tools::ToolResult {
-        // P2-C: 重型 handler 入口处合作式取消检查
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Publish artifact not executed: run was cancelled".to_string(),
-            );
-        }
-        execute_publish_artifact(
-            args,
-            context.session_artifact_store.as_deref(),
-            &context.workspace_root,
-            &context.session_id,
-            &context.user_id,
-            context.journal_turn_index.load(Ordering::Relaxed),
-        )
-        .await
     }
 }
 

@@ -65,6 +65,7 @@ export type ChatArtifactRef = {
   contentType?: string | null;
   renderer?: string | null;
   downloadFilename?: string | null;
+  downloadUrl?: string | null;
   content?: unknown;
   createdAt?: string | null;
 };

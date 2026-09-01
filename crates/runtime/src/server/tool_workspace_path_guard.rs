@@ -130,8 +130,7 @@ pub(crate) fn server_sandbox_tool_path_mismatch(
     }
 
     let fields: &[&str] = match tool_name {
-        "publish_artifact" | "read_file" | "write_file" | "str_replace" | "list_dir"
-        | "symbols" => &["path"],
+        "read_file" | "write_file" | "str_replace" | "list_dir" | "symbols" => &["path"],
         "grep" => &["path"],
         "glob" => &["path", "pattern"],
         "git" => &["path", "file"],

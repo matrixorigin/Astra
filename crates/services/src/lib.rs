@@ -21,6 +21,7 @@ pub mod evaluation;
 pub mod event_ingestion;
 pub mod events;
 pub mod execution_grant;
+pub mod external_artifacts;
 pub mod harness;
 pub mod inference_execution;
 pub mod interaction_contract;

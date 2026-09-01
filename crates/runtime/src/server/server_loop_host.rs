@@ -376,30 +376,6 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
     }
 }
 
-fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
-    // Provider tokenizers differ; the important invariant is not exact
-    // accounting, it is that each LLM call's manifest records a non-zero,
-    // queryable tool-schema budget when tools were actually exposed.
-    let site = astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization;
-    match serde_json::to_string(tools) {
-        Ok(value) => {
-            if astra_core::history_work::instrumentation_enabled() {
-                astra_core::history_work::record_operation(
-                    site,
-                    value.len().try_into().unwrap_or(u64::MAX),
-                    tools.len().try_into().unwrap_or(u64::MAX),
-                    0,
-                );
-            }
-            u64::from(astra_turn_core::section_types::estimate_text_tokens(&value))
-        }
-        Err(error) => {
-            astra_core::history_work::record_serialization_failure(site, &error);
-            0
-        }
-    }
-}
-
 fn record_existing_server_artifact(
     site: astra_core::history_work::HistoryWorkSite,
     bytes: usize,
@@ -1244,7 +1220,6 @@ pub struct ServerAgenticLoopHost {
     executor_binding: ExecutorBinding,
     runtime_binding: Option<astra_runtime_env::RuntimeBinding>,
     request_scoped_mcp_provider_ready: bool,
-    request_scoped_file_transfer_provider_ready: bool,
     /// Request-scoped terminal control metadata supplied by the runtime
     /// provider. Kept outside the provider-facing tool schemas.
     runtime_control_tools: crate::turn::terminal_control::RuntimeControlToolSnapshot,
@@ -1368,6 +1343,72 @@ struct PromptMemoryRecallCache {
     session_turn: u32,
     user_content: String,
     entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
+}
+
+async fn fetch_prompt_memory_entries(
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    user_id: String,
+    session_id: String,
+    session_turn: u32,
+    user_content: String,
+) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
+    let Some(client) = memoria_client.as_deref() else {
+        return Vec::new();
+    };
+    let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(5);
+    let (prefetched, session_start) = tokio::join!(
+        crate::turn::memory_prefetch::prefetch_memories_with_client(
+            client,
+            &user_content,
+            &user_id,
+            &session_id,
+            top_k,
+        ),
+        async {
+            if session_turn <= 1 {
+                crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
+                    client,
+                    &user_id,
+                    &session_id,
+                )
+                .await
+                .entries
+            } else {
+                Vec::new()
+            }
+        }
+    );
+    let mut entries = session_start;
+    entries.extend(prefetched.entries);
+    crate::turn::memory_prefetch::admit_prompt_memory_entries(&session_id, entries)
+}
+
+async fn load_initial_session_memory_entry(
+    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
+    session_id: String,
+) -> Option<astra_turn_core::context_sources::MemoryEntry> {
+    if let Some(service) = memory_extraction_service.as_ref() {
+        return service
+            .current_session_memory_entry_for_pipeline(&session_id)
+            .await;
+    }
+    let client = memoria_client.as_deref()?;
+    let loaded =
+        crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
+            client,
+            &session_id,
+        )
+        .await;
+    loaded.as_ref().and_then(|loaded| {
+        crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+            Some(&loaded.content),
+            loaded.updated_turn,
+        )
+    })
 }
 
 #[derive(Clone)]
@@ -1908,7 +1949,6 @@ impl ServerAgenticLoopHostBuilder {
             executor_binding: schema_executor.clone(),
             runtime_binding: schema_runtime.clone(),
             request_scoped_mcp_provider_ready: false,
-            request_scoped_file_transfer_provider_ready: false,
             runtime_control_tools: Default::default(),
             runtime_stop_after_success_tools: Default::default(),
             terminal_handoff_window: Default::default(),
@@ -2426,31 +2466,6 @@ impl ServerAgenticLoopHost {
         }
         self.request_scoped_mcp_provider_ready |= installed_request_scoped_mcp_schema;
         self.tool_schemas.extend(schemas);
-    }
-
-    /// Install tools backed by a validated, request-scoped managed file
-    /// transfer descriptor. These schemas are intentionally absent from every
-    /// generic provider catalog and become admissible only for this run.
-    pub(crate) fn install_managed_file_transfer_tool_schemas(&mut self) {
-        self.request_scoped_file_transfer_provider_ready = true;
-        for schema in astra_tools::schemas::all_tool_schemas()
-            .into_iter()
-            .filter(|schema| {
-                tool_schema_name(schema).is_some_and(|name| {
-                    astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES.contains(&name)
-                })
-            })
-        {
-            append_tool_schemas_unique(&mut self.admission_tool_schemas, vec![schema.clone()]);
-            let Some(name) = tool_schema_name(&schema).map(str::to_string) else {
-                continue;
-            };
-            self.valid_tools.insert(name.clone());
-            if !self.admissible_extras.iter().any(|extra| extra == &name) {
-                self.admissible_extras.push(name);
-            }
-            append_tool_schemas_unique(&mut self.tool_schemas, vec![schema]);
-        }
     }
 
     pub(crate) fn install_runtime_stop_after_success_tools(
@@ -4376,9 +4391,8 @@ impl ServerAgenticLoopHost {
                 runtime: self.runtime_binding.clone(),
                 selected_offer: None,
                 policy: ToolPolicySnapshot::default(),
-                runtime_file_transfer: None,
-                runtime_file_transfer_required: false,
-                runtime_filesystem_boundary: None,
+                runtime_process_authorization: None,
+                runtime_process_authorization_required: false,
                 runtime_edge_dispatch_authorization: None,
                 runtime_edge_dispatch_authorization_required: false,
             };
@@ -4475,8 +4489,6 @@ impl ServerAgenticLoopHost {
             server_service_provider_ready: self.server_service_provider_catalog_enabled,
             control_plane_provider_ready: self.control_plane_provider_catalog_enabled,
             request_scoped_mcp_provider_ready: self.request_scoped_mcp_provider_ready,
-            request_scoped_file_transfer_provider_ready: self
-                .request_scoped_file_transfer_provider_ready,
             selected_runtime_platform: self
                 .runtime_binding
                 .as_ref()
@@ -4881,6 +4893,7 @@ impl ServerAgenticLoopHost {
     /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
     /// tool schemas. Callers that only want the system text can discard the
     /// extra fields.
+    #[cfg(test)]
     async fn prompt_memory_entries_for_turn(
         &mut self,
         session_turn: u32,
@@ -4892,39 +4905,14 @@ impl ServerAgenticLoopHost {
             return cached.entries.clone();
         }
 
-        let entries = if let Some(client) = self.memoria_client.as_deref() {
-            let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
-                .ok()
-                .and_then(|value| value.parse::<u32>().ok())
-                .unwrap_or(5);
-            let (prefetched, session_start) = tokio::join!(
-                crate::turn::memory_prefetch::prefetch_memories_with_client(
-                    client,
-                    user_content,
-                    &self.user_id,
-                    &self.session_id,
-                    top_k,
-                ),
-                async {
-                    if session_turn <= 1 {
-                        crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
-                            client,
-                            &self.user_id,
-                            &self.session_id,
-                        )
-                        .await
-                        .entries
-                    } else {
-                        Vec::new()
-                    }
-                }
-            );
-            let mut entries = session_start;
-            entries.extend(prefetched.entries);
-            crate::turn::memory_prefetch::admit_prompt_memory_entries(&self.session_id, entries)
-        } else {
-            Vec::new()
-        };
+        let entries = fetch_prompt_memory_entries(
+            self.memoria_client.clone(),
+            self.user_id.clone(),
+            self.session_id.clone(),
+            session_turn,
+            user_content.to_string(),
+        )
+        .await;
         self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
             session_turn,
             user_content: user_content.to_string(),
@@ -5461,8 +5449,72 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
         }
 
+        let user_content = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+
+        // Model revalidation, query-relevant recall, and the current-session
+        // snapshot are independent remote reads. Start them together so a
+        // healthy turn pays the slowest boundary once instead of serially.
+        let cached_prompt_memory = self
+            .prompt_memory_recall_cache
+            .as_ref()
+            .filter(|cached| {
+                cached.session_turn == state.session_turn && cached.user_content == user_content
+            })
+            .map(|cached| cached.entries.clone());
+        let prompt_memoria_client = self.memoria_client.clone();
+        let prompt_memory_user_id = self.user_id.clone();
+        let prompt_memory_session_id = self.session_id.clone();
+        let prompt_memory_user_content = user_content.clone();
+        let prompt_memory_turn = state.session_turn;
+        let session_memory_service = state.memory_extraction_service.clone();
+        let session_memoria_client = self.memoria_client.clone();
+        let session_memory_session_id = self.session_id.clone();
+        let (
+            llm_cfg_result,
+            (memoria_prefetch_entries, fetched_prompt_memory),
+            initial_session_memory_entry,
+        ) = tokio::join!(
+            self.resolve_llm_config_for_state(state),
+            async move {
+                if let Some(entries) = cached_prompt_memory {
+                    (entries, false)
+                } else {
+                    (
+                        fetch_prompt_memory_entries(
+                            prompt_memoria_client,
+                            prompt_memory_user_id,
+                            prompt_memory_session_id,
+                            prompt_memory_turn,
+                            prompt_memory_user_content,
+                        )
+                        .await,
+                        true,
+                    )
+                }
+            },
+            load_initial_session_memory_entry(
+                session_memory_service,
+                session_memoria_client,
+                session_memory_session_id,
+            ),
+        );
+        if fetched_prompt_memory {
+            self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
+                session_turn: state.session_turn,
+                user_content: user_content.clone(),
+                entries: memoria_prefetch_entries.clone(),
+            });
+        }
+
         // ── 1. Resolve LLM model ────────────────────────────────────────
-        let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
+        let mut llm_cfg = match llm_cfg_result {
             Ok(m) => m,
             Err(e) => {
                 let message = format!("Model resolution failed: {e}");
@@ -5539,15 +5591,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
 
         // ── 2. Build messages ───────────────────────────────────────────
-        let user_content = state
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .and_then(|m| m.get("content").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
-
         let final_answer_settlement_text_only = state.hooks.completion_settlement.text_only;
         let effective_restricted = self.compute_effective_restricted(state, true);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
@@ -5567,30 +5610,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
-        let memoria_client = self.memoria_client.clone();
-        let memoria_prefetch_entries = self
-            .prompt_memory_entries_for_turn(state.session_turn, &user_content)
-            .await;
-        let initial_session_memory_entry = if let Some(svc) =
-            state.memory_extraction_service.as_ref()
-        {
-            svc.current_session_memory_entry_for_pipeline(&self.session_id)
-                .await
-        } else if let Some(client) = memoria_client.as_deref() {
-            let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
-                    client,
-                    &self.session_id,
-                )
-                .await;
-            loaded.as_ref().and_then(|loaded| {
-                crate::turn::wire_assembly::session_memory_entry_for_user_turn(
-                    Some(&loaded.content),
-                    loaded.updated_turn,
-                )
-            })
-        } else {
-            None
-        };
         tracing::debug!(
             target: "astra_runtime::server_loop",
             session_id = %self.session_id,
@@ -5812,7 +5831,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "final wire estimate exceeds the model limit; provider tokenizer remains authoritative"
             );
         }
-        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
+        state.pinned_tool_schema_tokens =
+            u64::try_from(final_wire_budget_status.estimated_tool_schema_tokens)
+                .unwrap_or(u64::MAX);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
 
@@ -5828,12 +5849,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut action_window_updates = Vec::new();
         let result = loop {
             let attempt_label = llm_main_attempt_label(attempt_in_round);
-            let admission_estimated_tokens = crate::prompts::estimate_tokens(
-                &llm_messages,
-                state.pinned_tool_schema_tokens as usize,
-                0,
-            )
-            .saturating_add(effective_max_output);
+            let admission_estimated_tokens = final_wire_budget_status
+                .admission_estimated_input_tokens
+                .saturating_add(effective_max_output);
             match crate::llm_provider_admission::admit_llm_provider_request(
                 self.shared_pool.as_ref(),
                 &llm_cfg.provider,
@@ -8048,35 +8066,6 @@ mod tests {
             selected.is_empty(),
             "request-scoped MCP tools must not be delivered to the edge ledger"
         );
-    }
-
-    #[test]
-    fn managed_file_transfer_install_adds_both_request_scoped_tools() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-transfer".to_string(),
-            "s-transfer".to_string(),
-        )
-        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-            false, false,
-        ))
-        .with_server_service_tool_catalog_enabled(false)
-        .with_static_tool_catalog_admissible(false)
-        .build();
-
-        host.install_managed_file_transfer_tool_schemas();
-
-        let installed = schema_names(&host.tool_schemas);
-        let admission = schema_names(&host.admission_tool_schemas);
-        for tool_name in astra_tools::schemas::MANAGED_FILE_TRANSFER_TOOL_NAMES {
-            assert!(installed.contains(*tool_name), "missing {tool_name} schema");
-            assert!(
-                admission.contains(*tool_name),
-                "missing {tool_name} admission schema"
-            );
-            assert!(host.valid_tool_names().contains(*tool_name));
-        }
     }
 
     #[test]

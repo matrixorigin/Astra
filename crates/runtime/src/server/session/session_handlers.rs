@@ -282,6 +282,8 @@ pub(crate) struct TranscriptItemResponse {
     pub tool_result: Option<astra_thin_client::SessionTranscriptToolResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<astra_turn_types::AgentTranscriptEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_event_id: Option<String>,
     pub created_at: String,
@@ -739,6 +741,13 @@ pub(crate) async fn get_session_transcript_handler(
             ))
         })?;
     items.reverse();
+    hydrate_transcript_artifacts(pool, &user_id, &session_id, &mut items)
+        .await
+        .map_err(|error| {
+            internal_error(format!(
+                "hydrate transcript artifacts failed for session {session_id}: {error}"
+            ))
+        })?;
     let transcript_item_count = items.len();
     let transcript_first_seq = items.first().map(|item| item.item_seq);
     let transcript_last_seq = items.last().map(|item| item.item_seq);
@@ -845,9 +854,111 @@ fn decode_transcript_item(row: &impl RowExt) -> Result<TranscriptItemResponse, S
         tool_calls: payload.tool_calls,
         tool_result: payload.tool_result,
         evidence: payload.evidence,
+        artifacts: Vec::new(),
         source_event_id: session_row_optional_string(row, "source_event_id")?,
         created_at: session_row_string(row, "created_at")?,
     })
+}
+
+fn attach_transcript_artifacts(
+    items: &mut [TranscriptItemResponse],
+    events: impl IntoIterator<Item = (String, i64, Value)>,
+) {
+    let item_indexes = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            item.run_id
+                .as_ref()
+                .map(|run_id| ((run_id.clone(), item.item_seq), index))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (run_id, item_seq, event) in events {
+        let Some(index) = item_indexes.get(&(run_id, item_seq)).copied() else {
+            continue;
+        };
+        let projected = astra_services::runs::transform_run_event_for_client(event);
+        let Some(artifacts) = projected.get("artifacts").and_then(Value::as_array) else {
+            continue;
+        };
+        items[index].artifacts.extend(artifacts.iter().cloned());
+    }
+}
+
+async fn hydrate_transcript_artifacts(
+    pool: &SharedPool,
+    user_id: &str,
+    session_id: &str,
+    items: &mut [TranscriptItemResponse],
+) -> Result<(), String> {
+    let run_ids = items
+        .iter()
+        .filter(|item| item.role == "assistant")
+        .filter_map(|item| item.run_id.as_deref())
+        .collect::<HashSet<_>>();
+    if run_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut query = QueryBuilder::<sqlx::MySql>::new(
+        "SELECT event.run_id AS run_id, event.payload_json AS payload_json, \
+                target.item_seq AS target_item_seq \
+         FROM agent_run_events AS event \
+         INNER JOIN ( \
+             SELECT run_id, MAX(item_seq) AS item_seq \
+             FROM session_transcript_items \
+             WHERE user_id = ",
+    );
+    query
+        .push_bind(user_id)
+        .push(" AND session_id = ")
+        .push_bind(session_id)
+        .push(" AND role = 'assistant' AND run_id IN (");
+    {
+        let mut separated = query.separated(", ");
+        for run_id in &run_ids {
+            separated.push_bind(*run_id);
+        }
+    }
+    query
+        .push(
+            ") GROUP BY run_id \
+             ) AS target ON target.run_id = event.run_id \
+         WHERE event.user_id = ",
+        )
+        .push_bind(user_id)
+        .push(" AND event.session_id = ")
+        .push_bind(session_id)
+        .push(
+            " AND event.event_type IN ('tool_result', 'tool_call_end') \
+              ORDER BY event.run_id ASC, event.event_idx ASC",
+        );
+
+    let rows = query
+        .build()
+        .fetch_all(pool.get())
+        .await
+        .map_err(|error| format!("query durable artifact events: {error}"))?;
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            let run_id = row
+                .try_get::<String, _>("run_id")
+                .map_err(|error| format!("decode artifact event run_id: {error}"))?;
+            let item_seq = row
+                .try_get::<i64, _>("target_item_seq")
+                .map_err(|error| format!("decode artifact target item_seq: {error}"))?;
+            let payload = row
+                .try_get::<String, _>("payload_json")
+                .map_err(|error| format!("decode artifact event payload: {error}"))?;
+            let payload = serde_json::from_str::<Value>(&payload)
+                .map_err(|error| format!("parse artifact event payload: {error}"))?;
+            Ok((run_id, item_seq, payload))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    attach_transcript_artifacts(items, events);
+    Ok(())
 }
 
 async fn load_transcript_page_refs(
@@ -3772,6 +3883,57 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::{AppState, HealthChecker, ServiceInfo};
+
+    fn transcript_item(run_id: &str, item_seq: i64, content: &str) -> TranscriptItemResponse {
+        TranscriptItemResponse {
+            session_id: "session-1".to_string(),
+            item_seq,
+            run_id: Some(run_id.to_string()),
+            role: "assistant".to_string(),
+            content: content.to_string(),
+            reasoning: None,
+            reasoning_status: None,
+            tool_calls: Vec::new(),
+            tool_result: None,
+            evidence: None,
+            artifacts: Vec::new(),
+            source_event_id: None,
+            created_at: "2026-09-01T00:00:00".to_string(),
+        }
+    }
+
+    #[test]
+    fn durable_artifacts_attach_only_to_the_last_assistant_item_for_their_run() {
+        let mut items = vec![
+            transcript_item("run-1", 1, ""),
+            transcript_item("run-2", 2, "other run"),
+            transcript_item("run-1", 3, "final answer"),
+        ];
+        attach_transcript_artifacts(
+            &mut items,
+            [(
+                "run-1".to_string(),
+                3,
+                json!({
+                    "event_type": "tool_result",
+                    "data": {
+                        "tool_call_id": "call-1",
+                        "name": "bash",
+                        "output": "created report",
+                        "artifacts": [{
+                            "artifact_id": "artifact-1",
+                            "type": "file",
+                            "data": {"download_url": "/api/files/file-1"}
+                        }]
+                    }
+                }),
+            )],
+        );
+
+        assert!(items[0].artifacts.is_empty());
+        assert!(items[1].artifacts.is_empty());
+        assert_eq!(items[2].artifacts[0]["artifact_id"], "artifact-1");
+    }
 
     #[derive(Clone)]
     struct FakeSessionRow {

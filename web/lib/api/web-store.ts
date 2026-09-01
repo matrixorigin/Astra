@@ -1,5 +1,9 @@
 import type { RuntimeConfig } from "@/lib/runtime-config";
 import {
+  artifactsFromValues,
+  mergeChatArtifacts,
+} from "@/lib/api/stream-artifacts";
+import {
   buildQueryString,
   chatRunStreamPath,
   parseSseDataEvents,
@@ -1509,7 +1513,10 @@ export function updateStreamingAssistantMessage(
     message.status = patch.status;
   }
   if (patch.artifacts !== undefined) {
-    message.artifacts = patch.artifacts;
+    message.artifacts = mergeChatArtifacts(
+      message.artifacts ?? [],
+      patch.artifacts,
+    );
   }
   chat.lastMessageAt = nowIso();
   if (chat.projectId) {
@@ -2098,10 +2105,19 @@ function transcriptItemToMessage(
   }
   const reasoning =
     typeof item.reasoning === "string" ? item.reasoning.trim() : "";
+  const artifacts = mergeChatArtifacts(
+    [],
+    artifactsFromValues(item.artifacts),
+  );
   // Canonical transcripts retain assistant tool-call scaffolding even when it
   // has no user-visible text. It is valid replay state, but rendering it as a
   // blank chat message makes a cancelled/refreshed turn look like data loss.
-  if (item.role === "assistant" && !item.content.trim() && !reasoning) {
+  if (
+    item.role === "assistant" &&
+    !item.content.trim() &&
+    !reasoning &&
+    artifacts.length === 0
+  ) {
     return null;
   }
   const reasoningStatus =
@@ -2118,6 +2134,7 @@ function transcriptItemToMessage(
     content: item.content,
     reasoning: reasoning || undefined,
     reasoningStatus,
+    artifacts: artifacts.length > 0 ? artifacts : undefined,
     createdAt: item.created_at ?? nowIso(),
     status: "complete",
   };

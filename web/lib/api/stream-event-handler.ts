@@ -10,6 +10,11 @@ import {
 } from "@/lib/api/web-store";
 import { mergeTextDelta, splitThinkingTags } from "@/lib/api/stream-text";
 import {
+  artifactsFromToolCallEnd,
+  mergeChatArtifacts,
+} from "@/lib/api/stream-artifacts";
+import type { ChatArtifactRef } from "@/lib/api/types";
+import {
   extractBlockedReason,
   projectRunWaitingState,
 } from "@/lib/run-status-messages";
@@ -26,6 +31,7 @@ export interface StreamEventState {
   assistantText: string;
   assistantRawText: string;
   reasoningText: string;
+  artifacts?: ChatArtifactRef[];
   statusFeedbackText?: string;
   reasoningFromThinkingTags?: boolean;
   lastStatus: "streaming" | "complete" | "failed";
@@ -327,6 +333,21 @@ export function applyStreamEvent(
         event.content,
       );
       applyAssistantText(state.assistantRawText, "streaming");
+      break;
+    }
+
+    case "tool_call_end": {
+      const artifacts = artifactsFromToolCallEnd(
+        event as unknown as Record<string, unknown>,
+      );
+      if (artifacts.length === 0) break;
+      state.artifacts = mergeChatArtifacts(state.artifacts ?? [], artifacts);
+      updateStreamingAssistantMessage(
+        ctx.ownerUserId,
+        ctx.chatId,
+        ctx.assistantMessageId,
+        { artifacts: state.artifacts },
+      );
       break;
     }
 

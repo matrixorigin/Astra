@@ -5879,205 +5879,6 @@ fn test_runtime_descriptor(
     }
 }
 
-fn file_transfer_request_with_attachment(
-    attachment: Value,
-) -> astra_services::runs::ChatRequestData {
-    file_transfer_request_with_attachments(vec![attachment])
-}
-
-fn file_transfer_request_with_attachments(
-    attachments: Vec<Value>,
-) -> astra_services::runs::ChatRequestData {
-    let mut request = prepared_test_request("hello");
-    request.provider_runtime_authorized = true;
-    request.runtime_auth = Some(RuntimeAuthRequest {
-        authorization: "Bearer runtime-grant".to_string(),
-    });
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-        display_name: Some("Managed sandbox".to_string()),
-        root: Some("/sandbox".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/sandbox".to_string(),
-        }),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-        executor_id: Some("sbx-test".to_string()),
-        display_name: Some("Managed sandbox".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
-    let mut descriptor = test_runtime_descriptor(
-        "moi-runtime-files",
-        "file_transfer",
-        "http://127.0.0.1/runtime-files",
-    );
-    descriptor.protocol = "moi_runtime_files_v1".to_string();
-    descriptor.metadata = json!({
-        "contract_version": 1,
-        "task_id": "task-1",
-        "root": "/sandbox/.moi/runtime/task-1",
-        "catalog_dir": "/sandbox/.moi/runtime/task-1/catalog",
-        "session_dir": "/sandbox/.moi/sessions/session-1",
-        "scratch_dir": "/sandbox/.moi/runtime/task-1/scratch",
-        "max_file_bytes": 1024,
-        "attachments": attachments
-    })
-    .as_object()
-    .unwrap()
-    .clone();
-    request.capability_descriptors =
-        Some(astra_services::runs::RuntimeCapabilityDescriptorsRequest {
-            model_gateway: None,
-            mcp: None,
-            skills: None,
-            edge_agent: None,
-            file_transfer: Some(descriptor),
-        });
-    request
-}
-
-fn ephemeral_file_transfer_request_with_attachments(
-    attachments: Vec<Value>,
-) -> astra_services::runs::ChatRequestData {
-    let mut request = file_transfer_request_with_attachments(attachments);
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
-        display_name: Some("Ephemeral sandbox".to_string()),
-        root: Some("/sandbox/.moi".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/sandbox/.moi".to_string(),
-        }),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::EdgeAgent,
-        executor_id: Some("eph-test".to_string()),
-        display_name: Some("Ephemeral sandbox".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::EdgeWs),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
-    let descriptor = request
-        .capability_descriptors
-        .as_mut()
-        .and_then(|descriptors| descriptors.file_transfer.as_mut())
-        .expect("file transfer descriptor");
-    descriptor.metadata = json!({
-        "contract_version": 2,
-        "work_dir": "/sandbox/.moi",
-        "max_file_bytes": 1024,
-        "attachments": descriptor.metadata["attachments"].clone(),
-    })
-    .as_object()
-    .expect("ephemeral file transfer metadata")
-    .clone();
-    request
-}
-
-#[test]
-fn runtime_file_transfer_assigns_pairwise_distinct_names_at_request_boundary() {
-    let request = file_transfer_request_with_attachments(vec![
-        json!({"file_id": "file-1", "name": "input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
-        json!({"file_id": "file-2", "name": "input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
-        json!({"file_id": "file-3", "name": "000000-input.txt", "size": 1, "md5": "0123456789abcdef0123456789abcdef"}),
-    ]);
-    let context = AgenticRunLifecycleService::runtime_file_transfer_context(&request)
-        .expect("attachment inventory must be valid")
-        .expect("file transfer context");
-    let names = context
-        .attachments
-        .iter()
-        .enumerate()
-        .map(|(index, attachment)| {
-            astra_server_types::edge_ws_protocol::runtime_attachment_destination_name(
-                index,
-                &attachment.name,
-            )
-            .expect("validated destination name")
-        })
-        .collect::<HashSet<_>>();
-
-    assert_eq!(names.len(), context.attachments.len());
-    assert!(names.contains("000000-input.txt"));
-    assert!(names.contains("000001-input.txt"));
-    assert!(names.contains("000002-000000-input.txt"));
-}
-
-#[test]
-fn ephemeral_file_transfer_uses_one_flat_work_dir() {
-    let request = ephemeral_file_transfer_request_with_attachments(Vec::new());
-    let context = AgenticRunLifecycleService::runtime_file_transfer_context(&request)
-        .expect("ephemeral file transfer must be valid")
-        .expect("ephemeral file transfer context");
-    assert_eq!(context.workspace_root, "/sandbox/.moi");
-    assert!(matches!(
-        context.layout,
-        astra_services::runs::RuntimeFileTransferLayout::Ephemeral { ref work_dir }
-            if work_dir == "/sandbox/.moi"
-    ));
-}
-
-#[test]
-fn runtime_file_transfer_rejects_edge_invalid_attachment_inventory_at_request_boundary() {
-    let valid = json!({
-        "file_id": "file-1",
-        "name": "paper.pdf",
-        "size": 512,
-        "md5": "0123456789abcdef0123456789abcdef"
-    });
-    assert!(
-        AgenticRunLifecycleService::runtime_file_transfer_context(
-            &file_transfer_request_with_attachment(valid.clone())
-        )
-        .unwrap()
-        .is_some()
-    );
-
-    for invalid in [
-        json!({"file_id": "file-1", "name": "../paper.pdf", "size": 512, "md5": "0123456789abcdef0123456789abcdef"}),
-        json!({"file_id": "file-1", "name": "paper.pdf", "size": 1025, "md5": "0123456789abcdef0123456789abcdef"}),
-        json!({"file_id": "file-1", "name": "paper.pdf", "size": 512, "md5": "0123456789ABCDEF0123456789ABCDEF"}),
-        json!({"file_id": "file-1", "name": "x".repeat(241), "size": 512, "md5": "0123456789abcdef0123456789abcdef"}),
-    ] {
-        let error = AgenticRunLifecycleService::runtime_file_transfer_context(
-            &file_transfer_request_with_attachment(invalid),
-        )
-        .expect_err("invalid inventory must be rejected before edge dispatch");
-        assert_eq!(error, "file_transfer attachment inventory is invalid");
-    }
-}
-
-#[test]
-fn runtime_file_transfer_rejects_non_edge_execution_boundary() {
-    let mut request = file_transfer_request_with_attachment(json!({
-        "file_id": "file-1",
-        "name": "paper.pdf",
-        "size": 512,
-        "md5": "0123456789abcdef0123456789abcdef"
-    }));
-    request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
-        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
-        display_name: Some("Server sandbox".to_string()),
-        root: Some("/sandbox".to_string()),
-        source: Some(astra_services::runs::WorkspaceSourceRequest::Scratch),
-        authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
-    });
-    request.executor_binding = Some(astra_services::runs::ExecutorBindingRequest {
-        kind: astra_services::runs::ExecutorBindingRequestKind::ServerLocal,
-        executor_id: Some("server".to_string()),
-        display_name: Some("Server".to_string()),
-        transport: Some(astra_services::runs::ToolTransportKindRequest::ServerLocal),
-        status: Some(astra_services::runs::ExecutorStatusRequest::Online),
-    });
-
-    assert_eq!(
-        AgenticRunLifecycleService::runtime_file_transfer_context(&request).unwrap_err(),
-        "file_transfer requires an edge_workspace and Edge WebSocket executor"
-    );
-}
-
 #[test]
 fn runtime_provider_endpoints_require_plain_http_authority() {
     for endpoint in [
@@ -6141,9 +5942,139 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
             mcp: None,
             skills: None,
             edge_agent: Some(descriptor),
-            file_transfer: None,
         });
     request
+}
+
+fn edge_runtime_advertisement(edge_agent_id: &str, process_authorization_v1: bool) -> Value {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/workspace",
+            astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+        astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+        astra_runtime_env::PolicyIntent::local_developer(),
+        &registry,
+    );
+    let mut advertisement = serde_json::to_value(
+        astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding),
+    )
+    .expect("serialize edge runtime advertisement");
+    if process_authorization_v1 {
+        advertisement["protocol_capabilities"] = json!({
+            "runtime_process_authorization_v1": true,
+        });
+    }
+    advertisement
+}
+
+#[tokio::test]
+async fn provider_edge_requires_process_authorization_support_before_host_start() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+    let old_advertisement = edge_runtime_advertisement("runner-r1", false);
+    assert!(
+        old_advertisement["binding"]["tool_surface"]["tool_names"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "bash")),
+        "the pre-v1 Edge must advertise Bash to exercise the mixed-version regression"
+    );
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-r1",
+        Some("old-runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(old_advertisement),
+        None,
+        old_tx,
+    );
+    let service = test_service().with_edge_connection_pool(pool.clone());
+    let mut request = authorized_edge_dispatch_request();
+    let descriptors = request
+        .capability_descriptors
+        .as_mut()
+        .expect("authorized edge descriptor");
+    descriptors.model_gateway = Some(test_runtime_descriptor(
+        "moi-model-gateway",
+        "model_gateway",
+        "http://127.0.0.1/model-gateway",
+    ));
+    request.context = Some(serde_json::Map::from_iter([(
+        "edge_tools".to_string(),
+        json!([{"function": {"name": "bash", "parameters": {}}}]),
+    )]));
+
+    let error = service
+        .validate_request_constraints("user-1", &request)
+        .await
+        .expect_err("a pre-v1 Edge must be rejected before its Bash surface reaches the host");
+    assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("runtime_executor_upgrade_required")
+    );
+
+    let (current_tx, _current_rx) = tokio::sync::mpsc::channel(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-r1",
+        Some("current-runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_advertisement("runner-r1", true)),
+        None,
+        current_tx,
+    );
+    service
+        .validate_request_constraints("user-1", &request)
+        .await
+        .expect("a v1-capable Edge keeps the existing Bash surface");
+}
+
+#[test]
+fn provider_edge_bash_uses_runtime_auth_without_an_extra_capability() {
+    let mut request = authorized_edge_dispatch_request();
+    request.capability_descriptors = None;
+    let context = AgenticRunLifecycleService::runtime_process_authorization_context(&request)
+        .expect("valid provider runtime context")
+        .expect("edge process authorization");
+    assert_eq!(context.authorization, "Bearer runtime-grant");
+
+    let mut ordinary_edge_ws = request.clone();
+    ordinary_edge_ws
+        .executor_binding
+        .as_mut()
+        .expect("executor binding")
+        .transport = Some(astra_services::runs::ToolTransportKindRequest::EdgeWs);
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&ordinary_edge_ws)
+            .unwrap()
+            .is_some(),
+        "ordinary edge WebSocket execution uses the same runtime authorization"
+    );
+
+    let mut server_workspace = request.clone();
+    server_workspace.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
+        kind: astra_services::runs::WorkspaceBindingRequestKind::ServerSandbox,
+        display_name: Some("Server sandbox".to_string()),
+        root: None,
+        source: None,
+        authority: None,
+    });
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&server_workspace)
+            .is_err()
+    );
+
+    let mut untrusted = request;
+    untrusted.provider_runtime_authorized = false;
+    assert!(
+        AgenticRunLifecycleService::runtime_process_authorization_context(&untrusted)
+            .unwrap()
+            .is_none(),
+        "an untrusted request has no provider runtime authorization to inject"
+    );
 }
 
 #[test]
@@ -6217,7 +6148,6 @@ async fn prepare_chat_request_normalizes_provider_descriptor_without_registered_
             mcp: None,
             skills: None,
             edge_agent: None,
-            file_transfer: None,
         });
 
     let prepared = service
@@ -6261,7 +6191,6 @@ async fn validate_request_constraints_rejects_descriptor_without_provider_author
             mcp: None,
             skills: None,
             edge_agent: None,
-            file_transfer: None,
         });
 
     let err = service
@@ -10668,7 +10597,6 @@ async fn agent_binding_runtime_discovers_descriptor_capabilities_concurrently() 
                 &format!("http://{addr}/skills"),
             )),
             edge_agent: None,
-            file_transfer: None,
         });
 
     let capabilities = tokio::time::timeout(

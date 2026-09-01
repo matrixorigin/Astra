@@ -27,6 +27,7 @@ import { IconButton } from "@/components/ui/icon-button";
 import { useToast } from "@/components/ui/toast";
 import { splitThinkingTags } from "@/lib/api/chats";
 import type { ChatArtifactRef, ChatMessage } from "@/lib/api/types";
+import { safeArtifactDownloadUrl } from "@/lib/api/stream-artifacts";
 import { isChatScrolledToBottom } from "@/lib/chat-scroll-state";
 import { cn } from "@/lib/utils/cn";
 
@@ -370,6 +371,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
       ? (artifact.content as Record<string, unknown>)
       : null;
   const payload = buildArtifactPayload(artifact, content);
+  const downloadUrl = safeArtifactDownloadUrl(artifact.downloadUrl);
   const title =
     artifact.title ||
     artifact.filename ||
@@ -381,9 +383,20 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
       .join(" · ") || artifact.kind;
 
   const download = () => {
-    if (!payload) {
+    if (!payload && !downloadUrl) {
       return;
     }
+    if (!payload && downloadUrl) {
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = artifact.downloadFilename || artifact.filename || title;
+      anchor.rel = "noopener noreferrer";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return;
+    }
+    if (!payload) return;
     const blob = new Blob([payload.bytes], { type: payload.contentType });
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
@@ -407,7 +420,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
         <button
           type="button"
           onClick={download}
-          disabled={!payload}
+          disabled={!payload && !downloadUrl}
           className="inline-flex shrink-0 items-center gap-1.5 rounded-control border border-border bg-bg px-2.5 py-1.5 text-xs font-medium text-text-secondary transition hover:bg-surface-muted hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Download className="size-3.5" />
@@ -430,7 +443,7 @@ function ArtifactCard({ artifact }: { artifact: ChatArtifactRef }) {
         </pre>
       ) : (
         <div className="px-4 py-5 text-sm text-text-muted">
-          {payload
+          {payload || downloadUrl
             ? "Preview is not available for this artifact type. Use Download to open the file."
             : "Artifact payload is not available in this message."}
         </div>

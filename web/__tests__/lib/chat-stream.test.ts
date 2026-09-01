@@ -481,6 +481,35 @@ describe('streamChatMessage cancellation semantics', () => {
     );
   });
 
+  it('projects tool_call_end artifacts into the live assistant message', async () => {
+    const onArtifacts = vi.fn();
+    const onWorkSurfaceEvent = vi.fn();
+
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"tool_call_end","call_id":"call-1","artifacts":[{"artifact_id":"artifact-1","name":"report.pdf","type":"file","data":{"filename":"report.pdf","download_url":"/api/files/file-1"}}]}\n\n',
+        'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, {
+      onArtifacts,
+      onWorkSurfaceEvent,
+    });
+
+    expect(onWorkSurfaceEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'tool_call_end', call_id: 'call-1' }),
+    );
+    expect(onArtifacts).toHaveBeenCalledWith([
+      expect.objectContaining({
+        id: 'artifact-1',
+        filename: 'report.pdf',
+        downloadUrl: '/api/files/file-1',
+      }),
+    ]);
+  });
+
   it('forwards run_started bindings to the work surface without dropping run state updates', async () => {
     const onWorkSurfaceEvent = vi.fn();
     const onRunStarted = vi.fn();

@@ -12,9 +12,6 @@ use serde_json::{Map, Value, json};
 pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
 pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
 pub const PER_ACTION_ALLOWED_KEY: &str = "x-astra-per-action-allowed";
-pub const MANAGED_FILE_TRANSFER_TOOL_NAMES: &[&str] =
-    &["materialize_attachment", "publish_artifact"];
-
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -709,43 +706,6 @@ fn run_script_schema_for(enabled_tool_names: &[&str]) -> Value {
 
 fn all_tool_schemas_core() -> Vec<Value> {
     vec![
-        json!({
-            "type": "function",
-            "function": {
-                "name": "materialize_attachment",
-                "description": "Copy one current-turn MOI attachment into the managed runtime catalog directory. Use the exact file_id from the current attachment inventory before opening the file with local tools.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "file_id": {"type": "string", "description": "Exact file_id from the current-turn attachment inventory."}
-                    },
-                    "required": ["file_id"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
-                "name": "publish_artifact",
-                "description": "Publish a file that was already generated in the current runtime workspace so the web UI can preview and download it. Use this after creating the file; do not use it to generate content directly.",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": false,
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path of the generated file. Relative paths are resolved under the runtime workspace. Absolute paths must satisfy the current host's declared path policy."
-                        },
-                        "title": {"type": "string", "description": "Optional short display title for the artifact."},
-                        "artifact_kind": {"type": "string", "description": "Optional stable kind such as image, pdf, markdown, html, data, text, code, archive, or file. If omitted, Astra infers it from the filename/content type."},
-                        "content_type": {"type": "string", "description": "Optional MIME type. If omitted, Astra infers it from the file extension."},
-                        "description": {"type": "string", "description": "Optional one-sentence explanation shown next to the artifact in the web UI."}
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
         json!({
             "type": "function",
             "function": {
@@ -2095,21 +2055,6 @@ mod tests {
             task_board_tokens <= 1100,
             "task_board schema regressed to {task_board_tokens} tokens; keep the resource tool compact"
         );
-    }
-
-    #[test]
-    fn publish_artifact_schema_does_not_prescribe_a_runtime_layout() {
-        let schemas = all_tool_schemas();
-        let publish = find_schema(&schemas, "publish_artifact").expect("publish_artifact schema");
-        let description = publish["function"]["description"]
-            .as_str()
-            .expect("publish_artifact description");
-        for obsolete_dir in ["catalog_dir", "session_dir", "scratch_dir"] {
-            assert!(
-                !description.contains(obsolete_dir),
-                "publish_artifact schema leaked obsolete runtime directory {obsolete_dir}: {description}"
-            );
-        }
     }
 
     #[test]
