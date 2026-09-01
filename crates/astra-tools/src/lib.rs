@@ -9,7 +9,6 @@
 //! on this crate and compose its `DefaultToolExecutor` with their own wrappers.
 
 pub mod agent_tool_contract;
-pub mod artifact_metadata;
 pub mod char_boundary;
 pub use char_boundary::CharBoundaryExt;
 

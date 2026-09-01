@@ -8142,8 +8142,11 @@ fn copy_explicit_artifacts(
     out: &mut serde_json::Map<String, serde_json::Value>,
     source: &serde_json::Map<String, serde_json::Value>,
 ) {
-    if let Some(artifacts) = source.get("artifacts") {
-        out.insert("artifacts".to_string(), artifacts.clone());
+    if let Some(artifacts) = source
+        .get("artifacts")
+        .and_then(crate::external_artifacts::project_external_artifacts)
+    {
+        out.insert("artifacts".to_string(), artifacts);
     }
 }
 

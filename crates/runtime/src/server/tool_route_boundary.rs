@@ -361,9 +361,11 @@ fn copy_result_artifacts_metadata(
     let Some(artifacts) = artifacts else {
         return;
     };
-    event
-        .entry("artifacts".to_string())
-        .or_insert_with(|| artifacts.clone());
+    let Some(artifacts) = astra_services::external_artifacts::project_external_artifacts(artifacts)
+    else {
+        return;
+    };
+    event.entry("artifacts".to_string()).or_insert(artifacts);
 }
 
 pub(crate) fn projected_tool_start_event_fields(

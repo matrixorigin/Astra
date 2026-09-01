@@ -1029,8 +1029,13 @@ fn route_boundary_tool_call_end_promotes_structured_artifacts() {
         serde_json::json!({
             "artifacts": [{
                 "artifact_id": "artifact_file_1",
+                "name": "x".repeat(161),
                 "type": "file",
-                "data": {"file_id": "file_1"}
+                "data": {
+                    "file_id": "file_1",
+                    "content_type": "text/html; charset=utf-8",
+                    "mime_type": "IMAGE/PNG"
+                }
             }]
         }),
     )]));
@@ -1052,6 +1057,13 @@ fn route_boundary_tool_call_end_promotes_structured_artifacts() {
         "artifact_file_1"
     );
     assert_eq!(end_event["artifacts"][0]["artifact_id"], "artifact_file_1");
+    assert!(end_event["artifacts"][0].get("name").is_none());
+    assert!(
+        end_event["artifacts"][0]["data"]
+            .get("content_type")
+            .is_none()
+    );
+    assert_eq!(end_event["artifacts"][0]["data"]["mime_type"], "image/png");
     assert!(end_event.get("output").is_none());
     assert!(end_event.get("artifact").is_none());
 }
